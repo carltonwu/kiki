@@ -2,15 +2,15 @@
 // then apply with `railway config apply`.
 import { defineRailway, github, postgres, preserve, project, service } from "railway/iac";
 
-// TODO: set to the GitHub repo this monorepo is pushed to.
-const REPO = "OWNER/kiki";
+const REPO = "carltonwu/kiki";
 
 export default defineRailway(() => {
   const db = postgres("postgres");
 
   const ingester = service("ingester", {
     // No rootDirectory: the build needs the whole Cargo workspace.
-    source: github(REPO, { branch: "main" }),
+    // checkSuites: deploy only after GitHub Actions checks pass (.github/workflows/ci.yml).
+    source: github(REPO, { branch: "main", checkSuites: true }),
     build: {
       builder: "DOCKERFILE",
       dockerfilePath: "services/ingester/Dockerfile",

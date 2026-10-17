@@ -23,7 +23,8 @@ embedded in the binary and applied by `ingester migrate`, which Railway runs bef
 
 ## Deploying (Railway)
 
-Infrastructure is defined in `.railway/railway.ts`. Services build from GitHub on push to `main`.
+Infrastructure is defined in `.railway/railway.ts`. Services build from GitHub on push to `main`,
+after the GitHub Actions checks in `.github/workflows/ci.yml` pass (a failing check skips the deploy).
 
 ```sh
 cd .railway && npm install && cd ..
