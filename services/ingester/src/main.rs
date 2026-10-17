@@ -5,18 +5,26 @@
 //!   ingester           run the service
 //!   ingester migrate   apply database migrations and exit (Railway pre-deploy step)
 
+mod catch_up;
 mod config;
+mod gateway;
 mod health;
 mod leader;
+mod rest;
+mod store;
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, bail};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::watch;
 use tracing::info;
 
-use crate::config::Config;
+use crate::{
+    catch_up::CatchUp,
+    config::{Config, DiscordConfig},
+    gateway::Listener,
+};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -43,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
         Some(other) => bail!("unknown command `{other}` (expected `migrate` or no arguments)"),
     }
 
+    let discord = DiscordConfig::from_env()?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -50,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let health = tokio::spawn(health::serve(
+    let mut health = tokio::spawn(health::serve(
         config.port,
         pool.clone(),
         shutdown_rx.clone(),
@@ -58,21 +68,64 @@ async fn main() -> anyhow::Result<()> {
 
     // Only one instance may hold the Gateway connection. During a Railway deploy the
     // new instance waits here until the old one shuts down and releases the lock.
-    let Some(leader) = leader::acquire(&pool, shutdown_rx.clone()).await? else {
+    let Some(mut leader) = leader::acquire(&pool, shutdown_rx.clone()).await? else {
         info!("shut down before acquiring leadership");
         return Ok(());
     };
     info!("leader lock acquired");
 
-    // TODO: start the Gateway connection and message pipeline here.
+    let mut ingest = tokio::spawn(ingest(pool, discord, shutdown_rx.clone()));
 
-    tokio::select! {
-        result = leader.hold(shutdown_rx.clone()) => result?,
-        result = health => result??,
-    }
+    // `ingest` returns after shutdown, once the Gateway connection is closed.
+    let result = tokio::select! {
+        result = &mut ingest => joined(result),
+        error = leader.watch() => Err(error),
+        result = &mut health => match joined(result) {
+            Ok(()) => joined(ingest.await), // shutting down; let ingest finish
+            Err(e) => Err(e),
+        },
+    };
+    // Only now may the next instance connect to the Gateway.
+    leader.release().await;
+    result?;
 
     info!("stopped");
     Ok(())
+}
+
+/// Backfills every enabled guild over REST, then listens to the Gateway.
+async fn ingest(
+    pool: sqlx::PgPool,
+    discord: DiscordConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    let http = Arc::new(twilight_http::Client::new(discord.token.clone()));
+    let catch_up = Arc::new(CatchUp::new(http, pool.clone(), &discord.guild_ids));
+
+    info!(
+        guilds = discord.guild_ids.len(),
+        "backfilling before connecting to the Gateway"
+    );
+    let backfill = async {
+        for &guild_id in &discord.guild_ids {
+            catch_up.run_logged(guild_id).await;
+        }
+    };
+    tokio::select! {
+        () = backfill => {}
+        _ = shutdown.wait_for(|stop| *stop) => return Ok(()),
+    }
+
+    let listener = Listener {
+        db: pool,
+        catch_up,
+        guild_ids: discord.guild_ids.iter().map(|id| id.get() as i64).collect(),
+    };
+    listener.run(discord.token, shutdown).await
+}
+
+fn joined(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    result.context("task panicked")?
 }
 
 fn init_tracing(config: &Config) {

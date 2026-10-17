@@ -31,8 +31,13 @@ cd .railway && npm install && cd ..
 railway link                          # select the project
 railway config plan                   # review changes
 railway config apply                  # apply them
-railway variable set --service ingester DISCORD_BOT_TOKEN=... DISCORD_GUILD_ID=...
+railway variable set --service ingester DISCORD_BOT_TOKEN=...
 ```
+
+On start, the ingester backfills every guild in `DISCORD_GUILD_IDS` over REST (resuming from
+each channel's `complete_through` cursor, so restarts only fetch what's new), then connects to
+the Gateway and stores live message, edit, delete and channel events. Each `GUILD_CREATE` (every
+new Gateway session) runs another catch-up in the background to fill any gap.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

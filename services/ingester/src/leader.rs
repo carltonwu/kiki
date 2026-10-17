@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow};
 use sqlx::{Connection, PgConnection, PgPool};
 use tokio::sync::watch;
 use tracing::info;
@@ -52,21 +52,20 @@ pub async fn acquire(
 }
 
 impl Leader {
-    /// Keeps the lock until shutdown. Fails if the lock connection drops, because the
-    /// lock is gone and another instance may take over; exiting lets Railway restart us.
-    pub async fn hold(mut self, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
+    /// Returns only if the lock connection drops: the lock is gone and another
+    /// instance may take over, so the caller must stop; exiting lets Railway restart us.
+    pub async fn watch(&mut self) -> anyhow::Error {
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(PING_INTERVAL) => {
-                    if let Err(e) = self.conn.ping().await {
-                        bail!("lost leader lock connection: {e}");
-                    }
-                }
-                _ = shutdown.wait_for(|stop| *stop) => break,
+            tokio::time::sleep(PING_INTERVAL).await;
+            if let Err(e) = self.conn.ping().await {
+                return anyhow!("lost leader lock connection: {e}");
             }
         }
+    }
+
+    /// Releases the lock. Call only after the Gateway connection is closed.
+    pub async fn release(self) {
         self.conn.close().await.ok();
         info!("leader lock released");
-        Ok(())
     }
 }

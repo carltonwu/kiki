@@ -33,7 +33,8 @@ export default defineRailway(() => {
       LOG_FORMAT: "json",
       RUST_LOG: "info,sqlx=warn",
       DISCORD_BOT_TOKEN: preserve(), // secret: set with `railway variable set`
-      DISCORD_GUILD_ID: preserve(),
+      // Comma-separated guilds to ingest. Disabled for now: 348273727298863104.
+      DISCORD_GUILD_IDS: "1358240830887952575",
     },
   });
 
