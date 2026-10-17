@@ -1,0 +1,9 @@
+{
+  "name": "kiki-infra",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "railway": "^3.16.0",
+    "typescript": "^7.0.2"
+  }
+}

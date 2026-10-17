@@ -1,0 +1,7 @@
+target/
+.git/
+tools/
+.railway/
+**/.env
+# The image's Rust version is pinned by the base image; skip rustup's toolchain file.
+rust-toolchain.toml

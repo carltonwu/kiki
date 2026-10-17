@@ -1,0 +1,32 @@
+# Secrets: every .env file except the template
+.env
+.env.*
+!.env.example
+
+# Rust
+/target
+
+# Python (tools/)
+.venv/
+__pycache__/
+.ruff_cache/
+
+# Node (.railway/)
+node_modules/
+
+# Local data (backfill SQLite database and its WAL files)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+
+# Railway saved plans can contain variable values
+railway-plan*.json
+
+# Logs, editor and OS files
+*.log
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

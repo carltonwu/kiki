@@ -1,0 +1,13 @@
+[project]
+name = "backfill"
+version = "0.1.0"
+description = "Backfill a Discord guild's messages into SQLite"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.4",
+    "rich>=15.0.0",
+]
+
+[tool.ruff]
+line-length = 100

@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["services/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.91"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
