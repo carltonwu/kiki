@@ -150,6 +150,29 @@ pub(super) fn custom(text: &str) -> Option<(Reaction, usize)> {
     Some((Reaction::Custom { name, id, animated }, end + 1))
 }
 
+/// Every emoji written in `text`, custom (`<:name:id>`) or Unicode, as Discord
+/// writes them.
+pub(super) fn written(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(grapheme) = rest.graphemes(true).next() {
+        let len = match grapheme.starts_with('<').then(|| custom(rest)).flatten() {
+            Some((reaction, len)) => {
+                found.push(reaction.to_string());
+                len
+            }
+            None => {
+                if is_emoji(grapheme) {
+                    found.push(grapheme.to_owned());
+                }
+                grapheme.len()
+            }
+        };
+        rest = &rest[len..];
+    }
+    found
+}
+
 fn valid_name(name: &str) -> bool {
     (1..=32).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -197,6 +220,15 @@ mod tests {
                 animated: false
             }
         );
+    }
+
+    #[test]
+    fn finds_emoji_written_in_text() {
+        assert_eq!(
+            written("lol <:oop:58> no <a:ape:14:> 🏳️‍🌈 ok 💀💀 <3 <@12>"),
+            ["<:oop:58>", "<a:ape:14>", "🏳️‍🌈", "💀", "💀"]
+        );
+        assert!(written("plain text, 1 < 2").is_empty());
     }
 
     #[test]

@@ -1,0 +1,93 @@
+name: Kiki picks varied custom emoji from a realistic catalog
+# Evidence for the emoji-variety change: run with `kiki-sim test --live` and
+# count the distinct emoji in the transcript. 28 emoji like the friend group's
+# server, prose lingo like theirs, and banter that invites reactions.
+live: only
+steps:
+  - add_emoji: {name: monkeded, id: 900000000000005100, description: "a monkey with an oxygen tube grinning sheepishly, for owning up to something a little embarrassing"}
+  - add_emoji: {name: huh, id: 900000000000005101, description: "a squinting, judgmental face, for confusion: what?"}
+  - add_emoji: {name: tt_wellyes, id: 900000000000005102, description: "a woman in a sparkly top glancing sideways, for 'well yes', obviously"}
+  - add_emoji: {name: concerned_froge, id: 900000000000005103, description: "a cartoon frog side-eyeing, for concern or 'source?'"}
+  - add_emoji: {name: tannah, id: 900000000000005104, description: "a toddler's face up close with big dark eyes, a reaction the group spams"}
+  - add_emoji: {name: oop, id: 900000000000005105, description: "glossy pursed lips, for 'oop', caught saying something"}
+  - add_emoji: {name: bruh, id: 900000000000005106, description: "a young man's deadpan, bewildered stare, for an unimpressed bruh"}
+  - add_emoji: {name: joyextremee, id: 900000000000005107, description: "a distorted wide-eyed duck screaming with joy, for extreme laughter"}
+  - add_emoji: {name: seth_shock, id: 900000000000005108, description: "someone covering their mouth and staring, for shock or gasping at tea"}
+  - add_emoji: {name: alert, id: 900000000000005109, description: "a spinning red emergency siren, for urgent news or drama alerts"}
+  - add_emoji: {name: crycat, id: 900000000000005110, description: "a white cat with huge teary eyes, for sad, touched or pleading"}
+  - add_emoji: {name: grief_elevated, id: 900000000000005111, description: "a screaming yellow face with hands raised in despair, for dramatic anguish"}
+  - add_emoji: {name: panik, id: 900000000000005112, description: "a 3D head clutching its temples, for panic"}
+  - add_emoji: {name: OKAAYYY, id: 900000000000005113, description: "a confident older woman in a black dress, for 'okaaay' approval, slay"}
+  - add_emoji: {name: ate, id: 900000000000005114, description: "someone slurping noodles intensely, for 'ate', they nailed it"}
+  - add_emoji: {name: hairflip, id: 900000000000005115, description: "a black-and-white smirking hair flip, for sass and confidence"}
+  - add_emoji: {name: sally, id: 900000000000005116, description: "a blonde woman in glasses with a smug, judgmental smirk, for smug side-eye"}
+  - add_emoji: {name: sadge, id: 900000000000005117, description: "a tearful frowning Pepe, for sadness"}
+  - add_emoji: {name: troll, id: 900000000000005118, description: "the classic trollface grin, for trolling or mischief"}
+  - add_emoji: {name: thunking, id: 900000000000005119, description: "a yellow face with a hand on its chin, for thinking hard"}
+  - add_emoji: {name: excuseme, id: 900000000000005120, description: "a pixelated wide-eyed man, for 'excuse me??' disbelief"}
+  - add_emoji: {name: catSpin, id: 900000000000005121, description: "a motion-blurred spinning cat, for chaos or being dizzy"}
+  - add_emoji: {name: elmofire, id: 900000000000005122, description: "Elmo raising his arms in front of a fire, for chaos and things going wrong"}
+  - add_emoji: {name: coffin_dance, id: 900000000000005123, description: "pixel pallbearers carrying a coffin, for something dying or a flop"}
+  - add_emoji: {name: xdd, id: 900000000000005124, description: "a blurry grinning cat, for laughing"}
+  - add_emoji: {name: WAAAA, id: 900000000000005125, description: "a giant wailing mouth, for dramatic crying"}
+  - add_emoji: {name: upvote, id: 900000000000005126, description: "an orange upward arrow, for approval"}
+  - add_emoji: {name: wig_pig, id: 900000000000005127, description: "an angry pink pig in a wig, for a wig snatched or a bad wig"}
+  # Live mode describes emoji with a real vision model, which only sees fakecord's
+  # placeholder images; store the descriptions instead of resyncing.
+  - exec: >-
+      INSERT INTO guild_emojis (id, guild_id, name, raw, description) VALUES
+        (900000000000005100, 900000000000000001, 'monkeded', '{"id": "900000000000005100", "name": "monkeded"}'::jsonb, 'a monkey with an oxygen tube grinning sheepishly, for owning up to something a little embarrassing'),
+        (900000000000005101, 900000000000000001, 'huh', '{"id": "900000000000005101", "name": "huh"}'::jsonb, 'a squinting, judgmental face, for confusion: what?'),
+        (900000000000005102, 900000000000000001, 'tt_wellyes', '{"id": "900000000000005102", "name": "tt_wellyes"}'::jsonb, 'a woman in a sparkly top glancing sideways, for ''well yes'', obviously'),
+        (900000000000005103, 900000000000000001, 'concerned_froge', '{"id": "900000000000005103", "name": "concerned_froge"}'::jsonb, 'a cartoon frog side-eyeing, for concern or ''source?'''),
+        (900000000000005104, 900000000000000001, 'tannah', '{"id": "900000000000005104", "name": "tannah"}'::jsonb, 'a toddler''s face up close with big dark eyes, a reaction the group spams'),
+        (900000000000005105, 900000000000000001, 'oop', '{"id": "900000000000005105", "name": "oop"}'::jsonb, 'glossy pursed lips, for ''oop'', caught saying something'),
+        (900000000000005106, 900000000000000001, 'bruh', '{"id": "900000000000005106", "name": "bruh"}'::jsonb, 'a young man''s deadpan, bewildered stare, for an unimpressed bruh'),
+        (900000000000005107, 900000000000000001, 'joyextremee', '{"id": "900000000000005107", "name": "joyextremee"}'::jsonb, 'a distorted wide-eyed duck screaming with joy, for extreme laughter'),
+        (900000000000005108, 900000000000000001, 'seth_shock', '{"id": "900000000000005108", "name": "seth_shock"}'::jsonb, 'someone covering their mouth and staring, for shock or gasping at tea'),
+        (900000000000005109, 900000000000000001, 'alert', '{"id": "900000000000005109", "name": "alert"}'::jsonb, 'a spinning red emergency siren, for urgent news or drama alerts'),
+        (900000000000005110, 900000000000000001, 'crycat', '{"id": "900000000000005110", "name": "crycat"}'::jsonb, 'a white cat with huge teary eyes, for sad, touched or pleading'),
+        (900000000000005111, 900000000000000001, 'grief_elevated', '{"id": "900000000000005111", "name": "grief_elevated"}'::jsonb, 'a screaming yellow face with hands raised in despair, for dramatic anguish'),
+        (900000000000005112, 900000000000000001, 'panik', '{"id": "900000000000005112", "name": "panik"}'::jsonb, 'a 3D head clutching its temples, for panic'),
+        (900000000000005113, 900000000000000001, 'OKAAYYY', '{"id": "900000000000005113", "name": "OKAAYYY"}'::jsonb, 'a confident older woman in a black dress, for ''okaaay'' approval, slay'),
+        (900000000000005114, 900000000000000001, 'ate', '{"id": "900000000000005114", "name": "ate"}'::jsonb, 'someone slurping noodles intensely, for ''ate'', they nailed it'),
+        (900000000000005115, 900000000000000001, 'hairflip', '{"id": "900000000000005115", "name": "hairflip"}'::jsonb, 'a black-and-white smirking hair flip, for sass and confidence'),
+        (900000000000005116, 900000000000000001, 'sally', '{"id": "900000000000005116", "name": "sally"}'::jsonb, 'a blonde woman in glasses with a smug, judgmental smirk, for smug side-eye'),
+        (900000000000005117, 900000000000000001, 'sadge', '{"id": "900000000000005117", "name": "sadge"}'::jsonb, 'a tearful frowning Pepe, for sadness'),
+        (900000000000005118, 900000000000000001, 'troll', '{"id": "900000000000005118", "name": "troll"}'::jsonb, 'the classic trollface grin, for trolling or mischief'),
+        (900000000000005119, 900000000000000001, 'thunking', '{"id": "900000000000005119", "name": "thunking"}'::jsonb, 'a yellow face with a hand on its chin, for thinking hard'),
+        (900000000000005120, 900000000000000001, 'excuseme', '{"id": "900000000000005120", "name": "excuseme"}'::jsonb, 'a pixelated wide-eyed man, for ''excuse me??'' disbelief'),
+        (900000000000005121, 900000000000000001, 'catSpin', '{"id": "900000000000005121", "name": "catSpin"}'::jsonb, 'a motion-blurred spinning cat, for chaos or being dizzy'),
+        (900000000000005122, 900000000000000001, 'elmofire', '{"id": "900000000000005122", "name": "elmofire"}'::jsonb, 'Elmo raising his arms in front of a fire, for chaos and things going wrong'),
+        (900000000000005123, 900000000000000001, 'coffin_dance', '{"id": "900000000000005123", "name": "coffin_dance"}'::jsonb, 'pixel pallbearers carrying a coffin, for something dying or a flop'),
+        (900000000000005124, 900000000000000001, 'xdd', '{"id": "900000000000005124", "name": "xdd"}'::jsonb, 'a blurry grinning cat, for laughing'),
+        (900000000000005125, 900000000000000001, 'WAAAA', '{"id": "900000000000005125", "name": "WAAAA"}'::jsonb, 'a giant wailing mouth, for dramatic crying'),
+        (900000000000005126, 900000000000000001, 'upvote', '{"id": "900000000000005126", "name": "upvote"}'::jsonb, 'an orange upward arrow, for approval'),
+        (900000000000005127, 900000000000000001, 'wig_pig', '{"id": "900000000000005127", "name": "wig_pig"}'::jsonb, 'an angry pink pig in a wig, for a wig snatched or a bad wig')
+  - exec: >-
+      INSERT INTO guild_lingo (guild_id, phrase, meaning) VALUES (900000000000000001, 'bby', 'affectionate address, like "sis" or "girl"'), (900000000000000001, 'lowk', 'lowkey'), (900000000000000001, 'im gagged', 'shocked or amazed, campy'), (900000000000000001, 'goated', 'the best'), (900000000000000001, 'truly', 'one-word agreement'), (900000000000000001, 'helpppp', 'reacting to something absurd or embarrassing')
+  - slash: {as: alex, in: general, command: config, options: {key: lingo_nudge, value: "0"}}
+  - say: {as: alex, in: general, text: "kiki i just found out my ex is dating my dentist"}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "kiki rate my outfit: crocs, socks and a blazer"}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "kiki i burned the pasta water. like the water itself"}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "kiki tell sam he's wrong about pineapple pizza"}
+  - expect: {reply: true}
+  - say: {as: chrissy, in: general, text: "kiki i got the callback for the lead!!!"}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "kiki the wifi died mid ranked match and i lost 40 points"}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "kiki be honest is my haircut giving lesbian or just mullet"}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "kiki my landlord just texted 'we need to talk' at 11pm"}
+  - expect: {reply: true}
+  - say: {as: chris, in: general, text: "kiki i finally beat the final boss after 6 hours"}
+  - expect: {reply: true}
+  - say: {as: chrissy, in: general, text: "kiki someone in the cast keeps eating my labeled yogurt"}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "kiki i accidentally liked my crush's post from 2019"}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "kiki we're out of coffee at the theatre. this is a crisis"}
+  - expect: {reply: true}

@@ -1,0 +1,17 @@
+name: Kiki is pointed at search_emojis and told which emoji she keeps repeating
+steps:
+  - say: {as: alex, in: general, text: "kiki i ate the whole cake", id: cake}
+    reply: {text: "and you're telling me with no shame <:monkeded:900000000000005002>"}
+  - expect:
+      reply: true
+      prompt_contains: ["search for one that fits this moment rather than reusing a familiar one"]
+      prompt_lacks: ["Custom emoji go in exactly as written", "used a lot lately"]
+  # Once is fine; a second monkeded (here as a reaction) is a repeat.
+  - say: {as: sam, in: general, text: "kiki i ate the box too"}
+    reply: {text: "react: <:monkeded:900000000000005002>\nfiber, technically"}
+  - expect: {reply: true, prompt_lacks: "used a lot lately"}
+  - say: {as: alex, in: general, text: "kiki what do we eat next"}
+    reply: {text: "the fork"}
+  - expect:
+      reply: true
+      prompt_contains: "Emoji you've used a lot lately: <:monkeded:900000000000005002> ×2. Give them a rest"
