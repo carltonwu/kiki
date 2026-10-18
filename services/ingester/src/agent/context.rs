@@ -99,7 +99,11 @@ impl Agent {
             .with_context(|| format!("conversation {conversation_id} not found"))?;
         let settings = self.settings.snapshot(this.guild_id);
         let (history, others, channel, (guild_name, now), lingo) = tokio::try_join!(
-            self.conversation_messages(conversation_id, settings.history_messages),
+            self.conversation_messages(
+                conversation_id,
+                settings.history_messages,
+                history_step(settings.history_messages),
+            ),
             async {
                 // Only this channel's: the prompt must not reveal other channels to
                 // the people reading the reply.
@@ -246,23 +250,32 @@ impl Agent {
         }))
     }
 
+    /// The conversation's latest messages, at least `limit` of them. With `step`
+    /// above 1 the window's start moves `step` messages at a time (see
+    /// [`history_step`]), so the oldest shown message, and with it the prompt's
+    /// cacheable history prefix, stays put across runs.
     pub(super) async fn conversation_messages(
         &self,
         conversation_id: i64,
         limit: i64,
+        step: i64,
     ) -> sqlx::Result<Vec<StoredMessage>> {
         sqlx::query_as(&format!(
             r#"
-            SELECT * FROM (
-                SELECT {MESSAGE_COLUMNS}
+            WITH tagged AS (
+                SELECT m.id, row_number() OVER (ORDER BY m.id) - 1 AS i, count(*) OVER () AS total
                 FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
                 WHERE cm.conversation_id = $1 AND m.deleted_at IS NULL
-                ORDER BY m.id DESC LIMIT $2
-            ) latest ORDER BY id
+            )
+            SELECT {MESSAGE_COLUMNS}
+            FROM tagged t JOIN messages m ON m.id = t.id
+            WHERE t.i >= greatest(t.total - $2, 0) / $3 * $3
+            ORDER BY m.id
             "#
         ))
         .bind(conversation_id)
         .bind(limit)
+        .bind(step)
         .fetch_all(&self.db)
         .await
     }
@@ -455,6 +468,14 @@ The last message starts with application-provided context (time, people, convers
     }
 }
 
+/// How far the reply history window moves at a time: shown history grows from
+/// `history_messages` to at most `history_messages + step - 1` messages, then
+/// drops its oldest `step` at once. Between those drops the history turns are
+/// an unchanged prompt prefix the provider can serve from its cache.
+fn history_step(history_messages: i64) -> i64 {
+    (history_messages / 3).clamp(1, 10)
+}
+
 /// One of the server's phrases for `percent`% of replies, picked from the
 /// trigger message ID: random enough across messages, the same on a retry.
 fn lingo_nudge(
@@ -634,6 +655,128 @@ pub(super) mod tests {
         assert_eq!(rows[1].images.len(), 10, "read_image reads at most 10");
         assert_eq!(rows[1].images.last().unwrap(), "9.png");
 
+        test.drop().await;
+    }
+
+    /// Replays a conversation growing one message per run, for several
+    /// `history_messages` settings: the stepped window shows at least as much as
+    /// the plain last-N window did, and keeps its first message (the start of
+    /// the cacheable history prefix) across most runs.
+    #[tokio::test]
+    async fn history_window_steps_for_prefix_caching() {
+        let Some(test) = crate::test_db::migrated("ingester_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        sqlx::raw_sql(
+            "INSERT INTO guilds (id, name) VALUES (9, 'Theatre');
+             INSERT INTO channels (id, guild_id, name, type) VALUES (2, 9, 'general', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let agent = agent(db.clone());
+        let runs_past_limit = 60;
+        for (conversation, limit) in [(1_i64, 1_i64), (2, 5), (3, 30), (4, 190)] {
+            let step = super::history_step(limit);
+            let total = limit + runs_past_limit;
+            let ids: Vec<i64> = (0..total).map(|i| conversation * 1000 + i).collect();
+            let rows: Vec<Value> = ids
+                .iter()
+                .map(|&id| {
+                    // People and Kiki take turns, like a conversation she's in.
+                    let author = if id % 2 == 0 {
+                        json!({"id": "101", "username": "alex"})
+                    } else {
+                        json!({"id": "1", "username": "Kiki", "bot": true})
+                    };
+                    let text = format!("message {id}: who's bringing snacks to rehearsal tonight?");
+                    message(id, author, json!({}), &text, json!([]))
+                })
+                .collect();
+            store::upsert_messages(&db, GUILD, &rows).await.unwrap();
+            sqlx::query("INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES ($1, 9, 2, 101)")
+                .bind(conversation)
+                .execute(&db)
+                .await
+                .unwrap();
+            let (mut kept, mut kept_before, mut previous, mut previous_before) = (0, 0, None, None);
+            let (mut previous_prompt, mut prompt_chars, mut prefix_chars) = (String::new(), 0, 0);
+            for (t, &id) in ids.iter().enumerate() {
+                let t = t as i64 + 1;
+                sqlx::query("INSERT INTO conversation_messages VALUES ($1, $2, 'decide')")
+                    .bind(id)
+                    .bind(conversation)
+                    .execute(&db)
+                    .await
+                    .unwrap();
+                let shown: Vec<i64> = agent
+                    .conversation_messages(conversation, limit, step)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.id)
+                    .collect();
+                // The plain last-N window this replaced.
+                let before: Vec<i64> = ids[(t - limit.min(t)) as usize..t as usize].to_vec();
+                assert!(
+                    shown.ends_with(&before),
+                    "limit {limit}, {t} messages: {shown:?}"
+                );
+                assert!(
+                    (shown.len() as i64) < limit + step,
+                    "limit {limit}, {t} messages: {} shown",
+                    shown.len()
+                );
+                if t > limit {
+                    kept += i32::from(previous == Some(shown[0]));
+                    kept_before += i32::from(previous_before == Some(before[0]));
+                }
+                previous = Some(shown[0]);
+                previous_before = Some(before[0]);
+
+                // The whole prompt of a reply to each person's message: how much of
+                // it repeats the previous reply's prompt, i.e. can be a cache hit.
+                if limit == 30 && id % 2 == 0 {
+                    let prompt: String = agent
+                        .context(conversation, &[id])
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .messages
+                        .iter()
+                        .map(|m| format!("{}\n{}\n", m.role, m.content))
+                        .collect();
+                    if t > limit {
+                        let common = prompt
+                            .chars()
+                            .zip(previous_prompt.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        prompt_chars += prompt.chars().count();
+                        prefix_chars += common;
+                    }
+                    previous_prompt = prompt;
+                }
+            }
+            if limit == 30 {
+                println!(
+                    "history_messages=30: {} chars of prompt per reply past the limit, {:.0}% repeating the previous reply's prompt",
+                    prompt_chars / (runs_past_limit as usize / 2),
+                    prefix_chars as f64 * 100.0 / prompt_chars as f64,
+                );
+            }
+            let share = |n: i32| f64::from(n) / runs_past_limit as f64;
+            println!(
+                "history_messages={limit} step={step}: first history message kept on {:.0}% of runs past the limit (before {:.0}%)",
+                share(kept) * 100.0,
+                share(kept_before) * 100.0,
+            );
+            assert_eq!(kept_before, 0);
+            if step == 10 {
+                assert!(share(kept) >= 0.9, "{kept} of {runs_past_limit}");
+            }
+        }
         test.drop().await;
     }
 
