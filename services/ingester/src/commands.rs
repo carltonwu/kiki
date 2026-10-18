@@ -30,14 +30,17 @@ use twilight_model::{
     util::Timestamp,
 };
 use twilight_util::builder::{
-    command::{CommandBuilder, IntegerBuilder, StringBuilder, SubCommandBuilder, UserBuilder},
+    command::{
+        BooleanBuilder, CommandBuilder, IntegerBuilder, StringBuilder, SubCommandBuilder,
+        UserBuilder,
+    },
     embed::{EmbedBuilder, EmbedFieldBuilder, EmbedFooterBuilder, ImageSource},
 };
 
 use crate::{
     catch_up::snowflake,
     config::{AgentConfig, RouterConfig},
-    conversation, guild_models,
+    conversation, guild_settings,
     rest::get_json,
     router::unix_millis,
 };
@@ -94,58 +97,41 @@ pub struct Commands {
 }
 
 pub struct Settings {
-    /// `None` when the agent is off (no AGENT_HOST_URL).
     chat_model: Option<String>,
     topic_model: Option<String>,
     decide_model: String,
     decide_enabled: bool,
-    max_active_conversations: i64,
-    routing: Vec<(&'static str, String)>,
-    agent: Vec<(&'static str, String)>,
+    global: Vec<(&'static str, String)>,
+    guilds: Arc<guild_settings::Store>,
 }
 
 impl Settings {
-    pub fn new(router: &RouterConfig, agent: &AgentConfig) -> Self {
+    pub fn new(
+        router: &RouterConfig,
+        agent: &AgentConfig,
+        guilds: Arc<guild_settings::Store>,
+    ) -> Self {
         let enabled = agent.host_url.is_some();
-        let pending_emoji = if router.pending_emoji.is_empty() {
-            "off".to_owned()
-        } else {
-            router.pending_emoji.clone()
-        };
         Self {
             chat_model: enabled.then(|| agent.chat_model.clone()),
             topic_model: enabled.then(|| agent.topic_model.clone()),
             decide_model: router.jev_model.clone(),
             decide_enabled: router.jev_api_key.is_some(),
-            max_active_conversations: router.max_active_conversations,
-            routing: vec![
-                ("ROUTE_KEYWORDS", router.keywords.join(", ")),
-                ("ROUTE_PENDING_EMOJI", pending_emoji),
-                ("ROUTE_ACTIVE_WINDOW_SECS", duration(router.active_window)),
-                ("ROUTE_MAX_MESSAGE_AGE_MS", duration(router.max_message_age)),
-                ("POOL_DEBOUNCE_MS", duration(router.pool_debounce)),
-                ("POOL_MAX_WAIT_MS", duration(router.pool_max_wait)),
-                ("POOL_MAX_MESSAGES", router.pool_max_messages.to_string()),
+            global: vec![
                 (
-                    "MAX_ACTIVE_CONVERSATIONS",
-                    router.max_active_conversations.to_string(),
+                    "Pending emoji",
+                    if router.pending_emoji.is_empty() {
+                        "off".into()
+                    } else {
+                        router.pending_emoji.clone()
+                    },
                 ),
-                ("JEV_MIN_CONFIDENCE", router.jev_min_confidence.to_string()),
-                ("JEV_TIMEOUT_MS", duration(router.jev_timeout)),
+                ("Message age", duration(router.max_message_age)),
+                ("Decide timeout", duration(router.jev_timeout)),
+                ("Host timeout", duration(agent.host_timeout)),
+                ("Run max age", duration(agent.run_max_age)),
             ],
-            agent: vec![
-                (
-                    "AGENT_HOST_URL",
-                    if enabled { "set" } else { "not set" }.to_owned(),
-                ),
-                ("AGENT_HOST_TIMEOUT_MS", duration(agent.host_timeout)),
-                ("AGENT_HISTORY_MESSAGES", agent.history_messages.to_string()),
-                ("AGENT_RUN_MAX_AGE_SECS", duration(agent.run_max_age)),
-                (
-                    "TOPIC_EVERY_MESSAGES",
-                    agent.topic_every_messages.to_string(),
-                ),
-            ],
+            guilds,
         }
     }
 }
@@ -309,7 +295,7 @@ impl Commands {
             "conversations" => self.conversations(invocation.guild_id).await?,
             "stats" => self.stats(invocation.guild_id).await?,
             "runs" => self.runs(invocation).await?,
-            "config" => self.config(invocation.guild_id).await?,
+            "config" => self.config(invocation).await?,
             "model" => self.model(invocation).await?,
             "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
@@ -320,17 +306,16 @@ impl Commands {
 
     async fn conversations(&self, guild_id: i64) -> anyhow::Result<Embed> {
         let pool = conversation::active(&self.db, self.bot_user_id).await?;
-        let total = pool.len();
         let here: Vec<_> = pool
             .into_iter()
             .filter(|c| c.guild_id == guild_id)
             .collect();
-        let max = self.settings.max_active_conversations;
-        let footer = if here.len() == total {
-            format!("{total} of {max} slots in use")
-        } else {
-            format!("{total} of {max} slots in use across all servers")
-        };
+        let max = self
+            .settings
+            .guilds
+            .snapshot(guild_id)
+            .max_active_conversations;
+        let footer = format!("{} of {max} server slots in use", here.len());
         let embed = EmbedBuilder::new()
             .color(COLOR)
             .title("Active conversations")
@@ -635,23 +620,29 @@ impl Commands {
             .ok_or_else(|| UserError("The agent is off: AGENT_HOST_URL is not set.".into()))?;
         if let Some((actor, model)) = change {
             if let Some(model) = model {
-                let catalog: Value = reqwest::Client::new()
-                    .get("https://openrouter.ai/api/v1/models")
-                    .timeout(Duration::from_secs(10))
-                    .send().await
-                    .and_then(reqwest::Response::error_for_status)
-                    .map_err(|_| UserError("Couldn't check OpenRouter's model catalog. Try again; your setting has not changed.".into()))?
-                    .json().await
-                    .map_err(|_| UserError("Couldn't read OpenRouter's model catalog. Try again; your setting has not changed.".into()))?;
-                validate_catalog_model(&catalog, model)?;
+                check_catalog_model(model).await?;
             }
-            guild_models::set(&self.db, invocation.guild_id, model, actor).await?;
+            self.settings
+                .guilds
+                .change(
+                    invocation.guild_id,
+                    "chat_model",
+                    model.map(|m| Value::String(m.to_owned())),
+                    actor,
+                )
+                .await
+                .map_err(|e| UserError(e.to_string()))?;
             info!(
                 guild_id = invocation.guild_id,
                 actor, model, "server chat model changed"
             );
         }
-        let effective = guild_models::effective(&self.db, invocation.guild_id, default).await?;
+        let effective = self
+            .settings
+            .guilds
+            .snapshot(invocation.guild_id)
+            .chat_model
+            .clone();
         let detail = if change.is_some() {
             "Applies to new replies. Jobs already in progress keep their original model."
         } else {
@@ -666,94 +657,55 @@ impl Commands {
             .build())
     }
 
-    async fn config(&self, guild_id: i64) -> anyhow::Result<Embed> {
-        let (last_chat, last_decide): (Option<String>, Option<String>) = sqlx::query_as(
-            r#"
-            SELECT
-                (SELECT r.model FROM agent_runs r JOIN conversations c ON c.id = r.conversation_id
-                 WHERE c.guild_id = $1 AND r.model IS NOT NULL ORDER BY r.id DESC LIMIT 1),
-                (SELECT c.jev_model FROM classifications c JOIN messages m ON m.id = c.message_id
-                 WHERE m.guild_id = $1 AND c.jev_model IS NOT NULL
-                 ORDER BY c.classified_at DESC LIMIT 1)
-            "#,
-        )
-        .bind(guild_id)
-        .fetch_one(&self.db)
-        .await?;
-
-        let s = &self.settings;
-        let chat_model = match &s.chat_model {
-            Some(default) => Some(guild_models::effective(&self.db, guild_id, default).await?),
-            None => None,
-        };
-        let off = || "off".to_owned();
-        let models = [
-            vec![
-                "Chat".to_owned(),
-                chat_model.unwrap_or_else(off),
-                last_chat.unwrap_or_else(|| "–".into()),
-            ],
-            vec![
-                "Topic".to_owned(),
-                s.topic_model.clone().unwrap_or_else(off),
-                "–".into(),
-            ],
-            vec![
-                "Decide".to_owned(),
-                if s.decide_enabled {
-                    s.decide_model.clone()
-                } else {
-                    off()
-                },
-                last_decide.unwrap_or_else(|| "–".into()),
-            ],
-        ];
-        let settings_table = |rows: &[(&'static str, String)]| {
-            let rows: Vec<Vec<String>> = rows
+    async fn config(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        if let Some((actor, key, value)) = config_change(invocation)? {
+            if key == "chat_model"
+                && let Some(model) = value.as_ref().and_then(Value::as_str)
+            {
+                check_catalog_model(model).await?;
+            }
+            self.settings
+                .guilds
+                .change(invocation.guild_id, key, value, actor)
+                .await
+                .map_err(|e| UserError(e.to_string()))?;
+            info!(
+                guild_id = invocation.guild_id,
+                actor, key, "server setting changed"
+            );
+        }
+        let snapshot = self.settings.guilds.snapshot(invocation.guild_id);
+        let key = invocation.option("key").and_then(Value::as_str);
+        if let Some(key) = key {
+            guild_settings::spec(key).map_err(|e| UserError(e.to_string()))?;
+        }
+        let global = format!(
+            "Chat agent: {} · Decide: {}\nTopic model (global): {} · Decide model (global): {}\n{}",
+            if self.settings.chat_model.is_some() {
+                "on"
+            } else {
+                "off"
+            },
+            if self.settings.decide_enabled {
+                "on"
+            } else {
+                "off"
+            },
+            self.settings.topic_model.as_deref().unwrap_or("off"),
+            self.settings.decide_model,
+            self.settings
+                .global
                 .iter()
-                .map(|(name, value)| vec![(*name).to_owned(), value.clone()])
-                .collect();
-            table(&[("Variable", Align::Left), ("Value", Align::Left)], &rows)
-        };
-        let mut notes = Vec::new();
-        if s.chat_model.is_none() {
-            notes.push("AGENT_HOST_URL is not set: routed messages get no reply.");
-        }
-        if !s.decide_enabled {
-            notes.push("OPENROUTER_DECISION_API_KEY is not set: Decide always answers no.");
-        }
-        let mut embed = EmbedBuilder::new()
-            .color(COLOR)
-            .title("Kiki config")
-            .field(EmbedFieldBuilder::new(
-                "Models",
-                truncate(
-                    &table(
-                        &[
-                            ("Role", Align::Left),
-                            ("Configured", Align::Left),
-                            ("Last answered", Align::Left),
-                        ],
-                        &models,
-                    ),
-                    MAX_FIELD_CHARS,
-                ),
-            ))
-            .field(EmbedFieldBuilder::new(
-                "Routing",
-                truncate(&settings_table(&s.routing), MAX_FIELD_CHARS),
-            ))
-            .field(EmbedFieldBuilder::new(
-                "Agent",
-                truncate(&settings_table(&s.agent), MAX_FIELD_CHARS),
-            ))
-            .footer(EmbedFooterBuilder::new(
-                "Read from environment variables at startup",
-            ));
-        if !notes.is_empty() {
-            embed = embed.description(notes.join("\n"));
-        }
-        Ok(embed.build())
+                .map(|(k, v)| format!("{k}: {v}"))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
+        Ok(config_embed(
+            &snapshot,
+            self.settings.guilds.default_values(),
+            key,
+            &global,
+        ))
     }
 
     async fn whois(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
@@ -1045,6 +997,116 @@ impl Commands {
     }
 }
 
+fn require_manage_server(invocation: &Invocation<'_>) -> Result<i64, UserError> {
+    let permissions = snowflake(&invocation.member["permissions"])
+        .map(|bits| Permissions::from_bits_truncate(bits as u64))
+        .unwrap_or_else(Permissions::empty);
+    if !permissions.intersects(Permissions::MANAGE_GUILD | Permissions::ADMINISTRATOR) {
+        return Err(UserError(
+            "You need Manage Server permission to change server settings.".into(),
+        ));
+    }
+    snowflake(&invocation.member["user"]["id"])
+        .ok_or_else(|| UserError("Couldn't identify who is changing the setting.".into()))
+}
+
+type ConfigChange<'a> = (i64, &'a str, Option<Value>);
+
+fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<'a>>, UserError> {
+    let value = invocation.option("value");
+    let reset = invocation
+        .option("reset")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if value.is_none() && !reset {
+        return Ok(None);
+    }
+    let actor = require_manage_server(invocation)?;
+    let key = invocation
+        .option("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| UserError("Choose a key to change or reset.".into()))?;
+    let spec = guild_settings::spec(key).map_err(|e| UserError(e.to_string()))?;
+    if reset && value.is_some() {
+        return Err(UserError("Use either value or reset, not both.".into()));
+    }
+    let value = if reset {
+        None
+    } else {
+        Some(
+            spec.parse(
+                value
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| UserError("Use a text value.".into()))?,
+            )
+            .map_err(|e| UserError(e.to_string()))?,
+        )
+    };
+    Ok(Some((actor, key, value)))
+}
+
+async fn check_catalog_model(model: &str) -> anyhow::Result<()> {
+    let catalog: Value = reqwest::Client::new()
+                    .get("https://openrouter.ai/api/v1/models")
+                    .timeout(Duration::from_secs(10))
+                    .send().await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|_| UserError("Couldn't check OpenRouter's model catalog. Try again; your setting has not changed.".into()))?
+                    .json().await
+                    .map_err(|_| UserError("Couldn't read OpenRouter's model catalog. Try again; your setting has not changed.".into()))?;
+    validate_catalog_model(&catalog, model)?;
+    Ok(())
+}
+
+fn config_embed(
+    settings: &guild_settings::Resolved,
+    defaults: &guild_settings::GuildSettings,
+    key: Option<&str>,
+    global: &str,
+) -> Embed {
+    let values = serde_json::to_value(&settings.values).expect("settings serialize");
+    let mut embed = EmbedBuilder::new().color(COLOR).title("Server config")
+        .description(truncate(global, 1000))
+        .footer(EmbedFooterBuilder::new("Use key + value to edit, or key + reset:true. New pools and jobs use the new settings."));
+    for spec in guild_settings::SPECS
+        .iter()
+        .filter(|s| key.is_none_or(|key| key == s.key))
+    {
+        let source = if settings.ignored.iter().any(|k| k == spec.key) {
+            "default (invalid override ignored)"
+        } else if settings.overrides.contains_key(spec.key) {
+            "server"
+        } else {
+            "default"
+        };
+        let value = format!(
+            "{}\n{}\n{} · {}",
+            code_block(&truncate(&values[spec.key].to_string(), 700)),
+            spec.description,
+            source,
+            spec.bounds()
+        );
+        embed = embed.field(EmbedFieldBuilder::new(
+            spec.key,
+            truncate(&value, MAX_FIELD_CHARS),
+        ));
+    }
+    if let Some(key) = key {
+        let defaults = serde_json::to_value(defaults).expect("defaults serialize");
+        embed = embed.field(EmbedFieldBuilder::new(
+            "Reset value",
+            code_block(&truncate(&defaults[key].to_string(), 700)),
+        ));
+    }
+    if !settings.ignored.is_empty() {
+        embed = embed.field(EmbedFieldBuilder::new(
+            "Ignored overrides",
+            truncate(&settings.ignored.join(", "), MAX_FIELD_CHARS),
+        ));
+    }
+    embed.build()
+}
+
 /// Read access can be delegated, but model changes always require Manage Server.
 fn model_change<'a>(
     invocation: &Invocation<'a>,
@@ -1052,28 +1114,12 @@ fn model_change<'a>(
     let Some(value) = invocation.option("model") else {
         return Ok(None);
     };
-    let permissions = snowflake(&invocation.member["permissions"])
-        .map(|bits| Permissions::from_bits_truncate(bits as u64))
-        .unwrap_or_else(Permissions::empty);
-    if !permissions.intersects(Permissions::MANAGE_GUILD | Permissions::ADMINISTRATOR) {
-        return Err(UserError(
-            "You need Manage Server permission to change the chat model.".into(),
-        ));
-    }
-    let actor = snowflake(&invocation.member["user"]["id"])
-        .ok_or_else(|| UserError("Couldn't identify who is changing the model.".into()))?;
+    let actor = require_manage_server(invocation)?;
     let model = value.as_str().unwrap_or_default().trim();
     if model == "default" {
         return Ok(Some((actor, None)));
     }
-    if model.len() > 200
-        || !model
-            .split_once('/')
-            .is_some_and(|(provider, name)| !provider.is_empty() && !name.is_empty())
-        || !model
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || b"/-_.:~".contains(&c))
-    {
+    if !guild_settings::valid_model_id(model) {
         return Err(UserError("Use an OpenRouter model ID like `deepseek/deepseek-v4.1-flash-1017`, or `default` to reset.".into()));
     }
     Ok(Some((actor, Some(model))))
@@ -1129,10 +1175,24 @@ fn definition() -> CommandBuilder {
                         .max_value(25),
                 ),
         )
-        .option(SubCommandBuilder::new(
-            "config",
-            "Models and routing and agent settings in effect",
-        ))
+        .option(
+            SubCommandBuilder::new("config", "View or change this server's settings")
+                .option(
+                    StringBuilder::new("key", "Setting to inspect, change or reset")
+                        .choices(guild_settings::SPECS.iter().map(|s| (s.key, s.key))),
+                )
+                .option(
+                    StringBuilder::new(
+                        "value",
+                        "New value; durations accept ms, s, m, h; empty keywords disables triggers",
+                    )
+                    .max_length(1000),
+                )
+                .option(BooleanBuilder::new(
+                    "reset",
+                    "Reset the selected key to its current default",
+                )),
+        )
         .option(
             SubCommandBuilder::new(
                 "model",
@@ -1395,6 +1455,90 @@ mod tests {
             Some((42, None))
         );
         assert!(model_change(&invoke(&Value::Null, &options)).is_err());
+    }
+
+    #[test]
+    fn config_writes_require_manage_server_and_validate_option_combinations() {
+        use super::{Invocation, Permissions, config_change};
+        use serde_json::{Value, json};
+        fn invoke<'a>(member: &'a Value, options: &'a Value) -> Invocation<'a> {
+            Invocation {
+                guild_id: 1,
+                member,
+                subcommand: "config",
+                options,
+                resolved: &Value::Null,
+            }
+        }
+        let denied = json!({"user": {"id": "42"}, "permissions": "0"});
+        let allowed = json!({"user": {"id": "42"}, "permissions": Permissions::MANAGE_GUILD.bits().to_string()});
+        let options =
+            json!([{"name": "key", "value": "pool_debounce"}, {"name": "value", "value": "2s"}]);
+        assert!(config_change(&invoke(&denied, &options)).is_err());
+        assert_eq!(
+            config_change(&invoke(&allowed, &options)).unwrap(),
+            Some((42, "pool_debounce", Some(json!(2000))))
+        );
+        let read = json!([{"name": "key", "value": "chat_model"}]);
+        assert!(config_change(&invoke(&denied, &read)).unwrap().is_none());
+        let reset =
+            json!([{"name": "key", "value": "chat_model"}, {"name": "reset", "value": true}]);
+        assert!(config_change(&invoke(&denied, &reset)).is_err());
+        assert_eq!(
+            config_change(&invoke(&allowed, &reset)).unwrap(),
+            Some((42, "chat_model", None))
+        );
+        for options in [
+            json!([{"name": "value", "value": "10"}]),
+            json!([{"name": "reset", "value": true}]),
+            json!([{"name": "key", "value": "history_messages"}, {"name": "value", "value": "191"}]),
+            json!([{"name": "key", "value": "unknown"}, {"name": "value", "value": "1"}]),
+            json!([{"name": "key", "value": "chat_model"}, {"name": "reset", "value": true}, {"name": "value", "value": "test/model"}]),
+        ] {
+            assert!(config_change(&invoke(&allowed, &options)).is_err());
+        }
+    }
+
+    #[test]
+    fn config_display_fits_discord_limits_with_maximum_length_values() {
+        use super::config_embed;
+        use crate::guild_settings::{Resolved, SPECS, tests::defaults};
+        let mut values = defaults();
+        values.chat_model = format!("test/{}", "m".repeat(195));
+        values.keywords = vec!["a".repeat(32); 20];
+        let encoded = serde_json::to_value(&values).unwrap();
+        let settings = Resolved {
+            overrides: SPECS
+                .iter()
+                .map(|s| (s.key.to_owned(), encoded[s.key].clone()))
+                .collect(),
+            values: values.clone(),
+            ignored: vec!["unknown".into()],
+        };
+        for key in [None, Some("keywords"), Some("chat_model")] {
+            let embed = config_embed(&settings, &values, key, &"x".repeat(1000));
+            assert!(embed.fields.len() <= 25);
+            assert!(
+                embed
+                    .fields
+                    .iter()
+                    .all(|f| f.name.chars().count() <= 256 && f.value.chars().count() <= 1024)
+            );
+            let size = embed.title.as_deref().unwrap_or_default().chars().count()
+                + embed
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                + embed.footer.as_ref().map_or(0, |f| f.text.chars().count())
+                + embed
+                    .fields
+                    .iter()
+                    .map(|f| f.name.chars().count() + f.value.chars().count())
+                    .sum::<usize>();
+            assert!(size <= 6000, "embed has {size} characters");
+        }
     }
 
     #[test]

@@ -26,16 +26,8 @@ or correction to Kiki's recent reply continues that conversation even without me
 Use that reply's conversation_id to distinguish conversations with the same people. \
 Talking about Kiki or unrelated chatter is not talking to her; an active conversation alone is not \
 enough. Kiki's own messages in recent_channel_messages have from = \"Kiki\".";
-const RECENT_MESSAGES: i64 = 15;
 // Jev allows 10 choices: eight conversations plus "new" and "no".
 const CONVERSATION_CHOICES: usize = 8;
-const CONVERSATION_PREVIEW: i64 = 3;
-/// A conversation idle this long is usually over: Jev must be this confident to
-/// continue it, or the message starts a new one. Replayed decisions put a
-/// 75-minute-old match at 0.79 and real follow-ups within minutes at 0.82-0.95.
-const STALE_AFTER_SECS: i64 = 30 * 60;
-const STALE_MIN_CONFIDENCE: f64 = 0.9;
-
 #[derive(FromRow)]
 struct PooledMessage {
     id: i64,
@@ -84,13 +76,13 @@ fn idle_secs(active: &[Value], conversation_id: i64) -> Option<i64> {
         .and_then(|c| c["last_active_seconds_ago"].as_i64())
 }
 
-fn is_stale(active: &[Value], conversation_id: i64) -> bool {
-    idle_secs(active, conversation_id).is_some_and(|idle| idle >= STALE_AFTER_SECS)
+fn is_stale(active: &[Value], conversation_id: i64, stale_after: u64) -> bool {
+    idle_secs(active, conversation_id).is_some_and(|idle| idle >= stale_after as i64)
 }
 
 /// Whether any listed conversation was active within `window_secs`. Older ones
 /// still go to Jev when a keyword matched, but don't send every message there:
-/// past `STALE_AFTER_SECS` Jev rarely clears the bar to continue them anyway.
+/// past the configured stale age Jev rarely clears the bar to continue them anyway.
 fn any_recent(active: &[Value], window_secs: i64) -> bool {
     active
         .iter()
@@ -132,10 +124,15 @@ impl Router {
         } else if messages.iter().any(|m| self.mentions_kiki(m)) {
             (Check::Mention, Outcome::New { via: "mention" })
         } else {
-            let active = self.active_conversations(key.channel_id).await?;
-            let check = if messages.iter().any(|m| self.has_keyword(&m.content)) {
+            let active = self
+                .active_conversations(key.channel_id, pool.settings.decide_conversation_preview)
+                .await?;
+            let check = if messages
+                .iter()
+                .any(|m| has_keyword(&m.content, &pool.settings.keywords))
+            {
                 Check::Keyword
-            } else if any_recent(&active, self.config.active_window.as_secs() as i64) {
+            } else if any_recent(&active, pool.settings.active_window as i64) {
                 Check::ActiveConversation
             } else {
                 Check::None
@@ -223,14 +220,11 @@ impl Router {
                 .any(|r| self.bot_role_ids.contains(r))
     }
 
-    fn has_keyword(&self, content: &str) -> bool {
-        content
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .any(|word| self.config.keywords.iter().any(|k| k == word))
-    }
-
-    async fn active_conversations(&self, channel_id: i64) -> anyhow::Result<Vec<Value>> {
+    async fn active_conversations(
+        &self,
+        channel_id: i64,
+        preview: i64,
+    ) -> anyhow::Result<Vec<Value>> {
         let active = conversation::active(&self.db, self.bot_user_id).await?;
 
         let mut conversations = Vec::new();
@@ -248,7 +242,7 @@ impl Router {
                 "#,
             )
             .bind(c.id)
-            .bind(CONVERSATION_PREVIEW)
+            .bind(preview)
             .fetch_all(&self.db)
             .await?;
             let latest: Vec<Value> = latest
@@ -350,12 +344,12 @@ impl Router {
         jev_result.cost_usd = answer.cost;
         jev_result.choice = Some(answer.choice.clone());
         jev_result.confidence = Some(answer.confidence);
-        if answer.confidence < self.config.jev_min_confidence {
+        if answer.confidence < pool.settings.decide_min_confidence {
             debug!(
                 channel_id = key.channel_id,
                 pool_id = pool.message_ids.last(),
                 confidence = answer.confidence,
-                min_confidence = self.config.jev_min_confidence,
+                min_confidence = pool.settings.decide_min_confidence,
                 "Jev confidence too low; treating as no"
             );
             return Outcome::No;
@@ -370,14 +364,14 @@ impl Router {
                 .filter(|&id| idle_secs(active, id).is_some())
             {
                 Some(conversation_id)
-                    if is_stale(active, conversation_id)
-                        && answer.confidence < STALE_MIN_CONFIDENCE =>
+                    if is_stale(active, conversation_id, pool.settings.stale_after)
+                        && answer.confidence < pool.settings.stale_min_confidence =>
                 {
                     debug!(
                         conversation_id,
                         pool_id = pool.message_ids.last(),
                         confidence = answer.confidence,
-                        min_confidence = STALE_MIN_CONFIDENCE,
+                        min_confidence = pool.settings.stale_min_confidence,
                         "Jev chose a stale conversation; starting a new one"
                     );
                     Outcome::New { via: "decide" }
@@ -419,7 +413,7 @@ impl Router {
         )
         .bind(key.channel_id)
         .bind(first)
-        .bind(RECENT_MESSAGES)
+        .bind(pool.settings.decide_recent_messages)
         .fetch_all(&self.db)
         .await?;
         let author: Option<String> =
@@ -509,8 +503,8 @@ impl Router {
         let mut evicted = Vec::new();
         let mut run_id: Option<i64> = None;
         if let (Some(conversation_id), Some(via)) = (conversation_id, via) {
-            evicted =
-                conversation::evict_beyond(&mut tx, self.config.max_active_conversations).await?;
+            let max = self.settings.active_limit(&mut *tx, pool.guild_id).await?;
+            evicted = conversation::evict_beyond(&mut tx, pool.guild_id, max).await?;
             sqlx::query(
                 r#"
                 INSERT INTO conversation_messages (message_id, conversation_id, via)
@@ -596,6 +590,13 @@ impl Router {
     }
 }
 
+fn has_keyword(content: &str, keywords: &[String]) -> bool {
+    content
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| keywords.iter().any(|k| k == word))
+}
+
 impl Check {
     fn as_str(self) -> &'static str {
         match self {
@@ -620,9 +621,9 @@ mod tests {
             json!({ "id": 5, "last_active_seconds_ago": 4512 }),
             json!({ "id": 6, "last_active_seconds_ago": 30 }),
         ];
-        assert!(is_stale(&active, 5));
-        assert!(!is_stale(&active, 6));
-        assert!(!is_stale(&active, 7));
+        assert!(is_stale(&active, 5, 1800));
+        assert!(!is_stale(&active, 6, 1800));
+        assert!(!is_stale(&active, 7, 1800));
         assert!(any_recent(&active, 60));
         assert!(!any_recent(&active[..1], 3600));
         assert!(!any_recent(&[], 3600));

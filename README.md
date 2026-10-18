@@ -71,8 +71,8 @@ shared-token configuration, retries, migrations, and Railway sleeping, and
 [the agent tools HLD](docs/agent-tools-hld.md) for the design. No Railway resources are
 changed until the IaC is applied.
 
-At most `MAX_ACTIVE_CONVERSATIONS` (8)
-conversations are open at once across all channels; opening another closes the least recently
+Each server keeps at most `max_active_conversations` (default 8) conversations open
+across its channels; opening another closes the least recently
 active one (`closed_reason = 'evicted'`).
 
 Slash commands (`services/ingester/src/commands.rs`) are registered per guild at startup. Replies
@@ -85,17 +85,25 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki conversations` | The active pool: channel, messages, people, last activity and cost per conversation, then each one's topic and participants. |
 | `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
-| `/kiki config` | Configured models next to the version that last answered, and the routing and agent settings in effect, by environment variable. |
+| `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
 | `/kiki model [model]` | View this server's chat model. Set `model` to an OpenRouter ID to change it, or `default` to restore `OPENROUTER_CHAT_MODEL`. Changes require Manage Server. |
 | `/kiki whois <user>` | Every name Kiki has seen for someone (nickname, display name, username) with first and last seen, plus their message and conversation counts. |
 
 The bot must be invited with the `applications.commands` scope for registration to succeed.
 
-Chat model changes persist per server and apply to new reply jobs without a restart.
-For example: `/kiki model model:deepseek/deepseek-v4.1-flash-1017`.
-The model must be listed by OpenRouter and support text output and tools. `/kiki config`
-shows the effective chat model for this server. In-flight jobs keep their original model;
-topic summaries and Decide keep their global models.
+Server settings persist in Postgres and apply without a restart. Examples:
+
+- `/kiki config key:pool_debounce value:750ms`
+- `/kiki config key:history_messages value:50`
+- `/kiki config key:reply_max_tokens value:3000`
+- `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
+- `/kiki config key:pool_debounce reset:true`
+
+`/kiki model` remains an alias for `chat_model`. Model IDs must be listed by OpenRouter and
+support text output and tools. Unset keys inherit startup env defaults, then built-in defaults.
+New pools capture routing settings; new reply jobs capture context, model and token settings.
+In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
+models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

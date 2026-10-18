@@ -35,13 +35,13 @@ const NOTIFY_CHANNEL: &str = "agent_run_queued";
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// At shutdown, replies in progress get this long to finish (Railway drains for 30 s).
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
-const MAX_REPLY_TOKENS: u32 = 2000;
 
 pub struct Agent {
     db: PgPool,
     http: Arc<Client>,
     host: host::Host,
     config: AgentConfig,
+    settings: Arc<crate::guild_settings::Store>,
     bot_user_id: i64,
     pending_emoji: String,
 }
@@ -71,6 +71,7 @@ impl Agent {
         config: AgentConfig,
         bot_user_id: i64,
         pending_emoji: String,
+        settings: Arc<crate::guild_settings::Store>,
     ) -> anyhow::Result<Self> {
         info!(
             chat_model = config.chat_model,
@@ -82,6 +83,7 @@ impl Agent {
             http,
             host: host::Host::new(&config)?,
             config,
+            settings,
             bot_user_id,
             pending_emoji,
         })
@@ -327,14 +329,9 @@ impl Agent {
                         context.channel_id,
                         claim.conversation_id,
                     ),
-                    model: crate::guild_models::effective(
-                        &self.db,
-                        context.guild_id,
-                        &self.config.chat_model,
-                    )
-                    .await?,
+                    model: context.settings.chat_model.clone(),
                     messages: context.messages.clone(),
-                    max_output_tokens: MAX_REPLY_TOKENS,
+                    max_output_tokens: context.settings.reply_max_tokens,
                     people: context.people.clone(),
                 };
                 sqlx::query("UPDATE agent_runs SET host_request = $2 WHERE id = $1")

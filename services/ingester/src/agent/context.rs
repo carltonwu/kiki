@@ -30,13 +30,9 @@ use crate::{
 /// Writing-style rules for replies, part of the system prompt.
 const UNSLOP: &str = include_str!("unslop.md");
 
-/// Messages from the channel outside the conversation, shown for context...
-const CHANNEL_CONTEXT: i64 = 8;
-/// ...if they're at most this old.
-const CHANNEL_CONTEXT_SECS: f64 = 30.0 * 60.0;
-
 pub(super) struct Context {
     pub guild_id: i64,
+    pub settings: std::sync::Arc<crate::guild_settings::Resolved>,
     pub channel_id: i64,
     /// Newest trigger message that still exists; the reply quotes it.
     pub reply_to: i64,
@@ -78,8 +74,9 @@ impl Agent {
         let this = conversation::get(&self.db, self.bot_user_id, conversation_id)
             .await?
             .with_context(|| format!("conversation {conversation_id} not found"))?;
+        let settings = self.settings.snapshot(this.guild_id);
         let (history, others, channel, (guild_name, now)) = tokio::try_join!(
-            self.conversation_messages(conversation_id, self.config.history_messages),
+            self.conversation_messages(conversation_id, settings.history_messages),
             async {
                 // Only this channel's: the prompt must not reveal other channels to
                 // the people reading the reply.
@@ -89,7 +86,7 @@ impl Agent {
                     .filter(|c| c.id != conversation_id && c.channel_id == this.channel_id)
                     .collect::<Vec<_>>())
             },
-            self.channel_messages(this.channel_id, conversation_id),
+            self.channel_messages(this.channel_id, conversation_id, &settings),
             sqlx::query_as::<_, (Option<String>, String)>(
                 r#"SELECT (SELECT name FROM guilds WHERE id = $1),
                           to_char(now() AT TIME ZONE 'America/New_York', 'Dy YYYY-MM-DD HH24:MI')"#,
@@ -97,12 +94,10 @@ impl Agent {
             .bind(this.guild_id)
             .fetch_one(&self.db),
         )?;
-        let Some(reply_to) = history
-            .iter()
-            .rev()
-            .map(|m| m.id)
-            .find(|id| trigger_message_ids.contains(id))
-        else {
+        let reply_to: Option<i64> = sqlx::query_scalar(
+            "SELECT max(m.id) FROM messages m JOIN conversation_messages cm ON cm.message_id = m.id WHERE m.id = ANY($1) AND cm.conversation_id = $2 AND m.deleted_at IS NULL",
+        ).bind(trigger_message_ids).bind(conversation_id).fetch_one(&self.db).await?;
+        let Some(reply_to) = reply_to else {
             return Ok(None);
         };
 
@@ -155,6 +150,7 @@ impl Agent {
 
         Ok(Some(Context {
             guild_id: this.guild_id,
+            settings,
             channel_id: this.channel_id,
             reply_to,
             messages,
@@ -187,6 +183,7 @@ impl Agent {
         &self,
         channel_id: i64,
         conversation_id: i64,
+        settings: &crate::guild_settings::GuildSettings,
     ) -> sqlx::Result<Vec<StoredMessage>> {
         let mut messages: Vec<StoredMessage> = sqlx::query_as(&format!(
             r#"
@@ -200,9 +197,9 @@ impl Agent {
             "#
         ))
         .bind(channel_id)
-        .bind(CHANNEL_CONTEXT_SECS)
+        .bind(settings.channel_context_age as f64)
         .bind(conversation_id)
-        .bind(CHANNEL_CONTEXT)
+        .bind(settings.channel_context)
         .fetch_all(&self.db)
         .await?;
         messages.reverse();
@@ -374,8 +371,17 @@ mod tests {
             run_max_age: Duration::from_secs(120),
             topic_every_messages: 4,
         };
+        let settings = Arc::new(
+            crate::guild_settings::Store::new(
+                db.clone(),
+                crate::guild_settings::tests::defaults(),
+                5000,
+            )
+            .unwrap(),
+        );
         Agent {
             db,
+            settings,
             http: Arc::new(twilight_http::Client::new("unused".into())),
             host: Host::new(&config).unwrap(),
             config,
@@ -503,6 +509,31 @@ mod tests {
         let last = context.messages.last().unwrap();
         assert_eq!(last.role, "user");
         assert!(last.content.ends_with("answer with exactly NO_REPLY."));
+
+        // Settings change context for future work, while delivery can still find
+        // an existing trigger after history shrinks below its position.
+        agent
+            .settings
+            .change(GUILD, "history_messages", Some(json!(1)), 101)
+            .await
+            .unwrap();
+        agent
+            .settings
+            .change(GUILD, "channel_context", Some(json!(0)), 101)
+            .await
+            .unwrap();
+        let context = agent.context(1, &[13]).await.unwrap().unwrap();
+        assert_eq!(context.reply_to, 13);
+        assert_eq!(context.settings.history_messages, 1);
+        assert_eq!(context.settings.channel_context, 0);
+        assert!(
+            !context
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("unrelated")
+        );
 
         db.close().await;
         admin

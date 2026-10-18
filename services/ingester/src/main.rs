@@ -12,7 +12,7 @@ mod commands;
 mod config;
 mod conversation;
 mod gateway;
-mod guild_models;
+mod guild_settings;
 mod health;
 mod jev;
 mod leader;
@@ -121,13 +121,28 @@ async fn ingest(
 
     // The router starts before the Gateway so it sees every live message.
     let pending_emoji = router_config.pending_emoji.clone();
-    let settings = Settings::new(&router_config, &agent_config);
+    let guild_settings = Arc::new(guild_settings::Store::new(
+        pool.clone(),
+        guild_settings::GuildSettings::defaults(&router_config, &agent_config),
+        router_config.max_message_age.as_millis() as u64,
+    )?);
+    guild_settings
+        .load(
+            &discord
+                .guild_ids
+                .iter()
+                .map(|id| id.get() as i64)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    let settings = Settings::new(&router_config, &agent_config, guild_settings.clone());
     let router = Arc::new(
         Router::new(
             pool.clone(),
             http.clone(),
             &discord.guild_ids,
             router_config,
+            guild_settings.clone(),
         )
         .await?,
     );
@@ -138,6 +153,7 @@ async fn ingest(
             agent_config,
             router.bot_user_id(),
             pending_emoji,
+            guild_settings.clone(),
         )?)),
         None => {
             warn!("AGENT_HOST_URL is not set: the agent is off and routed messages get no reply");

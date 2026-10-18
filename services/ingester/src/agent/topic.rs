@@ -15,7 +15,6 @@ use super::{
 };
 use crate::{chat::Message, conversation};
 
-const SAMPLE_MESSAGES: i64 = 12;
 const MAX_TOPIC_TOKENS: u32 = 400;
 const MAX_TOPIC_CHARS: usize = 200;
 
@@ -43,6 +42,7 @@ impl Agent {
         let Some(c) = conversation::get(&self.db, self.bot_user_id, conversation_id).await? else {
             return Ok(());
         };
+        let settings = self.settings.snapshot(c.guild_id);
         let new_messages: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM conversation_messages WHERE conversation_id = $1 AND message_id > $2",
         )
@@ -50,12 +50,12 @@ impl Agent {
         .bind(c.topic_through_message_id.unwrap_or(0))
         .fetch_one(&self.db)
         .await?;
-        if c.topic.is_some() && new_messages < self.config.topic_every_messages {
+        if c.topic.is_some() && new_messages < settings.topic_every_messages {
             return Ok(());
         }
 
         let messages = self
-            .conversation_messages(conversation_id, SAMPLE_MESSAGES)
+            .conversation_messages(conversation_id, settings.topic_sample_messages)
             .await?;
         let Some(through) = messages.last().map(|m| m.id) else {
             return Ok(());
@@ -73,7 +73,7 @@ impl Agent {
         let completion = self
             .host
             .execute(&JobRequest {
-                id: format!("topic:{conversation_id}:{through}"),
+                id: topic_job_id(conversation_id, through, settings.topic_sample_messages),
                 kind: "topic".into(),
                 scope: Scope::new(c.guild_id, c.channel_id, conversation_id),
                 model: self.config.topic_model.clone(),
@@ -116,6 +116,10 @@ impl Agent {
     }
 }
 
+fn topic_job_id(conversation_id: i64, through: i64, sample: i64) -> String {
+    format!("topic:{conversation_id}:{through}:{sample}")
+}
+
 fn clean_topic(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     let line = line
@@ -134,7 +138,13 @@ fn clean_topic(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_topic;
+    use super::{clean_topic, topic_job_id};
+
+    #[test]
+    fn changed_sample_uses_a_distinct_durable_job() {
+        assert_eq!(topic_job_id(1, 100, 12), "topic:1:100:12");
+        assert_ne!(topic_job_id(1, 100, 12), topic_job_id(1, 100, 20));
+    }
 
     #[test]
     fn cleans_model_output() {

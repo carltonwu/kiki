@@ -33,6 +33,7 @@ pub struct Router {
     db: PgPool,
     http: Arc<Client>,
     config: RouterConfig,
+    settings: Arc<crate::guild_settings::Store>,
     jev: Option<Jev>,
     guild_ids: HashSet<i64>,
     /// Kiki's user id, and her managed role in each guild: mentioning either is an @Kiki.
@@ -55,6 +56,7 @@ struct Inserted {
 
 struct Pool {
     guild_id: i64,
+    settings: Arc<crate::guild_settings::Resolved>,
     message_ids: Vec<i64>,
     first_at: Instant,
     deadline: Instant,
@@ -72,6 +74,7 @@ impl Router {
         http: Arc<Client>,
         guild_ids: &[Id<GuildMarker>],
         config: RouterConfig,
+        settings: Arc<crate::guild_settings::Store>,
     ) -> anyhow::Result<Self> {
         let me = get_json("current user", || http.current_user())
             .await?
@@ -116,6 +119,7 @@ impl Router {
             db,
             http,
             config,
+            settings,
             jev,
             guild_ids: guild_ids.iter().map(|id| id.get() as i64).collect(),
             bot_user_id,
@@ -200,14 +204,15 @@ impl Router {
         let now = Instant::now();
         let pool = pools.entry(key).or_insert_with(|| Pool {
             guild_id: msg.guild_id,
+            settings: self.settings.snapshot(msg.guild_id),
             message_ids: Vec::new(),
             first_at: now,
             deadline: now,
         });
         pool.message_ids.push(msg.id);
-        pool.deadline =
-            (now + self.config.pool_debounce).min(pool.first_at + self.config.pool_max_wait);
-        if pool.message_ids.len() >= self.config.pool_max_messages {
+        pool.deadline = (now + Duration::from_millis(pool.settings.pool_debounce))
+            .min(pool.first_at + Duration::from_millis(pool.settings.pool_max_wait));
+        if pool.message_ids.len() >= pool.settings.pool_max_messages {
             return pools.remove_entry(&key);
         }
         None

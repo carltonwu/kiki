@@ -1,7 +1,7 @@
 //! Kiki's conversations: the active pool and each conversation's metadata.
 //!
 //! The pool is every open conversation (`closed_at IS NULL`). It holds at most
-//! `MAX_ACTIVE_CONVERSATIONS`: when the router opens or revives one past that,
+//! `MAX_ACTIVE_CONVERSATIONS` per server: when the router opens or revives one past that,
 //! the least recently active are closed as `evicted` (see [`evict_beyond`]).
 
 use serde::Deserialize;
@@ -92,17 +92,22 @@ pub async fn lock_pool(tx: &mut sqlx::PgConnection) -> sqlx::Result<()> {
 
 /// Closes the least recently active open conversations beyond `max`. Call with
 /// [`lock_pool`] held.
-pub async fn evict_beyond(tx: &mut sqlx::PgConnection, max: i64) -> sqlx::Result<Vec<i64>> {
+pub async fn evict_beyond(
+    tx: &mut sqlx::PgConnection,
+    guild_id: i64,
+    max: i64,
+) -> sqlx::Result<Vec<i64>> {
     sqlx::query_scalar(
         r#"
         UPDATE conversations SET closed_at = now(), closed_reason = 'evicted'
-        WHERE closed_at IS NULL AND id NOT IN (
-            SELECT id FROM conversations WHERE closed_at IS NULL
+        WHERE guild_id = $2 AND closed_at IS NULL AND id NOT IN (
+            SELECT id FROM conversations WHERE guild_id = $2 AND closed_at IS NULL
             ORDER BY last_active_at DESC, id DESC LIMIT $1)
         RETURNING id
         "#,
     )
     .bind(max)
+    .bind(guild_id)
     .fetch_all(tx)
     .await
 }
