@@ -1,0 +1,6 @@
+name: an edit inside a pool is what gets routed
+env: {POOL_DEBOUNCE_MS: "1500"}
+steps:
+  - send: {as: alex, in: general, text: "hello everyone", id: msg}
+  - edit: {of: msg, text: "hello kiki"}
+  - expect: {of: msg, check: keyword, outcome: new, reply: true, text_contains: "hello kiki"}

@@ -1,0 +1,7 @@
+name: catch-up pages through more than 100 messages per channel
+fixture: bulk
+steps:
+  - expect: {sql: "SELECT count(*) FROM messages WHERE content LIKE 'lore drop%'", equals: 250}
+  - expect: {sql: "SELECT count(DISTINCT content) FROM messages WHERE content LIKE 'lore drop%'", equals: 250}
+  - say: {as: alex, in: general, text: "@kiki still there?"}
+  - expect: {reply: true}

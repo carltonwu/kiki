@@ -1,0 +1,9 @@
+name: past the active pool limit the least recent conversation closes
+env: {MAX_ACTIVE_CONVERSATIONS: "2"}
+steps:
+  - say: {as: alex, in: general, text: "@kiki one", id: one}
+  - say: {as: sam, in: lore, text: "@kiki two"}
+  - say: {as: ethan, in: general-thread, text: "@kiki three"}
+  - expect: {reply: true}
+  - expect: {sql: "SELECT closed_reason FROM conversations ORDER BY id LIMIT 1", equals: evicted}
+  - expect: {sql: "SELECT count(*) FROM conversations WHERE closed_at IS NULL", equals: 2}

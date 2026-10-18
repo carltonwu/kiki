@@ -1,0 +1,3 @@
+#!/bin/sh
+# Local Discord simulator for Kiki. See docs/kiki-sim-hld.md.
+exec uv run --quiet --project "$(dirname "$(realpath "$0")")" --locked kiki-sim "$@"

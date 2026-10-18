@@ -1,0 +1,10 @@
+name: rapid messages from one person are answered once
+steps:
+  - batch:
+      - {as: alex, in: general, text: "@kiki ok so", id: one}
+      - {as: alex, in: general, text: "what do you think", id: two}
+      - {as: alex, in: general, text: "about the release", id: three}
+  - expect: {of: three, outcome: new, reply: true}
+  - expect: {of: one, outcome: new, conversation: {same_as: three}}
+  - expect: {sql: "SELECT count(*) FROM agent_runs", equals: 1}
+  - expect: {sql: "SELECT count(DISTINCT pool_id) FROM classifications", equals: 1}

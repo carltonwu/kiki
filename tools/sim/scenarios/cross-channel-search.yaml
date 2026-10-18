@@ -1,0 +1,8 @@
+name: search covers every channel of the guild
+steps:
+  - say: {as: alex, in: general, text: "kiki who shipped the release?"}
+    reply: {tool: {name: search_messages, args: {query: "release shipped"}}, text: "found {ids}"}
+  - expect: {reply: true, tool_called: search_messages, tool_result_contains: ["#lore", "shipped the release"]}
+  - say: {as: alex, in: general, text: "kiki anything in staff about budgets?"}
+    reply: {tool: {name: search_messages, args: {query: "budget meeting", channel: "#staff"}}, text: "found {ids}"}
+  - expect: {reply: true, tool_result_contains: "#staff"}

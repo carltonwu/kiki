@@ -1047,7 +1047,7 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
 
 async fn check_catalog_model(model: &str) -> anyhow::Result<()> {
     let catalog: Value = reqwest::Client::new()
-                    .get("https://openrouter.ai/api/v1/models")
+                    .get(format!("{}/v1/models", crate::config::openrouter_base()))
                     .timeout(Duration::from_secs(10))
                     .send().await
                     .and_then(reqwest::Response::error_for_status)

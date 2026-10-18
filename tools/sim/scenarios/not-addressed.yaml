@@ -1,0 +1,9 @@
+name: chatter next to an active conversation is left alone
+steps:
+  - say: {as: alex, in: general, text: "@kiki hi", id: start}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "anyway did anyone see the game"}
+  - expect: {check: active_conversation, outcome: "no", run: none, reply: false}
+  - say: {as: sam, in: general, text: "kiki is so annoying lol"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {check: keyword, outcome: "no", reply: false}

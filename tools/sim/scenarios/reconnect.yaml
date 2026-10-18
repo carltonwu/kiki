@@ -1,0 +1,7 @@
+name: Kiki keeps working after the Gateway drops
+steps:
+  - say: {as: alex, in: general, text: "@kiki before", id: before}
+  - expect: {reply: true}
+  - drop_gateway: {}
+  - say: {as: alex, in: general, text: "@kiki after"}
+  - expect: {reply: true, outcome: new}

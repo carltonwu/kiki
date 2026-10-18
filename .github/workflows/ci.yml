@@ -67,6 +67,50 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
+  # End-to-end: the real ingester and agent host against a fake Discord and stub
+  # LLMs (tools/sim, docs/kiki-sim-hld.md).
+  sim:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18-trixie
+        env:
+          POSTGRES_USER: kiki
+          POSTGRES_PASSWORD: kiki
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-retries 15
+    env:
+      KIKI_SIM_POSTGRES: postgres://kiki:kiki@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.7"
+          enable-cache: true
+          cache-dependency-glob: |
+            services/agent/uv.lock
+            tools/sim/uv.lock
+      # kiki-sim only touches a server that has this table.
+      - run: psql "$KIKI_SIM_POSTGRES" -f tools/sim/initdb/00-sim-marker.sql
+      - run: uv run --project tools/sim --locked ruff check tools/sim
+      - run: uv run --project tools/sim --locked ruff format --check tools/sim
+      - run: tools/sim/kiki-sim up
+      - run: tools/sim/kiki-sim test
+      - if: always()
+        run: tools/sim/kiki-sim down
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-logs
+          path: .sim/logs/
+
   iac:
     runs-on: ubuntu-latest
     defaults:

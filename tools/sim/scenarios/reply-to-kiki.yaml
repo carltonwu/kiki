@@ -1,0 +1,6 @@
+name: replying to Kiki continues that conversation without Jev
+steps:
+  - say: {as: alex, in: general, text: "@kiki hi", id: start}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "ok but why", reply_to: kiki}
+  - expect: {check: reply, outcome: continue, conversation: {same_as: start}, reply: true}

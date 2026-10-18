@@ -1,0 +1,23 @@
+# The default guild. IDs are fixed so scenarios and logs are stable.
+guild: {id: 900000000000000001, name: Sim Theatre}
+kiki: {id: 900000000000000010, username: Kiki, role_id: 900000000000000011}
+members:
+  alex: {id: 900000000000000101, username: alex_99, global_name: Alex, admin: true}
+  sam: {id: 900000000000000102, username: samwise, global_name: Sam}
+  ethan: {id: 900000000000000103, username: wheatthin512, global_name: wheatthin, nick: Ethan}
+  chris: {id: 900000000000000104, username: chris_w, nick: Chris}
+  chrissy: {id: 900000000000000105, username: chrissy.com, global_name: Chrissy}
+  chris_l: {id: 900000000000000106, username: chris.l, global_name: Chris}
+  # Another bot in the guild (Kiki ignores bots for routing).
+  pilz: {id: 900000000000000107, username: PilzBrots, bot: true}
+channels:
+  general: {id: 900000000000001001}
+  lore: {id: 900000000000001002}
+  staff: {id: 900000000000001003}
+  general-thread: {id: 900000000000001004, type: 11, parent: general}
+history:
+  - {in: lore, as: sam, text: "we shipped the release on friday, finally", days_ago: 6}
+  - {in: lore, as: chris, text: "the lighting rig is held together with tape", days_ago: 5}
+  - {in: general, as: ethan, text: "r8 da eats", days_ago: 2}
+  - {in: general, as: alex, text: "pizza for lunch?", days_ago: 1}
+  - {in: staff, as: alex, text: "budget meeting moved to thursday", days_ago: 3}

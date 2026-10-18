@@ -1,0 +1,20 @@
+# The simulator's own Postgres: separate project, port and (ephemeral) storage,
+# so kiki-sim can drop and recreate databases without touching anything else.
+name: kiki-sim
+services:
+  postgres:
+    image: pgvector/pgvector:pg18-trixie
+    environment:
+      POSTGRES_USER: kiki
+      POSTGRES_PASSWORD: kiki
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:54339:5432"
+    tmpfs:
+      - /var/lib/postgresql
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kiki -d postgres"]
+      interval: 1s
+      retries: 30

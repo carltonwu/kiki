@@ -1,0 +1,7 @@
+name: an @mention always starts a conversation and gets a reply
+steps:
+  - say: {as: alex, in: general, text: "@kiki hey", id: hi}
+  - expect: {check: mention, outcome: new, run: done, reply: true, text_contains: "hey"}
+  - expect: {reaction: {emoji: "👀", present: false}}
+  - say: {as: sam, in: general, text: "@kiki me too"}
+  - expect: {check: mention, outcome: new, reply: true}

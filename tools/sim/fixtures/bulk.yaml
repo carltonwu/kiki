@@ -1,0 +1,12 @@
+# minimal, plus enough history in #lore to need several catch-up pages.
+guild: {id: 900000000000000001, name: Sim Theatre}
+kiki: {id: 900000000000000010, username: Kiki, role_id: 900000000000000011}
+members:
+  alex: {id: 900000000000000101, username: alex_99, global_name: Alex, admin: true}
+  sam: {id: 900000000000000102, username: samwise, global_name: Sam}
+channels:
+  general: {id: 900000000000001001}
+  lore: {id: 900000000000001002}
+history:
+  - {in: lore, as: sam, text: "lore drop number {i}", days_ago: 2, repeat: 250}
+  - {in: general, as: alex, text: "hi", days_ago: 1}

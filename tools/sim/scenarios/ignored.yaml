@@ -1,0 +1,6 @@
+name: bots and old messages are never routed
+steps:
+  - say: {as: pilz, in: general, text: "kiki you are a bot"}
+  - expect: {classified: false, reply: false}
+  - say: {as: alex, in: general, text: "@kiki from the past", age_s: 30}
+  - expect: {classified: false, reply: false}

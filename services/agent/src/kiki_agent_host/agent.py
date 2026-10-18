@@ -202,7 +202,10 @@ def history(messages: list[Message]) -> list[ModelMessage]:
 class PydanticExecutor:
     def __init__(self, database_url: str, api_key: str):
         self.database_url = database_url
-        self.provider = OpenRouterProvider(api_key=api_key)
+        if os.getenv("OPENROUTER_BASE_URL"):
+            self.provider = OpenRouterProvider(openai_client=retrieval.openrouter_client(api_key))
+        else:
+            self.provider = OpenRouterProvider(api_key=api_key)
         # Fail fast inside a tool's deadline: a slow embedding degrades to "partial"
         # indexing and lexical search instead of losing the whole call.
         self.embeddings = retrieval.openrouter_client(

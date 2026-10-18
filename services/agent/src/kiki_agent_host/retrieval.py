@@ -8,6 +8,7 @@ Embeddings are computed lazily for the searched guild, or all at once by
 
 import asyncio
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -57,8 +58,13 @@ class Embedder:
         ]
 
 
+def openrouter_base() -> str:
+    """OpenRouter's API root; `OPENROUTER_BASE_URL` points at the local simulator."""
+    return (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api").rstrip("/")
+
+
 def openrouter_client(api_key: str, **options) -> AsyncOpenAI:
-    return AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key, **options)
+    return AsyncOpenAI(base_url=f"{openrouter_base()}/v1", api_key=api_key, **options)
 
 
 @dataclass(frozen=True)

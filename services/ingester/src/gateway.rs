@@ -12,7 +12,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
-use twilight_gateway::{CloseFrame, Intents, Message, Shard, ShardId};
+use twilight_gateway::{CloseFrame, ConfigBuilder, Intents, Message, Shard, ShardId};
 use twilight_model::id::Id;
 
 use crate::{
@@ -28,6 +28,8 @@ pub struct Listener {
     pub catch_up: Arc<CatchUp>,
     pub guild_ids: HashSet<i64>,
     pub commands: Arc<Commands>,
+    /// A fake Gateway for local testing; `None` is Discord's.
+    pub gateway_url: Option<String>,
 }
 
 impl Listener {
@@ -38,7 +40,11 @@ impl Listener {
     ) -> anyhow::Result<()> {
         // MESSAGE_CONTENT is privileged: enable it in the Discord developer portal.
         let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
-        let mut shard = Shard::new(ShardId::ONE, token, intents);
+        let mut config = ConfigBuilder::new(token, intents);
+        if let Some(url) = &self.gateway_url {
+            config = config.proxy_url(url.clone());
+        }
+        let mut shard = Shard::with_config(ShardId::ONE, config.build());
         info!("connecting to the Discord Gateway");
 
         loop {

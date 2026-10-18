@@ -1,0 +1,6 @@
+name: saying kiki goes to Jev, which can start or continue a conversation
+steps:
+  - say: {as: alex, in: general, text: "kiki whats good", id: start}
+  - expect: {check: keyword, outcome: new, jev_choice: new, reply: true}
+  - say: {as: alex, in: general, text: "kiki and also this"}
+  - expect: {check: keyword, outcome: continue, conversation: {same_as: start}, reply: true}

@@ -31,3 +31,6 @@ railway-plan*.json
 *.swp
 .DS_Store
 Thumbs.db
+
+# kiki-sim state and logs
+/.sim/

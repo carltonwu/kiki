@@ -9,10 +9,9 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-const URL: &str = "https://openrouter.ai/api/alpha/decisions";
-
 pub struct Jev {
     http: reqwest::Client,
+    url: String,
     api_key: String,
     model: String,
 }
@@ -52,6 +51,7 @@ impl Jev {
             .context("building Jev HTTP client")?;
         Ok(Self {
             http,
+            url: format!("{}/alpha/decisions", crate::config::openrouter_base()),
             api_key,
             model,
         })
@@ -72,7 +72,7 @@ impl Jev {
         });
         let response = self
             .http
-            .post(URL)
+            .post(&self.url)
             .bearer_auth(&self.api_key)
             .header("HTTP-Referer", "https://github.com/carltonwu/kiki")
             .header("X-Title", "Kiki")

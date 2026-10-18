@@ -14,6 +14,10 @@ pub struct DiscordConfig {
     pub token: String,
     /// Guilds to ingest. Events from any other guild the bot is in are ignored.
     pub guild_ids: Vec<Id<GuildMarker>>,
+    /// `DISCORD_API_PROXY` (`host:port`, plain HTTP) and `DISCORD_GATEWAY_URL`
+    /// (`ws://…`): a fake Discord for local testing (`tools/sim`). Unset in production.
+    pub api_proxy: Option<String>,
+    pub gateway_url: Option<String>,
 }
 
 impl Config {
@@ -45,9 +49,17 @@ impl DiscordConfig {
         if guild_ids.is_empty() {
             bail!("DISCORD_GUILD_IDS is empty");
         }
+        let api_proxy = optional_env("DISCORD_API_PROXY");
+        let gateway_url = optional_env("DISCORD_GATEWAY_URL");
+        // Half a fake would send the rest of the traffic to real Discord.
+        if api_proxy.is_some() != gateway_url.is_some() {
+            bail!("set both DISCORD_API_PROXY and DISCORD_GATEWAY_URL, or neither");
+        }
         Ok(Self {
             token: token.trim().to_owned(),
             guild_ids,
+            api_proxy,
+            gateway_url,
         })
     }
 }
@@ -163,6 +175,14 @@ impl AgentConfig {
             topic_every_messages: env_or("TOPIC_EVERY_MESSAGES", 4)?,
         })
     }
+}
+
+/// `OPENROUTER_BASE_URL`: OpenRouter's API root. Overridden only by the local
+/// simulator (`tools/sim`), which fakes Jev and the model catalog.
+pub fn openrouter_base() -> String {
+    optional_env("OPENROUTER_BASE_URL")
+        .map(|url| url.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| "https://openrouter.ai/api".into())
 }
 
 fn optional_env(name: &str) -> Option<String> {

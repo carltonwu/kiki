@@ -116,7 +116,12 @@ async fn ingest(
     agent_config: AgentConfig,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let http = Arc::new(twilight_http::Client::new(discord.token.clone()));
+    let mut http = twilight_http::Client::builder().token(discord.token.clone());
+    if let Some(proxy) = &discord.api_proxy {
+        warn!(proxy, gateway = ?discord.gateway_url, "using a fake Discord (local testing only)");
+        http = http.proxy(proxy.clone(), true).ratelimiter(None);
+    }
+    let http = Arc::new(http.build());
     let catch_up = Arc::new(CatchUp::new(http.clone(), pool.clone(), &discord.guild_ids));
 
     // The router starts before the Gateway so it sees every live message.
@@ -168,6 +173,7 @@ async fn ingest(
         db: pool,
         catch_up,
         guild_ids: discord.guild_ids.iter().map(|id| id.get() as i64).collect(),
+        gateway_url: discord.gateway_url.clone(),
     };
     let agent_shutdown = shutdown.clone();
     tokio::try_join!(
