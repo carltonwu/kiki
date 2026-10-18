@@ -141,6 +141,13 @@ latest human message if the subject hasn't spoken), because the prompt doesn't
 show IDs for the current conversation. Only non-deleted human messages in the
 guild count. The same message cited twice counts once.
 
+**A person's own request to forget** skips the temperature check (not the
+stale-evidence one): if the evidence includes a message by the subject in the
+current conversation (cited, or, uncited, their message being the
+conversation's latest human one), `forget` retires the entry however settled
+it is. People control what Kiki keeps about them; a third party asking still
+needs the full evidence.
+
 Adding a new entry isn't temperature-checked: it changes nothing already known.
 Confirming (`replaces` with the same text) is always accepted and adds sources.
 
@@ -178,8 +185,10 @@ needed to change it, so Kiki knows before trying.
   too. Each hit says which subject and doc it's in.
 - **Placement**: `remember` without `doc` ranks the subject's docs by how well
   the new text matches each doc's title, summary and entries, and uses the best
-  match with room. The base profile wins ties and empty matches. If nothing has
-  room, it fails with the split instructions. The result names the chosen doc
+  match with room. The base profile wins ties and empty matches. A doc that
+  doesn't match at all is never a fallback; if neither the best match nor any
+  other matching doc has room, it fails with the best match's split
+  instructions. The result names the chosen doc
   and the closest existing entries in the subject's docs, with a hint to use
   `replaces` if one of them is the same claim.
 - Semantic (embedding) ranking for placement and search is a follow-up: the
@@ -193,12 +202,13 @@ needed to change it, so Kiki knows before trying.
 | `recall(subject, doc?)` | Read a subject's base profile or a named doc, plus the doc index |
 | `search_memory(query, subject?)` | Find entries across subjects and docs |
 | `remember(subject, text, kind, doc?, replaces?, sources?)` | Add, confirm or replace an entry, placed automatically without `doc` |
-| `forget(entry, reason, sources?)` | Retire an entry; same evidence rule as replacing |
+| `forget(entry, sources?)` | Retire an entry; same evidence rule as replacing |
 | `split_doc(subject, new_doc, title, summary, move_entries, from_doc?)` | Create a sub doc, moving entries into it |
 
 - `subject` is a roster ref (best), an @username, a name someone has had, or the
   name of a thing. A name that matches a person is that person; a name matching
-  several people is an error that lists them. Anything else is a thing.
+  several people is an error that lists them, and so is an `@username` that
+  matches no one. Anything else is a thing.
 - Scope is the job's guild, from trusted run context, like message search.
 - Budget: memory tools share a separate budget of 6 calls per run, so filing a
   memory doesn't use up searches. The model request limit rises from 6 to 10 so
@@ -207,7 +217,9 @@ needed to change it, so Kiki knows before trying.
   can't both squeeze into the last words of a doc.
 - **Replays.** A retried job repeats inference, so writes record the job ID; a
   write whose live text already exists in the subject's docs is a confirmation,
-  and a confirmation from the same job is a no-op.
+  and a confirmation from the same job is a no-op. Replaying a replacement
+  (`replaces` an entry this job already superseded, with the same text) returns
+  the saved replacement instead of an error.
 
 ### Prompt
 

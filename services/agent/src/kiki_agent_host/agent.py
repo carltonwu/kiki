@@ -174,7 +174,16 @@ async def get_message_context(
 async def on_memory(ctx: RunContext[Deps], name: str, operation) -> dict:
     async def work():
         async with ctx.deps.memory_lock:
-            return await operation(await ctx.deps.memory_db())
+            connection = await ctx.deps.memory_db()
+            try:
+                return await operation(connection)
+            except asyncio.CancelledError:
+                # Timed out mid-query: the connection's state is unknown, so the
+                # next memory call opens a fresh one.
+                ctx.deps.memory_connection = None
+                with contextlib.suppress(Exception):
+                    await connection.close()
+                raise
 
     return await guarded(ctx, name, work, kind="memory")
 
@@ -262,7 +271,8 @@ async def remember(
 async def forget(ctx: RunContext[Deps], entry: str, sources: list[str] | None = None) -> dict:
     """Retire a saved entry that turned out wrong or outdated, or that someone asked you to forget.
 
-    Needs the same evidence as changing it (see remember).
+    Needs the same evidence as changing it (see remember), unless the person it's about
+    asked you to forget it themselves in this conversation.
 
     Args:
         entry: The entry ID, like e12.

@@ -118,7 +118,11 @@ async def resolve_subject(
         row = await cursor.fetchone()
         return Subject(row and row[0], "person", user_id, None, label)
 
-    name = subject.removeprefix("@").strip()
+    if subject.startswith("@"):
+        raise ValueError(
+            f"no one here goes by {subject!r}. Use a ref like u2, or leave out @ for a thing."
+        )
+    name = subject.strip()
     if len(name) > 80:
         raise ValueError("subject names are at most 80 characters")
     if create:
@@ -366,8 +370,14 @@ async def evidence(
     )
 
 
-def resists(entry: dict, proof: Evidence, now: datetime) -> str | None:
-    """Why `proof` can't change `entry`, or None if it can."""
+def resists(
+    entry: dict, proof: Evidence, now: datetime, *, own_request: bool = False
+) -> str | None:
+    """Why `proof` can't change `entry`, or None if it can.
+
+    A person's own request (to forget something about them) skips the temperature
+    check, but not the stale-evidence one.
+    """
     seen = entry["last_observed_at"]
     if proof.last < seen:
         return (
@@ -375,6 +385,8 @@ def resists(entry: dict, proof: Evidence, now: datetime) -> str | None:
             f" ({proof.last:%Y-%m-%d}). Older evidence doesn't override newer knowledge;"
             " if the earlier state matters, remember it as a separate dated entry."
         )
+    if own_request:
+        return None
     t = temperature(
         entry["kind"], entry["first_observed_at"], entry["recorded_at"], proof.last, now
     )
@@ -445,11 +457,21 @@ LIMIT 3
 
 
 async def place(connection: AsyncConnection, subject: Subject, text: str, docs: list[dict]) -> dict:
-    """The doc whose title, summary and entries best match `text`; the profile on ties."""
+    """The doc whose title, summary and entries best match `text` and that has room
+    for it; the profile on ties. If none that matches at all has room, the best
+    match (whose split instructions the caller returns)."""
     cursor = await connection.execute(PLACE, {"query": text, "subject": subject.id})
     scores = dict(await cursor.fetchall())
-    # docs is profile-first, and max() keeps the first of equal scores.
-    return max(docs, key=lambda d: scores.get(d["id"], 0) or 0)
+    # docs is profile-first, and sorted() keeps equal scores in order.
+    ranked = sorted(docs, key=lambda d: -(scores.get(d["id"]) or 0))
+    best = ranked[0]
+    fits = [
+        d
+        for d in ranked
+        if (d is best or (scores.get(d["id"]) or 0) > 0)
+        and d["words"] + words(text) <= MAX_DOC_WORDS
+    ]
+    return fits[0] if fits else best
 
 
 async def remember(
@@ -488,6 +510,9 @@ async def remember(
         if old_id is not None:
             old = by_id.get(old_id)
             if old is None:
+                if replayed := await replayed_replacement(connection, old_id, text, job_id):
+                    replayed["subject"] = who.label
+                    return replayed
                 return {"error": await missing_entry(connection, who, old_id)}
         else:
             same = [e for e in entries if norm(e["text"]) == norm(text)]
@@ -577,6 +602,29 @@ async def confirm(
     return {"confirmed": f"e{entry['id']}", "doc": slug}
 
 
+async def replayed_replacement(
+    connection: AsyncConnection, old_id: int, text: str, job_id: str
+) -> dict | None:
+    """A retried job replacing an entry it already replaced: the replacement it saved."""
+    if not job_id:
+        return None
+    cursor = await connection.execute(
+        "SELECT n.id, n.text, d.slug FROM memory_entries o"
+        " JOIN memory_entries n ON n.id = o.superseded_by JOIN memory_docs d ON d.id = n.doc_id"
+        " WHERE o.id = %s AND n.job_id = %s AND n.superseded_at IS NULL",
+        (old_id, job_id),
+    )
+    row = await cursor.fetchone()
+    if row is None or norm(row[1]) != norm(text):
+        return None
+    return {
+        "saved": f"e{row[0]}",
+        "doc": row[2],
+        "replaced": f"e{old_id}",
+        "note": "already saved by this reply",
+    }
+
+
 async def missing_entry(connection: AsyncConnection, subject: Subject, id: int) -> str:
     cursor = await connection.execute(
         "SELECT e.superseded_by, d.subject_id FROM memory_entries e"
@@ -589,6 +637,38 @@ async def missing_entry(connection: AsyncConnection, subject: Subject, id: int) 
     if row[0]:
         return f"e{id} was already replaced by e{row[0]}."
     return f"e{id} was already forgotten."
+
+
+# The subject asking, in this conversation: a cited message of theirs in it, or
+# (uncited) their message being its latest human one.
+OWN_REQUEST = f"""
+SELECT EXISTS (
+    SELECT 1 FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
+    WHERE cm.conversation_id = %(conversation)s AND m.id = ANY(%(ids)s)
+      AND m.author_id = %(user)s
+      AND (%(cited)s OR m.id = (
+          SELECT max(m2.id) FROM conversation_messages c2 JOIN messages m2 ON m2.id = c2.message_id
+          WHERE c2.conversation_id = %(conversation)s AND m2.deleted_at IS NULL
+            AND NOT m2.author_bot AND {HEARD.replace("m.", "m2.")}))
+)
+"""
+
+
+async def asked_by_subject(
+    connection: AsyncConnection, scope: Scope, subject: Subject, proof: Evidence, *, cited: bool
+) -> bool:
+    if subject.user_id is None:
+        return False
+    cursor = await connection.execute(
+        OWN_REQUEST,
+        {
+            "conversation": scope.conversation_id,
+            "ids": proof.ids,
+            "user": subject.user_id,
+            "cited": cited,
+        },
+    )
+    return (await cursor.fetchone())[0]
 
 
 async def forget(
@@ -617,7 +697,8 @@ async def forget(
         if row["superseded_at"] is not None:
             return {"error": await missing_entry(connection, who, id)}
         proof = await evidence(connection, scope, who, sources)
-        if reason := resists(row, proof, now):
+        own = await asked_by_subject(connection, scope, who, proof, cited=bool(sources))
+        if reason := resists(row, proof, now, own_request=own):
             return {"error": "Not forgotten: " + reason}
         await connection.execute(
             "UPDATE memory_entries SET superseded_at = %s WHERE id = %s", (now, id)

@@ -336,3 +336,67 @@ async def test_entries_are_single_claims(db):
         await remember(db, "u1", " ".join(["word"] * 61), sources=["1"])
     with pytest.raises(ValueError, match="kind"):
         await remember(db, "u1", "x", kind="rumor", sources=["1"])
+
+
+async def test_unknown_usernames_are_errors_not_things(db):
+    with pytest.raises(ValueError, match="no one here goes by"):
+        await remember(db, "@nobody", "likes tape", sources=["1"])
+    cursor = await db.execute("SELECT count(*) FROM memory_subjects")
+    assert (await cursor.fetchone())[0] == 0
+
+
+async def test_people_can_have_settled_facts_about_them_forgotten(db):
+    year_ago = NOW - days(365)
+    await add(db, 10, "i'm a nurse", at=year_ago)
+    fact = await remember(db, "u1", "is a nurse", sources=["10"], now=year_ago)
+
+    # Someone else asking isn't enough for a settled fact...
+    await add(db, 20, "kiki forget that alex is a nurse", author="sam", author_id=SAM)
+    await add(db, 21, "kiki forget i'm a nurse", conversation=True)
+    await add(db, 22, "kiki forget alex is a nurse", author="sam", author_id=SAM, conversation=True)
+    result = await memory.forget(db, SCOPE, ROSTER, fact["saved"], ["20"], now=NOW)
+    assert "takes 4 source" in result["error"]
+    # ...nor, uncited, is Alex's message once someone else has spoken since.
+    result = await memory.forget(db, SCOPE, ROSTER, fact["saved"], now=NOW)
+    assert "takes 4 source" in result["error"]
+    # Alex asking in this conversation is.
+    result = await memory.forget(db, SCOPE, ROSTER, fact["saved"], ["21"], now=NOW)
+    assert result["forgot"] == fact["saved"]
+
+
+async def test_the_subjects_latest_request_forgets_without_citing(db):
+    year_ago = NOW - days(365)
+    await add(db, 10, "i'm a nurse", at=year_ago)
+    fact = await remember(db, "u1", "is a nurse", sources=["10"], now=year_ago)
+    await add(db, 21, "kiki please forget that i'm a nurse", conversation=True)
+    result = await memory.forget(db, SCOPE, ROSTER, fact["saved"], now=NOW)
+    assert result["forgot"] == fact["saved"]
+
+
+async def test_a_replayed_replacement_returns_what_it_saved(db):
+    await add(db, 10, "i live in denver", conversation=True)
+    fact = await remember(db, "u1", "lives in Denver", job_id="reply:1")
+    await add(db, 11, "moved to austin", conversation=True)
+    first = await remember(db, "u1", "lives in Austin", replaces=fact["saved"], job_id="reply:2")
+    again = await remember(db, "u1", "lives in Austin", replaces=fact["saved"], job_id="reply:2")
+    assert again["saved"] == first["saved"] and "already saved" in again["note"]
+    other = await remember(db, "u1", "lives in Austin", replaces=fact["saved"], job_id="reply:3")
+    assert "already replaced" in other["error"]
+    cursor = await db.execute("SELECT count(*) FROM memory_entries")
+    assert (await cursor.fetchone())[0] == 2
+
+
+async def test_placement_skips_full_docs_but_never_falls_back_to_unrelated_ones(db):
+    await memory.split_doc(
+        db, SCOPE, ROSTER, "u1", "music", "Music", "Bands, concerts and songs", [], now=NOW
+    )
+    await fill(db, "u1", 1000, doc="profile")
+    # The profile is full: a band fact still finds the music doc...
+    placed = await remember(
+        db, "u1", "plays in a band called Tape Hiss " + "x " * 20, sources=["1"]
+    )
+    assert placed["doc"] == "music"
+    # ...but a work fact isn't dumped there: it fails with the profile's split steps.
+    result = await remember(db, "u1", "works at the hospital " + "y " * 30, sources=["1"])
+    assert "Not saved" in result["error"] and "'profile'" in result["error"]
+    assert [d["doc"] for d in result["other_docs"]] == ["music"]
