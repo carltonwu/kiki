@@ -117,10 +117,7 @@ impl RouterConfig {
                 .map(|k| k.trim().to_lowercase())
                 .filter(|k| !k.is_empty())
                 .collect(),
-            jev_api_key: std::env::var("OPENROUTER_DECISION_API_KEY")
-                .ok()
-                .map(|k| k.trim().to_owned())
-                .filter(|k| !k.is_empty()),
+            jev_api_key: optional_env("OPENROUTER_DECISION_API_KEY"),
             jev_model: std::env::var("OPENROUTER_DECISION_MODEL")
                 .unwrap_or_else(|_| "~typesafe/jev-latest".into()),
             jev_min_confidence: env_or("JEV_MIN_CONFIDENCE", 0.5)?,
@@ -143,6 +140,11 @@ pub struct AgentConfig {
     pub host_timeout: Duration,
     pub chat_model: String,
     pub topic_model: String,
+    /// `OPENROUTER_IMAGE_MODEL`: default model for the `generate_image` tool.
+    pub image_model: String,
+    /// `OPENROUTER_EMOJI_MODEL`: the vision model that describes custom emoji
+    /// (`/kiki emojis resync:true`).
+    pub emoji_model: String,
     /// `AGENT_HISTORY_MESSAGES`: conversation messages sent with each run.
     pub history_messages: i64,
     /// `AGENT_RUN_MAX_AGE_SECS`: runs queued longer ago than this get no reply
@@ -175,7 +177,11 @@ impl AgentConfig {
             host_timeout: Duration::from_millis(timeout_ms),
             topic_model: std::env::var("OPENROUTER_TOPIC_MODEL")
                 .unwrap_or_else(|_| chat_model.clone()),
+            emoji_model: optional_env("OPENROUTER_EMOJI_MODEL")
+                .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".into()),
             chat_model,
+            image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-image-2.5-flare".into()),
             history_messages,
             run_max_age: Duration::from_secs(env_or("AGENT_RUN_MAX_AGE_SECS", 120)?),
             topic_every_messages: env_or("TOPIC_EVERY_MESSAGES", 4)?,
@@ -240,6 +246,8 @@ impl AgentConfig {
             host_timeout: Duration::from_secs(1),
             chat_model: "test/default".into(),
             topic_model: "test/default".into(),
+            image_model: "test/image".into(),
+            emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
             topic_every_messages: 4,

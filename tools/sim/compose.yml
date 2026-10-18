@@ -4,6 +4,8 @@ name: kiki-sim
 services:
   postgres:
     image: pgvector/pgvector:pg18-trixie
+    # About 15 per stack (`stack.CONNECTIONS_PER_STACK`): room for 30 stacks.
+    command: ["postgres", "-c", "max_connections=500"]
     environment:
       POSTGRES_USER: kiki
       POSTGRES_PASSWORD: kiki

@@ -1,0 +1,2 @@
+main: http-layer import median 152 ms (min 141, max 171); import + application() median 508 ms (min 470, max 578); runs 30; sdk loaded after factory: {'True'}
+head: http-layer import median 155 ms (min 144, max 169); import + application() median 514 ms (min 485, max 561); runs 30; sdk loaded after factory: {'True'}

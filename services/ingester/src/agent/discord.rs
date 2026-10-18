@@ -1,33 +1,37 @@
 //! Sending Kiki's reply to Discord, and tagging it into the conversation.
 
-use anyhow::Context as _;
+use anyhow::{Context as _, ensure};
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 use twilight_http::request::channel::reaction::RequestReactionType;
-use twilight_model::{channel::message::AllowedMentions, id::Id};
+use twilight_model::{channel::message::AllowedMentions, http::attachment::Attachment, id::Id};
 
-use super::{Agent, RunRecord, context::Context};
+use super::{Agent, RunRecord, context::Context, emoji::Reaction, host::ImageRef};
 use crate::store;
 
 /// Discord allows 2000 characters per message; leave room for safety.
 pub(super) const MAX_MESSAGE_CHARS: usize = 1900;
 
 impl Agent {
-    /// Delivers planned messages with bounded pauses and an optional first reply
-    /// reference. Each message is stored right away (the Gateway copy may arrive
-    /// later) and tagged into the conversation.
+    /// Delivers planned messages with bounded pauses and, if `reference`, a reply
+    /// reference on the first (which also pings its author); images go with the
+    /// first message. Each message is stored right away (the Gateway copy may
+    /// arrive later) and tagged into the conversation.
     ///
     /// Sends aren't retried: a retry after a timeout could post the reply twice.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
         &self,
         context: &Context,
         run_id: i64,
         conversation_id: i64,
         plan: &[super::delivery::Message],
+        images: &[Attachment],
+        reference: bool,
         record: &mut RunRecord,
     ) -> anyhow::Result<()> {
         let mentions = AllowedMentions {
-            replied_user: context.settings.chat_reply_reference,
+            replied_user: reference,
             ..Default::default()
         };
         let mut draining = self.draining.subscribe();
@@ -38,13 +42,17 @@ impl Agent {
                     _ = draining.wait_for(|drain| *drain) => {},
                 }
             }
-            let chunk = &message.text;
             let mut request = self
                 .http
                 .create_message(Id::new(context.channel_id as u64))
-                .content(chunk)
                 .allowed_mentions(Some(&mentions));
-            if i == 0 && context.settings.chat_reply_reference {
+            if !message.text.is_empty() {
+                request = request.content(&message.text);
+            }
+            if i == 0 && !images.is_empty() {
+                request = request.attachments(images);
+            }
+            if i == 0 && reference {
                 request = request
                     .reply(Id::new(context.reply_to as u64))
                     .fail_if_not_exists(false);
@@ -86,6 +94,67 @@ impl Agent {
         Ok(())
     }
 
+    /// Reacts to the newest trigger message, like a person would before typing.
+    /// Adding a reaction is idempotent, so unlike sends a failure is only logged:
+    /// Discord rejects emoji it doesn't know or that Kiki can't use.
+    pub(super) async fn react(
+        &self,
+        context: &Context,
+        reactions: &[Reaction],
+        record: &mut RunRecord,
+    ) {
+        let (channel_id, message_id) = (context.channel_id, context.reply_to);
+        for reaction in reactions {
+            let emoji = reaction.request();
+            let request = self.http.create_reaction(
+                Id::new(channel_id as u64),
+                Id::new(message_id as u64),
+                &emoji,
+            );
+            match request.await {
+                Ok(_) => {
+                    record.reactions.push(reaction.to_string());
+                    record.reacted_to = Some(message_id);
+                }
+                Err(e) => {
+                    warn!(channel_id, message_id, %reaction, error = %e, "couldn't add a reaction")
+                }
+            }
+        }
+    }
+
+    /// The images the host generated for this job, as Discord attachments.
+    pub(super) async fn load_images(
+        &self,
+        job_id: &str,
+        refs: &[ImageRef],
+    ) -> anyhow::Result<Vec<Attachment>> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = refs.iter().map(|r| r.id).collect();
+        let rows: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, mime_type, data FROM agent_host_images \
+             WHERE job_id = $1 AND id = ANY($2) ORDER BY id",
+        )
+        .bind(job_id)
+        .bind(&ids)
+        .fetch_all(&self.db)
+        .await?;
+        ensure!(
+            rows.len() == refs.len(),
+            "agent host returned images that weren't saved for this job"
+        );
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, (id, mime_type, data))| {
+                let filename = format!("kiki-{id}.{}", extension(&mime_type));
+                Attachment::from_bytes(filename, data, i as u64)
+            })
+            .collect())
+    }
+
     pub(super) fn clear_pending(&self, channel_id: i64, message_ids: &[i64]) {
         if self.pending_emoji.is_empty() {
             return;
@@ -106,6 +175,15 @@ impl Agent {
                 }
             }
         });
+    }
+}
+
+fn extension(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
     }
 }
 
@@ -131,7 +209,48 @@ pub(super) fn split_message(text: &str, max: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_message;
+    use super::{extension, split_message};
+
+    #[tokio::test]
+    async fn loads_only_this_jobs_images() {
+        use crate::agent::{context::tests, host::ImageRef};
+        let Some(test) = crate::test_db::migrated("ingester_images_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "WITH jobs AS (INSERT INTO agent_host_jobs (id, request, status) \
+                 VALUES ('reply:1', '{}', 'running'), ('reply:2', '{}', 'running')) \
+             INSERT INTO agent_host_images (job_id, mime_type, data) \
+             VALUES ('reply:1', 'image/jpeg', '\\x01'), ('reply:2', 'image/png', '\\x02') \
+             RETURNING id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let agent = tests::agent(db.clone());
+        let mine = agent
+            .load_images("reply:1", &[ImageRef { id: ids[0] }])
+            .await
+            .unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].filename, format!("kiki-{}.jpg", ids[0]));
+        assert_eq!(mine[0].file, [1]);
+        assert!(agent.load_images("reply:1", &[]).await.unwrap().is_empty());
+        let theirs = agent
+            .load_images("reply:1", &[ImageRef { id: ids[1] }])
+            .await;
+        assert!(theirs.is_err());
+        test.drop().await;
+    }
+
+    #[test]
+    fn image_filenames_follow_the_mime_type() {
+        assert_eq!(extension("image/jpeg"), "jpg");
+        assert_eq!(extension("image/webp"), "webp");
+        assert_eq!(extension("image/png"), "png");
+        assert_eq!(extension("image/unknown"), "png");
+    }
 
     #[test]
     fn short_text_is_one_chunk() {

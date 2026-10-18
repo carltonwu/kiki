@@ -4,7 +4,7 @@ kiki: {id: 900000000000000010, username: Kiki, role_id: 900000000000000011}
 members:
   alex: {id: 900000000000000101, username: alex_99, global_name: Alex, admin: true}
   sam: {id: 900000000000000102, username: samwise, global_name: Sam}
-  ethan: {id: 900000000000000103, username: wheatthin512, global_name: wheatthin, nick: Ethan}
+  ethan: {id: 900000000000000103, username: wheatthin512, global_name: wheatthin, nick: Ethan, avatar: ethanface}
   chris: {id: 900000000000000104, username: chris_w, nick: Chris}
   chrissy: {id: 900000000000000105, username: chrissy.com, global_name: Chrissy}
   chris_l: {id: 900000000000000106, username: chris.l, global_name: Chris}
@@ -15,6 +15,13 @@ channels:
   lore: {id: 900000000000001002}
   staff: {id: 900000000000001003}
   general-thread: {id: 900000000000001004, type: 11, parent: general}
+  boba: {id: 900000000000001005}
+# Custom emoji; `description` is what the stub vision model says about each.
+# Reactions with any other custom emoji are rejected.
+emojis:
+  huh: {id: 900000000000005001, description: "a cartoon face squinting in confusion, for when something makes no sense"}
+  monkeded: {id: 900000000000005002, description: "a monkey grinning sheepishly, for owning up to something a little embarrassing"}
+  tannah: {id: 900000000000005003, animated: true, description: "someone dancing in a loop, for hype and celebration"}
 history:
   - {in: lore, as: sam, text: "we shipped the release on friday, finally", days_ago: 6}
   - {in: lore, as: chris, text: "the lighting rig is held together with tape", days_ago: 5}

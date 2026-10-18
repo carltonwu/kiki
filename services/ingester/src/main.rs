@@ -12,6 +12,7 @@ mod chat;
 mod commands;
 mod config;
 mod conversation;
+mod emojis;
 mod gateway;
 mod guild_settings;
 mod health;
@@ -20,6 +21,8 @@ mod leader;
 mod rest;
 mod router;
 mod store;
+#[cfg(test)]
+mod test_db;
 
 use std::{sync::Arc, time::Duration};
 
@@ -117,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
             Some(admin::router(Arc::new(admin::Admin {
                 token: token.clone(),
                 settings: guild_settings.clone(),
-                global: Settings::new(&router_config, &agent_config, guild_settings.clone()),
+                global: Settings::new(&router_config, &agent_config, guild_settings.clone())?,
                 chat,
             })))
         }
@@ -180,7 +183,7 @@ async fn ingest(
 
     // The router starts before the Gateway so it sees every live message.
     let pending_emoji = router_config.pending_emoji.clone();
-    let settings = Settings::new(&router_config, &agent_config, guild_settings.clone());
+    let settings = Settings::new(&router_config, &agent_config, guild_settings.clone())?;
     let router = Arc::new(
         Router::new(
             pool.clone(),

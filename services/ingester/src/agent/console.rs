@@ -96,6 +96,8 @@ impl ConsoleChat {
             messages,
             max_output_tokens: settings.reply_max_tokens,
             people: vec![],
+            // Pictures are posted to Discord after a reply; the console has nowhere to put them.
+            image_model: None,
         };
         let started = Instant::now();
         let result = self.host.execute(&job).await?;

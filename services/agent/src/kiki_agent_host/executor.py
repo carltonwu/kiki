@@ -2,7 +2,14 @@
 
 from typing import Protocol
 
-from .contracts import JobRequest, JobResult
+from .contracts import (
+    DescribeEmojisRequest,
+    DescribeEmojisResult,
+    ImageJobRequest,
+    ImageJobResult,
+    JobRequest,
+    JobResult,
+)
 
 
 class TransientError(Exception):
@@ -12,3 +19,7 @@ class TransientError(Exception):
 
 class Executor(Protocol):
     async def execute(self, request: JobRequest) -> JobResult: ...
+
+    async def draw(self, request: ImageJobRequest) -> ImageJobResult: ...
+
+    async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult: ...

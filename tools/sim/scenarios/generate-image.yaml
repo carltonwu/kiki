@@ -1,0 +1,79 @@
+name: generate_image queues a picture; Kiki's own ack goes first, then the picture, drawn from reference photos, as a reply
+steps:
+  # Nougie's photo is a day old, so its Discord link has expired; a meme names him too.
+  - send:
+      as: sam
+      in: lore
+      text: "Nougie got adopted today!"
+      age_s: 86400
+      attachments: [{filename: nougie.jpg, content_type: image/jpeg, label: "photo of nougie, a small white dog", expired: true}]
+  - send:
+      as: sam
+      in: lore
+      text: "nougie meme lmao"
+      age_s: 80000
+      attachments: [{filename: meme.png, label: "a meme screenshot about nougie"}]
+  - say: {as: ethan, in: general, text: "kiki draw nougie on the beach with me walking him"}
+    reply:
+      tool:
+        name: generate_image
+        args:
+          prompt: "Ethan walks Nougie along a beach at sunset"
+          subjects: [{name: Nougie, description: "sam's dog"}, {name: Ethan, person: u1}]
+          aspect_ratio: "4:3"
+          caption: "beach walk, as ordered"
+      text: "ooh ok, grabbing my sunscreen 🧴"
+  # The ack is the model's own text, posted first and without the picture.
+  - expect:
+      run: done
+      tool_called: generate_image
+      tool_result_contains: '"queued":true'
+      text_contains: "ooh ok, grabbing my sunscreen 🧴"
+      attachments: 0
+      prompt_contains: "your reply is the heads-up"
+  # The picture follows as its own message replying to the request, with her
+  # caption. Its references: Nougie's photo (refreshed link; the meme was turned
+  # down) and Ethan's avatar, as bytes, numbered in the prompt.
+  - expect:
+      followup: {status: done, attachments: 1, text_contains: "beach walk, as ordered"}
+      image_references: ["photo of nougie", "avatar of wheatthin512"]
+      image_prompt_contains:
+        - "Ethan walks Nougie along a beach at sunset"
+        - "Nougie, shown in reference image 1: sam's dog."
+        - "Ethan, shown in reference image 2"
+        - "Style: A real photograph, candid, taken on a phone camera"
+  # Stored for audit: the final prompt, the references by message or avatar, the cost.
+  - expect: {sql: "SELECT jsonb_array_length(reference_images) FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: 2}
+  - expect: {sql: "SELECT reference_images->1->>'avatar_of' FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: "900000000000000103"}
+  - expect: {sql: "SELECT prompt LIKE '%shown in reference image 1%' AND model = 'sim/image' FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: true}
+  - expect: {sql: "SELECT status || ' ' || (cost_usd > 0.04)::text FROM agent_image_jobs ORDER BY id DESC LIMIT 1", equals: "done true"}
+  # Kiki sees her picture in later turns' history and can read it back from the store.
+  - say: {as: alex, in: general, text: "kiki love it, what's in it again?"}
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "{result}"}
+  - expect:
+      run: done
+      reply: true
+      prompt_contains: "[image: kiki-"
+      tool_result_contains: ['"drawn_by_kiki":true', "Image 1: a drawing of Ethan walks Nougie"]
+  # A refusal: the follow-up is Kiki's own note about it, written by the chat model.
+  - say: {as: alex, in: general, text: "kiki draw something cursed"}
+    reply: {tool: {name: generate_image, args: {prompt: "refuse this"}}, text: "hmm. attempting it, no promises"}
+  - expect:
+      run: done
+      text_contains: "attempting it, no promises"
+      followup:
+        status: failed
+        attachments: 0
+        text_contains: "stub note, in her words: the image model returned HTTP 400"
+        text_lacks: "couldn't make that picture"
+  # No ack at all: the picture still comes.
+  - say: {as: alex, in: general, text: "kiki just the picture please"}
+    reply: {tool: {name: generate_image, args: {prompt: "a frog, no text"}}, text: "NO_REPLY"}
+  - expect: {run: done, reply: false, followup: {status: done, attachments: 1}}
+  # Servers can turn it off, and image_model must be an image model.
+  - slash: {as: alex, in: general, command: config, options: {key: image_model, value: sim/chat}}
+  - expect: {response_contains: "image catalog"}
+  - slash: {as: alex, in: general, command: config, options: {key: image_model, value: sim/image}}
+  - slash: {as: alex, in: general, command: config, options: {key: image_generation, value: "false"}}
+  - say: {as: alex, in: general, text: "kiki draw me another"}
+  - expect: {run: done, reply: true, prompt_lacks: "generate_image", followup: {count: 0}}

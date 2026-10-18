@@ -1,16 +1,44 @@
 # Kiki agent host
 
 Python 3.13 service managed with Astral `uv`. FastAPI is the HTTP transport and
-[Pydantic AI](https://ai.pydantic.dev/) (`agent.py`) runs the model loop over
+[Pydantic AI](https://ai.pydantic.dev/) (`agent/`) runs the model loop over
 OpenRouter behind `executor.Executor`. It generates both replies and topic summaries.
 
 Without `OPENROUTER_CHAT_API_KEY`, the host serves `/health`, but authenticated
 execution requests return **501**. Keep Rust's `AGENT_HOST_URL` unset until the key
 is set.
 
+## Layout
+
+`src/kiki_agent_host/` has one package per layer. A layer imports only the layers
+listed before it. The one exception is `chat/`, which downloads emoji through
+`media/fetch.py`. `tests/test_structure.py` fails the build on any other import
+across this order, and on a module named after a chat platform.
+
+- `config.py`, `db.py`, `logs.py`, `contracts.py`, `executor.py`, `prompt.py`: env
+  settings, connections, log format, the wire contract, the `Executor` protocol, and
+  the job's messages as model messages.
+- `openrouter/`: the provider. Clients, embeddings, the chat model with web fetch,
+  and the image model.
+- `chat/`: the community's history in Postgres. Scope and people, message search and
+  indexing, attachments, custom emoji, and subject memory. No agent code.
+- `media/`: images in and out. Downloads, the vision call, `read_image`, drawing
+  jobs, and generation.
+- `agent/`: the Pydantic AI layer. `executor.py` runs jobs. `tools/` has one
+  `FunctionToolset` per capability. `guard.py` gives every tool its deadline, its
+  budget, and its log line.
+- `api/`: HTTP and durable jobs. Importing it does not load the agent SDK, so the
+  host starts fast. `api/app.py` loads the executor only when a key is set.
+
+To give the agent a new capability, add a module to `agent/tools/` that exports a
+`toolset`. Run each tool through `guard.guarded`, with a `Budget` of its own if its
+calls must not use up the lookups. Then add the toolset to `TOOLSETS` in
+`agent/tools/__init__.py`. Then run `UPDATE_SNAPSHOT=1 uv run pytest
+tests/test_contract_snapshot.py` and review the diff in `tests/snapshots/contract.json`.
+
 ## Tools and search
 
-Reply jobs get two tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get search, emoji, image and memory tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -23,9 +51,53 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- `read_image(message_id, question?)`: a vision model describes the message's images
+  for Kiki, each one and a gallery as a whole. The model is `OPENROUTER_VISION_MODEL`,
+  or the chat model when unset (the tool reports an error if it can't read images).
+  Images come from the stored message and are downloaded only from Discord's CDN and
+  media proxy (`DISCORD_MEDIA_EXTRA_HOSTS` adds hosts, for the simulator). Search and
+  context hits with images carry `images: n`.
+- `generate_image(prompt, subjects?, style?, aspect_ratio?, caption?, edit?)`: offered
+  only when the request has `image_model`. It only queues the picture: the result's
+  `drawings` (at most 2) go back to Rust, which posts Kiki's reply first and then
+  runs each as an image job (below). Bad subject refs or photo IDs are tool errors
+  the model can fix ([design](../../docs/image-generation.md)).
+- Image jobs (`media/drawing.py`): reference photos per subject from the guild's history
+  and avatars, checked by the vision model, a final prompt numbering them, and a
+  Pydantic AI `ImageGenerator` over `openrouter/images.py`'s `OpenRouterImageModel` (OpenRouter's
+  Images API, `POST /api/v1/images` with `input_references`, same key). The image
+  (PNG/JPEG/WebP/GIF ≤ 8 MiB) is saved in `agent_host_images` with its prompt,
+  references, model, cost and latency. 75 s for the image call, no client retries;
+  a refusal or provider error gets a note in Kiki's voice instead.
+- Shared image code is `media/fetch.py` (Discord-only downloads, refreshing expired
+  attachment links with `DISCORD_BOT_TOKEN`, types from the bytes for downloads and
+  drawings alike) and `media/vision.py` (the vision call, `ImageRefused`, billed
+  cost); reading is `media/reading.py`, drawing `media/drawing.py` and
+  `media/generation.py`. `read_image` reads Kiki's own
+  drawings (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
+- `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
+  (full text over name and description, plus vectors of `:name: description`).
+- `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
+  message (`<:huh:123>`) or its ID, which also explains emoji since removed.
+
+Emoji results carry the `<:name:id>` form to write in a reply. Descriptions come
+from `POST /v1/emojis/describe` (below).
+
+Reply jobs also always offer OpenRouter's server tools `openrouter:web_search` and
+`openrouter:web_fetch`, which OpenRouter runs itself (at most 3 server-tool steps per
+model request; fetched pages are cut to about 6,000 tokens). Their fees are in the
+reply's cost, and the result adds `web: {searches, fetches, sources}` when they were
+used ([design](../../docs/agent-tools-hld.md#web-search-and-fetch-issue-1)).
+
+Memory tools ([design](../../docs/subject-memory-hld.md)), `recall`, `search_memory`,
+`remember`, `forget` and `split_doc`, read and write documents about people and
+things in the guild (a base profile each, plus sub docs of at most 1024 words).
+Changes to saved entries need cited evidence in proportion to how settled they are.
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 tool calls and 6 model requests. Topic jobs have
+(already in the prompt). A run gets 4 lookup tool calls (`read_image` is one of them;
+drawings and memory are capped separately) and 10 model requests; vision and image calls add their
+cost to the reply's. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all
@@ -37,7 +109,7 @@ latency, RSS and capacity; executions report job, channel and conversation IDs,
 model requests, tool calls, tokens, cost and latency. Tool calls report outcomes,
 latency, hits and semantic coverage. Set `LOG_LEVEL=DEBUG` for saved-result reuse,
 HTTP job status, indexing and top vector similarity (to calibrate
-`retrieval.MIN_SIMILARITY`). Routine HTTP client logs are suppressed at INFO.
+`chat/search.py` `MIN_SIMILARITY`). Routine HTTP client logs are suppressed at INFO.
 The container writes JSON logs to stdout so Railway records their actual severity;
 local logs use plain text unless `LOG_FORMAT=json` is set.
 
@@ -76,11 +148,13 @@ the job request from Rust's `OPENROUTER_CHAT_MODEL` and `OPENROUTER_TOPIC_MODEL`
   "model": "provider/model",
   "messages": [{"role": "user", "content": "[u1 Alex] hello"}],
   "max_output_tokens": 2000,
-  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}]
+  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}],
+  "image_model": "openai/gpt-image-2.5-flare"
 }
 ```
 
-`kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
+`image_model` is optional (omitted: no `generate_image` tool); `drawings` and
+`images` default to empty. `kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
 `topic:<conversation_id>:<newest_message_id>`. Discord and conversation IDs are
 strings on the wire. A completed response is:
 
@@ -92,11 +166,34 @@ strings on the wire. A completed response is:
     "text": "A reply",
     "model": "provider/model",
     "steps": 1,
-    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001}
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001},
+    "drawings": [{"prompt": "…", "subjects": [{"name": "Nougie", "photos": []}],
+                  "style": null, "aspect_ratio": "4:3", "caption": "…", "edit": false}]
   },
   "error": null
 }
 ```
+
+`POST /v1/images` draws one queued picture, with the same durable job contract and
+an ID `image:<run_id>:<n>`:
+
+```json
+{
+  "id": "image:42:1",
+  "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "3"},
+  "image_model": "openai/gpt-image-2.5-flare",
+  "reply_job": "reply:42",
+  "chat_model": "provider/model",
+  "ack": "Kiki's reply when she queued it",
+  "drawing": {"prompt": "…", "subjects": […], "caption": "…"}
+}
+```
+
+Its result is `{image: {id, mime_type} | null, caption, prompt, references, model,
+cost, latency_ms, error, failure_note}`: `error` is `refused` or `failed` when there's
+no image, and `failure_note` is Kiki's message about it, written by `chat_model` from
+the `reply_job`'s saved prompt (empty if that failed too). Results saved before
+drawings were queued may still list drawn `images`, which Rust attaches to the reply.
 
 The host persists input and results in `agent_host_jobs`, created by Rust's
 migrations. Matching retries return the saved result. A session advisory lock
@@ -115,9 +212,32 @@ omit a reply if a crash happens before the send; it avoids blind duplicate posts
 Legacy runs already in progress when the migration runs are also failed.
 
 If the Python process dies before saving a result, inference may repeat on retry.
-Current tools only read; future tools with side effects or costs must tolerate replay.
+Search tools only read, and `generate_image` only queues. An image job costs money and
+saves a row, so a replay of a job that died before saving can bill again and leave an
+unreferenced image row; Rust only posts the image in the saved result.
+Memory writes tolerate replay: they record the job ID, and saving text that is already
+live confirms it, which is a no-op for the same job.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
+
+### Emoji descriptions
+
+`POST /v1/emojis/describe` (same bearer token) describes one batch of a server's
+custom emoji that `/kiki emojis resync:true` copied into `guild_emojis`:
+
+```json
+{"guild_id": "1", "model": "deepseek/deepseek-v4.1-flash-1017",
+ "attempted_before_ms": 1792000000000, "redescribe": false}
+```
+
+It claims up to 8 emoji not tried since `attempted_before_ms` (the database clock
+when the resync started), downloads each as a 128 px PNG from Discord's CDN
+(`DISCORD_CDN_URL` overrides it for the simulator), asks the model for a short
+description, then embeds the described ones. The response is
+`{"described", "failed", "remaining", "cost"}`; Rust repeats the call until
+`remaining` is 0 or nothing progresses. A failed emoji (download or model) waits
+for the next resync. It's not a durable job: writes are idempotent, so a retry
+after 503 simply continues. It shares the job concurrency slots and timeout.
 
 ## Railway and idle resources
 

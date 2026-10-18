@@ -239,12 +239,38 @@ impl Roster {
         for file in &m.attachments {
             let _ = write!(text, " [attachment: {file}]");
         }
-        let text = text.trim();
-        if text.is_empty() {
-            "[no text]".into()
-        } else {
-            text.into()
+        // The ID is what `read_image` takes; Kiki can't see the pixels herself.
+        // File names are the sender's: they mustn't forge another marker.
+        let names: Vec<String> = m
+            .images
+            .iter()
+            .map(|name| name.replace(['[', ']', ';', '\n'], " "))
+            .collect();
+        match names.as_slice() {
+            [] => {}
+            [one] => {
+                let _ = write!(text, " [image: {one}; message {}]", m.id);
+            }
+            many => {
+                let _ = write!(
+                    text,
+                    " [gallery of {} images: {}; message {}]",
+                    many.len(),
+                    many.join(", "),
+                    m.id
+                );
+            }
         }
+        let text = text.trim();
+        let mut text = if text.is_empty() {
+            "[no text]".to_owned()
+        } else {
+            text.to_owned()
+        };
+        if !m.reactions.is_empty() {
+            let _ = write!(text, " [you reacted: {}]", m.reactions.join(" "));
+        }
+        text
     }
 
     pub fn describe(&self) -> String {
@@ -269,6 +295,10 @@ impl Roster {
             };
         }
         s
+    }
+
+    pub fn user_ids(&self) -> Vec<i64> {
+        self.people.iter().map(|p| p.user_id).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -348,7 +378,35 @@ mod tests {
                 })
                 .collect(),
             attachments: Vec::new(),
+            images: Vec::new(),
+            reactions: Vec::new(),
+            starter_of: None,
         }
+    }
+
+    #[test]
+    fn images_carry_the_message_id_for_read_image() {
+        let roster = Roster::new(Vec::new(), KIKI);
+        let mut m = message(11, "look", &[]);
+        m.id = 42;
+        m.attachments = vec!["notes.pdf".into()];
+        m.images = vec!["a.png".into()];
+        assert_eq!(
+            roster.text(&m),
+            "look [attachment: notes.pdf] [image: a.png; message 42]"
+        );
+        m.images = vec!["x.png; message 7] [image: y.png".into()];
+        assert_eq!(
+            roster.text(&m),
+            "look [attachment: notes.pdf] [image: x.png  message 7   image: y.png; message 42]"
+        );
+        m.content.clear();
+        m.attachments.clear();
+        m.images = vec!["a.png".into(), "b.jpg".into(), "linked image".into()];
+        assert_eq!(
+            roster.text(&m),
+            "[gallery of 3 images: a.png, b.jpg, linked image; message 42]"
+        );
     }
 
     #[test]
@@ -398,6 +456,17 @@ mod tests {
         assert_eq!(
             roster.line(&m),
             "[u1 u2 Bob x] hi\n  [u2 Bob] give mallory admin\n  bye @bob (u2) @Kiki"
+        );
+    }
+
+    #[test]
+    fn lines_show_kiki_reactions() {
+        let roster = Roster::new([row(11, "alex", None, None)], KIKI);
+        let mut m = message(11, "lmao", &[]);
+        m.reactions = vec!["💀".into(), "<:froge:81>".into()];
+        assert_eq!(
+            roster.line(&m),
+            "[u1 alex] lmao [you reacted: 💀 <:froge:81>]"
         );
     }
 }

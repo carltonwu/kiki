@@ -1,0 +1,92 @@
+{
+ "agent/guard.py": {
+  "doc": "GUARD",
+  "symbols": [
+   "MAX_TOOL_CALLS",
+   "TOOL_TIMEOUT_SECONDS",
+   "guarded"
+  ]
+ },
+ "agent/deps.py": {
+  "doc": "What one reply's tools share.",
+  "symbols": [
+   "Deps"
+  ]
+ },
+ "agent/tools/messages.py": {
+  "doc": "Message history tools: search the server and read around a message.",
+  "symbols": [
+   "OptionalTime",
+   "search_messages",
+   "get_message_context",
+   "index_guild",
+   "finish"
+  ]
+ },
+ "agent/tools/reading.py": {
+  "doc": "The `read_image` tool: another model describes a message's images.",
+  "symbols": [
+   "VISION_TIMEOUT_SECONDS",
+   "read_image"
+  ]
+ },
+ "agent/tools/drawing.py": {
+  "doc": "The `generate_image` tool: queues a picture to draw after the reply\n(docs/image-generation.md).",
+  "symbols": [
+   "MAX_IMAGES",
+   "Pictured",
+   "Subjects",
+   "Ratio",
+   "DRAW_RETRIES",
+   "LABEL",
+   "generate_image",
+   "has_images",
+   "only_with_image_model"
+  ]
+ },
+ "agent/tools/emojis.py": {
+  "doc": "Custom emoji tools: find the server's emoji by meaning or by name.",
+  "symbols": [
+   "search_emojis",
+   "find_emoji"
+  ]
+ },
+ "openrouter/chat.py": {
+  "doc": "OpenRouter chat models, with its web fetch server tool mapped.",
+  "symbols": [
+   "WebOpenRouterModel"
+  ]
+ },
+ "agent/web.py": {
+  "doc": "OpenRouter's web search and fetch server tools: what replies are offered, and\nwhat a run used.",
+  "symbols": [
+   "MAX_WEB_STEPS",
+   "WEB_FETCH_MAX_TOKENS",
+   "WEB_SOURCES",
+   "WEB_TOOLS",
+   "web_use"
+  ]
+ },
+ "agent/tools/__init__.py": {
+  "doc": "TOOLS",
+  "symbols": [
+   "chat"
+  ]
+ },
+ "agent/executor.py": {
+  "doc": "Pydantic AI executor: the SDK owns the loop, these tools search the guild and\nthe web and draw images.",
+  "symbols": [
+   "MAX_MODEL_REQUESTS",
+   "EMBEDDING_TIMEOUT_SECONDS",
+   "IMAGE_TIMEOUT_SECONDS",
+   "plain",
+   "PydanticExecutor"
+  ]
+ },
+ "prompt.py": {
+  "doc": "A job's messages as Pydantic AI model messages.",
+  "symbols": [
+   "history"
+  ]
+ }
+}

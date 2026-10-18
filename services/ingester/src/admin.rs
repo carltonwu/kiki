@@ -198,12 +198,12 @@ async fn change(
     if let Some(Value::String(model)) = &value
         && matches!(spec.kind, Kind::Model)
     {
-        commands::check_catalog_model(model).await.map_err(|e| {
-            match e.downcast::<UserError>() {
+        commands::check_catalog_model(&key, model)
+            .await
+            .map_err(|e| match e.downcast::<UserError>() {
                 Ok(user) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, user.0),
                 Err(e) => e.into(),
-            }
-        })?;
+            })?;
     }
     admin
         .settings
@@ -326,7 +326,7 @@ mod tests {
         let agent = crate::config::AgentConfig::for_tests();
         Arc::new(Admin {
             token: "secret-token".into(),
-            global: commands::Settings::new(&router, &agent, store.clone()),
+            global: commands::Settings::new(&router, &agent, store.clone()).unwrap(),
             settings: store,
             chat: None,
         })
@@ -420,7 +420,8 @@ mod tests {
                 &crate::config::RouterConfig::for_tests(),
                 &crate::config::AgentConfig::for_tests(),
                 store.clone(),
-            ),
+            )
+            .unwrap(),
             settings: store.clone(),
             chat: None,
         });

@@ -9,7 +9,7 @@ descriptions and defaults. Existing env variables supply startup defaults; the r
 behavioral defaults are in the registry. Overrides live in `guild_settings`, keyed by guild and
 setting, with actor and timestamp. Missing rows inherit current defaults.
 
-The settings are `chat_model`, `keywords`, `pool_debounce`, `pool_max_wait`, `pool_max_messages`,
+The settings are `chat_model`, `image_generation`, `image_model`, `keywords`, `pool_debounce`, `pool_max_wait`, `pool_max_messages`,
 `active_window`, `max_active_conversations`, `decide_min_confidence`,
 `decide_keyword_min_confidence`, `follow_up_window`, `follow_up_max_no_confidence`, `stale_after`,
 `stale_min_confidence`, `decide_recent_messages`, `decide_conversation_preview`, `history_messages`,
@@ -27,7 +27,8 @@ triggers; `value:,` can be used to supply an empty list in Discord.
 - Manage Server is checked at runtime for every write, before catalog requests or database work.
   Chat models retain the existing OpenRouter catalog check for text and tool support. Topic and
   Decide models remain global; the topic default derives from the env chat model, not its guild
-  override.
+  override. `image_model` is checked against OpenRouter's image catalog instead; its default is
+  env `OPENROUTER_IMAGE_MODEL` ([image generation](image-generation.md)).
 
 `follow_up_window` (default 300 seconds, range 0–3600) controls two ways to
 continue an open conversation in the same channel. First, a direct follow-up
@@ -164,7 +165,7 @@ settings whose upper bound the operator can lower with an env var (see Bounds).
 | Constant | Value | Why |
 |---|---|---|
 | Retrieval ranking (`MIN_SIMILARITY` 0.25, `RECENCY_WEIGHT` 0.15, `HALF_LIFE_DAYS` 30, `CANDIDATES` 50, `RRF_K` 60) | | Tuned together for the embedding model; change only with evals |
-| Context neighbours (`retrieval.py`) | default 5, cap 10 | Model chooses within the cap; revisit with search evals |
+| Context neighbours (`chat/search.py`) | default 5, cap 10 | Model chooses within the cap; revisit with search evals |
 | `SNIPPET_CHARS`, `MAX_TOPIC_TOKENS`, `MAX_TOPIC_CHARS` | 1000, 400, 200 | Product choices with little per-server value; promote later if asked |
 | Roster (`MAX_PEOPLE`, `MAX_LABEL_CHARS`, `FORMER_USERNAMES`) | 200, 32, 2 | Prompt-shape choices, same reasoning |
 | Discord and infra (`MAX_MESSAGE_CHARS` 1900, `PAGE_SIZE` 100, backfill concurrency, lock keys, intervals, REST retries, embedding batch sizes) | | Protocol or operational |
@@ -245,7 +246,7 @@ Changes apply to the next pool or run.
 ### Agent host contract
 
 New `JobRequest` fields: `max_tool_calls`, `max_model_requests`, `search_results`. Durable retries
-compare the stored request with the new one (`jobs.py`, `extra="forbid"`), so:
+compare the stored request with the new one (`api/jobs.py`, `extra="forbid"`), so:
 
 1. **Deploy the host first.** The new fields are optional, defaulting to today's constants, so it
    still accepts old requests.

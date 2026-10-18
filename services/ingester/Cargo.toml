@@ -22,6 +22,7 @@ twilight-gateway = "0.17.1"
 twilight-http = "0.17.1"
 twilight-model = "0.17.1"
 twilight-util = { version = "0.17", features = ["builder"] }
+unicode-segmentation = "1.13.3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

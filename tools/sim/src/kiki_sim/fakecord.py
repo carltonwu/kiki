@@ -7,13 +7,16 @@ The CLI drives it through `/_sim/…`; see docs/kiki-sim-hld.md.
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import itertools
 import json
 import logging
 import math
 import re
+import struct
 import time
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,6 +30,7 @@ EMBEDDING_DIMENSIONS = 1024
 ADMINISTRATOR = 1 << 3
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
+STUB_IMAGE_MODELS = ["sim/image"]
 
 
 def iso(ms: int) -> str:
@@ -36,9 +40,11 @@ def iso(ms: int) -> str:
 class World:
     """Everything fakecord knows, rebuilt from the fixture on reset."""
 
-    def __init__(self, fixture_path: Path):
+    def __init__(self, fixture_path: Path, media_base: str = "http://127.0.0.1:8090"):
         fixture = yaml.safe_load(fixture_path.read_text())
         self.fixture_path = fixture_path
+        self.media_base = media_base
+        self.files: dict[str, tuple[bytes, str]] = {}  # CDN path → (body, content type)
         self.guild = {"id": str(fixture["guild"]["id"]), "name": fixture["guild"]["name"]}
         kiki = fixture["kiki"]
         self.bot = {
@@ -59,7 +65,8 @@ class World:
                     "username": m["username"],
                     "global_name": m.get("global_name"),
                     "discriminator": "0",
-                    "avatar": None,
+                    # Served from /cdn/avatars as a PNG labeled "avatar of <username>".
+                    "avatar": m.get("avatar"),
                     "bot": bool(m.get("bot", False)),
                 },
                 "nick": m.get("nick"),
@@ -81,6 +88,10 @@ class World:
             if channel["type"] in (10, 11, 12):
                 channel["thread_metadata"] = {"archived": False, "archive_timestamp": iso(0)}
             self.channels[name] = channel
+        # Custom emoji: `description` is what the stub vision model answers.
+        self.emojis: dict[str, dict] = {}
+        for name, e in (fixture.get("emojis") or {}).items():
+            self.add_emoji(name, e)
         self.messages: dict[str, dict] = {}  # id → payload, insertion (= id) order
         self.deleted: set[str] = set()
         self.reactions: list[dict] = []  # {message_id, emoji, action, at}
@@ -100,7 +111,16 @@ class World:
             count = h.get("repeat", 1)
             for i in range(count):
                 at_ms = now - age_ms - (count - 1 - i) * 1000
-                self.create_message(h["as"], h["in"], h["text"].format(i=i), at_ms=at_ms)
+                self.create_message(
+                    h["as"],
+                    h["in"],
+                    h["text"].format(i=i),
+                    at_ms=at_ms,
+                    attachments=[
+                        self.attachment(self.channel(h["in"])["id"], a)
+                        for a in h.get("attachments") or []
+                    ],
+                )
 
     # --- lookups -----------------------------------------------------------
 
@@ -134,6 +154,23 @@ class World:
             "permissions": str(ADMINISTRATOR if m["admin"] else 0),
         }
 
+    def add_emoji(self, name: str, spec: dict) -> dict:
+        emoji = {
+            "id": str(spec["id"]),
+            "name": name,
+            "animated": bool(spec.get("animated", False)),
+            "available": bool(spec.get("available", True)),
+            "require_colons": True,
+            "managed": False,
+            "roles": [],
+            "description": spec.get("description"),
+        }
+        self.emojis[emoji["id"]] = emoji
+        return emoji
+
+    def emoji_payloads(self) -> list[dict]:
+        return [{k: v for k, v in e.items() if k != "description"} for e in self.emojis.values()]
+
     # --- messages ----------------------------------------------------------
 
     def create_message(
@@ -144,6 +181,7 @@ class World:
         *,
         at_ms: float | None = None,
         reply_to: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> dict:
         m = self.member(author)
         c = self.channel(channel)
@@ -160,8 +198,9 @@ class World:
             return f"<@{target['user']['id']}>"
 
         content = MENTION_TOKEN.sub(mention, content)
+        id = self.snowflake(at_ms)
         message = {
-            "id": self.snowflake(at_ms),
+            "id": id,
             "channel_id": c["id"],
             "guild_id": self.guild["id"],
             "author": m["user"],
@@ -172,7 +211,7 @@ class World:
             "mention_everyone": False,
             "mentions": mentions,
             "mention_roles": [],
-            "attachments": [],
+            "attachments": attachments or [],
             "embeds": [],
             "pinned": False,
             "type": 0,
@@ -196,15 +235,108 @@ class World:
         c["last_message_id"] = message["id"]
         return message
 
+    def start_thread(self, origin_id: str, name: str, author: str) -> tuple[dict, list[dict]]:
+        """A public thread started from a message, as Discord makes one: the thread
+        has the message's ID, the parent gets a THREAD_CREATED notice (type 18), and
+        the thread opens with an empty THREAD_STARTER_MESSAGE (type 21) by whoever
+        started it, pointing at the message."""
+        origin = self.messages[origin_id]
+        parent = self.channel(origin["channel_id"])
+        thread = {
+            "id": origin_id,
+            "guild_id": self.guild["id"],
+            "name": name,
+            "type": 11,
+            "parent_id": parent["id"],
+            "last_message_id": None,
+            "thread_metadata": {"archived": False, "archive_timestamp": iso(0)},
+        }
+        self.channels[name] = thread
+        notice = self.create_message(author, parent["id"], name)
+        notice["type"] = 18
+        notice["message_reference"] = {"channel_id": origin_id, "guild_id": self.guild["id"]}
+        starter = self.create_message(author, origin_id, "")
+        starter["type"] = 21
+        starter["message_reference"] = {
+            "message_id": origin_id,
+            "channel_id": parent["id"],
+            "guild_id": self.guild["id"],
+        }
+        return thread, [notice, starter]
+
+    def attachment(self, channel_id: str, spec: dict) -> dict:
+        """A scripted attachment, `{filename, label?, content_type?, width?, height?,
+        expired?}`. Images are tiny PNGs whose `label` the stub vision model reads
+        back, so a description proves the bytes made it through the agent host.
+        An `expired` link (`ex=0`) is a 404 until refreshed, like Discord's after a day."""
+        name = spec["filename"]
+        content_type = spec.get("content_type", "image/png")
+        if content_type.startswith("image/"):
+            body = png(spec.get("label", name))
+        else:
+            body = spec.get("label", name).encode()
+        ex = "0" if spec.get("expired") else "sim"
+        payload = self.upload(channel_id, name, body, content_type, ex)
+        return payload | {"width": spec.get("width", 64), "height": spec.get("height", 64)}
+
+    def upload(
+        self, channel_id: str, name: str, body: bytes, content_type: str, ex: str = "sim"
+    ) -> dict:
+        """Discord's attachment object; the bytes are served from fakecord's `/cdn`."""
+        id = self.snowflake(time.time() * 1000)
+        path = f"attachments/{channel_id}/{id}/{name}"
+        self.files[path] = (body, content_type)
+        url = f"{self.media_base}/cdn/{path}"
+        return {
+            "id": id,
+            "filename": name,
+            "size": len(body),
+            "url": f"{url}?ex={ex}",
+            "proxy_url": f"{url}?ex={ex}&proxy=1",
+            "content_type": content_type,
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+def png(label: str) -> bytes:
+    """A 1×1 PNG carrying `label` in a tEXt chunk."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"tEXt", b"sim\x00" + label.encode())
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def png_label(data: bytes) -> str | None:
+    at = 8
+    while at + 8 <= len(data):
+        (size,) = struct.unpack(">I", data[at : at + 4])
+        kind, body = data[at + 4 : at + 8], data[at + 8 : at + 8 + size]
+        if kind == b"tEXt" and body.startswith(b"sim\x00"):
+            return body[4:].decode(errors="replace")
+        at += 12 + size
+    return None
+
 
 class Fakecord:
     def __init__(self, fixture: Path, port: int):
         self.port = port
-        self.world = World(fixture)
+        self.world = World(fixture, self.media_base())
         self.sockets: set[web.WebSocketResponse] = set()
         self.identified: set[web.WebSocketResponse] = set()
         self.sequence = 0
         self.sessions = itertools.count(1)
+
+    def media_base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
     # --- Gateway -----------------------------------------------------------
 
@@ -296,7 +428,11 @@ class Fakecord:
     async def rest(self, request: web.Request) -> web.StreamResponse:
         w = self.world
         path = request.match_info["path"].rstrip("/")
-        body = await request.json() if request.can_read_body else None
+        files: list[dict] = []
+        if request.content_type == "multipart/form-data":
+            body, files = await self.multipart(request)
+        else:
+            body = await request.json() if request.can_read_body else None
         call = {"method": request.method, "path": path, "query": dict(request.query)}
         w.calls.append({**call, "body": body})
         route = f"{request.method} {path}"
@@ -316,6 +452,8 @@ class Fakecord:
             return json_response(commands)
         if route == f"GET guilds/{g}":
             return json_response({**w.guild, "roles": self.roles()})
+        if route == f"GET guilds/{g}/emojis":
+            return json_response(w.emoji_payloads())
         if route == f"GET guilds/{g}/channels":
             return json_response([c for c in w.channels.values() if c["type"] not in (10, 11, 12)])
         if route == f"GET guilds/{g}/threads/active":
@@ -330,10 +468,14 @@ class Fakecord:
         ):
             from urllib.parse import unquote
 
+            emoji = unquote(m[4])
+            # Custom emoji are `name:id`; Discord rejects ones Kiki can't use.
+            if ":" in emoji and emoji.rsplit(":", 1)[1] not in w.emojis:
+                return json_response({"message": "Unknown Emoji", "code": 10014}, status=400)
             w.reactions.append(
                 {
                     "message_id": m[3],
-                    "emoji": unquote(m[4]),
+                    "emoji": emoji,
                     "action": "add" if m[1] == "PUT" else "remove",
                     "at": time.time(),
                 }
@@ -342,12 +484,25 @@ class Fakecord:
         if m := re.fullmatch(r"POST channels/(\d+)/messages", route):
             reference = (body.get("message_reference") or {}).get("message_id")
             reply_to = reference if reference in w.messages else None
-            message = w.create_message("kiki", m[1], body.get("content", ""), reply_to=reply_to)
+            message = w.create_message(
+                "kiki",
+                m[1],
+                body.get("content", ""),
+                reply_to=reply_to,
+                attachments=self.attachments(m[1], body, files),
+            )
             # Discord echoes our own message over the Gateway, usually a bit later.
             asyncio.get_running_loop().call_later(
                 0.05, lambda: asyncio.ensure_future(self.dispatch("MESSAGE_CREATE", message))
             )
             return json_response(message)
+        if route == "POST attachments/refresh-urls":
+            # Re-signs expired links (`ex=0`), as Discord does for a bot.
+            refreshed = [
+                {"original": url, "refreshed": url.replace("ex=0", "ex=sim")}
+                for url in body.get("attachment_urls") or []
+            ]
+            return json_response({"refreshed_urls": refreshed})
         if m := re.fullmatch(r"POST interactions/(\d+)/([^/]+)/callback", route):
             w.interactions.append({"interaction_id": m[1], "kind": "callback", "body": body})
             return web.Response(status=204)
@@ -367,6 +522,40 @@ class Fakecord:
         log.warning("unexpected Discord call: %s", route)
         w.unexpected.append(call)
         return json_response({"message": "Unknown (kiki-sim)", "code": 0}, status=404)
+
+    async def multipart(self, request: web.Request) -> tuple[dict, list[dict]]:
+        """Discord uploads: `payload_json` plus `files[n]` parts."""
+        body, files = {}, []
+        reader = await request.multipart()
+        while part := await reader.next():
+            data = await part.read()
+            if part.name == "payload_json":
+                body = json.loads(data)
+            elif part.name and part.name.startswith("files["):
+                files.append(
+                    {
+                        "id": part.name[len("files[") : -1],
+                        "filename": part.filename,
+                        "content_type": part.headers.get("Content-Type"),
+                        "data": bytes(data),
+                    }
+                )
+        return body, files
+
+    def attachments(self, channel_id: str, body: dict, files: list[dict]) -> list[dict]:
+        """Discord's attachment objects for uploaded files, declared in `attachments`."""
+        declared = {str(a["id"]): a for a in body.get("attachments") or []}
+        if set(declared) != {f["id"] for f in files}:
+            raise web.HTTPBadRequest(text="uploaded files don't match payload attachments")
+        return [
+            self.world.upload(
+                channel_id,
+                declared[f["id"]].get("filename") or f["filename"],
+                f["data"],
+                f["content_type"] or sniff(f["data"]),
+            )
+            for f in files
+        ]
 
     def page(self, channel_id: str, query) -> list[dict]:
         w = self.world
@@ -399,6 +588,24 @@ class Fakecord:
                     ]
                 }
             )
+        if request.method == "GET" and path == "v1/images/models":
+            return web.json_response(
+                {
+                    "data": [
+                        {
+                            "id": model,
+                            "name": model,
+                            "architecture": {
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["image"],
+                            },
+                        }
+                        for model in STUB_IMAGE_MODELS
+                    ]
+                }
+            )
+        if request.method == "POST" and path == "v1/images":
+            return self.image(body)
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
@@ -414,6 +621,29 @@ class Fakecord:
                 entry["used"] = True
                 return entry
         return None
+
+    async def cdn(self, request: web.Request) -> web.StreamResponse:
+        """Discord's CDN: emoji images, and attachments (`?ex=` is ignored, like an
+        unexpired signed URL). Images are PNGs labeled for the stub vision model."""
+        path = request.match_info["path"]
+        if (m := re.fullmatch(r"emojis/(\d+)\.png", path)) and m[1] in self.world.emojis:
+            emoji = self.world.emojis[m[1]]
+            return web.Response(body=png(f"emoji :{emoji['name']}:"), content_type="image/png")
+        if m := re.fullmatch(r"avatars/(\d+)/(\w+)\.png", path):
+            user = next(
+                (u["user"] for u in self.world.members.values() if u["user"]["id"] == m[1]), None
+            )
+            if user and user.get("avatar") == m[2]:
+                return web.Response(
+                    body=png(f"avatar of {user['username']}"), content_type="image/png"
+                )
+        if request.query.get("ex") == "0":
+            return web.Response(status=404, text="This content is no longer available.")
+        if found := self.world.files.get(path):
+            body, content_type = found
+            return web.Response(body=body, content_type=content_type)
+        self.world.unexpected.append({"method": request.method, "path": f"cdn/{path}"})
+        return web.Response(status=404, text="This content is no longer available.")
 
     def jev(self, body: dict) -> dict:
         state = body["state"]
@@ -468,7 +698,38 @@ class Fakecord:
         w = self.world
         n = next(w.ids)
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
-        if record["kind"] == "topic":
+        usage = {}
+        if pictures := image_parts(messages):
+            record["kind"] = "vision"
+            prompt = " ".join(content_text(m.get("content")) for m in messages)
+            if "custom Discord emoji" in prompt:
+                # Describing a custom emoji: the fixture's description, by name.
+                record["kind"] = "emoji"
+                name = (re.search(r":(\w+):", prompt) or [None, ""])[1]
+                emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
+                text = emoji.get("description") or f"stub description of :{name}:"
+            elif "You pick reference photos" in prompt:
+                # The drawing step's reference check: memes and screenshots are out.
+                record["kind"] = "check"
+                text = "\n".join(
+                    f"Image {n}: {label} => "
+                    + ("no" if re.search(r"meme|screenshot", label, re.I) else "yes")
+                    for n, label in enumerate((png_label(p) or "an image" for p in pictures), 1)
+                )
+            else:
+                text = describe(pictures, body.get("model"))
+            message = {"role": "assistant", "content": text}
+        elif record["kind"] == "topic" and (
+            note := re.search(
+                r"couldn't be made: (.*?)\. Write the one short message",
+                content_text(messages[-1].get("content")),
+                re.S,
+            )
+        ):
+            # Kiki's note about a failed drawing, written with the reply's prompt.
+            record["kind"] = "note"
+            message = {"role": "assistant", "content": f"stub note, in her words: {note[1]}"}
+        elif record["kind"] == "topic":
             message = {"role": "assistant", "content": "stub topic"}
         else:
             user = [m for m in messages if m["role"] == "user"]
@@ -477,34 +738,45 @@ class Fakecord:
             record["trigger"] = trigger
             tool_results = [content_text(m.get("content")) for m in messages if m["role"] == "tool"]
             if messages[-1]["role"] == "tool":
-                # Second turn of a scripted tool call: answer from its result.
-                entry = next((e for e in w.scripts["reply"] if e.pop("pending", False)), {})
-                ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
-                text = entry.get("text", "stub: found {ids}").format(
-                    trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
-                )
+                entry = next((e for e in w.scripts["reply"] if e.get("pending")), {})
+                queue = entry.get("queue") or []
                 record["tool_results"] = tool_results
-                message = {"role": "assistant", "content": text}
+                if queue:
+                    # A scripted sequence: the next call may use IDs from this result.
+                    tool = fill_args(queue.pop(0), tool_results[-1])
+                    message = tool_call_message(n, tool)
+                    record["tool_call"] = tool
+                else:
+                    # Last turn of a scripted tool call: answer from its result.
+                    entry.pop("pending", None)
+                    ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
+                    text = entry.get("text", "stub: found {ids}").format(
+                        trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
+                    )
+                    message = {"role": "assistant", "content": text}
             else:
                 entry = self.take("reply", trigger)
-                if entry and entry.get("tool"):
+                tools = (entry or {}).get("tools") or (
+                    [entry["tool"]] if entry and entry.get("tool") else []
+                )
+                if tools:
                     entry["pending"] = True
-                    tool = entry["tool"]
-                    message = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": f"call_{n}",
-                                "type": "function",
-                                "function": {
-                                    "name": tool["name"],
-                                    "arguments": json.dumps(tool.get("args", {})),
-                                },
-                            }
-                        ],
-                    }
+                    # `{image_message}`: the message ID of the trigger's image marker,
+                    # else of the newest marker in the conversation (like Kiki's drawing).
+                    everything = "\n".join(content_text(m.get("content")) for m in messages)
+                    markers = re.findall(r"; message (\d+)\]", trigger) or re.findall(
+                        r"; message (\d+)\]", everything
+                    )
+                    args = json.dumps(tools[0].get("args", {})).replace(
+                        "{image_message}", markers[-1] if markers else ""
+                    )
+                    tool = {**tools[0], "args": json.loads(args)}
+                    entry["queue"] = list(tools[1:])
+                    message = tool_call_message(n, tool)
                     record["tool_call"] = tool
+                elif entry and entry.get("web"):
+                    message, usage = self.server_tools(body, entry, trigger)
+                    record["web"] = usage["server_tool_use_details"]
                 elif entry:
                     message = {
                         "role": "assistant",
@@ -533,8 +805,75 @@ class Fakecord:
                 "completion_tokens": 5,
                 "total_tokens": 15,
                 "cost": 0.0001,
+                **usage,
             },
         }
+
+    def server_tools(self, body: dict, entry: dict, trigger: str) -> tuple[dict, dict]:
+        """OpenRouter's server tools: it searches and fetches itself, then reports
+        counts in usage and search sources as `url_citation` annotations. A scripted
+        `web: [{search: q, source: url} | {fetch: url}]` only runs if it was offered."""
+        offered = {t.get("type") for t in body.get("tools", [])}
+        searches = fetches = 0
+        sources = []
+        for call in entry["web"]:
+            if "search" in call and "openrouter:web_search" in offered:
+                searches += 1
+                sources.append(call.get("source") or "https://example.com/search")
+            elif "fetch" in call and "openrouter:web_fetch" in offered:
+                fetches += 1
+        annotations = [
+            {
+                "type": "url_citation",
+                "url_citation": {"url": url, "title": url, "start_index": 0, "end_index": 0},
+            }
+            for url in sources
+        ]
+        text = entry.get("text", "stub web: {trigger}")
+        message = {
+            "role": "assistant",
+            "content": text.format(trigger=trigger, ids="", result=" ".join(sources)),
+            "annotations": annotations,
+        }
+        used = searches + fetches
+        details = {
+            "web_search_requests": searches,
+            "tool_calls_requested": used,
+            "tool_calls_executed": used,
+        }
+        return message, {"server_tool_use_details": details}
+
+    def image(self, body: dict) -> web.Response:
+        """OpenRouter's Images API: a 1×1 PNG labeled with the prompt (so the stub
+        vision model can tell what was drawn), or a 400 for prompts containing
+        "refuse", as a moderation block would. Reference images must be inline
+        bytes (Discord links expire); their labels are recorded, in order."""
+        w = self.world
+        prompt = body["prompt"]
+        references = []
+        for ref in body.get("input_references") or []:
+            url = ref["image_url"]["url"]
+            if ref.get("type") != "image_url" or not url.startswith("data:image/"):
+                error = {"code": 400, "message": "input_references must be image data URLs"}
+                return web.json_response({"error": error}, status=400)
+            references.append(png_label(base64.b64decode(url.partition(",")[2])) or "an image")
+        drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE)
+        w.llm.append(
+            {
+                "kind": "image",
+                "request": body,
+                "prompt": prompt,
+                "references": references,
+                "drew": drew,
+            }
+        )
+        if not drew:
+            error = {"code": 400, "message": "Request blocked by the provider's safety system"}
+            return web.json_response({"error": error}, status=400)
+        drawing = png(f"a drawing of {prompt[:80]}")
+        image = {"b64_json": base64.b64encode(drawing).decode(), "media_type": "image/png"}
+        usage = {"prompt_tokens": 10, "completion_tokens": 1056, "total_tokens": 1066, "cost": 0.04}
+        return web.json_response({"created": int(time.time()), "data": [image], "usage": usage})
 
     # --- control API -------------------------------------------------------
 
@@ -547,7 +886,7 @@ class Fakecord:
             return web.json_response(self.state())
         if route == "POST reset":
             fixture = Path(body.get("fixture") or w.fixture_path)
-            self.world = World(fixture)
+            self.world = World(fixture, self.media_base())
             self.disconnect()
             return web.json_response({"ok": True})
         if route == "POST drop-gateway":
@@ -560,7 +899,15 @@ class Fakecord:
         if route == "POST messages":
             at_ms = time.time() * 1000 - float(body.get("age_s", 0)) * 1000
             message = w.create_message(
-                body["as"], body["in"], body["text"], at_ms=at_ms, reply_to=body.get("reply_to")
+                body["as"],
+                body["in"],
+                body["text"],
+                at_ms=at_ms,
+                reply_to=body.get("reply_to"),
+                attachments=[
+                    w.attachment(w.channel(body["in"])["id"], a)
+                    for a in body.get("attachments") or []
+                ],
             )
             await self.dispatch("MESSAGE_CREATE", message)
             return web.json_response(message)
@@ -577,8 +924,20 @@ class Fakecord:
             message["edited_timestamp"] = iso(time.time() * 1000)
             await self.dispatch("MESSAGE_UPDATE", message)
             return web.json_response(message)
+        if route == "POST emojis":
+            # A server admin adds an emoji (no Gateway event: Kiki resyncs by command).
+            return web.json_response(w.add_emoji(body["name"], body))
+        if m := re.fullmatch(r"DELETE emojis/(\w+)", route):
+            w.emojis = {k: e for k, e in w.emojis.items() if e["name"] != m[1]}
+            return web.json_response({"ok": True})
         if route == "POST interactions":
             return web.json_response(await self.interaction(body))
+        if route == "POST threads":
+            thread, messages = w.start_thread(body["from"], body["name"], body["as"])
+            await self.dispatch("THREAD_CREATE", {**thread, "newly_created": True})
+            for message in messages:
+                await self.dispatch("MESSAGE_CREATE", message)
+            return web.json_response(thread)
         raise web.HTTPNotFound(text=f"no control route {route}")
 
     def disconnect(self) -> None:
@@ -649,8 +1008,38 @@ class Fakecord:
         app.router.add_get("/gateway/", self.gateway)
         app.router.add_route("*", "/api/v10/{path:.*}", self.rest)
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
+        app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
+
+
+def tool_call_message(n: int, tool: dict) -> dict:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": f"call_{n}",
+                "type": "function",
+                "function": {"name": tool["name"], "arguments": json.dumps(tool.get("args", {}))},
+            }
+        ],
+    }
+
+
+def fill_args(tool: dict, previous: str) -> dict:
+    """`{entry_id}` is the first memory entry ID (e12) in the previous tool result;
+    `{entry_ids:N}` the first N, as a list."""
+    entries = list(dict.fromkeys(re.findall(r"\be[0-9]+\b", previous)))
+
+    def fill(value):
+        if value == "{entry_id}":
+            return entries[0] if entries else value
+        if isinstance(value, str) and (m := re.fullmatch(r"\{entry_ids:(\d+)\}", value)):
+            return entries[: int(m[1])]
+        return value
+
+    return {**tool, "args": {k: fill(v) for k, v in (tool.get("args") or {}).items()}}
 
 
 def content_text(content) -> str:
@@ -659,6 +1048,30 @@ def content_text(content) -> str:
     if isinstance(content, list):
         return "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
     return "" if content is None else str(content)
+
+
+def image_parts(messages: list[dict]) -> list[bytes]:
+    """The images in a request (data URLs, as the agent host sends them)."""
+    found = []
+    for m in messages:
+        for part in m.get("content") if isinstance(m.get("content"), list) else []:
+            if part.get("type") == "image_url":
+                url = part["image_url"]["url"]
+                found.append(base64.b64decode(url.partition(",")[2]) if "," in url else b"")
+    return found
+
+
+def sniff(data: bytes) -> str:
+    return "image/png" if data.startswith(b"\x89PNG") else "application/octet-stream"
+
+
+def describe(pictures: list[bytes], model: str | None) -> str:
+    """The stub vision model: reads back each sim PNG's label."""
+    lines = [f"Image {n}: {png_label(p) or 'an image'}" for n, p in enumerate(pictures, 1)]
+    if len(pictures) > 1:
+        lines.append(f"Gallery: {len(pictures)} images together")
+    lines.append(f"(sim vision via {model})")
+    return "\n".join(lines)
 
 
 def trigger_line(prompt: str) -> str:

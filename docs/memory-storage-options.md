@@ -201,7 +201,7 @@ My recommendation is **one Postgres database, evaluation first, episode-centric,
 These come from reading the workspace source, not a production census:
 
 - **Unknown scale.** The local development database has 648 messages in 7 channels (checked with `psql` against the docker-compose database). I did not query production. Run one `SELECT count(*), count(DISTINCT channel_id) FROM messages` on production before choosing any engine. If the answer is in the hundreds of thousands, a channel's whole graph fits in application memory, and both "traversal performance" and "ANN recall under filters" stop mattering.
-- **Messages are embedded alone** (`retrieval.py`: `PENDING` and `Embedder`). Each message's `content` is embedded by itself. In chat, "yeah let's do Pine instead" or "lol same" carries almost no searchable meaning on its own. I think this is the largest single quality loss in the current retriever.
+- **Messages are embedded alone** (`chat/indexing.py` `PENDING` and `openrouter/embeddings.py` `Embedder`). Each message's `content` is embedded by itself. In chat, "yeah let's do Pine instead" or "lol same" carries almost no searchable meaning on its own. I think this is the largest single quality loss in the current retriever.
 - **Kiki's own messages can never be found by search** (`SCOPE` has `NOT m.author_bot`). Kiki's past answers and commitments ("I'll remind you Friday") are part of what users expect it to remember. Index them, labelled as bot-authored, and exclude them from the human-evidence count, as the HLD already recommends for assertions.
 - **Recency is measured from database `now()`** in `SEARCH`. A historical replay or an "as of T" evaluation therefore cannot reproduce ranking. Pass the reference time as a parameter.
 - **Exact vector scan.** There is no ANN index, so the semantic branch does an exact cosine scan with a similarity cutoff. At small scale this is a quality advantage, not a defect. The doc's warning about filtered ANN recall only applies once an index is added. Don't add one before latency requires it.
@@ -319,7 +319,7 @@ Every derived row carries an `input_hash`. Workers recompute any row whose input
 - PG 18 `WITHOUT OVERLAPS` and `PERIOD` semantics.
 - The SeCom, EM-LLM and Contextual Retrieval claims, quoted above.
 - The pgvector storage arithmetic in the cost section (`2d+8` bytes × 500k ≈ 1.03 GB; × 25k ≈ 51.4 MB). It is correct.
-- The code facts: `store.rs`, `retrieval.py`, migrations 0001/0007/0008, Gateway intents, and local DB counts.
+- The code facts: `store.rs`, `retrieval.py` (now `chat/`), migrations 0001/0007/0008, Gateway intents, and local DB counts.
 
 **Not verified:**
 

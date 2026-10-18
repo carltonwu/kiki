@@ -125,6 +125,7 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
 | `/kiki users [period] [sort]` | Top 20 active people by cost (default), messages or conversations. Period: `24h`, `7d` (default) or `all`. Shows total messages, messages with Kiki, conversations and attributed LLM cost. |
+| `/kiki emojis [resync] [redescribe]` | The server's custom emoji with Kiki's description of each. `resync:true` copies the list from Discord, marks deleted emoji removed, and has a vision model describe new ones; `redescribe:true` also replaces existing descriptions. Resyncing requires Manage Server. |
 | `/kiki whois <user>` | Up to 15 recently seen names (nickname, display name, username), first/last seen, join and message dates, plus messages, conversations and attributed cost over 24 h, 7 d and all time. |
 
 Per-person cost splits reply cost across the triggering messages and includes Decide;
@@ -139,6 +140,8 @@ Server settings persist in Postgres and apply without a restart. Examples:
 - `/kiki config key:history_messages value:50`
 - `/kiki config key:reply_max_tokens value:3000`
 - `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
+- `/kiki config key:image_model value:openai/gpt-image-2.5-flare` (from OpenRouter's image catalog)
+- `/kiki config key:image_generation value:false` (stop Kiki drawing images)
 - `/kiki config key:pool_debounce reset:true`
 
 Use `/kiki config key:chat_model` to view the chat model, or add `reset:true` to restore
@@ -147,6 +150,39 @@ support text output and tools. Unset keys inherit startup env defaults, then bui
 New pools capture routing settings; new reply jobs capture context, model and token settings.
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
+
+Kiki can draw: with `image_generation` on (the default), reply jobs get a
+`generate_image` tool backed by the server's `image_model`. Her reply goes out
+first; the picture follows as its own message, drawn from reference photos of its
+subjects found in the server. The agent host needs `DISCORD_BOT_TOKEN` to refresh
+expired attachment links. See [image generation](docs/image-generation.md).
+
+Server phrases and custom emoji come from the manually curated `guild_lingo`
+table (migration 0014 seeds one server). Reply prompts include only that server's
+entries. `/kiki config key:lingo_nudge value:35` sets how often a reply gets an
+extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
+removes the extra suggestion; the phrase list remains in the prompt, so natural
+use is still possible. Selection is stable for the triggering message and retries.
+There is no automatic phrase learning; edit the list in the console.
+
+Every custom emoji of a server is also in `guild_emojis` (migration 0017), with a
+one- or two-sentence description written by a vision model (`OPENROUTER_EMOJI_MODEL`,
+default `deepseek/deepseek-v4.1-flash-1017`). Replies can look
+them up with the `search_emojis` (by mood or meaning) and `find_emoji` (by name, or
+to explain `<:name:id>` in a message) tools. The list only changes on
+`/kiki emojis resync:true`: run it after adding, renaming or deleting emoji. Each
+resync describes only emoji without a description, and tries each at most once;
+run it again to retry failures.
+
+Only one ingester instance holds the Discord Gateway connection at a time: instances take a
+Postgres advisory lock first, so during a deploy the new instance waits until the old one has
+shut down.
+
+Logs default to INFO: routing decisions with a matching trigger, completed runs and
+actionable failures. Set `RUST_LOG=info,sqlx=warn,twilight_http_ratelimiting=warn,ingester=debug` for pool skips,
+run claims and retry details, or `LOG_LEVEL=DEBUG` on the Python host for job reuse
+and retrieval diagnostics. IDs connect routing pools to runs, host jobs and Discord
+replies; logs omit provider error bodies and message content.
 
 ## Web console
 
@@ -159,21 +195,3 @@ server. Operators (`CONSOLE_OPERATOR_IDS`) also get a view across servers and th
 Settings and chat go through the ingester's private admin API (`/admin/v1` on its port, enabled by
 `ADMIN_API_TOKEN`), so they use the same validation and prompt as Discord. The console service is
 not in the Railway IaC yet; the doc lists the deploy steps.
-
-Server phrases and custom emoji come from the manually curated `guild_lingo`
-table (migration 0014 seeds one server). Reply prompts include only that server's
-entries. `/kiki config key:lingo_nudge value:35` sets how often a reply gets an
-extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
-removes the extra suggestion; the phrase list remains in the prompt, so natural
-use is still possible. Selection is stable for the triggering message and retries.
-There is no automatic phrase learning; edit the list in the console.
-
-Only one ingester instance holds the Discord Gateway connection at a time: instances take a
-Postgres advisory lock first, so during a deploy the new instance waits until the old one has
-shut down.
-
-Logs default to INFO: routing decisions with a matching trigger, completed runs and
-actionable failures. Set `RUST_LOG=info,sqlx=warn,twilight_http_ratelimiting=warn,ingester=debug` for pool skips,
-run claims and retry details, or `LOG_LEVEL=DEBUG` on the Python host for job reuse
-and retrieval diagnostics. IDs connect routing pools to runs, host jobs and Discord
-replies; logs omit provider error bodies and message content.

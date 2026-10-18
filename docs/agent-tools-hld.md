@@ -32,9 +32,18 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 
 | File | Contents |
 |---|---|
-| `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
-| `agent.py` | `PydanticExecutor`: agents, trusted deps, two tools, message/usage mapping, transient-error mapping. |
-| `app.py` | Wires the executor when the key is set; startup and per-job logs. |
+| `chat/search.py`, `chat/indexing.py` | SDK-independent: index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
+| `chat/scope.py`, `chat/attachments.py` | The job's scope and people, name and channel resolution, and the images a stored message carries. |
+| `openrouter/embeddings.py` | The embedder: OpenRouter embeddings as `halfvec` literals, with their cost. |
+| `agent/executor.py` | `PydanticExecutor`: agents, message/usage mapping, transient-error mapping, image jobs and emoji descriptions. |
+| `agent/tools/` | One module per capability, each a `FunctionToolset` listed in `TOOLSETS`. Every tool runs through `agent/guard.py` (deadline, budget, log line). |
+| `agent/web.py`, `openrouter/chat.py` | OpenRouter's web search and fetch server tools, and the model subclass that maps fetch. |
+| `media/fetch.py`, `media/vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
+| `media/reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
+| `openrouter/images.py`, `media/generation.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)), and saving the result. |
+| `media/drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (`agent/tools/drawing.py`) only queues. |
+| `chat/emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
+| `api/app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
 
 Rust prompt changes, already made:
@@ -43,6 +52,20 @@ Rust prompt changes, already made:
   readers.
 - The capabilities line says Kiki can search every channel in this server, with
   an optional channel filter, and should cite message links.
+- Threads (issue #24): the system prompt names a thread with its parent channel
+  (`thread "Thread" in #boba`). Discord's thread starter message (type 21) is an
+  empty placeholder pointing at the message the thread was started from, so the
+  run context shows that message instead, on its own line with its real author,
+  text and `[image: …; message <id>]` marker (`read_image` takes that ID). A thread
+  started from a message has the message's ID, which finds it when the placeholder
+  is too old to be shown. `THREAD_CREATED` notices (type 18) stay out of the
+  channel context.
+- Server-specific names (issue #24): words in the newest messages that are also a
+  channel name or a memory subject of the server (`name_norm` match, single words
+  and pairs) are listed in the run context with a nudge to check memory or history
+  before answering from general knowledge, so "describe boba" in a server with a
+  #boba channel doesn't need Kiki to think of looking. The system prompt says the
+  same for bare names and nouns aimed at her.
 
 ## Tools
 
@@ -60,18 +83,119 @@ model arguments, and arguments can only narrow them.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
   target message's own channel (at most 10 on each side) and the reply parent
   if it is in the same guild.
+- `read_image(message_id, question?)` has another model look at a message's
+  images (see below). Search and context hits with images carry `images: n`.
+
+- `search_emojis(query, limit=5)` and `find_emoji(name)`: the guild's custom emoji
+  by mood or meaning, or by name (`huh`, `:huh:`, `<:huh:123>`). See
+  [Custom emoji](#custom-emoji).
 
 Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
 
+### Web search and fetch (issue #1)
+
+Every reply job also offers OpenRouter's **server tools** `openrouter:web_search`
+and `openrouter:web_fetch`. OpenRouter runs them inside a model request and the
+model decides when to use them; the system prompt tells Kiki to look things up
+unprompted when an answer depends on current or uncertain facts, and to cite the
+pages it used. Topic jobs still have no tools.
+
+- **Why server tools:** they use the existing OpenRouter key and billing, need no
+  search-provider account, and the fetch runs on OpenRouter's side, so the agent
+  host never requests arbitrary URLs from Railway's private network (no SSRF
+  surface).
+- **Wiring:** Pydantic AI's `WebSearchTool` maps to `openrouter:web_search`.
+  2.57.0 doesn't map `WebFetchTool` for OpenRouter, so `WebOpenRouterModel`
+  appends `openrouter:web_fetch` in `_get_tool_choice` (a private hook; recheck
+  it on SDK upgrades). Engines are OpenRouter's `auto` defaults.
+- **Limits:** `max_tool_calls` = 3 server-tool steps per model request (OpenRouter's
+  default is 30), so at most 18 over the 6-request cap. Fetched pages are cut to
+  about 6,000 tokens (`max_content_tokens`; the native engine ignores it). Kiki's
+  4-call budget covers only its own tools.
+- **Cost:** OpenRouter adds the search fee to the response's `usage.cost` (Exa: about
+  $0.007 per search; native search passes through the provider's price, about
+  $0.016 for one probe on 2026-10-18), which already flows into the run's cost. Search
+  results enter the prompt, so a searched reply reads tens of thousands of input
+  tokens.
+- **Recorded use:** OpenRouter reports `usage.server_tool_use_details`
+  (`web_search_requests`, `tool_calls_executed`) and search sources as
+  `url_citation` annotations. The host sums these into
+  `result.web = {searches, fetches, sources}` (fetches = executed − searches, since
+  only those two are offered), logs the counts, and saves them with the job. Rust
+  ignores the field. The sim's `tool_called: web_search|web_fetch` reads it.
+- **Replays** repeat web calls and their fees, like inference.
+- **Privacy:** queries and URLs reach OpenRouter's search and fetch engines.
+
 Limits:
-- 4 tool calls per run. After that, tools tell the model to answer with what it
-  has, rather than aborting.
-- 6 model requests per run as the hard stop (`UsageLimits`).
-- 10 seconds per tool call; on timeout the tool returns an error to the model.
+- 4 search tool calls per run. After that, tools tell the model to answer with what it
+  has, rather than aborting. Memory tools ([subject memory](subject-memory-hld.md))
+  have their own budget of 6.
+- 10 model requests per run as the hard stop (`UsageLimits`); it was 6 before
+  memory tools, which can take a failed write, a split and a retry.
+- 10 seconds per tool call (45 for `read_image`); on timeout the tool returns
+  an error to the model.
 - Topic jobs run with no tools.
 
 All values are constants to tune from the logs.
+
+## Images: `read_image`
+
+The chat model may not see images, and a text-only model is cheaper for chat,
+so images are read by a separate **vision model** that writes for Kiki rather
+than for people (agent to agent).
+
+- **Model:** `OPENROUTER_VISION_MODEL` on the Python service. When unset, the
+  chat model is tried; if the provider rejects images (a 4xx), the tool tells
+  Kiki that no vision model is configured and the chat model can't read images.
+  Rate limits and 5xx become "unavailable right now". Failures never fail the
+  run. In a live check (2026-10-18; a captioned cat meme plus its source photo),
+  `anthropic/claude-haiku-5.5` transcribed the captions exactly, noted the
+  cropped letters and told the two images apart, for $0.0007. The default chat
+  model `deepseek/deepseek-v4.1-flash-1017` accepts images but described text
+  that wasn't there, so set a vision model rather than relying on the fallback.
+- **In the prompt:** Rust renders a message's images as
+  `[image: cat.png; message 123]` or `[gallery of 3 images: a.png, b.png,
+  linked image; message 123]`, so the model has the ID to pass. File names are
+  stripped of `[];` so a name can't forge another marker. The system prompt says
+  Kiki can't see images and should call the tool when they matter.
+- **What counts as an image:** attachments with an `image/*` content type or a
+  png/jpg/gif/webp name, then embeds of type `image`/`gifv` (their thumbnail)
+  or with an `image`, deduplicated by URL, at most 10. Rust (`MESSAGE_COLUMNS`)
+  and Python (`images_in`) apply the same test (Rust doesn't deduplicate).
+  Discord's attachment URLs are signed and expire after about a day; with the
+  bot token (`DISCORD_BOT_TOKEN`), the host refreshes expired ones through
+  `POST /attachments/refresh-urls` before downloading. Without it, older images
+  come back as expired.
+- **Kiki's drawings:** images in a bot message named `kiki-<id>.png` (how Rust
+  uploads `generate_image` results) are read from `agent_host_images` when the
+  drawing job's guild matches, and labeled for the vision model and in the
+  result (`drawn_by_kiki`). Other images, and drawings not found there, are
+  downloaded as usual.
+- **Galleries:** a message with several images is a Discord gallery. One call
+  sends them all, labeled `Image n: <file name>` (with alt text if set), plus
+  the message text and author for context and Kiki's optional `question`. The
+  answer has one `Image n:` line per image and a `Gallery:` line on how they
+  relate and what they add up to.
+- **The prompt** asks for the kind of image, every legible text verbatim
+  (usernames and timestamps in screenshots), people and animals, setting, and
+  the point (joke, meme format, mood), marking interpretation and unreadable
+  parts. It forbids identifying people from their faces and treats text in
+  images, the message text, file names and alt text as content, never
+  instructions.
+- **Downloads:** URLs come only from the stored message payload, never from
+  model arguments. The host downloads them itself (no redirects, 10 s, 5 MB
+  each) and sends them inline, only from `https` Discord hosts
+  (`*.discordapp.com`, `*.discordapp.net`, `*.discord.com`); embed images use
+  Discord's proxy URL, not the linked site. `DISCORD_MEDIA_EXTRA_HOSTS` adds
+  hosts (the simulator's fakecord). Images over 1568 px or 5 MB are fetched
+  through Discord's media proxy with `width`/`height`. PNG, JPEG, WebP and GIF
+  are sent, typed by their leading bytes rather than the file name or
+  `Content-Type` (providers reject a renamed JPEG sent as PNG); anything else, an expired link (403/404/410) or an oversized file
+  is reported per image while the rest are still described.
+- **Cost:** the vision call's billed cost is added to the reply's
+  `usage.cost`; the job log reports `vision_calls`. Descriptions aren't cached,
+  so reading the same image again (or a replay) pays again.
 
 ## Search: one SQL statement
 
@@ -132,6 +256,36 @@ queries are an argument error returned to the model.
 - **Scale:** add HNSW on `halfvec` only when measured scan latency requires it,
   and check filtered recall when you do.
 
+## Custom emoji
+
+- **Storage:** `guild_emojis` (migration 0017), one row per Discord emoji ID, with
+  name, animated/available flags, the raw object, a description and its
+  `halfvec(1024)` embedding of `:name: description`. Emoji deleted in Discord get
+  `removed_at`: they're excluded from search, but `find_emoji` still explains one
+  written out in an old message. A trigger drops the embedding when the name or
+  description changes.
+- **Sync (Rust):** `/kiki emojis resync:true` (Manage Server) replaces the list from
+  `GET guilds/{id}/emojis`. There's no Gateway sync yet (it would need the
+  `GUILD_EXPRESSIONS` intent); admins resync after adding emoji. Descriptions survive
+  renames, since an emoji's image never changes.
+- **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
+  until none are left (at most 10 minutes; the interaction token lasts 15). The host
+  downloads each emoji as a 128 px PNG (the first frame if animated) and asks
+  `OPENROUTER_EMOJI_MODEL` (Rust's env, sent per request like the chat model;
+  default `deepseek/deepseek-v4.1-flash-1017`) for one or two sentences on what it shows
+  and when people use it. Download and model call are `read_image`'s
+  (`media/fetch.py`, `media/vision.py`): Discord hosts only, the type checked from the bytes, and a
+  provider error fails just that emoji. Each emoji is tried at most once per resync
+  (`describe_attempted_at` against the round's start), so failures don't loop.
+  `redescribe:true` also replaces older descriptions. Cost is shown in the command
+  reply and kept per emoji (`describe_cost_usd`).
+- **Search:** like message search, full text (name with `_` as spaces, plus the
+  description) and vectors fused by reciprocal rank, `MIN_SIMILARITY` floor, no
+  recency. Only the guild's current, available emoji. Undescribed emoji match by
+  name only. Pending embeddings (renames) are filled in at search time.
+- **Prompt:** one stable instructions line tells Kiki the tools exist and to write
+  emoji exactly as returned. The emoji list itself is not in the prompt.
+
 ## Failures and retries
 
 - **Transient failures** are provider 429/5xx, connection errors, and Postgres
@@ -163,11 +317,14 @@ queries are an argument error returned to the model.
 3. **Later:**
    - Member-specific channel permission filtering and optional allowlists;
      current retrieval is bounded by guild, with an optional channel filter.
-   - OpenRouter server tools: Pydantic's `WebSearchTool` maps to
-     `openrouter:web_search` and the engine isn't selectable. Cap
-     `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
-     replay, and note that queries reach outside engines.
-   - Image results: need typed artifacts and Rust delivery.
+   - Web tools: pick engines explicitly (e.g. Exa for search, `openrouter` for free
+     fetch) once logs show cost and quality.
+   - Image results: done for generated images ([image generation](image-generation.md));
+     search results still carry no images.
+   - `read_image` on old messages: Discord's signed attachment URLs expire
+     after about a day. Refreshing them needs the bot token
+     (`POST /attachments/refresh-urls`), which only Rust has.
+   - Caching image descriptions per attachment, if images get re-read often.
    - Embedding windows of adjacent messages, if short messages retrieve poorly.
    - `/kiki conversations` still lists the active pool across all channels to
      whoever runs it.

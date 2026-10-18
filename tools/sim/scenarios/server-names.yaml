@@ -1,0 +1,15 @@
+name: a word that's also this server's (a channel, a subject in memory) comes with a nudge to check before answering from general knowledge
+steps:
+  - exec: >-
+      INSERT INTO memory_subjects (guild_id, kind, name, name_norm)
+      VALUES (900000000000000001, 'thing', 'Waffles', 'waffles')
+  - say: {as: alex, in: general, text: "kiki describe boba"}
+  - expect:
+      reply: true
+      prompt_contains:
+        - "Names in these messages that mean something in this server: #boba (a channel here)."
+        - "check memory or the server's history before answering from general knowledge"
+  - say: {as: sam, in: lore, text: "kiki what do you think of waffles"}
+  - expect: {reply: true, prompt_contains: "Waffles (a subject in your memory)"}
+  - say: {as: chris, in: staff, text: "kiki describe pancakes"}
+  - expect: {reply: true, prompt_lacks: "Names in these messages"}

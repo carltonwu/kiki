@@ -32,6 +32,9 @@ class Observation:
     run: str | None = None  # done / failed / superseded / none
     run_error: str | None = None
     replies: list[dict] = field(default_factory=list)
+    # Pictures the run queued: {status, error, message} each, message being the
+    # follow-up Kiki posted for it.
+    drawings: list[dict] = field(default_factory=list)
 
     @property
     def reply(self) -> bool:
@@ -101,13 +104,42 @@ def observe(
             o.run = "timeout"
             return o
         o.run_id, o.run, o.run_error, reply_ids = run
-        if o.run == "done" and reply_ids:
-            wanted = {str(r) for r in reply_ids}
+        # Pictures the run queued are posted later, as their own messages.
+        finished = poll(lambda: drawn(db, o.run_id), RUN_TIMEOUT_S, 0.2)
+        if finished is None:
+            o.drawings = [{"status": "timeout", "error": None, "message": None}]
+        drawings = finished[0] if finished else []
+        followups = {str(d[1]) for d in drawings if d[1]}
+        if followups:
+            reply_ids = db.execute(
+                "SELECT reply_message_ids FROM agent_runs WHERE id = %s", (o.run_id,)
+            ).fetchone()[0]
+        wanted = {str(r) for r in reply_ids or []} | followups
+        messages = []
+        if wanted:
             messages = poll(
                 lambda: [m for m in control("state")["messages"] if m["id"] in wanted], 5
             )
-            o.replies = messages or []
+        by_id = {m["id"]: m for m in messages or []}
+        o.replies = [m for id, m in by_id.items() if id not in followups]
+        o.drawings += [
+            {"status": status, "error": error, "message": by_id.get(str(message_id))}
+            for status, message_id, error in drawings
+        ]
     return o
+
+
+def drawn(db, run_id: int):
+    """`(rows,)`, the run's drawings, once all are finished (rows are empty if it
+    queued none), else None."""
+    rows = db.execute(
+        "SELECT status, message_id, error FROM agent_image_jobs WHERE run_id = %s"
+        " ORDER BY position",
+        (run_id,),
+    ).fetchall()
+    if any(status not in ("done", "failed") for status, _, _ in rows):
+        return None
+    return (rows,)
 
 
 def never_classified(db, message: dict, config: Config, env: dict) -> str | None:
@@ -165,7 +197,9 @@ def render(message: dict, state: dict) -> str:
     if message.get("referenced_message"):
         reply = f" ↩ {name_of(state, message['referenced_message']['author'])}"
     emoji = reactions(state, message["id"])
+    files = "".join(f" [attachment: {a['filename']}]" for a in message.get("attachments") or [])
     flags = (" [deleted]" if message.get("deleted") else "") + (f" {emoji}" if emoji else "")
+    text += files
     channel = channels.get(message["channel_id"], message["channel_id"])
     return f"[{channel}] {name_of(state, message['author'])}{reply}: {text}{flags}"
 
