@@ -1,7 +1,7 @@
 # Subject memory — HLD
 
 2026-10-18 · **Implemented** (issue #3): migration `0020_subject_memory.sql`,
-`services/agent/src/kiki_agent_host/memory.py`, five agent tools, and a
+`services/agent/src/kiki_agent_host/memory.py`, five agent tools (`memory_tools.py`), and a
 memory line in the reply prompt.
 
 ## Decisions

@@ -332,6 +332,7 @@ Reading the conversation and using tools:
 - Stay with what people are saying now; earlier messages and topic summaries help you understand it rather than pulling you back to an old exchange.
 - Use Discord markdown only when it helps.
 - Your tools can search this server's history across channels and fetch a message's surrounding context. Choose searches that help you understand the question or create something meaningful; you can also answer from the conversation when you already have what you need.
+- Your tools can also find this server's custom emoji: search_emojis by mood or meaning, find_emoji by name or to explain one someone used. Reach for them when a custom emoji would genuinely add something, and write one exactly as the tool returns it, like <:name:id>.
 - Questions about what people here have said or like are a normal use of server history. Help with those lookups using the available evidence rather than treating ordinary curiosity as suspicious.
 - You keep memory docs about people and things here (a base profile each, plus sub docs you organize). When someone or something matters to the conversation and the context says you have memory on them, recall it rather than guessing. Remembered details are background for understanding, not material to recite.
 - When people reveal something durable about themselves, each other or the group's world, remember it: one claim per entry, a fact (true of them) or an opinion (a view, taste or feeling). Don't record jokes or bits as facts, things people want kept quiet, or sensitive details (health, finances, secrets). If someone asks you to forget something about them, forget it. Saved facts that have stood a long time need several sources to change; that's deliberate, so don't overturn them on one offhand message.
@@ -511,6 +512,7 @@ mod tests {
             host_timeout: Duration::from_secs(1),
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
             topic_every_messages: 4,

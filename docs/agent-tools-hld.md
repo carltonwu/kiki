@@ -61,6 +61,10 @@ model arguments, and arguments can only narrow them.
   target message's own channel (at most 10 on each side) and the reply parent
   if it is in the same guild.
 
+- `search_emojis(query, limit=5)` and `find_emoji(name)`: the guild's custom emoji
+  by mood or meaning, or by name (`huh`, `:huh:`, `<:huh:123>`). See
+  [Custom emoji](#custom-emoji).
+
 Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
 
@@ -133,6 +137,34 @@ queries are an argument error returned to the model.
   is added to its `usage.cost`.
 - **Scale:** add HNSW on `halfvec` only when measured scan latency requires it,
   and check filtered recall when you do.
+
+## Custom emoji
+
+- **Storage:** `guild_emojis` (migration 0017), one row per Discord emoji ID, with
+  name, animated/available flags, the raw object, a description and its
+  `halfvec(1024)` embedding of `:name: description`. Emoji deleted in Discord get
+  `removed_at`: they're excluded from search, but `find_emoji` still explains one
+  written out in an old message. A trigger drops the embedding when the name or
+  description changes.
+- **Sync (Rust):** `/kiki emojis resync:true` (Manage Server) replaces the list from
+  `GET guilds/{id}/emojis`. There's no Gateway sync yet (it would need the
+  `GUILD_EXPRESSIONS` intent); admins resync after adding emoji. Descriptions survive
+  renames, since an emoji's image never changes.
+- **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
+  until none are left (at most 10 minutes; the interaction token lasts 15). The host
+  downloads each emoji as a 128 px PNG (the first frame if animated) and asks
+  `OPENROUTER_EMOJI_MODEL` (Rust's env, sent per request like the chat model;
+  default `google/gemini-2.5-flash-lite`) for one or two sentences on what it shows
+  and when people use it. Each emoji is tried at most once per resync
+  (`describe_attempted_at` against the round's start), so failures don't loop.
+  `redescribe:true` also replaces older descriptions. Cost is shown in the command
+  reply and kept per emoji (`describe_cost_usd`).
+- **Search:** like message search, full text (name with `_` as spaces, plus the
+  description) and vectors fused by reciprocal rank, `MIN_SIMILARITY` floor, no
+  recency. Only the guild's current, available emoji. Undescribed emoji match by
+  name only. Pending embeddings (renames) are filled in at search time.
+- **Prompt:** one stable instructions line tells Kiki the tools exist and to write
+  emoji exactly as returned. The emoji list itself is not in the prompt.
 
 ## Failures and retries
 

@@ -6,7 +6,7 @@ import pytest
 from psycopg import AsyncConnection
 from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import retrieval
+from kiki_agent_host import memory_tools, retrieval
 from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.contracts import JobRequest
 
@@ -271,18 +271,14 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # TestModel calls each tool once (with placeholder arguments), then answers
     # with their results.
     assert result.steps == 2
-    tools = json.loads(result.text)
-    assert set(tools) == {
+    # Memory tools are covered in test_memory; placeholder arguments only get errors.
+    assert set(json.loads(result.text)) - {t.__name__ for t in memory_tools.TOOLS} == {
         "search_messages",
         "get_message_context",
-        "recall",
-        "search_memory",
-        "remember",
-        "forget",
-        "split_doc",
+        "search_emojis",
+        "find_emoji",
     }
-    # Placeholder arguments make memory tools return errors to the model, not crash the run.
-    assert "error" in tools["remember"] and "error" in tools["forget"]
-    assert result.usage.cost == pytest.approx(0.002)  # indexing + query embedding
+    # Message indexing plus the two searches' query embeddings.
+    assert result.usage.cost == pytest.approx(0.003)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1
