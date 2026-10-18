@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+{% if not guild_id %}<h1>Change log</h1>{% endif %}
+<div class="card">
+  <table>
+    <tr><th>When</th><th>Who</th>{% if not guild_id %}<th>Server</th>{% endif %}<th>Action</th><th>Detail</th></tr>
+    {% for a in rows %}
+    <tr><td>{{ a.at | when }}</td><td>{{ a.actor_name or a.actor_id }}</td>
+        {% if not guild_id %}<td>{{ a.guild or "–" }}</td>{% endif %}
+        <td>{{ a.action }}</td>
+        <td><details><summary>{{ (a.detail.key or a.detail.title or a.detail.part or a.detail.phrase or "") }}</summary>
+            <pre>{{ a.detail | tojson(indent=2) }}</pre></details></td></tr>
+    {% else %}<tr><td colspan="5" class="muted">No changes yet.</td></tr>{% endfor %}
+  </table>
+</div>
+{% endblock %}

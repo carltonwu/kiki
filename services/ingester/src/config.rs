@@ -7,6 +7,8 @@ pub struct Config {
     pub database_url: String,
     pub port: u16,
     pub json_logs: bool,
+    /// `ADMIN_API_TOKEN`: enables the console's admin API (`/admin/v1`) on `port`.
+    pub admin_token: Option<String>,
 }
 
 /// Discord settings. Separate from [`Config`] because `ingester migrate` doesn't need them.
@@ -29,6 +31,10 @@ impl Config {
                 Err(_) => 8080,
             },
             json_logs: std::env::var("LOG_FORMAT").is_ok_and(|f| f.eq_ignore_ascii_case("json")),
+            admin_token: match optional_env("ADMIN_API_TOKEN") {
+                Some(t) if t.len() < 32 => bail!("ADMIN_API_TOKEN must be at least 32 characters"),
+                token => token,
+            },
         })
     }
 }
@@ -208,5 +214,43 @@ where
             .parse()
             .with_context(|| format!("{name} is not valid")),
         Err(_) => Ok(default),
+    }
+}
+
+#[cfg(test)]
+impl RouterConfig {
+    pub fn for_tests() -> Self {
+        Self {
+            max_message_age: Duration::from_millis(5000),
+            pool_debounce: Duration::from_millis(500),
+            pool_max_wait: Duration::from_millis(8000),
+            pool_max_messages: 10,
+            keywords: vec!["kiki".into()],
+            jev_api_key: None,
+            jev_model: "test/jev".into(),
+            jev_min_confidence: 0.5,
+            jev_timeout: Duration::from_millis(5000),
+            pending_emoji: String::new(),
+            max_active_conversations: 8,
+            active_window: Duration::from_secs(3600),
+        }
+    }
+}
+
+#[cfg(test)]
+impl AgentConfig {
+    pub fn for_tests() -> Self {
+        Self {
+            host_url: None,
+            host_token: None,
+            host_timeout: Duration::from_secs(1),
+            chat_model: "test/default".into(),
+            topic_model: "test/default".into(),
+            image_model: "test/image".into(),
+            emoji_model: "test/vision".into(),
+            history_messages: 30,
+            run_max_age: Duration::from_secs(120),
+            topic_every_messages: 4,
+        }
     }
 }

@@ -11,6 +11,7 @@
 //! the others are marked `superseded`: their messages are in the history anyway.
 //! Drawings run on their own tasks ([`drawing`]), so the conversation carries on.
 
+pub mod console;
 mod context;
 mod delivery;
 mod discord;
@@ -18,6 +19,7 @@ mod drawing;
 pub(crate) mod emoji;
 pub(crate) mod host;
 mod people;
+pub mod prompt;
 mod topic;
 
 use std::{

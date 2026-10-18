@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block content %}
+{% if data %}
+<div class="card">
+  <p class="muted small">Same settings and validation as <code>/kiki config</code>. Changes apply to new pools and replies; in-flight work keeps its settings.</p>
+  <table>
+    <tr><th>Setting</th><th>Value</th><th></th></tr>
+    {% for s in data.settings %}
+    <tr>
+      <td><b>{{ s.key }}</b>{% if s.overridden %} <span class="small">· server</span>{% endif %}
+          {% if s.ignored %} <span class="small status-failed">· invalid override ignored</span>{% endif %}
+          <div class="muted small">{{ s.description }} · {{ s.bounds }} · default {{ s.default or "(empty)" }}</div></td>
+      <td>
+        <form method="post" class="row">
+          <input type="hidden" name="csrf" value="{{ session.csrf }}">
+          <input type="hidden" name="key" value="{{ s.key }}">
+          <input type="text" name="value" value="{{ s.value }}" aria-label="{{ s.key }}">
+          <button>Save</button>
+        </form>
+      </td>
+      <td>{% if s.overridden %}
+        <form method="post">
+          <input type="hidden" name="csrf" value="{{ session.csrf }}">
+          <input type="hidden" name="key" value="{{ s.key }}">
+          <input type="hidden" name="reset" value="1">
+          <button>Reset</button>
+        </form>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+<div class="card">
+  <h2>Global (read-only)</h2>
+  <table>{% for g in data.global %}<tr><td>{{ g.name }}</td><td>{{ g.value }}</td></tr>{% endfor %}</table>
+</div>
+{% endif %}
+{% endblock %}

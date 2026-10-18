@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Facts</h2>
+  <p class="muted small">Notes Kiki treats as background knowledge for this server, listed in every reply's system prompt.
+  Enabled facts use {{ enabled_chars }} of {{ budget }} characters{% if enabled_chars > budget %}: <span class="status-failed">the least recently edited ones are left out</span>{% endif %}.</p>
+  {% for f in facts %}
+  <form method="post" class="card">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <input type="hidden" name="fact_id" value="{{ f[0] }}">
+    <input type="text" name="title" value="{{ f[1] }}" aria-label="Title">
+    <textarea name="body" aria-label="Text">{{ f[2] }}</textarea>
+    <p class="row"><label class="shrink"><input type="checkbox" name="enabled" {{ 'checked' if f[3] }}> Enabled</label>
+      <span class="muted small">Updated {{ f[4] | when }}</span>
+      <button name="action" value="edit">Save</button><button name="action" value="delete">Delete</button></p>
+  </form>
+  {% endfor %}
+  <form method="post">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <input type="hidden" name="action" value="add">
+    <input type="text" name="title" placeholder="Title, e.g. Spring show" aria-label="New fact title">
+    <textarea name="body" placeholder="What Kiki should know" aria-label="New fact text"></textarea>
+    <p><button class="primary">Add fact</button></p>
+  </form>
+</div>
+<div class="card">
+  <h2>Lingo</h2>
+  <p class="muted small">The server's phrases and custom emoji (setting <code>lingo_nudge</code> controls how often a reply is nudged to use one).</p>
+  <table>
+    <tr><th>Phrase</th><th>Meaning</th><th></th></tr>
+    {% for phrase, meaning in lingo %}
+    <tr><td>{{ phrase }}</td><td>{{ meaning }}</td><td>
+      <form method="post"><input type="hidden" name="csrf" value="{{ session.csrf }}">
+        <input type="hidden" name="action" value="lingo_delete"><input type="hidden" name="phrase" value="{{ phrase }}">
+        <button>Delete</button></form></td></tr>
+    {% endfor %}
+  </table>
+  <form method="post" class="row">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <input type="hidden" name="action" value="lingo_set">
+    <input type="text" name="phrase" placeholder="Phrase" aria-label="Phrase">
+    <input type="text" name="meaning" placeholder="Meaning" aria-label="Meaning">
+    <button class="primary">Add or update</button>
+  </form>
+</div>
+{% endblock %}

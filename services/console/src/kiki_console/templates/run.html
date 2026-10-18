@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h2>Run {{ run.id }} · <span class="status-{{ run.status }}">{{ run.status }}</span></h2>
+  <table>
+    <tr><th>Channel</th><td>#{{ run.channel }}</td><th>Model</th><td>{{ run.model or "–" }}</td></tr>
+    <tr><th>Queued</th><td>{{ run.created_at | when }}</td><th>Finished</th><td>{{ run.finished_at | when }}</td></tr>
+    <tr><th>Latency</th><td>{{ run.latency_ms | ms }}</td><th>Model calls</th><td>{{ run.steps or "–" }}</td></tr>
+    <tr><th>Tokens in/out</th><td>{{ run.prompt_tokens or "–" }} / {{ run.completion_tokens or "–" }}</td><th>Cost</th><td>{{ usd(run.cost_usd) }}</td></tr>
+    <tr><th>Topic</th><td colspan="3">{{ run.topic or "–" }}</td></tr>
+    {% if run.reactions %}<tr><th>Reactions</th><td colspan="3">{{ run.reactions | join(" ") }}</td></tr>{% endif %}
+  </table>
+  {% if run.error %}<div class="error">{{ run.error }}</div>{% endif %}
+</div>
+<div class="card">
+  <h2>Triggered by</h2>
+  <table>
+    <tr><th>Author</th><th>Message</th><th>Check</th><th>Decide</th></tr>
+    {% for m in run.triggers %}
+    <tr><td>{{ m.author_name }}</td><td>{{ m.content }}</td><td>{{ m.check_hit or "–" }} → {{ m.outcome or "–" }}</td>
+        <td>{% if m.jev_choice %}{{ m.jev_choice }} ({{ "%.2f" | format(m.jev_confidence or 0) }}){% else %}–{% endif %}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% if run.drawings %}
+<div class="card">
+  <h2>Drawings</h2>
+  <table>
+    <tr><th>#</th><th>Status</th><th>Prompt</th><th class="num">Time</th><th class="num">Cost</th></tr>
+    {% for d in run.drawings %}
+    <tr><td>{{ d.position }}</td><td class="status-{{ d.status }}">{{ d.status }}</td>
+        <td class="small">{{ d.prompt or "–" }}{% if d.error %}<div class="status-failed">{{ d.error }}</div>{% endif %}</td>
+        <td class="num">{{ d.latency_ms | ms }}</td><td class="num">{{ usd(d.cost_usd) }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+{% if run.replies %}
+<div class="card"><h2>Kiki's messages</h2>{% for m in run.replies %}<pre>{{ m.content }}</pre>{% endfor %}</div>
+{% elif run.host_result %}
+<div class="card"><h2>Model output</h2><pre>{{ run.host_result.text }}</pre></div>
+{% endif %}
+<div class="card">
+  <h2>Prompt sent to the model</h2>
+  {% if run.host_request %}
+    {% for m in run.host_request.messages %}
+      <details {{ 'open' if loop.last }}><summary>{{ m.role }} · {{ m.content | length }} characters</summary><pre>{{ m.content }}</pre></details>
+    {% endfor %}
+  {% else %}<p class="muted">Not recorded (the run never reached the agent host).</p>{% endif %}
+</div>
+{% endblock %}

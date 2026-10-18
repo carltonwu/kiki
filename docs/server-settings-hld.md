@@ -64,8 +64,10 @@ This does not enable automatic learning or provide phrase-editing commands.
 
 The leader loads all configured guilds after acquiring leadership. Commands, router and agent
 share one cache. A writer mutex covers transaction commit and cache publication, preserving write
-order. There is no LISTEN listener: this process is the only supported writer; direct SQL edits
-require a restart. Pool creation takes a cached immutable snapshot without database I/O. Replies
+order. Since the console (docs/console-hld.md), a `guild_settings` trigger NOTIFYs
+`guild_settings_changed` on every write; each ingester LISTENs and rereads that guild under the
+same mutex, so writes from another instance, the console's admin API or manual SQL apply without
+a restart. Pool creation takes a cached immutable snapshot without database I/O. Replies
 snapshot settings when building context and persist model input in `host_request`; retries resend
 that input. Delivery finds the trigger independently of the current history window. Topic IDs
 include sample size to avoid durable input conflicts when that setting changes.

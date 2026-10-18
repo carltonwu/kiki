@@ -158,6 +158,35 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// Global (env) settings, read-only everywhere: for the console.
+    pub fn global(&self) -> Vec<(String, String)> {
+        let on = |model: &Option<String>| model.clone().unwrap_or_else(|| "off".into());
+        let mut rows = vec![
+            ("Chat model default".to_owned(), on(&self.chat_model)),
+            ("Topic model".to_owned(), on(&self.topic_model)),
+            (
+                "Emoji description model".to_owned(),
+                on(&self.describer.as_ref().map(|(_, model)| model.clone())),
+            ),
+            (
+                "Decide model".to_owned(),
+                if self.decide_enabled {
+                    self.decide_model.clone()
+                } else {
+                    "off".into()
+                },
+            ),
+        ];
+        rows.extend(
+            self.global
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone())),
+        );
+        rows
+    }
+}
+
 struct Invocation<'a> {
     guild_id: i64,
     member: &'a Value,
@@ -180,7 +209,7 @@ impl<'a> Invocation<'a> {
 
 /// A failure the person running the command can fix, shown as-is.
 #[derive(Debug)]
-struct UserError(String);
+pub(crate) struct UserError(pub String);
 
 impl std::fmt::Display for UserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1201,7 +1230,7 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
     Ok(Some((actor, key, value)))
 }
 
-async fn check_catalog_model(key: &str, model: &str) -> anyhow::Result<()> {
+pub(crate) async fn check_catalog_model(key: &str, model: &str) -> anyhow::Result<()> {
     // Image models are served by OpenRouter's Images API, which has its own catalog.
     let path = if key == "image_model" {
         "v1/images/models"

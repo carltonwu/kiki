@@ -43,6 +43,8 @@ KEPT_BUILDS = 8
 # The ingester's pool (10) plus the agent host's job connections and the CLI's.
 CONNECTIONS_PER_STACK = 15
 HOST_TOKEN = "sim-host-token"
+# The ingester's console admin API (docs/console-hld.md); 32+ characters.
+ADMIN_TOKEN = "sim-admin-token-0123456789abcdef0123"
 # Variables a toolchain needs; everything else is set explicitly per service.
 KEEP = [
     "PATH",
@@ -371,6 +373,7 @@ class Config:
             "DISCORD_GATEWAY_URL": f"ws://127.0.0.1:{self.ports.fakecord}/gateway",
             "AGENT_HOST_URL": f"http://127.0.0.1:{self.ports.host}",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
+            "ADMIN_API_TOKEN": ADMIN_TOKEN,
         }
         if self.live:
             values["OPENROUTER_DECISION_API_KEY"] = live_keys()["OPENROUTER_DECISION_API_KEY"]
@@ -634,3 +637,20 @@ def purge() -> None:
     """Removes the sim Postgres container, and with it every stack's database."""
     if not os.getenv("KIKI_SIM_POSTGRES"):
         run(["docker", "compose", "-f", str(SIM / "compose.yml"), "down", "-v"])
+
+
+def admin(config: "Config", method: str, path: str, body=None) -> tuple[int, dict]:
+    """Calls the ingester's admin API; `{guild}` in the path is the fixture guild."""
+    port = config.ports.ingester
+    url = f"http://127.0.0.1:{port}/admin/v1{path.replace('{guild}', config.guild_id())}"
+    request = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read() or b"{}")

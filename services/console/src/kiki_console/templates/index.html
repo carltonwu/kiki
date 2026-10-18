@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+{% if session.operator %}
+  <h1>All servers</h1>
+  <div class="kpis card">
+    <div class="kpi"><div class="value">{{ usd(totals.cost_24h) }}</div><div class="label">LLM cost, 24 h</div></div>
+    <div class="kpi"><div class="value">{{ usd(totals.cost_7d) }}</div><div class="label">LLM cost, 7 d</div></div>
+    <div class="kpi"><div class="value">{{ usd(totals.cost_30d) }}</div><div class="label">LLM cost, 30 d</div></div>
+    <div class="kpi"><div class="value">{{ totals.replies_7d }}</div><div class="label">Replies, 7 d</div></div>
+    <div class="kpi"><div class="value">{{ totals.failed_7d }}</div><div class="label">Failed runs, 7 d</div></div>
+  </div>
+  <div class="card"><h2>Daily cost, all servers</h2>{% include "_cost_chart.html" %}</div>
+{% else %}
+  <h1>Your servers</h1>
+{% endif %}
+<div class="card">
+  <table>
+    <tr><th>Server</th><th class="num">24 h</th><th class="num">7 d</th><th class="num">30 d</th>
+        <th class="num">Replies 7 d</th><th class="num">Failed 7 d</th><th class="num">Open conversations</th></tr>
+    {% for s in servers %}
+    <tr><td><a href="/g/{{ s.id }}">{{ s.name }}</a></td>
+        <td class="num">{{ usd(s.cost_24h) }}</td><td class="num">{{ usd(s.cost_7d) }}</td>
+        <td class="num">{{ usd(s.cost_30d) }}</td><td class="num">{{ s.replies_7d }}</td>
+        <td class="num">{{ s.failed_7d }}</td><td class="num">{{ s.open_conversations }}</td></tr>
+    {% else %}
+    <tr><td colspan="7" class="muted">No servers.</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted small">Costs: chat replies, Decide, console chat, drawings and emoji descriptions as billed by OpenRouter. Topic summaries count on each server's dashboard (all time).
+  Infrastructure: Railway's metrics and logs. Billing: OpenRouter's activity page.</p>
+</div>
+{% if session.operator and failures %}
+<div class="card">
+  <h2>Recent failures</h2>
+  <table>
+    <tr><th>Run</th><th>Server</th><th>When</th><th>Error</th></tr>
+    {% for f in failures %}
+    <tr><td><a href="/g/{{ f.guild_id }}/runs/{{ f.id }}">{{ f.id }}</a></td><td>{{ f.guild }}</td>
+        <td>{{ f.created_at | when }}</td><td class="small">{{ (f.error or "")[:200] }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+{% endblock %}

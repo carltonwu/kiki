@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<p class="muted">Two parts of Kiki's system prompt can be changed for this server. The rest (tool, people and delivery rules) is tied to the code. Edits apply to the next reply.</p>
+{% for part in parts %}
+{% set override = overrides.get(part) %}
+{% set default = defaults[part ~ "_default"] if defaults else "" %}
+<div class="card">
+  <h2>{{ "Persona (where Kiki is)" if part == "persona" else "Conversational guidance" }}
+    <span class="small muted">· {{ "server override" if override else "built-in default" }}</span></h2>
+  <form method="post">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <input type="hidden" name="part" value="{{ part }}">
+    <textarea class="tall" name="body" aria-label="{{ part }}">{{ override[0] if override else default }}</textarea>
+    <p class="row"><button class="primary">Save</button>
+      {% if override %}<button name="reset" value="1">Reset to default</button>
+      <span class="muted small">Last changed {{ override[2] | when }}</span>{% endif %}</p>
+  </form>
+  {% if override and default %}<details><summary>Built-in default</summary><pre>{{ default }}</pre></details>{% endif %}
+</div>
+{% endfor %}
+{% if defaults and defaults.system %}
+<div class="card"><details><summary>Full system prompt (as console chat sees it)</summary><pre>{{ defaults.system }}</pre></details></div>
+{% endif %}
+{% endblock %}

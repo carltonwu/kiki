@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card chat">
+  <p class="muted small">Kiki as configured for this server: same model, prompt, facts and history search. Nothing is posted to Discord.</p>
+  {% for m in messages %}
+    <div class="msg {{ m[1] }}">{{ m[2] }}</div>
+    {% if m[6] %}<div class="error small">Not answered: {{ m[6] }}</div>{% endif %}
+    {% if m[1] == "assistant" %}<div class="muted small">{{ m[3] }} · {{ m[5] | ms }} · {{ usd(m[4]) }}</div>{% endif %}
+  {% else %}
+    <p class="muted">Say something to Kiki.</p>
+  {% endfor %}
+  <form method="post" class="row">
+    <input type="hidden" name="csrf" value="{{ session.csrf }}">
+    <input type="hidden" name="thread" value="{{ thread_id }}">
+    <textarea name="message" aria-label="Message" placeholder="Message Kiki"></textarea>
+    <button class="primary">Send</button>
+  </form>
+  <p><a href="/g/{{ guild_id }}/chat">New chat</a></p>
+</div>
+{% if threads %}
+<div class="card">
+  <h2>Your recent chats</h2>
+  <table>{% for t in threads %}
+    <tr><td><a href="?thread={{ t[0] }}">{{ (t[3] or "")[:80] }}</a></td><td class="num">{{ t[2] }} messages</td><td>{{ t[1] | when }}</td></tr>
+  {% endfor %}</table>
+</div>
+{% endif %}
+{% endblock %}

@@ -6,6 +6,7 @@ Discord chat bot. Monorepo layout:
 |---|---|
 | `services/ingester/` | Rust service: Discord Gateway, message ingestion, conversation routing |
 | `services/agent/` | Python agent host: Pydantic AI, server history search, durable results |
+| `services/console/` | Python web console: per-server dashboards, costs, settings, prompts, facts, chat |
 | `tools/backfill/` | Python one-off: backfill a guild's history into SQLite |
 | `tools/sim/` | Local Discord and OpenRouter simulator for end-to-end checks |
 | `.railway/railway.ts` | Railway infrastructure as code (Postgres + services) |
@@ -162,7 +163,7 @@ entries. `/kiki config key:lingo_nudge value:35` sets how often a reply gets an
 extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
 removes the extra suggestion; the phrase list remains in the prompt, so natural
 use is still possible. Selection is stable for the triggering message and retries.
-There is no automatic phrase learning or Discord command to edit the phrase list.
+There is no automatic phrase learning; edit the list in the console.
 
 Every custom emoji of a server is also in `guild_emojis` (migration 0017), with a
 one- or two-sentence description written by a vision model (`OPENROUTER_EMOJI_MODEL`,
@@ -182,3 +183,15 @@ actionable failures. Set `RUST_LOG=info,sqlx=warn,twilight_http_ratelimiting=war
 run claims and retry details, or `LOG_LEVEL=DEBUG` on the Python host for job reuse
 and retrieval diagnostics. IDs connect routing pools to runs, host jobs and Discord
 replies; logs omit provider error bodies and message content.
+
+## Web console
+
+`services/console/` is a web page outside Discord ([design and build-vs-reuse
+decision](docs/console-hld.md), [setup](services/console/README.md)). People log in with Discord;
+each server's admins (Manage Server) see its dashboard (activity, latency, failures, LLM cost by
+kind and by person, every run with its prompt and output), edit its settings, facts, lingo and
+two prompt parts (persona and conversational guidance), and chat with Kiki as configured for that
+server. Operators (`CONSOLE_OPERATOR_IDS`) also get a view across servers and the change log.
+Settings and chat go through the ingester's private admin API (`/admin/v1` on its port, enabled by
+`ADMIN_API_TOKEN`), so they use the same validation and prompt as Discord. The console service is
+not in the Railway IaC yet; the doc lists the deploy steps.
