@@ -139,6 +139,12 @@ impl Agent {
             instructions.push_str(". Don't force extra messages or repeat yourself. ");
         }
         instructions.push_str("Keep each message under 1900 characters. ");
+        if settings.image_generation {
+            instructions.push_str(
+                "You can draw with generate_image when someone asks for an image or one would clearly land better than words. \
+                 It's attached to your first message, so write that message as if the image is posted with it; never paste image links or markdown for it. ",
+            );
+        }
         instructions.push_str(if settings.chat_allow_silence {
             "You may choose silence whenever joining in would add little, especially in a busy chat where people are talking to each other. Being given a message does not mean it needs a response. If you choose silence, return exactly NO_REPLY."
         } else {
@@ -416,7 +422,7 @@ mod lingo_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -435,7 +441,7 @@ mod tests {
     const GUILD: i64 = 9;
     const CHANNEL: i64 = 2;
 
-    fn agent(db: PgPool) -> Agent {
+    pub(in crate::agent) fn agent(db: PgPool) -> Agent {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = AgentConfig {
             host_url: Some("http://127.0.0.1:9".into()),
@@ -443,6 +449,7 @@ mod tests {
             host_timeout: Duration::from_secs(1),
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            image_model: "test/image".into(),
             emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),

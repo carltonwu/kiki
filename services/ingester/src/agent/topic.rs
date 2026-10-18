@@ -80,6 +80,7 @@ impl Agent {
                 messages: vec![Message::system(INSTRUCTIONS), Message::user(prompt)],
                 max_output_tokens: MAX_TOPIC_TOKENS,
                 people: roster.wire(),
+                image_model: None,
             })
             .await?;
         sqlx::query("UPDATE conversations SET topic_cost_usd = topic_cost_usd + $2 WHERE id = $1")

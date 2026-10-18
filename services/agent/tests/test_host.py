@@ -2,6 +2,7 @@ import asyncio
 
 import httpx
 from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
 
 from kiki_agent_host.app import Settings, create_app
 from kiki_agent_host.contracts import JobRequest, JobResult
@@ -61,6 +62,30 @@ async def test_result_survives_new_app_and_conflicting_input_is_rejected(databas
         changed = job()
         changed["messages"][0]["content"] = "different"
         assert (await http.post("/v1/jobs", json=changed, headers=HEADERS)).status_code == 409
+
+
+async def test_requests_saved_before_image_model_existed_still_match(database_url):
+    executor = FakeExecutor()
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        # A completed job saved by a host version without `image_model`.
+        await db.execute(
+            "INSERT INTO agent_host_jobs (id, request, status, result) "
+            "VALUES (%s, %s, 'completed', %s)",
+            (
+                "reply:42",
+                Jsonb({**job(), "people": []}),
+                Jsonb({"text": "saved", "model": None, "steps": 1, "usage": {}}),
+            ),
+        )
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert response.status_code == 200
+        assert response.json()["result"]["text"] == "saved"
+        assert executor.calls == 0
+        drawn = {**job("reply:43"), "image_model": "test/image"}
+        assert (await http.post("/v1/jobs", json=drawn, headers=HEADERS)).status_code == 200
+        assert (await http.post("/v1/jobs", json=drawn, headers=HEADERS)).status_code == 200
+        assert executor.calls == 1
 
 
 async def test_simultaneous_requests_execute_once_and_close_connections(database_url):
