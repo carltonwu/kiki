@@ -1,0 +1,33 @@
+name: read_image describes one image, and a gallery image by image and as a whole
+steps:
+  - say:
+      as: alex
+      in: general
+      text: "kiki look at my cat"
+      attachments: [{filename: cat.png, label: "a grey cat asleep on a piano"}]
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "aw {result}"}
+  - expect:
+      reply: true
+      tool_called: read_image
+      prompt_contains: "look at my cat [image: cat.png; message"
+      tool_result_contains: ["Image 1: a grey cat asleep on a piano", "sim vision via sim/vision"]
+      text_contains: "grey cat asleep"
+  - say:
+      as: sam
+      in: general
+      text: "kiki rate the set"
+      attachments:
+        - {filename: set1.png, label: "the stage under blue light"}
+        - {filename: notes.pdf, content_type: application/pdf}
+        - {filename: set2.jpg, content_type: image/jpeg, label: "a painted backdrop of a forest"}
+        - {filename: set3.webp, content_type: image/webp, label: "the cast bowing"}
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "{result}"}
+  - expect:
+      reply: true
+      prompt_contains:
+        - "[attachment: notes.pdf] [gallery of 3 images: set1.png, set2.jpg, set3.webp; message"
+      tool_result_contains:
+        - "Image 1: the stage under blue light"
+        - "Image 2: a painted backdrop of a forest"
+        - "Image 3: the cast bowing"
+        - "Gallery: 3 images together"

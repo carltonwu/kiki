@@ -21,8 +21,11 @@
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
-that channel), `age_s`, and the sugar `jev: {choice, confidence}` and
-`reply: {text | tool | web}` to script the stub's answer to exactly this message.
+that channel), `age_s`, `attachments` (`[{filename, label?, content_type?}]`;
+the stub vision model describes an image as its label), and the sugar
+`jev: {choice, confidence}` and `reply: {text | tool | web}` to script the stub's
+answer to exactly this message. In tool arguments, `{image_message}` is the
+message ID from the trigger's image marker, else the newest one in the conversation.
 `web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
 tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
 it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the
@@ -77,6 +80,8 @@ class Run:
         body = {"as": args["as"], "in": args["in"], "text": str(args["text"])}
         if "age_s" in args:
             body["age_s"] = args["age_s"]
+        if "attachments" in args:
+            body["attachments"] = args["attachments"]
         if reply_to := args.get("reply_to"):
             body["reply_to"] = self.resolve_reply(reply_to, args["in"])
         script = {}

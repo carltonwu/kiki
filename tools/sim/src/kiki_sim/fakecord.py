@@ -31,10 +31,6 @@ ADMINISTRATOR = 1 << 3
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
 STUB_IMAGE_MODELS = ["sim/image"]
-# A 1×1 transparent PNG: what the stub image model "draws".
-STUB_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-)
 
 
 def iso(ms: int) -> str:
@@ -44,9 +40,11 @@ def iso(ms: int) -> str:
 class World:
     """Everything fakecord knows, rebuilt from the fixture on reset."""
 
-    def __init__(self, fixture_path: Path):
+    def __init__(self, fixture_path: Path, media_base: str = "http://127.0.0.1:8090"):
         fixture = yaml.safe_load(fixture_path.read_text())
         self.fixture_path = fixture_path
+        self.media_base = media_base
+        self.files: dict[str, tuple[bytes, str]] = {}  # CDN path → (body, content type)
         self.guild = {"id": str(fixture["guild"]["id"]), "name": fixture["guild"]["name"]}
         kiki = fixture["kiki"]
         self.bot = {
@@ -112,7 +110,16 @@ class World:
             count = h.get("repeat", 1)
             for i in range(count):
                 at_ms = now - age_ms - (count - 1 - i) * 1000
-                self.create_message(h["as"], h["in"], h["text"].format(i=i), at_ms=at_ms)
+                self.create_message(
+                    h["as"],
+                    h["in"],
+                    h["text"].format(i=i),
+                    at_ms=at_ms,
+                    attachments=[
+                        self.attachment(self.channel(h["in"])["id"], a)
+                        for a in h.get("attachments") or []
+                    ],
+                )
 
     # --- lookups -----------------------------------------------------------
 
@@ -190,8 +197,9 @@ class World:
             return f"<@{target['user']['id']}>"
 
         content = MENTION_TOKEN.sub(mention, content)
+        id = self.snowflake(at_ms)
         message = {
-            "id": self.snowflake(at_ms),
+            "id": id,
             "channel_id": c["id"],
             "guild_id": self.guild["id"],
             "author": m["user"],
@@ -226,15 +234,75 @@ class World:
         c["last_message_id"] = message["id"]
         return message
 
+    def attachment(self, channel_id: str, spec: dict) -> dict:
+        """A scripted attachment, `{filename, label?, content_type?, width?, height?}`.
+        Images are tiny PNGs whose `label` the stub vision model reads back, so a
+        description proves the bytes made it through the agent host."""
+        name = spec["filename"]
+        content_type = spec.get("content_type", "image/png")
+        if content_type.startswith("image/"):
+            body = png(spec.get("label", name))
+        else:
+            body = spec.get("label", name).encode()
+        payload = self.upload(channel_id, name, body, content_type)
+        return payload | {"width": spec.get("width", 64), "height": spec.get("height", 64)}
+
+    def upload(self, channel_id: str, name: str, body: bytes, content_type: str) -> dict:
+        """Discord's attachment object; the bytes are served from fakecord's `/cdn`."""
+        id = self.snowflake(time.time() * 1000)
+        path = f"attachments/{channel_id}/{id}/{name}"
+        self.files[path] = (body, content_type)
+        url = f"{self.media_base}/cdn/{path}"
+        return {
+            "id": id,
+            "filename": name,
+            "size": len(body),
+            "url": f"{url}?ex=sim",
+            "proxy_url": f"{url}?ex=sim&proxy=1",
+            "content_type": content_type,
+            "sha256": hashlib.sha256(body).hexdigest(),
+        }
+
+
+def png(label: str) -> bytes:
+    """A 1×1 PNG carrying `label` in a tEXt chunk."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + chunk(b"tEXt", b"sim\x00" + label.encode())
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def png_label(data: bytes) -> str | None:
+    at = 8
+    while at + 8 <= len(data):
+        (size,) = struct.unpack(">I", data[at : at + 4])
+        kind, body = data[at + 4 : at + 8], data[at + 8 : at + 8 + size]
+        if kind == b"tEXt" and body.startswith(b"sim\x00"):
+            return body[4:].decode(errors="replace")
+        at += 12 + size
+    return None
+
 
 class Fakecord:
     def __init__(self, fixture: Path, port: int):
         self.port = port
-        self.world = World(fixture)
+        self.world = World(fixture, self.media_base())
         self.sockets: set[web.WebSocketResponse] = set()
         self.identified: set[web.WebSocketResponse] = set()
         self.sequence = 0
         self.sessions = itertools.count(1)
+
+    def media_base(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
     # --- Gateway -----------------------------------------------------------
 
@@ -438,22 +506,15 @@ class Fakecord:
         declared = {str(a["id"]): a for a in body.get("attachments") or []}
         if set(declared) != {f["id"] for f in files}:
             raise web.HTTPBadRequest(text="uploaded files don't match payload attachments")
-        found = []
-        for f in files:
-            id = self.world.snowflake(time.time() * 1000)
-            url = f"https://cdn.discordapp.com/attachments/{channel_id}/{id}/{f['filename']}"
-            found.append(
-                {
-                    "id": id,
-                    "filename": declared[f["id"]].get("filename") or f["filename"],
-                    "size": len(f["data"]),
-                    "url": url,
-                    "proxy_url": url,
-                    "content_type": f["content_type"] or sniff(f["data"]),
-                    "sha256": hashlib.sha256(f["data"]).hexdigest(),
-                }
+        return [
+            self.world.upload(
+                channel_id,
+                declared[f["id"]].get("filename") or f["filename"],
+                f["data"],
+                f["content_type"] or sniff(f["data"]),
             )
-        return found
+            for f in files
+        ]
 
     def page(self, channel_id: str, query) -> list[dict]:
         w = self.world
@@ -521,12 +582,17 @@ class Fakecord:
         return None
 
     async def cdn(self, request: web.Request) -> web.StreamResponse:
-        """Discord's CDN, for emoji images: a small PNG per emoji."""
+        """Discord's CDN: emoji images, and attachments (`?ex=` is ignored, like an
+        unexpired signed URL). Images are PNGs labeled for the stub vision model."""
         path = request.match_info["path"]
         if (m := re.fullmatch(r"emojis/(\d+)\.png", path)) and m[1] in self.world.emojis:
-            return web.Response(body=png(int(m[1])), content_type="image/png")
+            emoji = self.world.emojis[m[1]]
+            return web.Response(body=png(f"emoji :{emoji['name']}:"), content_type="image/png")
+        if found := self.world.files.get(path):
+            body, content_type = found
+            return web.Response(body=body, content_type=content_type)
         self.world.unexpected.append({"method": request.method, "path": f"cdn/{path}"})
-        return web.Response(status=404)
+        return web.Response(status=404, text="This content is no longer available.")
 
     def jev(self, body: dict) -> dict:
         state = body["state"]
@@ -582,13 +648,17 @@ class Fakecord:
         n = next(w.ids)
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
         usage = {}
-        if has_image(messages):
-            # Describing a custom emoji: the fixture's description, by name.
-            record["kind"] = "emoji"
+        if pictures := image_parts(messages):
+            record["kind"] = "vision"
             prompt = " ".join(content_text(m.get("content")) for m in messages)
-            name = (re.search(r":(\w+):", prompt) or [None, ""])[1]
-            emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
-            text = emoji.get("description") or f"stub description of :{name}:"
+            if "custom Discord emoji" in prompt:
+                # Describing a custom emoji: the fixture's description, by name.
+                record["kind"] = "emoji"
+                name = (re.search(r":(\w+):", prompt) or [None, ""])[1]
+                emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
+                text = emoji.get("description") or f"stub description of :{name}:"
+            else:
+                text = describe(pictures, body.get("model"))
             message = {"role": "assistant", "content": text}
         elif record["kind"] == "topic":
             message = {"role": "assistant", "content": "stub topic"}
@@ -612,6 +682,16 @@ class Fakecord:
                 if entry and entry.get("tool"):
                     entry["pending"] = True
                     tool = entry["tool"]
+                    # `{image_message}`: the message ID of the trigger's image marker,
+                    # else of the newest marker in the conversation (like Kiki's drawing).
+                    everything = "\n".join(content_text(m.get("content")) for m in messages)
+                    markers = re.findall(r"; message (\d+)\]", trigger) or re.findall(
+                        r"; message (\d+)\]", everything
+                    )
+                    marker = [None, markers[-1]] if markers else None
+                    args = json.dumps(tool.get("args", {})).replace(
+                        "{image_message}", marker[1] if marker else ""
+                    )
                     message = {
                         "role": "assistant",
                         "content": None,
@@ -621,7 +701,7 @@ class Fakecord:
                                 "type": "function",
                                 "function": {
                                     "name": tool["name"],
-                                    "arguments": json.dumps(tool.get("args", {})),
+                                    "arguments": args,
                                 },
                             }
                         ],
@@ -697,8 +777,9 @@ class Fakecord:
         return message, {"server_tool_use_details": details}
 
     def image(self, body: dict) -> web.Response:
-        """OpenRouter's Images API: draws STUB_PNG, or rejects prompts containing
-        "refuse" with a 400 as a moderation block would."""
+        """OpenRouter's Images API: a 1×1 PNG labeled with the prompt (so the stub
+        vision model can tell what was drawn), or a 400 for prompts containing
+        "refuse", as a moderation block would."""
         w = self.world
         prompt = body["prompt"]
         drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE)
@@ -706,7 +787,8 @@ class Fakecord:
         if not drew:
             error = {"code": 400, "message": "Request blocked by the provider's safety system"}
             return web.json_response({"error": error}, status=400)
-        image = {"b64_json": base64.b64encode(STUB_PNG).decode(), "media_type": "image/png"}
+        drawing = png(f"a drawing of {prompt[:80]}")
+        image = {"b64_json": base64.b64encode(drawing).decode(), "media_type": "image/png"}
         usage = {"prompt_tokens": 10, "completion_tokens": 1056, "total_tokens": 1066, "cost": 0.04}
         return web.json_response({"created": int(time.time()), "data": [image], "usage": usage})
 
@@ -721,7 +803,7 @@ class Fakecord:
             return web.json_response(self.state())
         if route == "POST reset":
             fixture = Path(body.get("fixture") or w.fixture_path)
-            self.world = World(fixture)
+            self.world = World(fixture, self.media_base())
             self.disconnect()
             return web.json_response({"ok": True})
         if route == "POST drop-gateway":
@@ -734,7 +816,15 @@ class Fakecord:
         if route == "POST messages":
             at_ms = time.time() * 1000 - float(body.get("age_s", 0)) * 1000
             message = w.create_message(
-                body["as"], body["in"], body["text"], at_ms=at_ms, reply_to=body.get("reply_to")
+                body["as"],
+                body["in"],
+                body["text"],
+                at_ms=at_ms,
+                reply_to=body.get("reply_to"),
+                attachments=[
+                    w.attachment(w.channel(body["in"])["id"], a)
+                    for a in body.get("attachments") or []
+                ],
             )
             await self.dispatch("MESSAGE_CREATE", message)
             return web.json_response(message)
@@ -842,35 +932,28 @@ def content_text(content) -> str:
     return "" if content is None else str(content)
 
 
+def image_parts(messages: list[dict]) -> list[bytes]:
+    """The images in a request (data URLs, as the agent host sends them)."""
+    found = []
+    for m in messages:
+        for part in m.get("content") if isinstance(m.get("content"), list) else []:
+            if part.get("type") == "image_url":
+                url = part["image_url"]["url"]
+                found.append(base64.b64decode(url.partition(",")[2]) if "," in url else b"")
+    return found
+
+
 def sniff(data: bytes) -> str:
     return "image/png" if data.startswith(b"\x89PNG") else "application/octet-stream"
 
 
-def has_image(messages: list[dict]) -> bool:
-    return any(
-        isinstance(part, dict) and part.get("type") == "image_url"
-        for m in messages
-        if isinstance(m.get("content"), list)
-        for part in m["content"]
-    )
-
-
-def png(seed: int) -> bytes:
-    """A valid 8×8 single-color PNG, colored by `seed`."""
-
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        crc = zlib.crc32(kind + data)
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
-
-    color = bytes([seed % 251, seed // 251 % 251, 200])
-    rows = b"".join(b"\x00" + color * 8 for _ in range(8))
-    header = struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(rows))
-        + chunk(b"IEND", b"")
-    )
+def describe(pictures: list[bytes], model: str | None) -> str:
+    """The stub vision model: reads back each sim PNG's label."""
+    lines = [f"Image {n}: {png_label(p) or 'an image'}" for n, p in enumerate(pictures, 1)]
+    if len(pictures) > 1:
+        lines.append(f"Gallery: {len(pictures)} images together")
+    lines.append(f"(sim vision via {model})")
+    return "\n".join(lines)
 
 
 def trigger_line(prompt: str) -> str:

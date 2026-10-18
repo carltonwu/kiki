@@ -276,6 +276,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert set(json.loads(result.text)) == {
         "search_messages",
         "get_message_context",
+        "read_image",
         "search_emojis",
         "find_emoji",
     }

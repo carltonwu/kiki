@@ -4,7 +4,8 @@ Rust copies the emoji list from Discord into `guild_emojis` (`/kiki emojis
 resync:true`) and then calls `POST /v1/emojis/describe`, which lands in
 `describe_pending`. Descriptions are embedded like messages, so `search` fuses
 full text and vectors the way message search does, without the recency vote.
-Independent of the agent framework: the model call is passed in.
+The model call is passed in; images are fetched like `read_image`'s
+(`vision.download`: Discord hosts only, typed by their bytes).
 """
 
 import asyncio
@@ -17,7 +18,9 @@ from datetime import UTC, datetime
 import httpx
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
+from pydantic_ai.messages import BinaryContent
 
+from . import vision
 from .retrieval import CANDIDATES, EMBED_BATCH, MIN_SIMILARITY, RRF_K, Embedder
 
 logger = logging.getLogger(__name__)
@@ -25,8 +28,6 @@ logger = logging.getLogger(__name__)
 DESCRIBE_BATCH = 8  # per call: Rust repeats calls until none are left
 DESCRIBE_CONCURRENCY = 4
 DESCRIPTION_CHARS = 400
-MAX_IMAGE_BYTES = 1_000_000
-IMAGE_TIMEOUT_SECONDS = 10
 INDEX_LIMIT = 256
 QUERY_INSTRUCTION = (
     "Instruct: Given a mood, reaction or subject, retrieve custom Discord emoji that fit it\n"
@@ -40,8 +41,8 @@ PROMPT = (
     "description."
 )
 
-# (name, animated, png bytes) → (description, cost in USD or None)
-Describe = Callable[[str, bool, bytes], Awaitable[tuple[str, float | None]]]
+# (name, animated, image) → (description, cost in USD or None)
+Describe = Callable[[str, bool, BinaryContent], Awaitable[tuple[str, float | None]]]
 EMOJI = re.compile(r"^<(a?):(\w+):([0-9]+)>$")
 MAX_ID = 2**63 - 1  # Postgres bigint
 
@@ -51,17 +52,17 @@ def cdn_base() -> str:
     return (os.getenv("DISCORD_CDN_URL") or "https://cdn.discordapp.com").rstrip("/")
 
 
-async def fetch_image(client: httpx.AsyncClient, emoji_id: int) -> bytes:
+class ImageUnavailable(Exception):
+    pass
+
+
+async def fetch_image(client: httpx.AsyncClient, emoji_id: int) -> BinaryContent:
     """The emoji as a PNG (the first frame, if animated): every vision model takes PNG."""
     url = f"{cdn_base()}/emojis/{emoji_id}.png?size=128"
-    async with client.stream("GET", url, timeout=IMAGE_TIMEOUT_SECONDS) as response:
-        response.raise_for_status()
-        data = b""
-        async for chunk in response.aiter_bytes():
-            data += chunk
-            if len(data) > MAX_IMAGE_BYTES:
-                raise ValueError("emoji image too large")
-    return data
+    image = await vision.download(client, url, "image/png")
+    if isinstance(image, str):
+        raise ImageUnavailable(image)
+    return image
 
 
 # Claims up to `limit` emoji not yet tried in this round, so concurrent and
@@ -141,7 +142,7 @@ async def describe_pending(
         )
         return True
 
-    async with client or httpx.AsyncClient(follow_redirects=True) as http:
+    async with client or vision.client() as http:
         results = await asyncio.gather(*(one(http, *row) for row in claimed))
     described = sum(results)
     try:

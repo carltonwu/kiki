@@ -230,7 +230,10 @@ AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
                 WHERE cm.message_id = m.id AND cm.conversation_id = %(conversation)s)
 """
 
-COLUMNS = "m.id, m.channel_id, m.author_name, m.author_id, m.content, m.created_at"
+COLUMNS = (
+    "m.id, m.channel_id, m.author_name, m.author_id, m.content, m.created_at,"
+    " m.raw->'attachments' AS attachments, m.raw->'embeds' AS embeds"
+)
 
 SEARCH = f"""
 WITH lexical AS (
@@ -395,12 +398,18 @@ async def cite_all(
     return [cite(scope, m, names, channels) for m in rows]
 
 
+def image_count(m: dict) -> int:
+    from .reading import images_in  # reading.py imports this module
+
+    return len(images_in({"attachments": m.get("attachments"), "embeds": m.get("embeds")}))
+
+
 def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str]) -> dict:
     def mention(match: re.Match) -> str:
         user_id = int(match[1])
         return "@" + names.get(user_id, match[0])
 
-    return {
+    cited = {
         "id": str(m["id"]),
         "author": names.get(m["author_id"]) or m["author_name"] or str(m["author_id"]),
         "channel": "#" + channels.get(m["channel_id"], str(m["channel_id"])),
@@ -408,6 +417,9 @@ def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str])
         "url": f"https://discord.com/channels/{scope.guild_id}/{m['channel_id']}/{m['id']}",
         "text": MENTION.sub(mention, m["content"])[:SNIPPET_CHARS],
     }
+    if images := image_count(m):
+        cited["images"] = images  # read_image can look at them
+    return cited
 
 
 async def index_all(database_url: str, api_key: str) -> None:

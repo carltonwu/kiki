@@ -98,13 +98,16 @@ async def test_generate_turns_failures_into_messages_for_the_model():
     model = FakeImageModel()
     assert await images.generate(model, " a frog ", "2:3") == (PNG, "image/png", 0.04)
     assert model.prompts == [("a frog", {"aspect_ratio": "2:3"})]
+    # The bytes decide the type (vision.sniff), not the provider's label.
+    mislabeled = FakeImageModel(media_type="image/jpeg")
+    assert (await images.generate(mislabeled, "x"))[1] == "image/png"
     # Pydantic AI's own test model works too.
     data, mime, _ = await images.generate(TestImageGenerationModel(), "x")
     assert mime == "image/png" and data.startswith(b"\x89PNG")
     cases = [
         (FakeImageModel(error=ContentFilterError("blocked", body=None)), "refused"),
         (FakeImageModel(error=UnexpectedModelBehavior("empty", body=None)), "No image"),
-        (FakeImageModel(media_type="image/svg+xml"), "unsupported image/svg"),
+        (FakeImageModel(image=b"<svg/>", media_type="image/svg+xml"), "unsupported image/svg"),
         (FakeImageModel(image=b"0" * (images.MAX_IMAGE_BYTES + 1)), "too large"),
     ]
     for model, message in cases:

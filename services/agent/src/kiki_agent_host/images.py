@@ -19,17 +19,14 @@ from pydantic_ai.images import (
 )
 from pydantic_ai.messages import BinaryImage
 
+from .vision import ImageRefused, sniff
+
 # Discord's smallest upload limit is 10 MiB; leave room for the rest of the request.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_CHARS = 4000
-MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 # GPT Image bills by output tokens: "medium" keeps a 1024² image at a few cents
 # (OpenAI's "auto" may pick "high", about 4× the cost).
 OPENAI_QUALITY = "medium"
-
-
-class ImageRefused(ValueError):
-    """No usable image; the message is safe to show the model."""
 
 
 class OpenRouterImageModel(ImageGenerationModel):
@@ -120,11 +117,14 @@ async def generate(
         raise ImageRefused("No image was generated.") from None
     image = result.image
     cost = float((result.provider_details or {}).get("cost") or 0)
-    if image.media_type not in MIME_TYPES:
-        raise ImageRefused(f"The image model returned an unsupported {image.media_type} file.")
+    # The bytes decide the type (`vision.sniff`), as for images Kiki reads: a
+    # provider's declared type can be wrong, and Discord shows these inline.
     if len(image.data) > MAX_IMAGE_BYTES:
         raise ImageRefused("The generated image was too large to send.")
-    return image.data, image.media_type, cost
+    media_type = sniff(image.data[:12])
+    if media_type is None:
+        raise ImageRefused(f"The image model returned an unsupported {image.media_type} file.")
+    return image.data, media_type, cost
 
 
 async def save(connection: AsyncConnection, job_id: str, mime_type: str, data: bytes) -> int:
