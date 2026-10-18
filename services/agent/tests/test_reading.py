@@ -7,12 +7,15 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import reading, retrieval, vision
-from kiki_agent_host.reading import images_in, sized
+from kiki_agent_host import vision
+from kiki_agent_host.chat.attachments import images_in, sized
+from kiki_agent_host.chat.scope import Roster, Scope
+from kiki_agent_host.chat.search import message_context
+from kiki_agent_host.reading import read_image
 from kiki_agent_host.vision import Vision, allowed
 
 GUILD, CHANNEL, CONVERSATION = 1, 2, 1
-SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
+SCOPE = Scope(GUILD, CHANNEL, CONVERSATION)
 CDN = "https://cdn.discordapp.com/attachments/2/3"
 PNG = b"\x89PNG\r\n\x1a\nsim"
 JPEG = b"\xff\xd8\xff\xe0sim"
@@ -145,7 +148,7 @@ async def add(db, id, content, raw_extra, *, guild=GUILD, author_id=100, bot=Fal
     )
 
 
-ROSTER = retrieval.Roster({"u1": 100}, {100: "u1 Alex"})
+ROSTER = Roster({"u1": 100}, {100: "u1 Alex"})
 CDN_FILES = {
     "/attachments/2/3/a.png": (200, PNG, "image/png"),
     "/attachments/2/3/b.JPG": (200, JPEG, "image/jpeg"),
@@ -167,7 +170,7 @@ def fake_vision(answer="Image 1: a stage.", error: Exception | None = None, fall
 
 
 async def read(db, vision_model, message_id=70, question=None, files=CDN_FILES):
-    return await reading.read_image(
+    return await read_image(
         db, SCOPE, ROSTER, vision_model, message_id, question, transport=serve(files)
     )
 
@@ -258,7 +261,7 @@ async def test_vision_failures_become_errors_for_kiki(db, status, fallback, expe
 async def test_search_results_say_which_messages_have_images(db):
     await add(db, 76, "plain", {})
     await add(db, 77, "pics", GALLERY)
-    result = await retrieval.message_context(db, SCOPE, 76)
+    result = await message_context(db, SCOPE, 76)
     assert [m.get("images") for m in result["messages"]] == [None, 5]
 
 

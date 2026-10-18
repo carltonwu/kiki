@@ -2,11 +2,9 @@
 
 import asyncio
 import logging
-import os
 import resource
 import secrets
 import time
-from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -15,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import OperationalError
 
 from . import STARTED
+from .config import Settings
 from .contracts import (
     DescribeEmojisRequest,
     DescribeEmojisResult,
@@ -26,36 +25,6 @@ from .executor import Executor, TransientError
 from .jobs import RequestConflict, run_image_job, run_job
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class Settings:
-    database_url: str
-    token: str
-    max_concurrent_jobs: int = 2
-    job_timeout_seconds: float = 120
-    openrouter_api_key: str = ""
-    openrouter_vision_model: str = ""
-    # Refreshes expired Discord attachment links (reference images; `vision.refresh`).
-    discord_bot_token: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.database_url.strip() or not self.token.strip():
-            raise ValueError("DATABASE_URL and AGENT_HOST_TOKEN must be nonempty")
-        if self.max_concurrent_jobs < 1 or self.job_timeout_seconds <= 0:
-            raise ValueError("job concurrency and timeout must be positive")
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        return cls(
-            database_url=os.environ["DATABASE_URL"],
-            token=os.environ["AGENT_HOST_TOKEN"],
-            max_concurrent_jobs=int(os.getenv("AGENT_HOST_MAX_CONCURRENT_JOBS", "2")),
-            job_timeout_seconds=float(os.getenv("AGENT_HOST_JOB_TIMEOUT_SECS", "120")),
-            openrouter_api_key=os.getenv("OPENROUTER_CHAT_API_KEY", ""),
-            openrouter_vision_model=os.getenv("OPENROUTER_VISION_MODEL", "").strip(),
-            discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
-        )
 
 
 def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:

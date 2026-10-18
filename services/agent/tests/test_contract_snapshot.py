@@ -14,7 +14,8 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host import contracts
 from kiki_agent_host.agent import PydanticExecutor
-from kiki_agent_host.app import Settings, create_app
+from kiki_agent_host.app import create_app
+from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import JobRequest
 
 SNAPSHOT = Path(__file__).parent / "snapshots/contract.json"

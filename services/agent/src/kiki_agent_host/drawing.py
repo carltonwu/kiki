@@ -31,9 +31,9 @@ from pydantic_ai.messages import BinaryContent, BinaryImage, ModelResponse, Text
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
+from .chat.attachments import images_in
+from .chat.scope import HEARD, Scope
 from .contracts import Drawing, JobRequest, Reference, Subject
-from .reading import images_in
-from .retrieval import HEARD, Scope
 from .vision import ImageRefused, Vision, billed_cost, client, download, look, refresh, sniff
 
 logger = logging.getLogger(__name__)

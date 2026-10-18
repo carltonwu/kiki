@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
-from .retrieval import HEARD, Roster, Scope, resolve_person, speakers
+from .scope import HEARD, Roster, Scope, resolve_person, speakers
 
 MAX_DOC_WORDS = 1024
 MAX_ENTRY_WORDS = 60

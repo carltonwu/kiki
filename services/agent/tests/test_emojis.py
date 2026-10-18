@@ -10,10 +10,13 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import emojis, retrieval, vision
+from kiki_agent_host import vision
 from kiki_agent_host.agent import PydanticExecutor
-from kiki_agent_host.app import Settings, create_app
+from kiki_agent_host.app import create_app
+from kiki_agent_host.chat import emojis
+from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult
+from kiki_agent_host.openrouter.embeddings import Embedder
 
 GUILD, OTHER_GUILD = 1, 7
 MOODS = [{"confused", "huh", "what"}, {"laughing", "crying", "funny", "dead"}]
@@ -39,7 +42,7 @@ class FakeEmbeddings:
 
 
 def embedder(fail=False):
-    return retrieval.Embedder(SimpleNamespace(embeddings=FakeEmbeddings(fail)))
+    return Embedder(SimpleNamespace(embeddings=FakeEmbeddings(fail)))
 
 
 def cdn(missing=(), html=()):
