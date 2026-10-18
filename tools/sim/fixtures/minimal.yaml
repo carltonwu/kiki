@@ -10,6 +10,8 @@ members:
   chris_l: {id: 900000000000000106, username: chris.l, global_name: Chris}
   # Another bot in the guild (Kiki ignores bots for routing).
   pilz: {id: 900000000000000107, username: PilzBrots, bot: true}
+# Custom emoji Kiki can react with (name: id); others are rejected.
+emojis: {froge: 900000000000002001}
 channels:
   general: {id: 900000000000001001}
   lore: {id: 900000000000001002}

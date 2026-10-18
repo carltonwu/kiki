@@ -84,6 +84,8 @@ class World:
         self.messages: dict[str, dict] = {}  # id → payload, insertion (= id) order
         self.deleted: set[str] = set()
         self.reactions: list[dict] = []  # {message_id, emoji, action, at}
+        # Custom emoji Kiki may react with: name → id.
+        self.emojis = {str(k): str(v) for k, v in (fixture.get("emojis") or {}).items()}
         self.interactions: list[dict] = []  # responses Kiki sent
         self.calls: list[dict] = []  # every Discord REST call
         self.unexpected: list[dict] = []
@@ -330,10 +332,14 @@ class Fakecord:
         ):
             from urllib.parse import unquote
 
+            emoji = unquote(m[4])
+            # Custom emoji are `name:id`; Discord rejects ones Kiki can't use.
+            if ":" in emoji and emoji.rsplit(":", 1)[1] not in w.emojis.values():
+                return json_response({"message": "Unknown Emoji", "code": 10014}, status=400)
             w.reactions.append(
                 {
                     "message_id": m[3],
-                    "emoji": unquote(m[4]),
+                    "emoji": emoji,
                     "action": "add" if m[1] == "PUT" else "remove",
                     "at": time.time(),
                 }

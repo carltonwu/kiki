@@ -2,11 +2,11 @@
 
 use anyhow::Context as _;
 use serde_json::Value;
-use tracing::debug;
+use tracing::{debug, warn};
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::{channel::message::AllowedMentions, id::Id};
 
-use super::{Agent, RunRecord, context::Context};
+use super::{Agent, RunRecord, context::Context, emoji::Reaction};
 use crate::store;
 
 /// Discord allows 2000 characters per message; leave room for safety.
@@ -84,6 +84,35 @@ impl Agent {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    /// Reacts to the newest trigger message, like a person would before typing.
+    /// Adding a reaction is idempotent, so unlike sends a failure is only logged:
+    /// Discord rejects emoji it doesn't know or that Kiki can't use.
+    pub(super) async fn react(
+        &self,
+        context: &Context,
+        reactions: &[Reaction],
+        record: &mut RunRecord,
+    ) {
+        let (channel_id, message_id) = (context.channel_id, context.reply_to);
+        for reaction in reactions {
+            let emoji = reaction.request();
+            let request = self.http.create_reaction(
+                Id::new(channel_id as u64),
+                Id::new(message_id as u64),
+                &emoji,
+            );
+            match request.await {
+                Ok(_) => {
+                    record.reactions.push(reaction.to_string());
+                    record.reacted_to = Some(message_id);
+                }
+                Err(e) => {
+                    warn!(channel_id, message_id, %reaction, error = %e, "couldn't add a reaction")
+                }
+            }
+        }
     }
 
     pub(super) fn clear_pending(&self, channel_id: i64, message_ids: &[i64]) {
