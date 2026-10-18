@@ -168,18 +168,35 @@ def test_compose_numbers_references_and_defaults_to_a_phone_photo():
     prompt, references, pictures = drawing.compose(
         Drawing(prompt="Ethan walks Nougie on a beach"), found
     )
-    assert prompt.startswith("Ethan walks Nougie on a beach\n\nStyle: A candid photo")
-    assert "- Ethan, shown in reference image 1: Keep their real look: face" in prompt
-    assert "- Nougie, shown in reference images 2-3: traumagotchi's dog. Keep their" in prompt
+    assert prompt.startswith("Ethan walks Nougie on a beach\n\nStyle: A real photograph, candid")
+    assert "No glamorization, no heavy retouching" in prompt
+    # Each reference by number and role, with what must stay the same.
+    assert (
+        "- Ethan, shown in reference image 1: Keep Ethan's face, facial features, hair, "
+        "skin tone and build the same; don't change Ethan's identity." in prompt
+    )
+    assert (
+        "- Nougie, shown in reference images 2-3: traumagotchi's dog. Keep Nougie's look "
+        "(for an animal: breed, size, coat colors and markings) the same" in prompt
+    )
     assert "- Kiki: a smoky mushroom sprite.\n" in prompt
+    assert prompt.endswith(drawing.REFERENCES_ONLY)
     assert [r.message_id or r.avatar_of for r in references] == ["2", "7", "8"]
     assert len(pictures) == 3
     styled, _, _ = drawing.compose(Drawing(prompt="x", style="90s anime"), [])
     assert styled == "x\n\nStyle: 90s anime"
+    # An edit changes only what's asked and keeps the photo's own look.
+    edited, _, _ = drawing.compose(Drawing(prompt="Give him a cowboy hat", edit=True), found[:1])
+    assert "Style:" not in edited
+    assert edited.endswith(drawing.EDIT) and "Reference image 1 is the photo to edit" in edited
 
 
 def test_verdicts_read_the_vision_check():
-    answer = "Image 1: yes - a white dog\nImage 2: no - a meme\n**Image 3:** Yes, the dog\nimage 4: maybe"
+    answer = (
+        "Image 1: a white dog on a couch => yes\nImage 2: a meme => no\n"
+        "**Image 3:** the dog, a selfie (yes) => **Yes**\nimage 4: blurry => maybe\n"
+        "Image 5: says yes on a sign => no"
+    )
     assert drawing.verdicts(answer) == {1, 3}
 
 
@@ -348,6 +365,22 @@ async def test_bad_subjects_are_tool_errors_the_model_can_fix(database_url):
     assert "No message with images" in results[1]["error"]
 
 
+async def test_common_argument_slips_queue_rather_than_fail_the_reply(database_url):
+    # Seen in prod: a bare name for a subject, twice, used up the tool's retries.
+    # And a person named without their ref is still found as that person.
+    await seed(database_url, (90, 200, "hi", []))
+    subjects = ["Nougie", "user200", "u2 Ethan (@user200)"]
+    args = {"prompt": "x", "subjects": subjects, "aspect_ratio": "5:7"}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.user_id) for s in queued.subjects] == [
+        ("Nougie", None),
+        ("user200", "200"),
+        ("Ethan", "200"),  # a roster label: by its @username
+    ]
+    assert queued.aspect_ratio is None
+
+
 async def test_at_most_max_images_are_queued_per_reply(database_url):
     def respond(messages, info):
         if len(messages) == 1:
@@ -443,10 +476,10 @@ async def test_drawing_finds_checks_and_numbers_references(database_url):
         if "draw Nougie" in texts[0]:
             # Newest first: snow, meme, adopted. The meme is turned down.
             return ModelResponse(
-                parts=[TextPart("Image 1: yes - dog\nImage 2: no - meme\nImage 3: yes - dog")]
+                parts=[TextPart("Image 1: dog => yes\nImage 2: meme => no\nImage 3: dog => yes")]
             )
         return ModelResponse(
-            parts=[TextPart("Image 1: yes - selfie\nImage 2: no - cartoon avatar")]
+            parts=[TextPart("Image 1: selfie => yes\nImage 2: cartoon avatar => no")]
         )
 
     model = FakeImageModel()
@@ -473,7 +506,7 @@ async def test_drawing_finds_checks_and_numbers_references(database_url):
     prompt = model.prompts[0][0]
     assert "Nougie, shown in reference images 1-2" in prompt
     assert "Ethan, shown in reference image 3" in prompt
-    assert "Style: A candid photo taken on a phone camera" in prompt
+    assert "Style: A real photograph, candid, taken on a phone camera" in prompt
     assert result.prompt == prompt and result.caption == "da beach"
     # The expired link was refreshed through Discord before downloading.
     assert any("adopted.jpg?ex=1&" in u for u in refreshed)

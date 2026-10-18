@@ -712,9 +712,8 @@ class Fakecord:
                 # The drawing step's reference check: memes and screenshots are out.
                 record["kind"] = "check"
                 text = "\n".join(
-                    f"Image {n}: "
+                    f"Image {n}: {label} => "
                     + ("no" if re.search(r"meme|screenshot", label, re.I) else "yes")
-                    + f" - {label}"
                     for n, label in enumerate((png_label(p) or "an image" for p in pictures), 1)
                 )
             else:

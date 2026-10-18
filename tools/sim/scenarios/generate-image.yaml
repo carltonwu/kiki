@@ -41,7 +41,7 @@ steps:
         - "Ethan walks Nougie along a beach at sunset"
         - "Nougie, shown in reference image 1: sam's dog."
         - "Ethan, shown in reference image 2"
-        - "Style: A candid photo taken on a phone camera"
+        - "Style: A real photograph, candid, taken on a phone camera"
   # Stored for audit: the final prompt, the references by message or avatar, the cost.
   - expect: {sql: "SELECT jsonb_array_length(reference_images) FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: 2}
   - expect: {sql: "SELECT reference_images->1->>'avatar_of' FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: "900000000000000103"}

@@ -107,6 +107,8 @@ class Drawing(Contract):
     aspect_ratio: AspectRatio | None = None
     # Kiki's words to post with the image.
     caption: str = Field(default="", max_length=1500)
+    # Changing a posted photo (the first subject's first photo) rather than a new picture.
+    edit: bool = False
 
 
 class JobResult(Contract):

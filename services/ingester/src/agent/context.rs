@@ -196,7 +196,8 @@ impl Agent {
                  So your reply is the heads-up: it tells them a picture is coming, in your own words for this moment and this person (or just a reaction, when that says it). \
                  Vary it like a person would; don't fall back on a stock phrase or the same emoji each time, and don't describe the picture as if it's already posted. \
                  Name the people, pets and things whose real look matters as its subjects: the drawing step finds their photos here and shows them to the image model. \
-                 Pictures are candid, photorealistic phone photos unless they asked for a style or the joke needs one. ",
+                 Pictures are candid, photorealistic phone photos unless they asked for a style or the joke needs one. \
+                 Write the picture's prompt literally, for a model that hasn't seen the chat: what kind of image, then the scene, framing and light as concrete details, and any text in quotes. ",
             );
         }
         instructions.push_str(if settings.chat_allow_silence {

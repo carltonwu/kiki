@@ -71,6 +71,8 @@ class Image:
     url: str
     media_type: str | None = None
     alt: str | None = None
+    # The attachment's ID (embeds have none), to record which image was used.
+    id: str | None = None
 
 
 def images_in(raw: dict) -> list[Image]:
@@ -82,7 +84,8 @@ def images_in(raw: dict) -> list[Image]:
         if not (content_type.startswith("image/") or IMAGE_NAME.search(name)):
             continue
         if url := sized(a):
-            found.append(Image(name, url, content_type or None, a.get("description")))
+            id = str(a["id"]) if a.get("id") else None
+            found.append(Image(name, url, content_type or None, a.get("description"), id))
     for e in raw.get("embeds") or []:
         media = e.get("thumbnail") if e.get("type") in ("image", "gifv") else None
         media = media or e.get("image")

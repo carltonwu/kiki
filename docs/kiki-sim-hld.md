@@ -98,6 +98,7 @@ Discord does.
 | commands | `GET /applications/@me`, `PUT /applications/{a}/guilds/{g}/commands`, `POST /interactions/{id}/{token}/callback`, `PATCH /webhooks/{a}/{token}/messages/@original` |
 | catch-up | `GET /guilds/{g}`, `/guilds/{g}/channels`, `/guilds/{g}/threads/active`, `/channels/{c}/threads/archived/{public,private}`, `/channels/{c}/messages?after=&limit=` (paginated: fixtures can hold more than 100 messages per channel) |
 | router, agent | `PUT`/`DELETE /channels/{c}/messages/{m}/reactions/{emoji}/@me`, `POST /channels/{c}/messages` |
+| agent host | `POST /attachments/refresh-urls` (expired attachment links), CDN avatars and attachments |
 
 **Unknown calls fail tests.** The ingester treats some failures as "skip" (a
 404 means inaccessible in `rest.rs`), so a 404 alone proves nothing. fakecord
@@ -120,7 +121,10 @@ name, Kiki's user and managed role, and seeded history.
 reply_to, mentions, age_s, attachments → the minted message), `PATCH`/`DELETE
 messages/{id}`, `POST interactions`, `GET state` (messages, reactions,
 interaction responses, `unexpected`, recorded LLM requests), `POST script`
-(stub answers), `POST reset`, and `POST drop-gateway` (to test reconnects).
+(stub answers), `POST reset`, `POST drop-gateway` (to test reconnects), and
+`POST threads` (`from`, `name`, `as`: a thread started from a message, as Discord
+makes one: the thread has the message's ID, the parent gets a `THREAD_CREATED`
+notice and the thread opens with an empty thread starter message).
 
 ## Stub LLMs (default) and live mode
 
@@ -148,7 +152,18 @@ channels and background topic jobs can't take each other's answers.
   The agent host gets `OPENROUTER_VISION_MODEL=sim/vision` and may download from
   fakecord (`DISCORD_MEDIA_EXTRA_HOSTS`). Live mode passes
   `OPENROUTER_VISION_MODEL` through from the environment or the repo's dotenv
-  file when set.
+  file when set. A drawing's reference check gets `Image n: <label> => yes`, or
+  `no` for labels saying meme or screenshot.
+- **Images** (`/v1/images`): a 1×1 PNG labeled with the prompt, or a 400 for
+  prompts containing "refuse". Reference images must be inline data URLs (it
+  rejects links, which expire on Discord); their labels are recorded in order for
+  `image_references`. A drawing's failure note (a tool-less request asking for
+  one) gets `stub note, in her words: <reason>`.
+- **Discord media**: `/cdn/avatars/{user}/{hash}.png` serves a fixture member's
+  `avatar` as a PNG labeled `avatar of <username>`. An attachment scripted with
+  `expired: true` has `ex=0` and is a 404 until the host refreshes it through
+  `POST /api/v10/attachments/refresh-urls` (the host gets `DISCORD_API_URL` and
+  `DISCORD_BOT_TOKEN` pointing at fakecord).
 - **Embeddings** (`/v1/embeddings`): 4096-dimensional vectors (the host keeps
   the first 1024) from a stable SHA-256 bag of words. They're never zero, and
   they're returned with `index`.
@@ -178,6 +193,7 @@ stage has its own completion barrier:
 | `classified` | a `classifications` row, or proof it can't come (ignored author, bot, `age_s` > limit; or "settled": no row 3 s after `POOL_MAX_WAIT_MS`) | `check`, `outcome`, `jev`, `conversation: same_as <step>` / `new` |
 | `run` | the `agent_runs` row for the pool reaches `done`, `failed` or `superseded` | `run: done / failed / superseded / none` |
 | `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` (`web_search`/`web_fetch` are read from the job's saved `web` result, so they work live too), `tools_offered` |
+| `drawn` | every `agent_image_jobs` row of the run is `done` or `failed` | `followup: {count, status, attachments, text_contains, text_lacks}` (each picture's follow-up must reply to the request), `image_references`, `image_prompt_contains` (the newest image model call) |
 | `reactions` | eventually, within 5 s | `reaction: {emoji: 👀, present: false}` |
 | any | none | `prompt_contains`, `prompt_lacks` (last recorded chat request), `rest_calls`; `decide_contains`, `decide_lacks` (compact JSON of the message's recorded Decide state; fail if Decide was not called) |
 

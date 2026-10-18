@@ -42,41 +42,67 @@ PER_SUBJECT = 3  # references per subject: enough for a likeness, room for sever
 CANDIDATE_MESSAGES = 10
 CANDIDATES = 8  # images shown to the vision check per subject
 VERIFY_TIMEOUT_SECONDS = 30
-VERIFY_MAX_TOKENS = 900
+# One line per photo, without thinking (`look(think=False)`): a reasoning model
+# spent over 2,000 tokens and 20 s on five photos, past the check's deadline.
+VERIFY_MAX_TOKENS = 1500
 NOTE_MAX_TOKENS = 400
 # GPT Image edits take PNG, JPEG and WebP.
 REFERENCE_TYPES = ("image/png", "image/jpeg", "image/webp")
 
+# The final prompt's wording follows OpenAI's image prompting guide
+# (https://developers.openai.com/api/docs/guides/image-prompting): ask for a real
+# photograph and against retouching, label references by number and role, list
+# what must stay fixed for identity, and phrase edits as "change only…, keep…".
 PHOTO_STYLE = (
-    "A candid photo taken on a phone camera: natural, realistic lighting, ordinary "
-    "framing and everyday imperfections. Photorealistic, not illustrated, painted or rendered."
+    "A real photograph, candid, taken on a phone camera: natural, realistic lighting, "
+    "ordinary framing and everyday imperfections. No glamorization, no heavy retouching; "
+    "not illustrated, painted or rendered."
+)
+PERSON_LOOK = "face, facial features, hair, skin tone and build"
+THING_LOOK = "look (for an animal: breed, size, coat colors and markings)"
+REFERENCES_ONLY = (
+    "Use the reference images only for how these subjects look, not for their "
+    "backgrounds, lighting, clothing or framing: make the new picture described above. "
+    "Only the subjects named here look like their references; anyone else in the "
+    "picture looks clearly different from them."
+)
+EDIT = (
+    "Reference image 1 is the photo to edit: change only what's described above and "
+    "keep everything else unchanged (faces, identity, pose, lighting, framing and "
+    "background, unless the request changes them). Don't add new elements or text."
 )
 
 VERIFY = """\
 You pick reference photos for an image generator. It will draw {name} ({what}), \
 and the photos you approve show it what {name} looks like.
 
-For each candidate below, decide whether it clearly shows {name}:
+For each candidate below, first look at what the image actually is, then decide \
+whether it clearly shows {name}. Captions help tell who is in a photo; they \
+never make a meme, artwork or screenshot into a photo.
 {rules}
-Answer one line per candidate and nothing else, exactly like:
-Image 1: yes - <what it shows, in a few words>
-Image 2: no - <why not>"""
+Answer one line per candidate and nothing else, in this form, describing that \
+image itself:
+Image <number>: <what this image shows, in a few words> => <yes or no>"""
 
 PERSON_RULES = """\
 - Candidates come from {name}'s own posts or posts that name them, with their \
-captions. Say yes for a real photo whose main person is plausibly {name}: a selfie \
-or a photo of the poster ("me", "me tonight"), or a caption naming them. If several \
-photos show the same person, that consistency supports them.
-- Say no for screenshots, memes, art, other people, crowds where you can't tell \
-who is who, and photos where the face isn't visible.
+captions. Say yes for a real camera photo whose main person is plausibly {name}: \
+a selfie or a photo of the poster ("me", "me tonight"), or a caption naming them. \
+If several photos show the same person, that consistency supports them; a photo \
+of someone who looks clearly different from the rest is no.
+- Say no for screenshots, memes, art, illustrations, other people, photos of \
+several people unless the caption says which one is {name}, and photos where the \
+face isn't visible.
 - The avatar is the picture they chose for their profile: yes only if it's a real \
-photo of a person."""
+photo of the same person as their other approved photos (or, with none, plainly a \
+casual photo of an ordinary person rather than a celebrity, model or character)."""
 
 THING_RULES = """\
 - Candidates are posts whose captions name {name}. Say yes when {name} is clearly \
 visible: the main subject, in focus, not tiny or hidden.
-- Say no for screenshots, memes, drawings, or photos where it isn't visible \
-(a caption can name {name} while the photo shows something else)."""
+- Say no for screenshots, memes, drawings, photos where it isn't visible (a \
+caption can name {name} while the photo shows something else), and photos of \
+several animals or things where you can't tell which one is {name}."""
 
 FAILURE_NOTE = """\
 (Not from the chat:) The picture you just said you'd make couldn't be made: \
@@ -115,8 +141,9 @@ WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {
 ORDER BY m.id DESC LIMIT %(limit)s
 """
 
-# A person's likely photos of themselves first: their own posts with first-person
-# captions, camera JPEGs (screenshots are PNGs), then posts naming them.
+# A person's likely photos of themselves first: their own posts with captions about
+# themselves ("me tonite" most of all), camera JPEGs (screenshots are PNGs), then
+# posts naming them.
 PERSON_CANDIDATES = f"""
 SELECT m.id, m.author_id, m.content, m.raw FROM messages m
 WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
@@ -124,12 +151,14 @@ WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {
   AND (m.author_id = %(user)s OR m.content LIKE %(mention)s OR m.content ~* %(pattern)s)
 ORDER BY (m.author_id = %(user)s)::int * 2
          + (m.author_id = %(user)s AND m.content ~* %(first_person)s)::int * 2
-         + (m.raw->'attachments'->0->>'content_type' = 'image/jpeg')::int * 2
+         + (m.author_id = %(user)s AND m.content ~* %(selfie)s)::int * 2
+         + coalesce(m.raw->'attachments'->0->>'content_type' = 'image/jpeg', false)::int * 2
          + (m.author_id <> %(user)s)::int DESC,
          m.id DESC
 LIMIT %(limit)s
 """
 FIRST_PERSON = r"\m(me|my|myself|i|im|i'm|selfie|us)\M"
+SELFIE = r"^\W*(me|selfie|my face|pic of me|it'?s me|us)\M"
 
 AVATAR = """
 SELECT raw->'author'->>'avatar' AS user_hash, raw->'member'->>'avatar' AS member_hash
@@ -169,17 +198,14 @@ def candidates_in(rows: list[dict], per_message: int) -> list[Candidate]:
     """Each message's first images (as `read_image` lists them), as candidates."""
     found = []
     for m in rows:
-        for n, image in enumerate(images_in(m["raw"] or {})[:per_message], 1):
-            if image.name == "linked image":
+        for image in images_in(m["raw"] or {})[:per_message]:
+            if image.id is None:
                 continue  # embeds are other sites' pictures, rarely the subject
-            attachment = (m["raw"].get("attachments") or [{}])[n - 1]
             found.append(
                 Candidate(
                     label="",
                     reference=Reference(
-                        subject="",
-                        message_id=str(m["id"]),
-                        attachment_id=str(attachment.get("id") or "") or None,
+                        subject="", message_id=str(m["id"]), attachment_id=image.id
                     ),
                     url=image.url,
                     media_type=image.media_type,
@@ -254,6 +280,7 @@ class Gatherer:
                     "mention": f"%<@{subject.user_id}>%",
                     "pattern": word(subject.name),
                     "first_person": FIRST_PERSON,
+                    "selfie": SELFIE,
                     "limit": CANDIDATE_MESSAGES,
                 },
             )
@@ -323,7 +350,7 @@ class Gatherer:
             prompt += [label, BinaryContent(image.data, media_type=image.media_type)]
         try:
             async with asyncio.timeout(VERIFY_TIMEOUT_SECONDS):
-                answer = await look(self.vision, prompt, max_tokens=VERIFY_MAX_TOKENS)
+                answer = await look(self.vision, prompt, max_tokens=VERIFY_MAX_TOKENS, think=False)
         except (TimeoutError, ImageRefused) as error:
             logger.warning(
                 "reference check failed subject_kind=%s error_type=%s",
@@ -336,8 +363,8 @@ class Gatherer:
 
 
 def verdicts(answer: str) -> set[int]:
-    """The image numbers the vision check approved ("Image 3: yes - …")."""
-    return {int(m[1]) for m in re.finditer(r"(?im)^\W*image\s+(\d+)\W+yes\b", answer)}
+    """The image numbers the vision check approved ("Image 3: a selfie => yes")."""
+    return {int(m[1]) for m in re.finditer(r"(?im)^\W*image\s+(\d+)\b[^\n]*?=>\W*yes\b", answer)}
 
 
 def binary(data: bytes) -> BinaryImage | None:
@@ -348,8 +375,9 @@ def binary(data: bytes) -> BinaryImage | None:
 
 
 def compose(drawing: Drawing, found: list[Found]) -> tuple[str, list[Reference], list[BinaryImage]]:
-    """The final prompt: Kiki's, then the style, then who's who with the
-    references numbered in the order the image model gets them."""
+    """The final prompt: Kiki's, then the style, then who's who, each reference
+    labeled by its number (in the order the image model gets them) and its role,
+    with what must stay the same, as OpenAI's image prompting guide advises."""
     references: list[Reference] = []
     images: list[BinaryImage] = []
     lines = []
@@ -359,28 +387,29 @@ def compose(drawing: Drawing, found: list[Found]) -> tuple[str, list[Reference],
             references.append(reference)
             images.append(image)
         last = len(images)
-        line = f"- {f.subject.name}"
+        name = f.subject.name
+        line = f"- {name}"
         details = []
         if f.subject.description.strip():
             details.append(f.subject.description.strip().rstrip(".") + ".")
         if last >= first:
             span = f"image {first}" if first == last else f"images {first}-{last}"
             line += f", shown in reference {span}"
-            details.append(
-                "Keep their real look: face, hair and build, or an animal's breed, coat "
-                "and markings."
-            )
+            keep = PERSON_LOOK if f.subject.user_id or f.subject.kiki else THING_LOOK
+            details.append(f"Keep {name}'s {keep} the same; don't change {name}'s identity.")
         if details:
             line += ": " + " ".join(details)
         lines.append(line)
-    parts = [drawing.prompt.strip(), f"Style: {(drawing.style or '').strip() or PHOTO_STYLE}"]
+    parts = [drawing.prompt.strip()]
+    style = (drawing.style or "").strip() or (None if drawing.edit else PHOTO_STYLE)
+    if style:  # an edit keeps the photo's own look unless they asked for a style
+        parts.append(f"Style: {style}")
     if lines:
         subjects = "Who and what is in it:\n" + "\n".join(lines)
-        if images:
-            subjects += (
-                "\nThe reference images only show what they look like: compose the new "
-                "scene described above, not a copy of the references."
-            )
+        if images and drawing.edit:
+            subjects += f"\n{EDIT}"
+        elif images:
+            subjects += f"\n{REFERENCES_ONLY}"
         parts.append(subjects)
     return "\n\n".join(parts), references, images
 

@@ -29,17 +29,23 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   Images come from the stored message and are downloaded only from Discord's CDN and
   media proxy (`DISCORD_MEDIA_EXTRA_HOSTS` adds hosts, for the simulator). Search and
   context hits with images carry `images: n`.
-- `generate_image(prompt, aspect_ratio?)`: offered only when the request has
-  `image_model`. Runs a Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel`
-  (OpenRouter's Images API, `POST /api/v1/images`, same key), saves the PNG/JPEG/WebP/GIF
-  (≤ 8 MiB) in `agent_host_images` and lists it in the result's
-  `images`; Rust attaches it to the first Discord message. At most 2 per run, 60 s per
-  call, no client retries; refusals and provider errors go back to the model as tool
-  errors ([design](../../docs/image-generation.md)).
-- Shared image code is `vision.py` (Discord-only downloads, types from the bytes for
-  downloads and drawings alike, the vision call, `ImageRefused`, billed cost); reading
-  is `reading.py`, drawing `images.py`. `read_image` reads Kiki's own drawings
-  (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
+- `generate_image(prompt, subjects?, style?, aspect_ratio?, caption?, edit?)`: offered
+  only when the request has `image_model`. It only queues the picture: the result's
+  `drawings` (at most 2) go back to Rust, which posts Kiki's reply first and then
+  runs each as an image job (below). Bad subject refs or photo IDs are tool errors
+  the model can fix ([design](../../docs/image-generation.md)).
+- Image jobs (`drawing.py`): reference photos per subject from the guild's history
+  and avatars, checked by the vision model, a final prompt numbering them, and a
+  Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel` (OpenRouter's
+  Images API, `POST /api/v1/images` with `input_references`, same key). The image
+  (PNG/JPEG/WebP/GIF ≤ 8 MiB) is saved in `agent_host_images` with its prompt,
+  references, model, cost and latency. 75 s for the image call, no client retries;
+  a refusal or provider error gets a note in Kiki's voice instead.
+- Shared image code is `vision.py` (Discord-only downloads, refreshing expired
+  attachment links with `DISCORD_BOT_TOKEN`, types from the bytes for downloads and
+  drawings alike, the vision call, `ImageRefused`, billed cost); reading is
+  `reading.py`, drawing `drawing.py` and `images.py`. `read_image` reads Kiki's own
+  drawings (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
 - `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
@@ -118,8 +124,8 @@ the job request from Rust's `OPENROUTER_CHAT_MODEL` and `OPENROUTER_TOPIC_MODEL`
 }
 ```
 
-`image_model` is optional (omitted: no `generate_image` tool); `images` defaults to
-empty, and each `id` is a row of `agent_host_images` for this job. `kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
+`image_model` is optional (omitted: no `generate_image` tool); `drawings` and
+`images` default to empty. `kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
 `topic:<conversation_id>:<newest_message_id>`. Discord and conversation IDs are
 strings on the wire. A completed response is:
 
@@ -132,11 +138,33 @@ strings on the wire. A completed response is:
     "model": "provider/model",
     "steps": 1,
     "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001},
-    "images": [{"id": 7, "mime_type": "image/png"}]
+    "drawings": [{"prompt": "…", "subjects": [{"name": "Nougie", "photos": []}],
+                  "style": null, "aspect_ratio": "4:3", "caption": "…", "edit": false}]
   },
   "error": null
 }
 ```
+
+`POST /v1/images` draws one queued picture, with the same durable job contract and
+an ID `image:<run_id>:<n>`:
+
+```json
+{
+  "id": "image:42:1",
+  "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "3"},
+  "image_model": "openai/gpt-image-2.5-flare",
+  "reply_job": "reply:42",
+  "chat_model": "provider/model",
+  "ack": "Kiki's reply when she queued it",
+  "drawing": {"prompt": "…", "subjects": […], "caption": "…"}
+}
+```
+
+Its result is `{image: {id, mime_type} | null, caption, prompt, references, model,
+cost, latency_ms, error, failure_note}`: `error` is `refused` or `failed` when there's
+no image, and `failure_note` is Kiki's message about it, written by `chat_model` from
+the `reply_job`'s saved prompt (empty if that failed too). Results saved before
+drawings were queued may still list drawn `images`, which Rust attaches to the reply.
 
 The host persists input and results in `agent_host_jobs`, created by Rust's
 migrations. Matching retries return the saved result. A session advisory lock
@@ -155,8 +183,9 @@ omit a reply if a crash happens before the send; it avoids blind duplicate posts
 Legacy runs already in progress when the migration runs are also failed.
 
 If the Python process dies before saving a result, inference may repeat on retry.
-Search tools only read. `generate_image` costs money and saves a row, so a replay can
-bill again and leave an unreferenced image row; Rust only attaches the IDs in the saved result.
+Search tools only read, and `generate_image` only queues. An image job costs money and
+saves a row, so a replay of a job that died before saving can bill again and leave an
+unreferenced image row; Rust only posts the image in the saved result.
 Memory writes tolerate replay: they record the job ID, and saving text that is already
 live confirms it, which is a no-op for the same job.
 Job tables contain private prompts and replies and currently have no automatic

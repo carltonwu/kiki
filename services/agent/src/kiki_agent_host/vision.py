@@ -157,15 +157,22 @@ async def look(
     *,
     max_tokens: int,
     instructions: str | None = None,
+    think: bool = True,
 ) -> str:
-    """One vision model request; its billed cost is added to `vision.cost`."""
+    """One vision model request; its billed cost is added to `vision.cost`.
+    `think=False` turns off a reasoning model's thinking, for quick yes/no checks:
+    over several photos it can take longer than the answer is worth."""
     vision.calls += 1
+    settings: dict = {"max_tokens": max_tokens, "openrouter_usage": {"include": True}}
+    if not think:
+        settings["openrouter_reasoning"] = {"enabled": False}
+        settings["temperature"] = 0  # the same photos get the same verdicts
     try:
         run = await viewer.run(
             prompt,
             model=vision.model,
             instructions=instructions,
-            model_settings={"max_tokens": max_tokens, "openrouter_usage": {"include": True}},
+            model_settings=settings,
             usage_limits=UsageLimits(request_limit=1),
         )
     except ModelHTTPError as error:
