@@ -1,0 +1,14 @@
+<div class="legend">
+  {% for key, label in series %}<span><span class="swatch s{{ loop.index }}"></span>{{ label }}</span>{% endfor %}
+</div>
+{{ chart | safe }}
+<details>
+  <summary>Table</summary>
+  <table>
+    <tr><th>Day (UTC)</th>{% for key, label in series %}<th class="num">{{ label }}</th>{% endfor %}<th class="num">Total</th></tr>
+    {% for d in days | reverse %}
+    <tr><td>{{ d.day }}</td>{% for key, label in series %}<td class="num">{{ usd(d[key]) }}</td>{% endfor %}
+        <td class="num">{{ usd(d.chat + d.decide + d.console) }}</td></tr>
+    {% endfor %}
+  </table>
+</details>

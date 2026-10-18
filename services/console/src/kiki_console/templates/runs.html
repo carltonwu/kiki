@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<form method="get" class="row card">
+  <select name="status">
+    <option value="">All statuses</option>
+    {% for s in statuses %}<option value="{{ s }}" {{ 'selected' if s == status }}>{{ s }}</option>{% endfor %}
+  </select>
+  <button>Filter</button>
+</form>
+<div class="card">
+  <table>
+    <tr><th>Run</th><th>Channel</th><th>Status</th><th>When</th><th>Model</th><th class="num">Tokens in/out</th>
+        <th class="num">Time</th><th class="num">Cost</th></tr>
+    {% for r in runs %}
+    <tr><td><a href="/g/{{ guild_id }}/runs/{{ r.id }}">{{ r.id }}</a></td><td>#{{ r.channel }}</td>
+        <td class="status-{{ r.status }}">{{ r.status }}</td><td>{{ r.created_at | when }}</td>
+        <td class="small">{{ r.model or "–" }}</td>
+        <td class="num">{{ r.prompt_tokens or "–" }} / {{ r.completion_tokens or "–" }}</td>
+        <td class="num">{{ r.latency_ms | ms }}</td><td class="num">{{ usd(r.cost_usd) }}</td></tr>
+    {% if r.error %}<tr><td></td><td colspan="7" class="small status-failed">{{ r.error[:300] }}</td></tr>{% endif %}
+    {% else %}<tr><td colspan="8" class="muted">No runs.</td></tr>{% endfor %}
+  </table>
+  {% if next_before %}<p><a href="?status={{ status }}&before={{ next_before }}">Older →</a></p>{% endif %}
+</div>
+{% endblock %}

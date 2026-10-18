@@ -6,6 +6,7 @@ Discord chat bot. Monorepo layout:
 |---|---|
 | `services/ingester/` | Rust service: Discord Gateway, message ingestion, conversation routing |
 | `services/agent/` | Python agent host: Pydantic AI, server history search, durable results |
+| `services/console/` | Python web console: per-server dashboards, costs, settings, prompts, facts, chat |
 | `tools/backfill/` | Python one-off: backfill a guild's history into SQLite |
 | `tools/sim/` | Local Discord and OpenRouter simulator for end-to-end checks |
 | `.railway/railway.ts` | Railway infrastructure as code (Postgres + services) |
@@ -147,13 +148,25 @@ New pools capture routing settings; new reply jobs capture context, model and to
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
 
+## Web console
+
+`services/console/` is a web page outside Discord ([design and build-vs-reuse
+decision](docs/console-hld.md), [setup](services/console/README.md)). People log in with Discord;
+each server's admins (Manage Server) see its dashboard (activity, latency, failures, LLM cost by
+kind and by person, every run with its prompt and output), edit its settings, facts, lingo and
+two prompt parts (persona and conversational guidance), and chat with Kiki as configured for that
+server. Operators (`CONSOLE_OPERATOR_IDS`) also get a view across servers and the change log.
+Settings and chat go through the ingester's private admin API (`/admin/v1` on its port, enabled by
+`ADMIN_API_TOKEN`), so they use the same validation and prompt as Discord. The console service is
+not in the Railway IaC yet; the doc lists the deploy steps.
+
 Server phrases and custom emoji come from the manually curated `guild_lingo`
 table (migration 0014 seeds one server). Reply prompts include only that server's
 entries. `/kiki config key:lingo_nudge value:35` sets how often a reply gets an
 extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
 removes the extra suggestion; the phrase list remains in the prompt, so natural
 use is still possible. Selection is stable for the triggering message and retries.
-There is no automatic phrase learning or Discord command to edit the phrase list.
+There is no automatic phrase learning; edit the list in the console.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

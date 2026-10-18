@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+{% set w = windows[1] %}
+<div class="kpis card">
+  <div class="kpi"><div class="value">{{ usd(windows[0].total_cost) }}</div><div class="label">LLM cost, 24 h</div></div>
+  <div class="kpi"><div class="value">{{ usd(w.total_cost) }}</div><div class="label">LLM cost, 7 d</div></div>
+  <div class="kpi"><div class="value">{{ w.replies }}</div><div class="label">Replies, 7 d</div></div>
+  <div class="kpi"><div class="value">{{ w.failed }}</div><div class="label">Failed runs, 7 d</div></div>
+  <div class="kpi"><div class="value">{{ w.p50_ms | ms }}</div><div class="label">Reply p50, 7 d</div></div>
+  <div class="kpi"><div class="value">{{ w.p95_ms | ms }}</div><div class="label">Reply p95, 7 d</div></div>
+</div>
+<div class="card"><h2>Daily cost, last 30 days</h2>{% include "_cost_chart.html" %}</div>
+<div class="card">
+  <h2>Activity and cost</h2>
+  <table>
+    <tr><th></th>{% for x in windows %}<th class="num">{{ x.label }}</th>{% endfor %}</tr>
+    <tr><td>Conversations</td>{% for x in windows %}<td class="num">{{ x.conversations }}</td>{% endfor %}</tr>
+    <tr><td>Replies</td>{% for x in windows %}<td class="num">{{ x.replies }}</td>{% endfor %}</tr>
+    <tr><td>Failed runs</td>{% for x in windows %}<td class="num">{{ x.failed }}</td>{% endfor %}</tr>
+    <tr><td>Reply p50</td>{% for x in windows %}<td class="num">{{ x.p50_ms | ms }}</td>{% endfor %}</tr>
+    <tr><td>Reply p95</td>{% for x in windows %}<td class="num">{{ x.p95_ms | ms }}</td>{% endfor %}</tr>
+    <tr><td>Chat cost</td>{% for x in windows %}<td class="num">{{ usd(x.chat_cost) }}</td>{% endfor %}</tr>
+    <tr><td>Decide cost</td>{% for x in windows %}<td class="num">{{ usd(x.decide_cost) }}</td>{% endfor %}</tr>
+    <tr><td>Console chat cost</td>{% for x in windows %}<td class="num">{{ usd(x.console_cost) }}</td>{% endfor %}</tr>
+    <tr><td>Topic summaries</td>{% for x in windows %}<td class="num">{{ usd(x.topic_cost) if x.topic_cost is defined else "–" }}</td>{% endfor %}</tr>
+    <tr><th>Total</th>{% for x in windows %}<th class="num">{{ usd(x.total_cost) }}</th>{% endfor %}</tr>
+  </table>
+  <p class="muted small">Topic summaries have no timestamp, so their cost counts toward All only.</p>
+</div>
+<div class="card">
+  <h2>Routing, 7 days</h2>
+  <table>
+    <tr><th>First check matched</th><th class="num">Messages</th><th class="num">Routed to Kiki</th></tr>
+    {% for r in routing %}<tr><td>{{ r.check_hit }}</td><td class="num">{{ r.messages }}</td><td class="num">{{ r.routed }}</td></tr>
+    {% else %}<tr><td colspan="3" class="muted">No classified messages.</td></tr>{% endfor %}
+  </table>
+</div>
+<div class="card">
+  <h2>Active conversations</h2>
+  <table>
+    <tr><th>Channel</th><th>Topic</th><th class="num">Messages</th><th>Last active</th><th class="num">Cost</th></tr>
+    {% for c in conversations %}
+    <tr><td>#{{ c.channel }}</td><td>{{ c.topic or "–" }}</td><td class="num">{{ c.message_count }}</td>
+        <td>{{ c.last_active_at | when }}</td><td class="num">{{ usd(c.cost) }}</td></tr>
+    {% else %}<tr><td colspan="5" class="muted">None open.</td></tr>{% endfor %}
+  </table>
+</div>
+<div class="card">
+  <h2>Top people by reply cost, 7 days</h2>
+  <table>
+    <tr><th>Person</th><th class="num">Runs</th><th class="num">Cost</th></tr>
+    {% for p in people %}<tr><td>{{ p.name }}</td><td class="num">{{ p.runs }}</td><td class="num">{{ usd(p.cost) }}</td></tr>
+    {% else %}<tr><td colspan="3" class="muted">No replies.</td></tr>{% endfor %}
+  </table>
+  <p class="muted small">Each reply's cost is split evenly across the messages that triggered it; Decide is excluded.</p>
+</div>
+{% endblock %}

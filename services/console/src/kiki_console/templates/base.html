@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}Kiki console{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <a class="brand" href="/">Kiki console</a>
+  {% if session %}
+    {% for id, name in guilds.items() %}<a href="/g/{{ id }}">{{ name }}</a>{% endfor %}
+    {% if session.operator %}<a href="/audit">Change log</a>{% endif %}
+    <form method="post" action="/logout" class="row">
+      <span class="muted small shrink">{{ session.user_name }}{% if session.operator %} · operator{% endif %}</span>
+      <input type="hidden" name="csrf" value="{{ session.csrf }}">
+      <button>Log out</button>
+    </form>
+  {% endif %}
+</header>
+<main>
+{% if guild_id %}
+  <h1>{{ guild_name }}</h1>
+  {% set here = request.url.path %}
+  <nav class="tabs">
+    {% for path, label in [("", "Dashboard"), ("/runs", "Runs"), ("/settings", "Settings"), ("/prompts", "Prompts"), ("/facts", "Facts & lingo"), ("/chat", "Chat"), ("/audit", "Change log")] %}
+      {% set href = "/g/" ~ guild_id ~ path %}
+      <a href="{{ href }}" class="{{ 'active' if here == href or (path and here.startswith(href ~ '/')) }}">{{ label }}</a>
+    {% endfor %}
+  </nav>
+{% endif %}
+{% if notice %}<div class="notice">{{ notice }}</div>{% endif %}
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>
