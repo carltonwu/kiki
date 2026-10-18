@@ -455,23 +455,29 @@ class Fakecord:
                         }
                         for model in STUB_MODELS
                     ]
-                    + [
+                }
+            )
+        if request.method == "GET" and path == "v1/images/models":
+            return web.json_response(
+                {
+                    "data": [
                         {
                             "id": model,
                             "name": model,
-                            "architecture": {"output_modalities": ["image", "text"]},
-                            "supported_parameters": [],
-                            "pricing": {"prompt": "0", "completion": "0"},
+                            "architecture": {
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["image"],
+                            },
                         }
                         for model in STUB_IMAGE_MODELS
                     ]
                 }
             )
+        if request.method == "POST" and path == "v1/images":
+            return self.image(body)
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
-            if "image" in (body.get("modalities") or []):
-                return web.json_response(self.image(body))
             return web.json_response(self.chat(body))
         if request.method == "POST" and path == "v1/embeddings":
             return web.json_response(embeddings(body))
@@ -606,39 +612,19 @@ class Fakecord:
             },
         }
 
-    def image(self, body: dict) -> dict:
-        """An image model: draws STUB_PNG, or refuses prompts containing "refuse"."""
+    def image(self, body: dict) -> web.Response:
+        """OpenRouter's Images API: draws STUB_PNG, or rejects prompts containing
+        "refuse" with a 400 as a moderation block would."""
         w = self.world
-        n = next(w.ids)
-        prompt = content_text(body["messages"][-1]["content"])
-        message = {"role": "assistant", "content": "stub image"}
-        if not re.search(r"\brefuse\b", prompt, re.IGNORECASE):
-            url = "data:image/png;base64," + base64.b64encode(STUB_PNG).decode()
-            message["images"] = [{"type": "image_url", "image_url": {"url": url}}]
-        w.llm.append(
-            {"kind": "image", "request": body, "prompt": prompt, "drew": "images" in message}
-        )
-        return {
-            "id": f"gen-sim-{n}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": body.get("model", "sim/image"),
-            "provider": "Sim",
-            "choices": [
-                {
-                    "index": 0,
-                    "finish_reason": "stop",
-                    "logprobs": None,
-                    "message": {"refusal": None, **message},
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 1290,
-                "total_tokens": 1300,
-                "cost": 0.04,
-            },
-        }
+        prompt = body["prompt"]
+        drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE)
+        w.llm.append({"kind": "image", "request": body, "prompt": prompt, "drew": drew})
+        if not drew:
+            error = {"code": 400, "message": "Request blocked by the provider's safety system"}
+            return web.json_response({"error": error}, status=400)
+        image = {"b64_json": base64.b64encode(STUB_PNG).decode(), "media_type": "image/png"}
+        usage = {"prompt_tokens": 10, "completion_tokens": 1056, "total_tokens": 1066, "cost": 0.04}
+        return web.json_response({"created": int(time.time()), "data": [image], "usage": usage})
 
     # --- control API -------------------------------------------------------
 

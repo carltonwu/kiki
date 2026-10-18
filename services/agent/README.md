@@ -23,9 +23,10 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
-- `generate_image(prompt)`: offered only when the request has `image_model`. Calls
-  OpenRouter chat completions with `modalities: ["image", "text"]`, saves the first
-  PNG/JPEG/WebP/GIF (≤ 8 MiB) in `agent_host_images` and lists it in the result's
+- `generate_image(prompt, aspect_ratio?)`: offered only when the request has
+  `image_model`. Runs a Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel`
+  (OpenRouter's Images API, `POST /api/v1/images`, same key), saves the PNG/JPEG/WebP/GIF
+  (≤ 8 MiB) in `agent_host_images` and lists it in the result's
   `images`; Rust attaches it to the first Discord message. At most 2 per run, 60 s per
   call, no client retries; refusals and provider errors go back to the model as tool
   errors ([design](../../docs/image-generation.md)).
@@ -83,7 +84,7 @@ the job request from Rust's `OPENROUTER_CHAT_MODEL` and `OPENROUTER_TOPIC_MODEL`
   "messages": [{"role": "user", "content": "[u1 Alex] hello"}],
   "max_output_tokens": 2000,
   "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}],
-  "image_model": "google/gemini-2.5-flash-image"
+  "image_model": "openai/gpt-image-2.5-flare"
 }
 ```
 

@@ -8,11 +8,13 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Literal
 
-from openai import APIError, APIStatusError, AsyncOpenAI
+from openai import APIError, APIStatusError
 from psycopg import AsyncConnection, OperationalError
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -53,8 +55,7 @@ class Deps:
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
-    image_model: str | None = None
-    image_client: AsyncOpenAI | None = None
+    image_model: ImageGenerationModel | None = None
     images: list[Image] = field(default_factory=list)
     image_cost: float = 0.0
     image_calls: int = 0
@@ -166,7 +167,11 @@ async def get_message_context(
     return await guarded(ctx, "get_message_context", work)
 
 
-async def generate_image(ctx: RunContext[Deps], prompt: str) -> dict:
+async def generate_image(
+    ctx: RunContext[Deps],
+    prompt: str,
+    aspect_ratio: Literal["1:1", "3:2", "2:3"] | None = None,
+) -> dict:
     """Draw an image and attach it to your reply.
 
     Use it when someone asks for a picture, drawing, meme or edit-free visual, or
@@ -179,6 +184,7 @@ async def generate_image(ctx: RunContext[Deps], prompt: str) -> dict:
             style, composition and any text it should contain. The image model
             can't see this conversation or people's faces, so describe what
             matters instead of referring to it.
+        aspect_ratio: 3:2 for wide scenes, 2:3 for tall ones; square by default.
     """
 
     async def work():
@@ -189,9 +195,7 @@ async def generate_image(ctx: RunContext[Deps], prompt: str) -> dict:
             return {"error": f"At most {MAX_IMAGES} images per reply. Answer with what you have."}
         deps.image_calls += 1
         try:
-            data, mime_type, cost = await images.generate(
-                deps.image_client, deps.image_model, prompt
-            )
+            data, mime_type, cost = await images.generate(deps.image_model, prompt, aspect_ratio)
         except APIStatusError as e:
             # Content-policy refusals are 4xx; tell the model rather than failing the reply.
             logger.warning(
@@ -226,7 +230,7 @@ async def only_with_image_model(
     ctx: RunContext[Deps], tool_def: ToolDefinition
 ) -> ToolDefinition | None:
     """Offers `generate_image` only when the server has image generation on."""
-    return tool_def if ctx.deps.image_model and ctx.deps.image_client else None
+    return tool_def if ctx.deps.image_model else None
 
 
 async def index_guild(deps: Deps) -> retrieval.Semantic:
@@ -304,6 +308,9 @@ class PydanticExecutor:
     def model(self, name: str) -> Model:
         return OpenRouterModel(name, provider=self.provider)
 
+    def image_model(self, name: str) -> ImageGenerationModel:
+        return images.OpenRouterImageModel(name, self.images)
+
     async def execute(self, request: JobRequest) -> JobResult:
         started = time.monotonic()
         if request.messages[-1].role != "user":
@@ -338,8 +345,9 @@ class PydanticExecutor:
                         embed,
                         retrieval.Roster.of(request.people),
                         job_id=request.id,
-                        image_model=request.image_model,
-                        image_client=self.images,
+                        image_model=self.image_model(request.image_model)
+                        if request.image_model
+                        else None,
                     )
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.

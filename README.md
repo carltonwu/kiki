@@ -138,7 +138,7 @@ Server settings persist in Postgres and apply without a restart. Examples:
 - `/kiki config key:history_messages value:50`
 - `/kiki config key:reply_max_tokens value:3000`
 - `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
-- `/kiki config key:image_model value:google/gemini-2.5-flash-image` (must output images)
+- `/kiki config key:image_model value:openai/gpt-image-2.5-flare` (from OpenRouter's image catalog)
 - `/kiki config key:image_generation value:false` (stop Kiki drawing images)
 - `/kiki config key:pool_debounce reset:true`
 

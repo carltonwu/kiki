@@ -27,7 +27,7 @@ triggers; `value:,` can be used to supply an empty list in Discord.
 - Manage Server is checked at runtime for every write, before catalog requests or database work.
   Chat models retain the existing OpenRouter catalog check for text and tool support. Topic and
   Decide models remain global; the topic default derives from the env chat model, not its guild
-  override. `image_model` gets the same catalog check, requiring image output; its default is
+  override. `image_model` is checked against OpenRouter's image catalog instead; its default is
   env `OPENROUTER_IMAGE_MODEL` ([image generation](image-generation.md)).
 
 `follow_up_window` (default 300 seconds, range 0–3600) controls two ways to

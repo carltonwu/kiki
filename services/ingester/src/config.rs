@@ -173,7 +173,7 @@ impl AgentConfig {
                 .unwrap_or_else(|_| chat_model.clone()),
             chat_model,
             image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
-                .unwrap_or_else(|_| "google/gemini-2.5-flash-image".into()),
+                .unwrap_or_else(|_| "openai/gpt-image-2.5-flare".into()),
             history_messages,
             run_max_age: Duration::from_secs(env_or("AGENT_RUN_MAX_AGE_SECS", 120)?),
             topic_every_messages: env_or("TOPIC_EVERY_MESSAGES", 4)?,

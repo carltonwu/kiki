@@ -1025,8 +1025,14 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
 }
 
 async fn check_catalog_model(key: &str, model: &str) -> anyhow::Result<()> {
+    // Image models are served by OpenRouter's Images API, which has its own catalog.
+    let path = if key == "image_model" {
+        "v1/images/models"
+    } else {
+        "v1/models"
+    };
     let catalog: Value = reqwest::Client::new()
-                    .get(format!("{}/v1/models", crate::config::openrouter_base()))
+                    .get(format!("{}/{path}", crate::config::openrouter_base()))
                     .timeout(Duration::from_secs(10))
                     .send().await
                     .and_then(reqwest::Response::error_for_status)
@@ -1113,25 +1119,25 @@ fn validate_catalog_model(catalog: &Value, key: &str, model: &str) -> Result<(),
     })?;
     let entry = models
         .iter()
-        .find(|entry| entry["id"].as_str() == Some(model))
-        .ok_or_else(|| {
-            UserError(
-                "That model ID isn't in OpenRouter's catalog. Check the ID and try again.".into(),
-            )
-        })?;
+        .find(|entry| entry["id"].as_str() == Some(model));
     let outputs = |modality: &str| {
-        entry["architecture"]["output_modalities"]
-            .as_array()
-            .is_some_and(|values| values.iter().any(|v| v == modality))
+        entry.is_some_and(|entry| {
+            entry["architecture"]["output_modalities"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == modality))
+        })
     };
     if key == "image_model" {
         if !outputs("image") {
             return Err(UserError(
-                "Choose a model that outputs images, such as google/gemini-2.5-flash-image.".into(),
+                "Choose a model from OpenRouter's image catalog that outputs images, such as openai/gpt-image-2.5-flare.".into(),
             ));
         }
         return Ok(());
     }
+    let entry = entry.ok_or_else(|| {
+        UserError("That model ID isn't in OpenRouter's catalog. Check the ID and try again.".into())
+    })?;
     let tools = entry["supported_parameters"]
         .as_array()
         .is_some_and(|values| values.iter().any(|v| v == "tools"));
