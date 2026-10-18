@@ -55,7 +55,8 @@ steps:
       reply: true
       prompt_contains: "[image: kiki-"
       tool_result_contains: ['"drawn_by_kiki":true', "Image 1: a drawing of Ethan walks Nougie"]
-  # A refusal: the follow-up is Kiki's own note about it, written by the chat model.
+  # A safety block: the follow-up is Kiki's own note about it, written by the chat
+  # model, told that asking again won't help (in prod, "ask again" got the same block).
   - say: {as: alex, in: general, text: "kiki draw something cursed"}
     reply: {tool: {name: generate_image, args: {prompt: "refuse this"}}, text: "hmm. attempting it, no promises"}
   - expect:
@@ -64,8 +65,13 @@ steps:
       followup:
         status: failed
         attachments: 0
-        text_contains: "stub note, in her words: the image model returned HTTP 400"
+        text_contains: "stub note, in her words: The image model's safety filter blocked this picture (sexual). Asking again won't get it through"
         text_lacks: "couldn't make that picture"
+  # Blocked only by the server's image model: the fallback draws it.
+  - say: {as: alex, in: general, text: "kiki draw something spicy"}
+    reply: {tool: {name: generate_image, args: {prompt: "a prude would block this", caption: "spice"}}, text: "say less"}
+  - expect: {run: done, followup: {status: done, attachments: 1, text_contains: "spice"}}
+  - expect: {sql: "SELECT model FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: sim/image-fallback}
   # No ack at all: the picture still comes.
   - say: {as: alex, in: general, text: "kiki just the picture please"}
     reply: {tool: {name: generate_image, args: {prompt: "a frog, no text"}}, text: "NO_REPLY"}

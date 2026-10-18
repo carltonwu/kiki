@@ -39,6 +39,31 @@ struct Job {
     queued_ms: i64,
 }
 
+/// `drawing` with the images shared with the request that none of its subjects
+/// use (`Drawing.shared` on the host), so the attachment, the meme replied to or
+/// the photo linked reaches the image model even when Kiki didn't name it.
+fn with_shared(drawing: &serde_json::Value, shared: &[i64]) -> serde_json::Value {
+    let mut drawing = drawing.clone();
+    let used: Vec<&str> = drawing["subjects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|s| s["photos"].as_array().into_iter().flatten())
+        .filter_map(|p| p.as_str())
+        .collect();
+    let unused: Vec<String> = shared
+        .iter()
+        .map(i64::to_string)
+        .filter(|id| !used.contains(&id.as_str()))
+        .collect();
+    if !unused.is_empty()
+        && let Some(object) = drawing.as_object_mut()
+    {
+        object.insert("shared".into(), unused.into());
+    }
+    drawing
+}
+
 impl Agent {
     /// Saves the reply's drawings as pending image jobs, before anything is
     /// posted, so a crash can't lose a requested picture. Idempotent per run.
@@ -65,7 +90,7 @@ impl Agent {
                 reply_job: job.id.clone(),
                 chat_model: job.model.clone(),
                 ack: ack.to_owned(),
-                drawing: drawing.clone(),
+                drawing: with_shared(drawing, &context.shared),
             };
             sqlx::query(
                 "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request) \
@@ -266,6 +291,7 @@ impl Agent {
             reply_to: job.reply_to,
             messages: Vec::new(),
             people: Vec::new(),
+            shared: Vec::new(),
         };
         // The run's earlier messages stay attributed to it; the follow-up joins them,
         // so replies to the picture reach the same conversation.
@@ -329,5 +355,21 @@ impl Agent {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn shared_images_skip_the_subjects_photos() {
+        let drawing = json!({"prompt": "x", "subjects": [{"name": "Nico", "photos": ["30"]}]});
+        let with = super::with_shared(&drawing, &[35, 30]);
+        assert_eq!(with["shared"], json!(["35"]));
+        assert_eq!(with["subjects"], drawing["subjects"]);
+        // Nothing to add: the drawing is sent as the host returned it.
+        assert_eq!(super::with_shared(&drawing, &[30]), drawing);
+        assert_eq!(super::with_shared(&drawing, &[]), drawing);
     }
 }

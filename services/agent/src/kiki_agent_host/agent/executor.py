@@ -29,6 +29,7 @@ from ..contracts import (
     ImageJobResult,
     JobRequest,
     JobResult,
+    Reference,
     Usage,
 )
 from ..executor import TransientError
@@ -37,7 +38,7 @@ from ..media.vision import ImageRefused, Vision, billed_cost, look
 from ..openrouter.chat import WebOpenRouterModel
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
-from ..openrouter.images import OpenRouterImageModel
+from ..openrouter.images import OpenRouterImageModel, aspect_ratio_for, reference_limit
 from ..prompt import history
 from .deps import Deps, MemorySession
 from .tools import reply_agent
@@ -62,9 +63,17 @@ class PydanticExecutor:
     transport: httpx.AsyncBaseTransport | None = None
 
     def __init__(
-        self, database_url: str, api_key: str, vision_model: str = "", discord_token: str = ""
+        self,
+        database_url: str,
+        api_key: str,
+        vision_model: str = "",
+        discord_token: str = "",
+        *,
+        image_fallback_model: str = "",
     ):
         self.database_url = database_url
+        # Draws what the server's image model's safety filter blocks; "" for none.
+        self.image_fallback_model = image_fallback_model
         # Without one, images go to the chat model, which may not read them.
         self.vision_model = vision_model
         # Without it, images in messages older than a day can't be downloaded.
@@ -189,6 +198,43 @@ class PydanticExecutor:
             self.model(name), name, not self.vision_model, discord_token=self.discord_token
         )
 
+    async def generate(
+        self,
+        request: ImageJobRequest,
+        found: list[drawing.Found],
+        shared: list,
+    ) -> tuple[bytes, str, float, str, str, list[Reference]]:
+        """The picture from the server's image model or, when its safety filter
+        blocks it, from the fallback (another provider's filter may let a campy,
+        harmless picture through). Each gets the references it takes, renumbered.
+        Returns the image, its type and cost, the model, the prompt and references."""
+        plan = request.drawing
+        models = [request.image_model]
+        if self.image_fallback_model not in ("", request.image_model):
+            models.append(self.image_fallback_model)
+        for model, fallback in zip(models, [*models[1:], None], strict=True):
+            prompt, references, pictures = drawing.compose(
+                plan, found, shared, max_references=reference_limit(model)
+            )
+            try:
+                async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
+                    data, mime_type, cost = await generation.generate(
+                        self.image_model(model),
+                        prompt,
+                        aspect_ratio_for(model, plan.aspect_ratio),
+                        pictures,
+                    )
+                return data, mime_type, cost, model, prompt, references
+            except generation.SafetyRefused:
+                if fallback is None:
+                    raise
+                logger.info(
+                    "drawing blocked, trying the fallback job_id=%s model=%s fallback=%s",
+                    request.id,
+                    model,
+                    fallback,
+                )
+
     async def draw(self, request: ImageJobRequest) -> ImageJobResult:
         """A drawing a reply queued: references, the final prompt, the image, and
         Kiki's note if it fails (docs/image-generation.md)."""
@@ -205,27 +251,41 @@ class PydanticExecutor:
         image_cost = note_cost = 0.0
         note = prompt = ""
         references = []
+        drew_with = request.image_model
         try:
             async with await db.connect(self.database_url) as connection:
                 gather = drawing.Gatherer(connection, scope, vision, cdn_base(), self.transport)
-                found = await asyncio.gather(*(gather.find(s) for s in plan.subjects))
-                prompt, references, pictures = drawing.compose(plan, found)
+                found, shared = await asyncio.gather(
+                    asyncio.gather(*(gather.find(s) for s in plan.subjects)),
+                    gather.shared(plan.shared),
+                )
+                # Recorded with a failure too: what the server's model was asked for.
+                prompt, references, _ = drawing.compose(
+                    plan, found, shared, max_references=reference_limit(request.image_model)
+                )
                 try:
-                    async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
-                        data, mime_type, image_cost = await generation.generate(
-                            self.image_model(request.image_model),
-                            prompt,
-                            plan.aspect_ratio,
-                            pictures,
-                        )
+                    (
+                        data,
+                        mime_type,
+                        image_cost,
+                        drew_with,
+                        prompt,
+                        references,
+                    ) = await self.generate(request, found, shared)
                 except ImageRefused as e:
                     error, reason = "refused", str(e)
                 except ValueError as e:
                     error, reason = "failed", str(e)
                 except APIStatusError as e:
-                    # Content-policy blocks are 4xx: don't retry them.
+                    # Other 4xx are bad requests: retrying them won't help either.
                     kind = "refused" if 400 <= e.status_code < 500 else "failed"
                     error, reason = kind, f"the image model returned HTTP {e.status_code}"
+                    logger.warning(
+                        "drawing rejected job_id=%s status=%d code=%s",
+                        request.id,
+                        e.status_code,
+                        e.code,
+                    )
                 except (APIError, TimeoutError) as e:
                     error, reason = "failed", f"the image model failed ({type(e).__name__})"
                 latency_ms = int((time.monotonic() - started) * 1000)
@@ -237,7 +297,7 @@ class PydanticExecutor:
                             mime_type,
                             data,
                             prompt=prompt,
-                            model=request.image_model,
+                            model=drew_with,
                             subjects=[s.model_dump(mode="json") for s in plan.subjects],
                             references=[r.model_dump(mode="json") for r in references],
                             cost=image_cost,
@@ -261,7 +321,7 @@ class PydanticExecutor:
             "vision_calls=%d outcome=%s cost_usd=%s latency_ms=%d",
             request.id,
             request.scope.channel_id,
-            request.image_model,
+            drew_with,
             len(plan.subjects),
             len(references),
             vision.calls,
@@ -274,7 +334,7 @@ class PydanticExecutor:
             caption=plan.caption,
             prompt=prompt,
             references=references,
-            model=request.image_model,
+            model=drew_with,
             cost=cost,
             latency_ms=int((time.monotonic() - started) * 1000),
             error=error,

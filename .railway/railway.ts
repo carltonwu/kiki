@@ -35,6 +35,8 @@ export default defineRailway(() => {
       OPENROUTER_CHAT_API_KEY: preserve(),
       // read_image's model; unset falls back to the chat model.
       OPENROUTER_VISION_MODEL: "deepseek/deepseek-v4.1-flash-1017",
+      // Draws what the server's image model's safety filter blocks; "" turns it off.
+      OPENROUTER_IMAGE_FALLBACK_MODEL: "qwen/qwen-image-2.1-turbo",
       // Refreshes expired attachment links (read_image, drawing references); read-only use.
       DISCORD_BOT_TOKEN: "${{ingester.DISCORD_BOT_TOKEN}}",
     },

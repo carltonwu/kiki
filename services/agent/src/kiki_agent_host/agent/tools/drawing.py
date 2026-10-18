@@ -32,8 +32,9 @@ class Pictured(BaseModel):
     photos: list[str] = Field(
         default_factory=list,
         description="IDs of messages whose images show them, when you or the people asking "
-        "already picked some (like the message in [image: …; message 123]). Otherwise leave "
-        "it empty: the drawing step finds their photos in the server's history.",
+        "already picked some (like the message in [image: …; message 123]; a Discord message "
+        "or attachment link they pasted works too). Otherwise leave it empty: the drawing "
+        "step finds their photos in the server's history.",
     )
     description: str = Field(
         default="",
@@ -53,6 +54,14 @@ Ratio = Annotated[
 DRAW_RETRIES = 3
 # A roster line as the prompt shows people: optional ref, name, optional @username.
 LABEL = re.compile(r"^(?:u[0-9]+\s+)?(?P<name>.+?)(?:\s*\(@(?P<username>[\w.]+)\))?$")
+# Links people paste for a photo: a message, or an attachment on Discord's CDN.
+MESSAGE_LINK = re.compile(r"discord(?:app)?\.com/channels/[0-9]+/[0-9]+/(?P<message>[0-9]+)")
+ATTACHMENT_LINK = re.compile(
+    r"(?:cdn|media)\.discord(?:app)?\.(?:com|net)/attachments/(?P<channel>[0-9]+)/(?P<attachment>[0-9]+)/"
+)
+# An attachment's ID is a snowflake made as it's uploaded, just before its message's:
+# the message is within this many IDs after it (a minute of snowflake time).
+ATTACHMENT_TO_MESSAGE = 60_000 << 22
 
 
 async def generate_image(
@@ -70,6 +79,8 @@ async def generate_image(
     would clearly land better than words. Your reply goes out first and lets them
     know it's on the way; the picture follows in about half a minute, replying to
     their message, with your caption. If drawing fails, you get to tell them.
+    A picture the context lists as still being drawn is on its way: don't queue
+    it again unless someone asks for something different.
 
     Name every person, pet or thing whose real look matters in `subjects`: the
     drawing step finds photos of them in the server's history (and people's
@@ -124,9 +135,7 @@ async def generate_image(
                     if len(ids) == 1:
                         user_id = str(ids[0])
                         break
-            photos = [p.strip() for p in s.photos if p.strip()]
-            if any(not p.isdigit() for p in photos):
-                raise ValueError("photos must be message IDs")
+            photos = [await photo_message(deps, p.strip()) for p in s.photos if p.strip()]
             if photos and not await has_images(deps, photos):
                 raise ValueError(f"No message with images among {photos} in this server")
             pictured.append(
@@ -167,6 +176,34 @@ async def generate_image(
         }
 
     return await guarded(ctx, "generate_image", work, budget=None)
+
+
+async def photo_message(deps: Deps, photo: str) -> str:
+    """The message ID for a photo given as an ID, a message link, or the link of an
+    attachment (found among its channel's messages)."""
+    if photo.isdigit():
+        return photo
+    if link := MESSAGE_LINK.search(photo):
+        return link["message"]
+    if link := ATTACHMENT_LINK.search(photo):
+        attachment = int(link["attachment"])
+        cursor = await deps.connection.execute(
+            "SELECT id FROM messages WHERE guild_id = %s AND channel_id = %s"
+            " AND id BETWEEN %s AND %s AND deleted_at IS NULL"
+            " AND raw->'attachments' @> jsonb_build_array(jsonb_build_object('id', %s::text))"
+            " ORDER BY id LIMIT 1",
+            (
+                deps.scope.guild_id,
+                int(link["channel"]),
+                attachment,
+                attachment + ATTACHMENT_TO_MESSAGE,
+                str(attachment),
+            ),
+        )
+        if row := await cursor.fetchone():
+            return str(row[0])
+        raise ValueError(f"No message in this server has the attachment {photo}")
+    raise ValueError("photos must be message IDs or Discord message links")
 
 
 async def has_images(deps: Deps, message_ids: list[str]) -> bool:

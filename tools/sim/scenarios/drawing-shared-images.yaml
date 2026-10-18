@@ -1,0 +1,34 @@
+name: a picture asked for in a reply to an image is drawn from that image, even when Kiki doesn't name it
+steps:
+  # Seen in prod: "edit this meme" replying to the meme, and the meme never
+  # reached the image model ("couldn't find the original meme in my scroll").
+  - send:
+      id: meme
+      as: sam
+      in: general
+      text: ""
+      age_s: 3000
+      attachments: [{filename: wig.png, label: "a meme with a woman in a wig", expired: true}]
+  - say: {as: ethan, in: general, reply_to: meme, text: "kiki put me in this meme instead of her"}
+    reply:
+      tool:
+        name: generate_image
+        args:
+          prompt: "The meme, with Ethan in place of the woman"
+          subjects: [{name: Ethan, person: u1}]
+          caption: "new cast"
+      text: "recasting it now"
+  # The prompt shows what the request replies to, with its image marker.
+  - expect:
+      run: done
+      text_contains: "recasting it now"
+      prompt_contains: ["replies to: [u2 sam] [image: wig.png; message"]
+  # The meme reaches the image model after Ethan's own reference, unchecked (the
+  # reference check would turn down a meme), labeled as what they shared.
+  - expect:
+      followup: {status: done, attachments: 1, text_contains: "new cast"}
+      image_references: ["avatar of wheatthin512", "a meme with a woman in a wig"]
+      image_prompt_contains:
+        - "Ethan, shown in reference image 1"
+        - "Reference image 2 is what they shared with the request"
+  - expect: {sql: "SELECT reference_images->1->>'subject' FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: shared}

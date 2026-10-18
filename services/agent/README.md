@@ -67,8 +67,10 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   Pydantic AI `ImageGenerator` over `openrouter/images.py`'s `OpenRouterImageModel` (OpenRouter's
   Images API, `POST /api/v1/images` with `input_references`, same key). The image
   (PNG/JPEG/WebP/GIF ≤ 8 MiB) is saved in `agent_host_images` with its prompt,
-  references, model, cost and latency. 75 s for the image call, no client retries;
-  a refusal or provider error gets a note in Kiki's voice instead.
+  references, model, cost and latency. 75 s for the image call, no client retries.
+  A safety-filter block is drawn again by `OPENROUTER_IMAGE_FALLBACK_MODEL`
+  (default `qwen/qwen-image-2.1-turbo`, with the references it takes; empty turns
+  it off). Any other refusal or provider error gets a note in Kiki's voice instead.
 - Shared image code is `media/fetch.py` (Discord-only downloads, refreshing expired
   attachment links with `DISCORD_BOT_TOKEN`, types from the bytes for downloads and
   drawings alike) and `media/vision.py` (the vision call, `ImageRefused`, billed
