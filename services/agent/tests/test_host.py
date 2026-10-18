@@ -162,7 +162,7 @@ async def test_capacity_is_bounded(database_url):
             await release.wait()
             return await super().execute(request)
 
-    settings = Settings(database_url, TOKEN, max_concurrent_jobs=1)
+    settings = Settings(database_url, TOKEN, max_concurrent_jobs=1, slot_wait_seconds=0.2)
     async with client(create_app(settings, BlockingExecutor())) as http:
         first = asyncio.create_task(http.post("/v1/jobs", json=job(), headers=HEADERS))
         await asyncio.wait_for(entered.wait(), 5)
@@ -216,3 +216,23 @@ async def test_last_allowed_request_offers_no_tools_so_the_reply_survives(databa
     assert all("find_emoji" in tools for tools in offered[:-1])
     assert "generate_image" not in offered[0]  # image gating still applies
     assert offered[-1] == []
+
+
+async def test_requests_over_capacity_wait_for_a_slot(database_url):
+    class SlowExecutor(FakeExecutor):
+        async def execute(self, request):
+            await asyncio.sleep(1.0)
+            return await super().execute(request)
+
+    settings = Settings(database_url, TOKEN, max_concurrent_jobs=2)
+    async with client(create_app(settings, SlowExecutor())) as http:
+        started = asyncio.get_running_loop().time()
+
+        async def post(job_id):
+            response = await http.post("/v1/jobs", json=job(job_id), headers=HEADERS)
+            return response.status_code, asyncio.get_running_loop().time() - started
+
+        results = await asyncio.gather(*(post(f"reply:{n}") for n in (50, 51, 52)))
+    print("status, seconds:", results)
+    assert [status for status, _ in results] == [200, 200, 200]
+    assert 1.8 < max(seconds for _, seconds in results) < 3.0
