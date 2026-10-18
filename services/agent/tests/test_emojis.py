@@ -10,12 +10,12 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import vision
 from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.app import create_app
 from kiki_agent_host.chat import emojis
 from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult
+from kiki_agent_host.media import fetch
 from kiki_agent_host.openrouter.embeddings import Embedder
 
 GUILD, OTHER_GUILD = 1, 7
@@ -251,12 +251,12 @@ async def test_describe_endpoint_needs_auth_and_executor_and_reports_counts():
 async def test_emoji_images_are_fetched_and_described_like_read_image(
     database_url, db, monkeypatch
 ):
-    """The executor's describer is `vision.look`, downloads are `vision.download`."""
+    """The executor's describer is `media.vision.look`, downloads are `media.fetch.download`."""
     await add(db, 11, "huh")
     await add(db, 12, "fake")  # the CDN answers with a page, not an image
     await add(db, 13, "busy")  # the model is rate limited for this one
     monkeypatch.setattr(
-        vision, "client", lambda: httpx.AsyncClient(transport=cdn_transport(html={12}))
+        fetch, "client", lambda: httpx.AsyncClient(transport=cdn_transport(html={12}))
     )
     prompts = []
 
