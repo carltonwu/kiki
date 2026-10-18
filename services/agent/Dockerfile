@@ -3,7 +3,7 @@ FROM ghcr.io/astral-sh/uv:0.11.7 AS uv
 FROM python:3.13-slim-bookworm
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
-ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy PYTHONUNBUFFERED=1 LOG_FORMAT=json
 COPY services/agent/pyproject.toml services/agent/uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 COPY services/agent/README.md ./README.md

@@ -35,6 +35,8 @@ model requests, tool calls, tokens, cost and latency. Tool calls report outcomes
 latency, hits and semantic coverage. Set `LOG_LEVEL=DEBUG` for saved-result reuse,
 HTTP job status, indexing and top vector similarity (to calibrate
 `retrieval.MIN_SIMILARITY`). Routine HTTP client logs are suppressed at INFO.
+The container writes JSON logs to stdout so Railway records their actual severity;
+local logs use plain text unless `LOG_FORMAT=json` is set.
 
 ## Local setup
 
