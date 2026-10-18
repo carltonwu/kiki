@@ -1,0 +1,80 @@
+name: subject memory saves, recalls, resists a joke on a settled fact, and splits a full doc
+steps:
+  - say: {as: sam, in: general, text: "kiki i finally adopted a corgi, his name is waffles"}
+    reply:
+      tool: {name: remember, args: {subject: "@samwise", text: "has a corgi named Waffles", kind: fact}}
+      text: "noted {result}"
+  - expect: {reply: true, tool_called: remember, tool_result_contains: ["saved", "profile"]}
+  - expect:
+      sql: >-
+        SELECT d.slug FROM memory_entries e JOIN memory_docs d ON d.id = e.doc_id
+        JOIN memory_subjects s ON s.id = d.subject_id
+        WHERE s.user_id = 900000000000000102 AND e.text = 'has a corgi named Waffles'
+      equals: profile
+
+  - say: {as: sam, in: general, text: "kiki what do you remember about me?"}
+    reply: {tool: {name: recall, args: {subject: "@samwise"}}, text: "i know {result}"}
+  - expect:
+      reply: true
+      tool_called: recall
+      tool_result_contains: ["corgi named Waffles", "changing it takes 1 source"]
+      prompt_contains: "You have memory on:"
+
+  # A year later the fact has settled: one joking message can't overturn it.
+  - exec: >-
+      UPDATE memory_entries SET first_observed_at = now() - interval '400 days',
+      last_observed_at = now() - interval '400 days', recorded_at = now() - interval '400 days'
+  - say: {as: alex, in: general, text: "kiki sam's dog is actually a cat lol"}
+    reply:
+      tools:
+        - {name: search_memory, args: {query: "corgi"}}
+        - {name: remember, args: {subject: "@samwise", text: "has a cat", kind: fact, replaces: "{entry_id}"}}
+      text: "nah {result}"
+  - expect: {reply: true, tool_called: remember, tool_result_contains: ["Not changed", "settled fact"]}
+  - expect:
+      sql: "SELECT string_agg(text, ';') FROM memory_entries WHERE superseded_at IS NULL"
+      equals: has a corgi named Waffles
+
+  # A full profile: the write fails with split instructions, Kiki splits and retries.
+  - exec: >-
+      INSERT INTO memory_entries (doc_id, kind, text, first_observed_at, last_observed_at)
+      SELECT d.id, 'fact', 'note' || g || ' ' || repeat('filler ', 49), now(), now()
+      FROM memory_docs d JOIN memory_subjects s ON s.id = d.subject_id, generate_series(1, 20) g
+      WHERE s.user_id = 900000000000000102 AND d.slug = 'profile'
+  - say: {as: sam, in: general, text: "kiki also i play bass in a punk band now"}
+    reply:
+      tools:
+        - name: remember
+          args:
+            subject: "@samwise"
+            kind: fact
+            text: >-
+              plays bass in a punk band called Tape Hiss with two friends from college,
+              practices every Tuesday night in a garage in Queens
+        - name: split_doc
+          args:
+            subject: "@samwise"
+            new_doc: music
+            title: "Sam's music"
+            summary: "Bands Sam plays in and music Sam likes"
+            move_entries: "{entry_ids:5}"
+        - name: remember
+          args:
+            subject: "@samwise"
+            kind: fact
+            doc: music
+            text: >-
+              plays bass in a punk band called Tape Hiss with two friends from college,
+              practices every Tuesday night in a garage in Queens
+      text: "rock on {result}"
+  - expect: {reply: true, tool_called: split_doc, tool_result_contains: ["how_to_fix", "limit is 1024", "created"]}
+  - expect:
+      sql: >-
+        SELECT d.slug FROM memory_entries e JOIN memory_docs d ON d.id = e.doc_id
+        WHERE e.text LIKE 'plays bass%' AND e.superseded_at IS NULL
+      equals: music
+  - expect:
+      sql: >-
+        SELECT count(*) FROM memory_docs d JOIN memory_subjects s ON s.id = d.subject_id
+        WHERE s.user_id = 900000000000000102
+      equals: 2

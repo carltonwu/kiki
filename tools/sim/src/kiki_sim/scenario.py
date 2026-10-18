@@ -19,7 +19,9 @@
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
 that channel), `age_s`, and the sugar `jev: {choice, confidence}` and
-`reply: {text | tool}` to script the stub's answer to exactly this message.
+`reply: {text | tool | tools}` to script the stub's answer to exactly this message.
+`tools` is a sequence of calls; an argument `"{entry_id}"` (or `"{entry_ids:N}"`)
+takes memory entry IDs from the previous call's result.
 """
 
 import json
