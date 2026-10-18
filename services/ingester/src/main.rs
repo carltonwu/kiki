@@ -113,24 +113,10 @@ async fn ingest(
     discord: DiscordConfig,
     router_config: RouterConfig,
     agent_config: AgentConfig,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let http = Arc::new(twilight_http::Client::new(discord.token.clone()));
     let catch_up = Arc::new(CatchUp::new(http.clone(), pool.clone(), &discord.guild_ids));
-
-    info!(
-        guilds = discord.guild_ids.len(),
-        "backfilling before connecting to the Gateway"
-    );
-    let backfill = async {
-        for &guild_id in &discord.guild_ids {
-            catch_up.run_logged(guild_id).await;
-        }
-    };
-    tokio::select! {
-        () = backfill => {}
-        _ = shutdown.wait_for(|stop| *stop) => return Ok(()),
-    }
 
     // The router starts before the Gateway so it sees every live message.
     let pending_emoji = router_config.pending_emoji.clone();
@@ -186,7 +172,7 @@ fn joined(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow:
 
 fn init_tracing(config: &Config) {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,sqlx=warn".into());
+        .unwrap_or_else(|_| "info,sqlx=warn,twilight_http_ratelimiting=warn".into());
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     if config.json_logs {
         builder.json().flatten_event(true).init();

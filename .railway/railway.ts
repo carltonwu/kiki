@@ -60,7 +60,7 @@ export default defineRailway(() => {
     env: {
       DATABASE_URL: db.env.DATABASE_URL, // private network URL
       LOG_FORMAT: "json",
-      RUST_LOG: "info,sqlx=warn",
+      RUST_LOG: "info,sqlx=warn,twilight_http_ratelimiting=warn",
       DISCORD_BOT_TOKEN: preserve(), // secret: set with `railway variable set`
       OPENROUTER_DECISION_API_KEY: preserve(), // secret, for Jev (Decide) via OpenRouter; optional
       // Set this to http://${{agent.RAILWAY_PRIVATE_DOMAIN}}:8081 once the agent

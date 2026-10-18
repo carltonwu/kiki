@@ -39,10 +39,10 @@ railway ssh --service agent kiki-agent-host index   # optional: embed existing h
 railway variable set --service ingester 'AGENT_HOST_URL=http://${{agent.RAILWAY_PRIVATE_DOMAIN}}:8081'
 ```
 
-On start, the ingester backfills every guild in `DISCORD_GUILD_IDS` over REST (resuming from
-each channel's `complete_through` cursor, so restarts only fetch what's new), then connects to
-the Gateway and stores live message, edit, delete and channel events. Each `GUILD_CREATE` (every
-new Gateway session) runs another catch-up in the background to fill any gap.
+On start, the ingester connects to the Gateway and stores live message, edit, delete
+and channel events. Each `GUILD_CREATE` starts a REST catch-up in the background,
+resuming from each channel's `complete_through` cursor. The first pass fills history;
+later passes fill gaps. Live chat stays available while history is fetched.
 
 After a message is stored, a Postgres trigger notifies the router (`services/ingester/src/router/`),
 which pools rapid messages per channel and user, classifies them (reply to Kiki or @Kiki, keyword,
@@ -95,7 +95,7 @@ Postgres advisory lock first, so during a deploy the new instance waits until th
 shut down.
 
 Logs default to INFO: routing decisions with a matching trigger, completed runs and
-actionable failures. Set `RUST_LOG=info,sqlx=warn,ingester=debug` for pool skips,
+actionable failures. Set `RUST_LOG=info,sqlx=warn,twilight_http_ratelimiting=warn,ingester=debug` for pool skips,
 run claims and retry details, or `LOG_LEVEL=DEBUG` on the Python host for job reuse
 and retrieval diagnostics. IDs connect routing pools to runs, host jobs and Discord
 replies; logs omit provider error bodies and message content.
