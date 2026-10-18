@@ -201,7 +201,8 @@ queries are an argument error returned to the model.
      `openrouter:web_search` and the engine isn't selectable. Cap
      `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
      replay, and note that queries reach outside engines.
-   - Image results: need typed artifacts and Rust delivery.
+   - Image results: done for generated images ([image generation](image-generation.md));
+     search results still carry no images.
    - Embedding windows of adjacent messages, if short messages retrieve poorly.
    - `/kiki conversations` still lists the active pool across all channels to
      whoever runs it.

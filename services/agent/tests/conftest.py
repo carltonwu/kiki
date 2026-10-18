@@ -7,6 +7,21 @@ from psycopg import AsyncConnection, sql
 from psycopg.conninfo import make_conninfo
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "ingester/migrations"
+# pgvector in public, set up once under a lock shared with the Rust tests
+# (services/ingester/src/test_db.rs): migration 0007 would otherwise install it
+# into the test schema, where it's dropped with the schema.
+VECTOR = """
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('kiki-tests-vector-extension'));
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
+DO $$ BEGIN
+    IF (SELECT n.nspname FROM pg_extension e JOIN pg_namespace n ON n.oid = e.extnamespace
+        WHERE e.extname = 'vector') <> 'public' THEN
+        ALTER EXTENSION vector SET SCHEMA public;
+    END IF;
+END $$;
+COMMIT;
+"""
 
 
 @pytest.fixture
@@ -17,6 +32,7 @@ async def database_url():
         pytest.skip("set TEST_DATABASE_URL for Postgres integration tests")
     schema = f"host_test_{uuid4().hex}"
     async with await AsyncConnection.connect(base, autocommit=True) as connection:
+        await connection.execute(VECTOR)
         await connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         scoped = make_conninfo(base, options=f"-csearch_path={schema},public")
         try:

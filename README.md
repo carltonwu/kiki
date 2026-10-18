@@ -139,6 +139,8 @@ Server settings persist in Postgres and apply without a restart. Examples:
 - `/kiki config key:history_messages value:50`
 - `/kiki config key:reply_max_tokens value:3000`
 - `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
+- `/kiki config key:image_model value:openai/gpt-image-2.5-flare` (from OpenRouter's image catalog)
+- `/kiki config key:image_generation value:false` (stop Kiki drawing images)
 - `/kiki config key:pool_debounce reset:true`
 
 Use `/kiki config key:chat_model` to view the chat model, or add `reset:true` to restore
@@ -147,6 +149,10 @@ support text output and tools. Unset keys inherit startup env defaults, then bui
 New pools capture routing settings; new reply jobs capture context, model and token settings.
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
+
+Kiki can draw: with `image_generation` on (the default), reply jobs get a
+`generate_image` tool backed by the server's `image_model`, and the picture is
+attached to her first message. See [image generation](docs/image-generation.md).
 
 Server phrases and custom emoji come from the manually curated `guild_lingo`
 table (migration 0014 seeds one server). Reply prompts include only that server's

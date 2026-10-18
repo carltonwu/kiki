@@ -20,6 +20,8 @@ mod leader;
 mod rest;
 mod router;
 mod store;
+#[cfg(test)]
+mod test_db;
 
 use std::{sync::Arc, time::Duration};
 

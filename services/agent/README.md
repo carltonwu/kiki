@@ -23,6 +23,13 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- `generate_image(prompt, aspect_ratio?)`: offered only when the request has
+  `image_model`. Runs a Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel`
+  (OpenRouter's Images API, `POST /api/v1/images`, same key), saves the PNG/JPEG/WebP/GIF
+  (≤ 8 MiB) in `agent_host_images` and lists it in the result's
+  `images`; Rust attaches it to the first Discord message. At most 2 per run, 60 s per
+  call, no client retries; refusals and provider errors go back to the model as tool
+  errors ([design](../../docs/image-generation.md)).
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
 - `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
@@ -37,7 +44,7 @@ things in the guild (a base profile each, plus sub docs of at most 1024 words).
 Changes to saved entries need cited evidence in proportion to how settled they are.
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 search tool calls, 6 memory tool calls and 10 model requests. Topic jobs have
+(already in the prompt). A run gets 4 lookup tool calls (images and memory are capped separately) and 10 model requests. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all
@@ -88,11 +95,13 @@ the job request from Rust's `OPENROUTER_CHAT_MODEL` and `OPENROUTER_TOPIC_MODEL`
   "model": "provider/model",
   "messages": [{"role": "user", "content": "[u1 Alex] hello"}],
   "max_output_tokens": 2000,
-  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}]
+  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}],
+  "image_model": "openai/gpt-image-2.5-flare"
 }
 ```
 
-`kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
+`image_model` is optional (omitted: no `generate_image` tool); `images` defaults to
+empty, and each `id` is a row of `agent_host_images` for this job. `kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
 `topic:<conversation_id>:<newest_message_id>`. Discord and conversation IDs are
 strings on the wire. A completed response is:
 
@@ -104,7 +113,8 @@ strings on the wire. A completed response is:
     "text": "A reply",
     "model": "provider/model",
     "steps": 1,
-    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001}
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001},
+    "images": [{"id": 7, "mime_type": "image/png"}]
   },
   "error": null
 }
@@ -127,8 +137,10 @@ omit a reply if a crash happens before the send; it avoids blind duplicate posts
 Legacy runs already in progress when the migration runs are also failed.
 
 If the Python process dies before saving a result, inference may repeat on retry.
+Search tools only read. `generate_image` costs money and saves a row, so a replay can
+bill again and leave an unreferenced image row; Rust only attaches the IDs in the saved result.
 Memory writes tolerate replay: they record the job ID, and saving text that is already
-live confirms it, which is a no-op for the same job. Other tools only read.
+live confirms it, which is a no-op for the same job.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
 
