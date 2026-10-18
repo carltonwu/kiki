@@ -49,6 +49,9 @@ pub(super) struct StoredMessage {
     #[sqlx(json)]
     pub mentions: Vec<MentionedUser>,
     pub attachments: Vec<String>,
+    /// Discord's previews of Spotify links (title — description), unfurled by
+    /// Discord itself: Kiki never calls Spotify (docs/spotify-spike.md).
+    pub spotify: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -61,7 +64,11 @@ pub(super) const MESSAGE_COLUMNS: &str = r#"
     m.id, m.author_id, m.author_name, m.content,
     coalesce(m.raw->'mentions', '[]') AS mentions,
     ARRAY(SELECT coalesce(a->>'filename', 'file')
-          FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a) AS attachments
+          FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a) AS attachments,
+    ARRAY(SELECT concat_ws(' — ', nullif(e->>'title', ''), nullif(e->>'description', ''))
+          FROM jsonb_array_elements(coalesce(m.raw->'embeds', '[]')) e
+          WHERE e->'provider'->>'name' = 'Spotify'
+            AND coalesce(nullif(e->>'title', ''), nullif(e->>'description', '')) IS NOT NULL) AS spotify
 "#;
 
 impl Agent {
@@ -428,6 +435,7 @@ mod tests {
         postgres::{PgConnectOptions, PgPoolOptions},
     };
 
+    use super::MESSAGE_COLUMNS;
     use crate::{
         agent::{Agent, host::Host},
         config::AgentConfig,
@@ -635,6 +643,45 @@ mod tests {
                 .unwrap()
                 .content
                 .contains("unrelated")
+        );
+
+        db.close().await;
+        admin
+            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn spotify_previews_come_from_spotify_embeds_with_text() {
+        let Some((admin, db, schema)) = database().await else {
+            return;
+        };
+        let alex = json!({"id": "102", "username": "alex_99"});
+        let spotify = json!({"name": "Spotify", "url": "https://open.spotify.com"});
+        let mut m = message(20, alex, json!({}), "listen", json!([]));
+        m["embeds"] = json!([
+            {"title": "Padam Padam", "description": "Kylie Minogue · Song", "provider": spotify},
+            {"title": "Elsewhere", "provider": {"name": "Example"}},
+            {"title": "", "description": "Only a description", "provider": spotify},
+            {"title": "Only a title", "description": null, "provider": spotify},
+            {"title": "", "provider": spotify},
+            {"provider": spotify},
+        ]);
+        store::upsert_messages(&db, GUILD, &[m]).await.unwrap();
+        let (spotify,): (Vec<String>,) = sqlx::query_as(&format!(
+            "SELECT spotify FROM (SELECT {MESSAGE_COLUMNS} FROM messages m) s"
+        ))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            spotify,
+            [
+                "Padam Padam — Kylie Minogue · Song",
+                "Only a description",
+                "Only a title"
+            ]
         );
 
         db.close().await;

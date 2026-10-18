@@ -20,7 +20,8 @@
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
-that channel), `age_s`, and the sugar `jev: {choice, confidence}` and
+that channel), `age_s`, `embeds` (link previews, delivered like Discord's unfurler
+as a follow-up MESSAGE_UPDATE), and the sugar `jev: {choice, confidence}` and
 `reply: {text | tool}` to script the stub's answer to exactly this message.
 """
 
@@ -70,6 +71,8 @@ class Run:
         body = {"as": args["as"], "in": args["in"], "text": str(args["text"])}
         if "age_s" in args:
             body["age_s"] = args["age_s"]
+        if "embeds" in args:
+            body["embeds"] = args["embeds"]
         if reply_to := args.get("reply_to"):
             body["reply_to"] = self.resolve_reply(reply_to, args["in"])
         script = {}

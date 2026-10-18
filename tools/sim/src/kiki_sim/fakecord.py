@@ -604,6 +604,13 @@ class Fakecord:
                 body["as"], body["in"], body["text"], at_ms=at_ms, reply_to=body.get("reply_to")
             )
             await self.dispatch("MESSAGE_CREATE", message)
+            if embeds := body.get("embeds"):
+                # Like Discord's unfurler: link previews arrive in a partial update.
+                message["embeds"] = embeds
+                await self.dispatch(
+                    "MESSAGE_UPDATE",
+                    {k: message[k] for k in ("id", "channel_id", "guild_id", "embeds")},
+                )
             return web.json_response(message)
         if m := re.fullmatch(r"(PATCH|DELETE) messages/(\d+)", route):
             message = w.messages[m[2]]
