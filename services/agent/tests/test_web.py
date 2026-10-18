@@ -81,11 +81,45 @@ async def test_reply_requests_offer_web_search_and_fetch_server_tools():
     assert any(t["type"] == "function" for t in body["tools"])
 
 
-async def test_topic_requests_have_no_tools():
+def executor_with(provider: OpenRouterProvider, database_url: str) -> PydanticExecutor:
+    class WebExecutor(PydanticExecutor):
+        def model(self, name):
+            return WebOpenRouterModel(name, provider=provider)
+
+    return WebExecutor(database_url, "unused-key")
+
+
+def job(kind: str, text: str) -> JobRequest:
+    return JobRequest.model_validate(
+        {
+            "id": f"{kind}:1" if kind == "reply" else f"{kind}:1:2",
+            "kind": kind,
+            "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "1"},
+            "model": "test/model",
+            "messages": [{"role": "user", "content": text}],
+            "max_output_tokens": 100,
+        }
+    )
+
+
+async def test_topic_jobs_have_no_tools_or_web_step_cap(database_url):
     requests: list[dict] = []
-    model = WebOpenRouterModel("test/model", provider=openrouter(requests))
-    await agent.plain.run("summarize", model=model)
-    assert "tools" not in requests[0]
+    executor = executor_with(openrouter(requests), database_url)
+    result = await executor.execute(job("topic", "[u1 alex] summarize"))
+
+    [body] = requests
+    assert "tools" not in body
+    assert "max_tool_calls" not in body
+    assert result.web is None
+
+
+async def test_reply_without_web_use_records_none(database_url):
+    requests: list[dict] = []
+    executor = executor_with(openrouter(requests), database_url)
+    result = await executor.execute(job("reply", "[u1 alex] kiki rate my outfit"))
+
+    assert result.web is None
+    assert result.model_dump(mode="json")["web"] is None
 
 
 def test_web_use_counts_searches_fetches_and_unique_sources():
@@ -123,22 +157,8 @@ async def test_executor_reports_web_use(database_url):
         annotations=["https://pypi.org/project/pydantic-ai/"],
     )
 
-    class WebExecutor(PydanticExecutor):
-        def model(self, name):
-            return WebOpenRouterModel(name, provider=provider)
-
-    executor = WebExecutor(database_url, "unused-key")
-    request = JobRequest.model_validate(
-        {
-            "id": "reply:1",
-            "kind": "reply",
-            "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "1"},
-            "model": "test/model",
-            "messages": [{"role": "user", "content": "[u1 alex] kiki latest pydantic ai?"}],
-            "max_output_tokens": 100,
-        }
-    )
-    result = await executor.execute(request)
+    executor = executor_with(provider, database_url)
+    result = await executor.execute(job("reply", "[u1 alex] kiki latest pydantic ai?"))
 
     assert result.web is not None
     assert result.web.model_dump() == {
