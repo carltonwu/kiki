@@ -283,8 +283,13 @@ queries are an argument error returned to the model.
   description) and vectors fused by reciprocal rank, `MIN_SIMILARITY` floor, no
   recency. Only the guild's current, available emoji. Undescribed emoji match by
   name only. Pending embeddings (renames) are filled in at search time.
-- **Prompt:** one stable instructions line tells Kiki the tools exist and to write
-  emoji exactly as returned. The emoji list itself is not in the prompt.
+- **Prompt:** one stable instructions line tells Kiki the tools exist, to search
+  for an emoji that fits the moment rather than reuse familiar ones, and to write
+  emoji exactly as returned. The emoji list itself is not in the prompt, and
+  neither are emoji in `guild_lingo` (migration 0022 removed them): a fixed few
+  listed in every prompt became all she used. The run context names emoji she
+  has used at least twice in the messages shown (text or reactions) and asks her
+  to give them a rest.
 
 ## Failures and retries
 
