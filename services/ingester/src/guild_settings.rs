@@ -53,7 +53,7 @@ settings! { r, a;
     max_active_conversations: i64 = r.max_active_conversations, Kind::Integer(1, 8), "Open conversations in this server";
     decide_min_confidence: f64 = r.jev_min_confidence, Kind::Float(0.0, 1.0), "Minimum Decide confidence";
     decide_keyword_min_confidence: f64 = 0.25, Kind::Float(0.0, 1.0), "Minimum Decide confidence when Kiki is named";
-    follow_up_window: u64 = 300, Kind::Duration(1000, 0, 3600), "After Kiki replies, a participant's unsure Decide answer continues (seconds)";
+    follow_up_window: u64 = 300, Kind::Duration(1000, 0, 3600), "After Kiki answers someone, their follow-ups to her continue without (or despite an unsure) Decide (seconds; 0 disables)";
     follow_up_max_no_confidence: f64 = 0.55, Kind::Float(0.0, 1.0), "Decide must be this sure to ignore such a follow-up";
     stale_after: u64 = 1800, Kind::Duration(1000, 60, 86_400), "Idle time before a conversation is stale (seconds)";
     stale_min_confidence: f64 = 0.9, Kind::Float(0.0, 1.0), "Confidence to continue a stale conversation";

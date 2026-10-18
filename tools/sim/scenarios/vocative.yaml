@@ -1,0 +1,20 @@
+name: Kiki's name plus "you" or a question is for her, even past a Jev "no"
+# 2026-10-18 live replay: "kiki this guy hates you" (after someone else spoke)
+# got Jev "no" at 0.56.
+steps:
+  - say: {as: alex, in: general, text: "@kiki hi", id: start}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "Bot broken man"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no"}
+  - say: {as: alex, in: general, text: "kiki this guy hates you"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: continue, conversation: {same_as: start}, reply: true}
+  # Her name mid-sentence is talking about her.
+  - say: {as: sam, in: general, text: "did you see what kiki said"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", reply: false}
+  # Someone she hasn't talked to: a new conversation.
+  - say: {as: chrissy, in: general, text: "kiki are you there"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: new, reply: true}

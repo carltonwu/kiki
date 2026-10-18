@@ -27,7 +27,9 @@ someone, their next message is usually for her even without her name: an answer,
 follow-up question, a new request, a complaint that she didn't answer, or a reaction aimed at her \
 (\"you're an idiot\", \"silly kiki\", \"so close\"). A question with \"you\" soon after her reply is \
 for her. Pick the conversation of the reply being answered (its conversation_id; \
-kiki_replied_seconds_ago says how fresh it is). Her name followed by a question or request is \
+kiki_replied_seconds_ago says how fresh it is). new_messages.author_in_conversations lists the \
+author's conversations with her, and kiki_last_answered_author_seconds_ago says how recently she \
+answered them; replying_to in recent_channel_messages shows who each message answered. Her name followed by a question or request is \
 addressed to her, even when it reads like a statement: \"kiki is chris single\", \"kiki who won\", \
 \"kiki roast him\". Laughter or emoji alone (\"lmao\", \"💀\") is usually not for her. Talking \
 about Kiki to other people (\"kiki is so annoying lol\", \"kiki doesn't need a reply\"), or chatter \
@@ -73,6 +75,33 @@ struct JevResult {
     cost_usd: Option<f64>,
     latency_ms: Option<i32>,
     error: Option<String>,
+}
+
+/// Second person or a question: "do I have to reply to you", "u up?".
+fn addresses_you(text: &str) -> bool {
+    text.contains('?')
+        || text
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| {
+                matches!(
+                    w,
+                    "you" | "u" | "ur" | "your" | "yours" | "youre" | "ya" | "yourself"
+                )
+            })
+}
+
+/// A keyword as the first or last word: "kiki …" or "… kiki".
+fn names_kiki(text: &str, keywords: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    [words.first(), words.last()]
+        .into_iter()
+        .flatten()
+        .any(|w| keywords.iter().any(|k| k == w))
 }
 
 fn idle_secs(active: &[Value], conversation_id: i64) -> Option<i64> {
@@ -145,10 +174,27 @@ impl Router {
             };
             let outcome = match check {
                 Check::None => Outcome::No,
-                _ => {
-                    self.decide(key, pool, check, &messages, &active, &mut jev)
-                        .await
-                }
+                _ => match self.direct_follow_up(key, pool, &messages).await {
+                    Ok(Some(conversation_id)) => {
+                        info!(
+                            channel_id = key.channel_id,
+                            pool_id = pool.message_ids.last(),
+                            conversation_id,
+                            "direct follow-up to Kiki's answer; continuing without Decide"
+                        );
+                        Outcome::Continue {
+                            conversation_id,
+                            via: "decide",
+                        }
+                    }
+                    result => {
+                        if let Err(e) = result {
+                            warn!(error = %e, "couldn't check for a direct follow-up");
+                        }
+                        self.decide(key, pool, check, &messages, &active, &mut jev)
+                            .await
+                    }
+                },
             };
             (check, outcome)
         };
@@ -373,7 +419,13 @@ impl Router {
         // reply to you?"): from someone Kiki just answered, take those as continuing.
         let doubtful_no =
             answer.choice == "no" && answer.confidence < settings.follow_up_max_no_confidence;
-        if unsure || doubtful_no {
+        // "kiki this guy hates you", "u up kiki?": her name opening or closing a
+        // message that says "you" or asks something is addressed to her.
+        let vocative = matches!(check, Check::Keyword)
+            && messages
+                .iter()
+                .any(|m| addresses_you(&m.content) && names_kiki(&m.content, &settings.keywords));
+        if unsure || doubtful_no || (vocative && answer.choice == "no") {
             match self.follow_up(key, settings.follow_up_window).await {
                 Ok(Some(conversation_id)) => {
                     info!(
@@ -388,6 +440,16 @@ impl Router {
                         conversation_id,
                         via: "decide",
                     };
+                }
+                Ok(None) if vocative => {
+                    info!(
+                        channel_id = key.channel_id,
+                        pool_id = pool.message_ids.last(),
+                        choice = answer.choice,
+                        confidence = answer.confidence,
+                        "addressed to Kiki by name; starting a conversation"
+                    );
+                    return Outcome::New { via: "decide" };
                 }
                 Ok(None) => {}
                 Err(e) => warn!(error = %e, "couldn't check for a follow-up"),
@@ -442,6 +504,64 @@ impl Router {
         }
     }
 
+    /// The conversation a pool directly follows up, if it's unmistakably aimed at
+    /// Kiki: her latest message in the channel answered this author within
+    /// `follow_up_window`, nobody else has spoken since, and the pool talks to her
+    /// ("you", "u", a question) without @mentioning anyone else.
+    async fn direct_follow_up(
+        &self,
+        key: PoolKey,
+        pool: &Pool,
+        messages: &[PooledMessage],
+    ) -> sqlx::Result<Option<i64>> {
+        let others = messages.iter().any(|m| {
+            m.mention_user_ids
+                .iter()
+                .any(|&u| u != self.bot_user_id && u != key.user_id)
+        });
+        if pool.settings.follow_up_window == 0
+            || others
+            || !messages.iter().any(|m| addresses_you(&m.content))
+        {
+            return Ok(None);
+        }
+        let first = pool.message_ids.iter().min().copied().unwrap_or_default();
+        sqlx::query_scalar(
+            r#"
+            WITH k AS (
+                SELECT k.id, cm.conversation_id FROM messages k
+                JOIN conversation_messages cm ON cm.message_id = k.id
+                JOIN conversations c ON c.id = cm.conversation_id AND c.closed_at IS NULL
+                WHERE k.channel_id = $1 AND k.author_id = $2 AND k.id < $4
+                  AND k.deleted_at IS NULL
+                ORDER BY k.id DESC LIMIT 1
+            ), answered AS (
+                -- A long answer is several messages; only the first is a Discord reply.
+                SELECT r.author_id FROM messages a
+                JOIN conversation_messages cm ON cm.message_id = a.id
+                JOIN messages r ON r.id = a.reply_to_id
+                WHERE cm.conversation_id = (SELECT conversation_id FROM k) AND a.author_id = $2
+                ORDER BY a.id DESC LIMIT 1
+            )
+            SELECT k.conversation_id FROM k, messages km
+            WHERE km.id = k.id AND km.created_at > now() - make_interval(secs => $5)
+              AND (SELECT author_id FROM answered) = $3
+              AND NOT EXISTS (
+                  SELECT 1 FROM messages o
+                  WHERE o.channel_id = $1 AND o.id > k.id AND o.id < $4 AND o.deleted_at IS NULL
+                    AND NOT o.author_bot AND o.author_id <> $3
+                    AND o.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)))
+            "#,
+        )
+        .bind(key.channel_id)
+        .bind(self.bot_user_id)
+        .bind(key.user_id)
+        .bind(first)
+        .bind(pool.settings.follow_up_window as f64)
+        .fetch_optional(&self.db)
+        .await
+    }
+
     /// The author's open conversation in this channel that Kiki replied to within
     /// `window_secs`, if any.
     async fn follow_up(&self, key: PoolKey, window_secs: u64) -> sqlx::Result<Option<i64>> {
@@ -471,11 +591,21 @@ impl Router {
         active: &[Value],
     ) -> anyhow::Result<Value> {
         let first = pool.message_ids.iter().min().copied().unwrap_or_default();
-        let recent: Vec<(i64, Option<String>, String, Option<i64>)> = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let recent: Vec<(
+            i64,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
             r#"
-            SELECT m.author_id, m.author_name, m.content, cm.conversation_id
+            SELECT m.author_id, m.author_name, m.content, cm.conversation_id,
+                   r.author_id, r.author_name
             FROM messages m
             LEFT JOIN conversation_messages cm ON cm.message_id = m.id
+            LEFT JOIN messages r ON r.id = m.reply_to_id
             WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
               AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
             ORDER BY m.id DESC LIMIT $3
@@ -496,20 +626,53 @@ impl Router {
         let recent: Vec<Value> = recent
             .into_iter()
             .rev()
-            .map(|(id, name, content, conversation_id)| {
-                json!({
+            .map(|(id, name, content, conversation_id, to_id, to_name)| {
+                let mut m = json!({
                     "from": self.display_name(id, name),
                     "text": content,
                     "conversation_id": conversation_id,
-                })
+                });
+                if let Some(to_id) = to_id {
+                    m["replying_to"] = json!(self.display_name(to_id, to_name));
+                }
+                m
             })
             .collect();
+        // Spelled out so Jev needn't infer them: which of the offered conversations
+        // the author is in, and how fresh Kiki's last answer to them is.
+        let offered: Vec<i64> = active.iter().filter_map(|c| c["id"].as_i64()).collect();
+        let theirs: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT cm.conversation_id FROM conversation_messages cm \
+             JOIN messages m ON m.id = cm.message_id \
+             WHERE m.author_id = $1 AND cm.conversation_id = ANY($2) ORDER BY 1",
+        )
+        .bind(key.user_id)
+        .bind(&offered)
+        .fetch_all(&self.db)
+        .await?;
+        let answered: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT extract(epoch FROM now() - k.created_at)::bigint
+            FROM messages k JOIN messages r ON r.id = k.reply_to_id
+            WHERE k.channel_id = $1 AND k.author_id = $2 AND r.author_id = $3 AND k.id < $4
+            ORDER BY k.id DESC LIMIT 1
+            "#,
+        )
+        .bind(key.channel_id)
+        .bind(self.bot_user_id)
+        .bind(key.user_id)
+        .bind(first)
+        .fetch_optional(&self.db)
+        .await?
+        .flatten();
         Ok(json!({
             "recent_channel_messages": recent,
             "conversations": active,
             "new_messages": {
                 "from": self.display_name(key.user_id, author),
                 "texts": messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+                "author_in_conversations": theirs,
+                "kiki_last_answered_author_seconds_ago": answered,
             },
         }))
     }
@@ -683,7 +846,32 @@ impl Check {
 mod tests {
     use serde_json::json;
 
-    use super::{any_recent, is_stale};
+    use super::{addresses_you, any_recent, is_stale, names_kiki};
+
+    #[test]
+    fn kiki_as_the_first_or_last_word_names_her() {
+        let k = ["kiki".to_owned()];
+        assert!(names_kiki("kiki this guy hates you", &k));
+        assert!(names_kiki("u up Kiki?", &k));
+        assert!(!names_kiki("did you see what kiki said", &k));
+        assert!(!names_kiki(
+            "yeah kiki doesn't, it has intent based detection",
+            &k
+        ));
+    }
+
+    #[test]
+    fn second_person_or_a_question_addresses_kiki() {
+        assert!(addresses_you(
+            "Do I not have to reply to you to get a response"
+        ));
+        assert!(addresses_you("u up"));
+        assert!(addresses_you("you're wrong"));
+        assert!(addresses_you("wait what?"));
+        assert!(!addresses_you("💀💀💀"));
+        assert!(!addresses_you("lmao yall are insane"));
+        assert!(!addresses_you("youtube is down"));
+    }
 
     #[test]
     fn staleness_uses_the_chosen_conversation() {

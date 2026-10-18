@@ -1,9 +1,10 @@
 name: naming Kiki counts even when Jev is unsure which conversation
-# 2026-10-18: "kiki this guy hates you" got conversation_3 at 0.38 and no reply.
+# 2026-10-18: "kiki this guy is a hater" got conversation_3 at 0.38 and no reply.
+# (No "you" here: that would be a direct follow-up, which skips Jev.)
 steps:
   - say: {as: alex, in: general, text: "kiki describe ethan", id: start}
   - expect: {reply: true}
-  - say: {as: alex, in: general, text: "kiki this guy hates you"}
+  - say: {as: alex, in: general, text: "kiki this guy is a hater"}
     jev: {choice: conversation_latest, confidence: 0.38}
   - expect: {check: keyword, outcome: continue, conversation: {same_as: start}, reply: true}
   - say: {as: alex, in: general, text: "kiki summarize the channel"}

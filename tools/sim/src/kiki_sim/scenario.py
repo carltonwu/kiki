@@ -70,7 +70,11 @@ class Run:
         if reply_to := args.get("reply_to"):
             body["reply_to"] = self.resolve_reply(reply_to, args["in"])
         script = {}
-        exact = re.escape(str(args["text"]))
+        # Matches the text as stored, where fakecord turned "@sam" into "<@id>".
+        exact = "".join(
+            rf"(?:@{re.escape(part[1:])}|<@\d+>)" if part.startswith("@") else re.escape(part)
+            for part in re.split(r"(@[A-Za-z0-9_.]+)", str(args["text"]))
+        )
         if "jev" in args:
             script["jev"] = [{"match": exact, **args["jev"]}]
         if "reply" in args:
@@ -199,6 +203,28 @@ class Run:
             self.expect_llm(step, args, label)
         if "reaction" in args:
             self.expect_reaction(step, args["reaction"], message, label)
+        if "decide_contains" in args or "decide_lacks" in args:
+            self.expect_decide(step, args, message, label)
+
+    def expect_decide(self, step: int, args: dict, message: dict, label: str) -> None:
+        """What the router sent Jev for this message (JSON, compact)."""
+        records = [
+            r
+            for r in stack.control("state")["llm"]
+            if r["kind"] == "jev" and message["content"] in r["texts"]
+        ]
+        if not records:
+            self.fail(step, f"{label}: Jev wasn't asked")
+            return
+        sent = json.dumps(
+            records[-1]["request"]["state"], ensure_ascii=False, separators=(",", ":")
+        )
+        for needle in as_list(args.get("decide_contains")):
+            if str(needle) not in sent:
+                self.fail(step, f"{label}: Decide state lacks {needle!r}: {sent[:600]}")
+        for needle in as_list(args.get("decide_lacks")):
+            if str(needle) in sent:
+                self.fail(step, f"{label}: Decide state contains {needle!r}")
 
     def expect_sql(self, step: int, args: dict) -> None:
         """Escape hatch: `{sql: "SELECT …", equals: value}` (first column, first row)."""

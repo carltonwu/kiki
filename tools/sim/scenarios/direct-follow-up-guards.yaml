@@ -1,0 +1,23 @@
+name: the direct follow-up rule needs Kiki's answer to be the last word
+steps:
+  - say: {as: ethan, in: general, text: "@kiki rate my lunch", id: start}
+  - expect: {reply: true}
+  # Someone else spoke after Kiki: Ethan's question goes to Jev.
+  - say: {as: sam, in: general, text: "ethan that salad is tragic"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no"}
+  - say: {as: ethan, in: general, text: "are you serious sam"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", jev_choice: "no"}
+  # Kiki answered Ethan, not Alex: Alex's question goes to Jev.
+  - say: {as: ethan, in: general, text: "@kiki defend me", id: defend}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "do you even like salad"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", jev_choice: "no"}
+  # @mentioning someone else isn't talking to Kiki.
+  - say: {as: ethan, in: general, text: "@kiki ok fine", id: fine}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "@sam did you hear that"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", jev_choice: "no"}

@@ -1,0 +1,14 @@
+name: talking to Kiki right after her answer continues without asking Jev
+# 2026-10-18: Ethan's "Do I not have to reply to you to get a response", three
+# minutes after Kiki answered him, got Jev "no" and no reply.
+steps:
+  - say: {as: ethan, in: general, text: "@kiki rate my lunch", id: start}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "💀💀💀"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", reply: false}
+  # No Jev script: a Decide call here would answer "no" and fail the step.
+  - say: {as: ethan, in: general, text: "Do I not have to reply to you to get a response"}
+  - expect: {outcome: continue, conversation: {same_as: start}, jev_choice: null, reply: true}
+  - say: {as: ethan, in: general, text: "u still there?"}
+  - expect: {outcome: continue, conversation: {same_as: start}, jev_choice: null}

@@ -1,0 +1,15 @@
+name: Decide is told whose conversation is whose and whom Kiki answered
+steps:
+  - say: {as: alex, in: general, text: "@kiki help me pick a movie", id: alex}
+  - expect: {reply: true}
+  - say: {as: sam, in: general, text: "@kiki what should i cook", id: sam}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "something scary maybe"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect:
+      decide_contains:
+        - '"author_in_conversations":[1]'
+        - '"from":"Kiki"'
+        - '"replying_to":"alex_99"'
+        - '"replying_to":"samwise"'
+        - '"kiki_last_answered_author_seconds_ago":'
