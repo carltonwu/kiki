@@ -119,6 +119,7 @@ it to other roles under Server Settings → Integrations → Kiki.
 | Command | Shows |
 | --- | --- |
 | `/kiki conversations` | The active pool: channel, messages, people, last activity and cost per conversation, then each one's topic and participants. |
+| `/kiki clear` | Closes every active conversation in the server (`closed_reason = 'cleared'`), so the next message starts fresh. History and costs stay. Requires Manage Server. |
 | `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |

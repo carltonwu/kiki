@@ -3,6 +3,7 @@
 //! The pool is every open conversation (`closed_at IS NULL`). It holds at most
 //! `MAX_ACTIVE_CONVERSATIONS` per server: when the router opens or revives one past that,
 //! the least recently active are closed as `evicted` (see [`evict_beyond`]).
+//! `/kiki clear` closes all of a server's as `cleared` (see [`clear`]).
 
 use serde::Deserialize;
 use sqlx::{FromRow, PgExecutor};
@@ -107,6 +108,17 @@ pub async fn evict_beyond(
         "#,
     )
     .bind(max)
+    .bind(guild_id)
+    .fetch_all(tx)
+    .await
+}
+
+/// Closes every open conversation of the guild. Call with [`lock_pool`] held.
+pub async fn clear(tx: &mut sqlx::PgConnection, guild_id: i64) -> sqlx::Result<Vec<i64>> {
+    sqlx::query_scalar(
+        "UPDATE conversations SET closed_at = now(), closed_reason = 'cleared' \
+         WHERE guild_id = $1 AND closed_at IS NULL RETURNING id",
+    )
     .bind(guild_id)
     .fetch_all(tx)
     .await

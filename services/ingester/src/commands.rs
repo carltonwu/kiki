@@ -293,6 +293,7 @@ impl Commands {
     async fn run(&self, invocation: &Invocation<'_>) -> anyhow::Result<Vec<Embed>> {
         let embed = match invocation.subcommand {
             "conversations" => self.conversations(invocation.guild_id).await?,
+            "clear" => self.clear(invocation).await?,
             "stats" => self.stats(invocation.guild_id).await?,
             "runs" => self.runs(invocation).await?,
             "config" => self.config(invocation).await?,
@@ -375,6 +376,33 @@ impl Commands {
             ));
         }
         Ok(embed.build())
+    }
+
+    /// Closes every active conversation in the server, so the next message
+    /// starts fresh. History and costs stay.
+    async fn clear(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        let actor = require_manage_server(invocation, "clear conversations")?;
+        let mut tx = self.db.begin().await?;
+        conversation::lock_pool(&mut tx).await?;
+        let closed = conversation::clear(&mut tx, invocation.guild_id).await?;
+        tx.commit().await?;
+        info!(
+            guild_id = invocation.guild_id,
+            actor,
+            ?closed,
+            "conversations cleared"
+        );
+        let description = match closed.len() {
+            0 => "No active conversations to clear.".to_owned(),
+            1 => "Cleared 1 conversation. The next message starts a new one.".to_owned(),
+            n => format!("Cleared {n} conversations. The next message starts a new one."),
+        };
+        Ok(EmbedBuilder::new()
+            .color(COLOR)
+            .title("Conversations cleared")
+            .description(description)
+            .timestamp(now())
+            .build())
     }
 
     async fn stats(&self, guild_id: i64) -> anyhow::Result<Embed> {
@@ -948,14 +976,14 @@ impl Commands {
     }
 }
 
-fn require_manage_server(invocation: &Invocation<'_>) -> Result<i64, UserError> {
+fn require_manage_server(invocation: &Invocation<'_>, action: &str) -> Result<i64, UserError> {
     let permissions = snowflake(&invocation.member["permissions"])
         .map(|bits| Permissions::from_bits_truncate(bits as u64))
         .unwrap_or_else(Permissions::empty);
     if !permissions.intersects(Permissions::MANAGE_GUILD | Permissions::ADMINISTRATOR) {
-        return Err(UserError(
-            "You need Manage Server permission to change server settings.".into(),
-        ));
+        return Err(UserError(format!(
+            "You need Manage Server permission to {action}."
+        )));
     }
     snowflake(&invocation.member["user"]["id"])
         .ok_or_else(|| UserError("Couldn't identify who is changing the setting.".into()))
@@ -972,7 +1000,7 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
     if value.is_none() && !reset {
         return Ok(None);
     }
-    let actor = require_manage_server(invocation)?;
+    let actor = require_manage_server(invocation, "change server settings")?;
     let key = invocation
         .option("key")
         .and_then(Value::as_str)
@@ -1112,6 +1140,10 @@ fn definition() -> CommandBuilder {
         .option(SubCommandBuilder::new(
             "conversations",
             "Active conversations: channel, topic, people, messages and cost",
+        ))
+        .option(SubCommandBuilder::new(
+            "clear",
+            "Close every active conversation in this server",
         ))
         .option(SubCommandBuilder::new(
             "stats",

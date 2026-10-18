@@ -1,0 +1,18 @@
+name: /kiki clear closes the server's active conversations and needs Manage Server
+steps:
+  - say: {as: alex, in: general, text: "@kiki one"}
+  - expect: {reply: true}
+  - say: {as: sam, in: lore, text: "@kiki two"}
+  - expect: {reply: true}
+  - slash: {as: sam, in: general, command: clear}
+  - expect: {response_contains: "manage server"}
+  - expect: {sql: "SELECT count(*) FROM conversations WHERE closed_at IS NULL", equals: 2}
+  - slash: {as: alex, in: general, command: clear}
+  - expect: {response_contains: "cleared 2 conversations"}
+  - expect: {sql: "SELECT count(*) FROM conversations WHERE closed_reason = 'cleared'", equals: 2}
+  - slash: {as: alex, in: general, command: conversations}
+  - expect: {response_contains: "no active conversations"}
+  - say: {as: alex, in: general, text: "@kiki three"}
+  - expect: {reply: true}
+  - expect: {sql: "SELECT count(*) FROM conversations WHERE closed_at IS NULL", equals: 1}
+  - expect: {sql: "SELECT count(*) FROM conversations", equals: 3}
