@@ -621,7 +621,7 @@ pub mod tests {
             .await
             .unwrap();
         sqlx::raw_sql("CREATE TABLE conversations (id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ, closed_reason TEXT)").execute(&db).await.unwrap();
-        sqlx::raw_sql(include_str!("../migrations/0017_console.sql"))
+        sqlx::raw_sql(include_str!("../migrations/0021_console.sql"))
             .execute(&db)
             .await
             .unwrap();
