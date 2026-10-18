@@ -1,9 +1,11 @@
-"""Looking at Discord images with a vision model: shared by `read_image`
-(message attachments and galleries) and custom emoji descriptions.
+"""The common image backing: reading (`reading.py`, `read_image`), drawing
+(`images.py`, `generate_image`) and custom emoji descriptions (`emojis.py`).
 
-Images are downloaded by the host itself, only from Discord's media hosts, and
-typed by their bytes; the model call maps provider failures to a `VisionError`
-whose message is safe to show the chat model, and accumulates billed cost.
+- One set of image types, decided by the bytes (`sniff`), for downloads and for
+  generated images alike.
+- Downloads only from Discord's media hosts.
+- One vision model call that maps provider failures to `ImageRefused`, the one
+  image error whose message is safe to show the chat model, and adds billed cost.
 """
 
 import logging
@@ -21,6 +23,8 @@ from pydantic_ai.usage import UsageLimits
 logger = logging.getLogger(__name__)
 
 MAX_BYTES = 5 * 1024 * 1024  # the strictest common provider limit per image
+# What vision models take and Discord shows inline; `sniff` recognizes exactly these.
+MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 DOWNLOAD_TIMEOUT_SECONDS = 10
 
 viewer = Agent()
@@ -37,8 +41,9 @@ class Vision:
     calls: int = 0
 
 
-class VisionError(Exception):
-    """Why the model couldn't describe the images, in words for the chat model."""
+class ImageRefused(ValueError):
+    """No usable image (read, described or drawn); the message is safe to show the
+    chat model. A ValueError, so tools report it rather than failing the reply."""
 
 
 def client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
@@ -90,7 +95,7 @@ async def download(
 
 
 def sniff(head: bytes) -> str | None:
-    """The supported image type these leading bytes start, if any."""
+    """Which of `MIME_TYPES` these leading bytes start, if any."""
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):
@@ -127,24 +132,24 @@ async def look(
             error.status_code,
         )
         if error.status_code == 429 or error.status_code >= 500:
-            raise VisionError(
+            raise ImageRefused(
                 "The image model is unavailable right now; try again later."
             ) from None
         if vision.fallback:
-            raise VisionError(
+            raise ImageRefused(
                 "No vision model is configured (OPENROUTER_VISION_MODEL), and the "
                 f"chat model {vision.name} can't read images. Tell them you can't see "
                 "images right now."
             ) from None
-        raise VisionError(f"The image model {vision.name} rejected these images.") from None
+        raise ImageRefused(f"The image model {vision.name} rejected these images.") from None
     except (ModelAPIError, UnexpectedModelBehavior) as error:
         logger.warning(
             "vision call failed model=%s error_type=%s", vision.name, type(error).__name__
         )
-        raise VisionError("The image model is unavailable right now; try again later.") from None
+        raise ImageRefused("The image model is unavailable right now; try again later.") from None
     vision.cost += billed_cost(run) or 0.0
     if not run.output.strip():
-        raise VisionError("The image model returned no description.")
+        raise ImageRefused("The image model returned no description.")
     return run.output.strip()
 
 

@@ -137,6 +137,8 @@ pub struct AgentConfig {
     pub host_timeout: Duration,
     pub chat_model: String,
     pub topic_model: String,
+    /// `OPENROUTER_IMAGE_MODEL`: default model for the `generate_image` tool.
+    pub image_model: String,
     /// `OPENROUTER_EMOJI_MODEL`: the vision model that describes custom emoji
     /// (`/kiki emojis resync:true`).
     pub emoji_model: String,
@@ -178,6 +180,8 @@ impl AgentConfig {
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "google/gemini-2.5-flash-lite".into()),
             chat_model,
+            image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
+                .unwrap_or_else(|_| "openai/gpt-image-2.5-flare".into()),
             history_messages,
             run_max_age: Duration::from_secs(env_or("AGENT_RUN_MAX_AGE_SECS", 120)?),
             topic_every_messages: env_or("TOPIC_EVERY_MESSAGES", 4)?,

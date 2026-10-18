@@ -30,6 +30,7 @@ EMBEDDING_DIMENSIONS = 1024
 ADMINISTRATOR = 1 << 3
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
+STUB_IMAGE_MODELS = ["sim/image"]
 
 
 def iso(ms: int) -> str:
@@ -114,7 +115,10 @@ class World:
                     h["in"],
                     h["text"].format(i=i),
                     at_ms=at_ms,
-                    attachments=h.get("attachments"),
+                    attachments=[
+                        self.attachment(self.channel(h["in"])["id"], a)
+                        for a in h.get("attachments") or []
+                    ],
                 )
 
     # --- lookups -----------------------------------------------------------
@@ -206,7 +210,7 @@ class World:
             "mention_everyone": False,
             "mentions": mentions,
             "mention_roles": [],
-            "attachments": [self.attachment(c["id"], id, a) for a in attachments or []],
+            "attachments": attachments or [],
             "embeds": [],
             "pinned": False,
             "type": 0,
@@ -230,28 +234,33 @@ class World:
         c["last_message_id"] = message["id"]
         return message
 
-    def attachment(self, channel_id: str, message_id: str, spec: dict) -> dict:
-        """`{filename, label?, content_type?, width?, height?}`. Images are tiny PNGs
-        whose `label` the stub vision model reads back, so a description proves the
-        bytes made it through the agent host."""
+    def attachment(self, channel_id: str, spec: dict) -> dict:
+        """A scripted attachment, `{filename, label?, content_type?, width?, height?}`.
+        Images are tiny PNGs whose `label` the stub vision model reads back, so a
+        description proves the bytes made it through the agent host."""
         name = spec["filename"]
         content_type = spec.get("content_type", "image/png")
         if content_type.startswith("image/"):
             body = png(spec.get("label", name))
         else:
             body = spec.get("label", name).encode()
-        path = f"attachments/{channel_id}/{message_id}/{name}"
+        payload = self.upload(channel_id, name, body, content_type)
+        return payload | {"width": spec.get("width", 64), "height": spec.get("height", 64)}
+
+    def upload(self, channel_id: str, name: str, body: bytes, content_type: str) -> dict:
+        """Discord's attachment object; the bytes are served from fakecord's `/cdn`."""
+        id = self.snowflake(time.time() * 1000)
+        path = f"attachments/{channel_id}/{id}/{name}"
         self.files[path] = (body, content_type)
         url = f"{self.media_base}/cdn/{path}"
         return {
-            "id": str(next(self.ids)),
+            "id": id,
             "filename": name,
             "size": len(body),
             "url": f"{url}?ex=sim",
             "proxy_url": f"{url}?ex=sim&proxy=1",
             "content_type": content_type,
-            "width": spec.get("width", 64),
-            "height": spec.get("height", 64),
+            "sha256": hashlib.sha256(body).hexdigest(),
         }
 
 
@@ -385,7 +394,11 @@ class Fakecord:
     async def rest(self, request: web.Request) -> web.StreamResponse:
         w = self.world
         path = request.match_info["path"].rstrip("/")
-        body = await request.json() if request.can_read_body else None
+        files: list[dict] = []
+        if request.content_type == "multipart/form-data":
+            body, files = await self.multipart(request)
+        else:
+            body = await request.json() if request.can_read_body else None
         call = {"method": request.method, "path": path, "query": dict(request.query)}
         w.calls.append({**call, "body": body})
         route = f"{request.method} {path}"
@@ -433,7 +446,13 @@ class Fakecord:
         if m := re.fullmatch(r"POST channels/(\d+)/messages", route):
             reference = (body.get("message_reference") or {}).get("message_id")
             reply_to = reference if reference in w.messages else None
-            message = w.create_message("kiki", m[1], body.get("content", ""), reply_to=reply_to)
+            message = w.create_message(
+                "kiki",
+                m[1],
+                body.get("content", ""),
+                reply_to=reply_to,
+                attachments=self.attachments(m[1], body, files),
+            )
             # Discord echoes our own message over the Gateway, usually a bit later.
             asyncio.get_running_loop().call_later(
                 0.05, lambda: asyncio.ensure_future(self.dispatch("MESSAGE_CREATE", message))
@@ -458,6 +477,40 @@ class Fakecord:
         log.warning("unexpected Discord call: %s", route)
         w.unexpected.append(call)
         return json_response({"message": "Unknown (kiki-sim)", "code": 0}, status=404)
+
+    async def multipart(self, request: web.Request) -> tuple[dict, list[dict]]:
+        """Discord uploads: `payload_json` plus `files[n]` parts."""
+        body, files = {}, []
+        reader = await request.multipart()
+        while part := await reader.next():
+            data = await part.read()
+            if part.name == "payload_json":
+                body = json.loads(data)
+            elif part.name and part.name.startswith("files["):
+                files.append(
+                    {
+                        "id": part.name[len("files[") : -1],
+                        "filename": part.filename,
+                        "content_type": part.headers.get("Content-Type"),
+                        "data": bytes(data),
+                    }
+                )
+        return body, files
+
+    def attachments(self, channel_id: str, body: dict, files: list[dict]) -> list[dict]:
+        """Discord's attachment objects for uploaded files, declared in `attachments`."""
+        declared = {str(a["id"]): a for a in body.get("attachments") or []}
+        if set(declared) != {f["id"] for f in files}:
+            raise web.HTTPBadRequest(text="uploaded files don't match payload attachments")
+        return [
+            self.world.upload(
+                channel_id,
+                declared[f["id"]].get("filename") or f["filename"],
+                f["data"],
+                f["content_type"] or sniff(f["data"]),
+            )
+            for f in files
+        ]
 
     def page(self, channel_id: str, query) -> list[dict]:
         w = self.world
@@ -490,6 +543,24 @@ class Fakecord:
                     ]
                 }
             )
+        if request.method == "GET" and path == "v1/images/models":
+            return web.json_response(
+                {
+                    "data": [
+                        {
+                            "id": model,
+                            "name": model,
+                            "architecture": {
+                                "input_modalities": ["text", "image"],
+                                "output_modalities": ["image"],
+                            },
+                        }
+                        for model in STUB_IMAGE_MODELS
+                    ]
+                }
+            )
+        if request.method == "POST" and path == "v1/images":
+            return self.image(body)
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
@@ -606,8 +677,13 @@ class Fakecord:
                 if entry and entry.get("tool"):
                     entry["pending"] = True
                     tool = entry["tool"]
-                    # `{image_message}`: the message ID of the trigger's image marker.
-                    marker = re.search(r"; message (\d+)\]", trigger)
+                    # `{image_message}`: the message ID of the trigger's image marker,
+                    # else of the newest marker in the conversation (like Kiki's drawing).
+                    everything = "\n".join(content_text(m.get("content")) for m in messages)
+                    markers = re.findall(r"; message (\d+)\]", trigger) or re.findall(
+                        r"; message (\d+)\]", everything
+                    )
+                    marker = [None, markers[-1]] if markers else None
                     args = json.dumps(tool.get("args", {})).replace(
                         "{image_message}", marker[1] if marker else ""
                     )
@@ -657,6 +733,22 @@ class Fakecord:
             },
         }
 
+    def image(self, body: dict) -> web.Response:
+        """OpenRouter's Images API: a 1×1 PNG labeled with the prompt (so the stub
+        vision model can tell what was drawn), or a 400 for prompts containing
+        "refuse", as a moderation block would."""
+        w = self.world
+        prompt = body["prompt"]
+        drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE)
+        w.llm.append({"kind": "image", "request": body, "prompt": prompt, "drew": drew})
+        if not drew:
+            error = {"code": 400, "message": "Request blocked by the provider's safety system"}
+            return web.json_response({"error": error}, status=400)
+        drawing = png(f"a drawing of {prompt[:80]}")
+        image = {"b64_json": base64.b64encode(drawing).decode(), "media_type": "image/png"}
+        usage = {"prompt_tokens": 10, "completion_tokens": 1056, "total_tokens": 1066, "cost": 0.04}
+        return web.json_response({"created": int(time.time()), "data": [image], "usage": usage})
+
     # --- control API -------------------------------------------------------
 
     async def control(self, request: web.Request) -> web.StreamResponse:
@@ -686,7 +778,10 @@ class Fakecord:
                 body["text"],
                 at_ms=at_ms,
                 reply_to=body.get("reply_to"),
-                attachments=body.get("attachments"),
+                attachments=[
+                    w.attachment(w.channel(body["in"])["id"], a)
+                    for a in body.get("attachments") or []
+                ],
             )
             await self.dispatch("MESSAGE_CREATE", message)
             return web.json_response(message)
@@ -803,6 +898,10 @@ def image_parts(messages: list[dict]) -> list[bytes]:
                 url = part["image_url"]["url"]
                 found.append(base64.b64decode(url.partition(",")[2]) if "," in url else b"")
     return found
+
+
+def sniff(data: bytes) -> str:
+    return "image/png" if data.startswith(b"\x89PNG") else "application/octet-stream"
 
 
 def describe(pictures: list[bytes], model: str | None) -> str:

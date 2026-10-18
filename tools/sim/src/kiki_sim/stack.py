@@ -218,6 +218,7 @@ class Config:
                 "OPENROUTER_BASE_URL": f"http://127.0.0.1:{FAKECORD_PORT}/openrouter",
                 "OPENROUTER_DECISION_API_KEY": "sim-key",
                 "OPENROUTER_CHAT_MODEL": "sim/chat",
+                "OPENROUTER_IMAGE_MODEL": "sim/image",
             }
         return service_env(values | self.env | overrides)
 

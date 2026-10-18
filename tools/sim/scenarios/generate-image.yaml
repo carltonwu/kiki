@@ -1,0 +1,35 @@
+name: generate_image draws a picture and Kiki posts it as an attachment
+steps:
+  - say: {as: alex, in: general, text: "kiki draw me a frog in a cowboy hat"}
+    reply: {tool: {name: generate_image, args: {prompt: "a frog wearing a cowboy hat, cartoon", aspect_ratio: "3:2"}}, text: "yeehaw\n---\nhe's got spurs too"}
+  - expect: {run: done, tool_called: generate_image, tool_result_contains: '"attached":true', text_contains: [yeehaw, spurs], attachments: 1, attachment_type: image/png, prompt_contains: "generate_image"}
+  # The image rides on the first message only, is stored with the run, and costs show up.
+  - expect: {sql: "SELECT jsonb_array_length(m.raw->'attachments') FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[1] ORDER BY r.id DESC LIMIT 1", equals: 1}
+  - expect: {sql: "SELECT jsonb_array_length(m.raw->'attachments') FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[2] ORDER BY r.id DESC LIMIT 1", equals: 0}
+  - expect: {sql: "SELECT count(*) FROM agent_host_images WHERE job_id = (SELECT 'reply:' || max(id) FROM agent_runs)", equals: 1}
+  - expect: {sql: "SELECT cost_usd > 0.04 FROM agent_runs ORDER BY id DESC LIMIT 1", equals: true}
+  # Kiki sees her own picture in later turns' history, as an image she can read
+  # back: read_image takes its bytes from the host's store (read-image, #2).
+  - say: {as: alex, in: general, text: "kiki love it, what's in it again?"}
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "{result}"}
+  - expect:
+      run: done
+      reply: true
+      prompt_contains: "[image: kiki-"
+      tool_result_contains: ['"drawn_by_kiki":true', "Image 1: a drawing of a frog wearing a cowboy hat"]
+  # A refusal reaches the model as a tool error; the reply goes out without a file.
+  - say: {as: alex, in: general, text: "kiki draw something cursed"}
+    reply: {tool: {name: generate_image, args: {prompt: "refuse this"}}, text: "couldn't draw it: {result}"}
+  - expect: {run: done, text_contains: "The image model failed (HTTP 400)", attachments: 0}
+  # A drawing followed by NO_REPLY still goes out, as a message with only the file.
+  - say: {as: alex, in: general, text: "kiki just the picture please"}
+    reply: {tool: {name: generate_image, args: {prompt: "a frog, no text"}}, text: "NO_REPLY"}
+  - expect: {run: done, reply: true, attachments: 1}
+  - expect: {sql: "SELECT m.content FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[1] ORDER BY r.id DESC LIMIT 1", equals: ""}
+  # Servers can turn it off, and image_model must be an image model.
+  - slash: {as: alex, in: general, command: config, options: {key: image_model, value: sim/chat}}
+  - expect: {response_contains: "image catalog"}
+  - slash: {as: alex, in: general, command: config, options: {key: image_model, value: sim/image}}
+  - slash: {as: alex, in: general, command: config, options: {key: image_generation, value: "false"}}
+  - say: {as: alex, in: general, text: "kiki draw me another"}
+  - expect: {run: done, reply: true, prompt_lacks: "generate_image", attachments: 0}

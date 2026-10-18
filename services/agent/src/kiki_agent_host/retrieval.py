@@ -399,7 +399,7 @@ async def cite_all(
 
 
 def image_count(m: dict) -> int:
-    from .images import images_in  # images.py imports this module
+    from .reading import images_in  # reading.py imports this module
 
     return len(images_in({"attachments": m.get("attachments"), "embeds": m.get("embeds")}))
 

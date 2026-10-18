@@ -34,8 +34,9 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 |---|---|
 | `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
 | `agent.py` | `PydanticExecutor`: agents, trusted deps, tools, message/usage mapping, transient-error mapping. |
-| `vision.py` | Shared by `read_image` and emoji descriptions: Discord-only downloads typed by their bytes, the vision model call with its error mapping, and billed cost. |
-| `images.py` | `read_image`: image extraction from the stored payload and the detailed agent-to-agent prompt. |
+| `vision.py` | The common image backing for `read_image`, `generate_image` and emoji descriptions: Discord-only downloads typed by their bytes, the vision model call with its error mapping, and billed cost. |
+| `reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
+| `images.py` | `generate_image`: drawing through OpenRouter's Images API ([image generation](image-generation.md)). |
 | `emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
 | `app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
@@ -109,6 +110,11 @@ than for people (agent to agent).
   and Python (`images_in`) apply the same test (Rust doesn't deduplicate).
   Discord's attachment URLs are signed and expire after about a day, and the
   host can't refresh them, so older images usually come back as expired.
+- **Kiki's drawings:** images in a bot message named `kiki-<id>.png` (how Rust
+  uploads `generate_image` results) are read from `agent_host_images` when the
+  drawing job's guild matches, and labeled for the vision model and in the
+  result (`drawn_by_kiki`). Other images, and drawings not found there, are
+  downloaded as usual.
 - **Galleries:** a message with several images is a Discord gallery. One call
   sends them all, labeled `Image n: <file name>` (with alt text if set), plus
   the message text and author for context and Kiki's optional `question`. The
@@ -258,7 +264,8 @@ queries are an argument error returned to the model.
      `openrouter:web_search` and the engine isn't selectable. Cap
      `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
      replay, and note that queries reach outside engines.
-   - Image results: need typed artifacts and Rust delivery.
+   - Image results: done for generated images ([image generation](image-generation.md));
+     search results still carry no images.
    - `read_image` on old messages: Discord's signed attachment URLs expire
      after about a day. Refreshing them needs the bot token
      (`POST /attachments/refresh-urls`), which only Rust has.

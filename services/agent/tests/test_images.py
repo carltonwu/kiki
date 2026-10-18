@@ -1,262 +1,217 @@
+import asyncio
+import base64
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 from psycopg import AsyncConnection
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
+from pydantic_ai.images import GeneratedImage, ImageGenerationResult, TestImageGenerationModel
+from pydantic_ai.messages import BinaryImage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import images, retrieval, vision
-from kiki_agent_host.images import images_in, sized
-from kiki_agent_host.vision import Vision, allowed
+from kiki_agent_host import images
+from kiki_agent_host.agent import MAX_IMAGES, PydanticExecutor
+from kiki_agent_host.contracts import JobRequest
 
-GUILD, CHANNEL, CONVERSATION = 1, 2, 1
-SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
-CDN = "https://cdn.discordapp.com/attachments/2/3"
-PNG = b"\x89PNG\r\n\x1a\nsim"
-JPEG = b"\xff\xd8\xff\xe0sim"
-WEBP = b"RIFF\x04\x00\x00\x00WEBPsim"
+PNG = b"\x89PNG\r\n\x1a\nfake"
 
 
-def attachment(name, content_type="image/png", **extra):
-    url = f"{CDN}/{name}?ex=1&hm=2"
-    return {"filename": name, "content_type": content_type, "url": url, **extra}
-
-
-GALLERY = {
-    "attachments": [
-        attachment("a.png", width=800, height=600),
-        attachment("notes.pdf", "application/pdf"),
-        attachment("b.JPG", None),
-        attachment("c.webp", "image/webp", description="a cat on a piano"),
-    ],
-    "embeds": [
-        {
-            "type": "gifv",
-            "thumbnail": {
-                "url": "https://media.tenor.com/x.png",
-                "proxy_url": "https://images-ext-1.discordapp.net/x.png",
-            },
-        },
-        {"type": "rich", "image": {"url": "https://example.com/y.jpg"}},
-        {"type": "rich", "thumbnail": {"url": "https://example.com/link-preview.jpg"}},
-        {"type": "image", "thumbnail": {"url": f"{CDN}/a.png?ex=1&hm=2"}},  # duplicate
-    ],
-}
-
-
-def test_finds_image_attachments_then_image_embeds():
-    found = images_in(GALLERY)
-    assert [i.name for i in found] == ["a.png", "b.JPG", "c.webp", "linked image", "linked image"]
-    assert found[2].alt == "a cat on a piano"
-    assert found[3].url == "https://images-ext-1.discordapp.net/x.png"  # Discord's proxy
-    assert images_in({"attachments": [attachment(f"{i}.png") for i in range(14)]})[-1].name == (
-        "9.png"
+def openrouter(handler) -> AsyncOpenAI:
+    """An OpenRouter client whose HTTP requests go to `handler`."""
+    transport = httpx.MockTransport(handler)
+    return AsyncOpenAI(
+        base_url="https://openrouter.test/api/v1",
+        api_key="test-key",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=transport),
     )
-    assert images_in({}) == []
 
 
-def test_large_images_use_the_resizing_proxy():
-    small = {"url": "u", "proxy_url": "p", "width": 100, "height": 50}
-    assert sized(small) == "u"
-    big = {
-        "url": "u",
-        "proxy_url": "https://media.discordapp.net/a.png?ex=1&width=9",
-        "width": 4000,
-        "height": 2000,
-    }
-    assert sized(big) == "https://media.discordapp.net/a.png?ex=1&width=1568&height=784"
-    heavy = {"url": "u", "proxy_url": "https://media.discordapp.net/a.png", "size": 9 << 20}
-    assert sized(heavy) == "https://media.discordapp.net/a.png?width=1568"
+async def test_openrouter_model_calls_the_images_api_and_reports_cost():
+    sent = []
 
-
-def test_downloads_only_from_discord(monkeypatch):
-    assert allowed(f"{CDN}/a.png")
-    assert allowed("https://media.discordapp.net/a.png?width=10")
-    assert not allowed("http://cdn.discordapp.com/a.png")
-    assert not allowed("https://cdn.discordapp.com.evil.example/a.png")
-    assert not allowed("https://cdn.discordapp.com:8443/a.png")
-    assert not allowed("http://127.0.0.1:8090/cdn/a.png")
-    monkeypatch.setenv("DISCORD_MEDIA_EXTRA_HOSTS", "127.0.0.1:8090")
-    assert allowed("http://127.0.0.1:8090/cdn/a.png")
-
-
-def serve(routes: dict[str, tuple[int, bytes, str]]):
     def handler(request: httpx.Request) -> httpx.Response:
-        status, body, content_type = routes.get(request.url.path, (404, b"", "text/plain"))
-        return httpx.Response(status, content=body, headers={"content-type": content_type})
+        sent.append(
+            (request.url.path, request.headers["authorization"], json.loads(request.content))
+        )
+        data = [
+            {"b64_json": "not base64!"},
+            {"b64_json": base64.b64encode(PNG).decode(), "media_type": "image/png"},
+        ]
+        return httpx.Response(200, json={"created": 1, "data": data, "usage": {"cost": 0.03}})
 
-    return httpx.MockTransport(handler)
+    model = images.OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
+    data, mime, cost = await images.generate(model, "  a frog in a hat ", "3:2")
+    assert (data, mime, cost) == (PNG, "image/png", 0.03)
+    [(path, authorization, body)] = sent
+    assert path == "/api/v1/images"
+    assert authorization == "Bearer test-key"
+    assert body == {
+        "model": "openai/gpt-image-2.5-flare",
+        "prompt": "a frog in a hat",
+        "n": 1,
+        "aspect_ratio": "3:2",
+        "quality": images.OPENAI_QUALITY,
+    }
 
 
-async def test_download_checks_status_size_and_format(monkeypatch):
-    monkeypatch.setattr(vision, "MAX_BYTES", 10)
-    transport = serve(
+async def test_openrouter_model_sends_quality_only_to_openai_and_raises_without_images():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"data": [], "usage": {"cost": 0}})
+
+    model = images.OpenRouterImageModel("google/gemini-2.5-flash-image", openrouter(handler))
+    with pytest.raises(UnexpectedModelBehavior):
+        await model.generate("x")
+    assert bodies == [{"model": "google/gemini-2.5-flash-image", "prompt": "x", "n": 1}]
+
+
+class FakeImageModel(TestImageGenerationModel):
+    """Records prompts; returns `image`, or raises `error`, after a short pause."""
+
+    def __init__(self, image=PNG, media_type="image/png", error=None, cost=0.04):
+        super().__init__("test/image")
+        self.image, self.media_type, self.error, self.cost = image, media_type, error, cost
+        self.prompts = []
+
+    async def generate(self, prompt, *, images=None, settings=None):
+        self.prompts.append((prompt, settings))
+        await asyncio.sleep(0.01)  # like a real call, let parallel tool calls interleave
+        if self.error:
+            raise self.error
+        return ImageGenerationResult(
+            [GeneratedImage(BinaryImage(self.image, media_type=self.media_type))],
+            prompt=prompt,
+            model_name=self.model_name,
+            provider_name="test",
+            provider_details={"cost": self.cost},
+        )
+
+
+async def test_generate_turns_failures_into_messages_for_the_model():
+    model = FakeImageModel()
+    assert await images.generate(model, " a frog ", "2:3") == (PNG, "image/png", 0.04)
+    assert model.prompts == [("a frog", {"aspect_ratio": "2:3"})]
+    # The bytes decide the type (vision.sniff), not the provider's label.
+    mislabeled = FakeImageModel(media_type="image/jpeg")
+    assert (await images.generate(mislabeled, "x"))[1] == "image/png"
+    # Pydantic AI's own test model works too.
+    data, mime, _ = await images.generate(TestImageGenerationModel(), "x")
+    assert mime == "image/png" and data.startswith(b"\x89PNG")
+    cases = [
+        (FakeImageModel(error=ContentFilterError("blocked", body=None)), "refused"),
+        (FakeImageModel(error=UnexpectedModelBehavior("empty", body=None)), "No image"),
+        (FakeImageModel(image=b"<svg/>", media_type="image/svg+xml"), "unsupported image/svg"),
+        (FakeImageModel(image=b"0" * (images.MAX_IMAGE_BYTES + 1)), "too large"),
+    ]
+    for model, message in cases:
+        with pytest.raises(images.ImageRefused, match=message):
+            await images.generate(model, "x")
+    for prompt in ["   ", "x" * (images.MAX_PROMPT_CHARS + 1)]:
+        with pytest.raises(ValueError, match="prompt"):
+            await images.generate(FakeImageModel(), prompt)
+
+
+def request(image_model):
+    return JobRequest.model_validate(
         {
-            "/ok.png": (200, PNG[:9], "image/png"),
-            "/untyped": (200, JPEG[:9], "application/octet-stream"),
-            "/renamed.png": (200, JPEG[:9], "image/png"),
-            "/big.png": (200, b"x" * 11, "image/png"),
-            "/page.png": (200, b"<html>", "text/html"),
-            "/svg": (200, b"<svg/>", "image/svg+xml"),
-            "/down.png": (503, b"", "text/plain"),
+            "id": "reply:1",
+            "kind": "reply",
+            "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "1"},
+            "model": "test/model",
+            "messages": [{"role": "user", "content": "alex: draw me a frog"}],
+            "max_output_tokens": 100,
+            "image_model": image_model,
         }
     )
-    async with httpx.AsyncClient(transport=transport) as client:
 
-        async def get(path, media_type=None):
-            return await vision.download(client, f"https://cdn.discordapp.com{path}", media_type)
 
-        ok = await get("/ok.png")
-        assert isinstance(ok, BinaryContent) and ok.media_type == "image/png"
-        # The bytes decide the type, not the header or the file name.
-        assert (await get("/untyped")).media_type == "image/jpeg"
-        assert (await get("/renamed.png", "image/png")).media_type == "image/jpeg"
-        assert await get("/gone.png") == "no longer available (deleted, or an expired Discord link)"
-        assert await get("/big.png") == "too large"
-        assert await get("/page.png", "image/png") == "unsupported format (text/html)"
-        assert await get("/svg", "image/svg+xml") == "unsupported format (image/svg+xml)"
-        assert await get("/down.png") == "download failed (HTTP 503)"
-        assert await vision.download(client, "https://example.com/a.png") == (
-            "not hosted by Discord"
+class FakeEmbeddings:
+    async def create(self, model, input):
+        data = [SimpleNamespace(index=i, embedding=[0.1] * 1024) for i in range(len(input))]
+        return SimpleNamespace(data=data, usage=SimpleNamespace(cost=0))
+
+
+def executor(database_url, image_model):
+    class TestExecutor(PydanticExecutor):
+        def model(self, name):
+            return TestModel()
+
+        def image_model(self, name):
+            self.names.append(name)
+            return image_model
+
+    executor = TestExecutor(database_url, "unused-key")
+    executor.names = []
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    return executor
+
+
+async def job_row(database_url, job_id="reply:1"):
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO agent_host_jobs (id, request, status) VALUES (%s, '{}', 'running')",
+            (job_id,),
         )
 
 
-# --- with Postgres -------------------------------------------------------------
-
-
-@pytest.fixture
-async def db(database_url):
-    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
-        await connection.execute(
-            "INSERT INTO channels (id, guild_id, name, type) VALUES (%s, %s, 'general', 0)",
-            (CHANNEL, GUILD),
+async def test_executor_saves_generated_images_for_rust_to_attach(database_url):
+    await job_row(database_url)
+    run = executor(database_url, FakeImageModel())
+    result = await run.execute(request("openai/gpt-image-2.5-flare"))
+    assert run.names == ["openai/gpt-image-2.5-flare"]
+    # TestModel calls every offered tool once, then answers with their results.
+    outputs = json.loads(result.text)
+    assert outputs["generate_image"] == {"attached": True, "images_attached": 1}
+    [image] = result.images
+    assert image.mime_type == "image/png"
+    assert result.usage.cost == pytest.approx(0.04)
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        cursor = await db.execute(
+            "SELECT job_id, mime_type, data FROM agent_host_images WHERE id = %s", (image.id,)
         )
-        yield connection
+        assert await cursor.fetchone() == ("reply:1", "image/png", PNG)
 
 
-async def add(db, id, content, raw_extra, *, guild=GUILD, author_id=100):
-    raw = {"author": {"id": str(author_id), "username": "alex"}, "mentions": [], **raw_extra}
-    await db.execute(
-        "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
-        " created_at, raw) VALUES (%s, %s, %s, %s, 'alex', %s, now(), %s)",
-        (id, guild, CHANNEL, author_id, content, json.dumps(raw)),
-    )
+async def test_generate_image_is_not_offered_without_an_image_model(database_url):
+    model = FakeImageModel()
+    run = executor(database_url, model)
+    result = await run.execute(request(None))
+    assert "generate_image" not in json.loads(result.text)
+    assert result.images == []
+    assert run.names == [] and model.prompts == []
 
 
-ROSTER = retrieval.Roster({"u1": 100}, {100: "u1 Alex"})
-CDN_FILES = {
-    "/attachments/2/3/a.png": (200, PNG, "image/png"),
-    "/attachments/2/3/b.JPG": (200, JPEG, "image/jpeg"),
-    "/attachments/2/3/c.webp": (200, WEBP, "image/webp"),
-    "/x.png": (200, PNG, "image/png"),
-}
+async def test_refusals_reach_the_model_instead_of_failing_the_reply(database_url):
+    model = FakeImageModel(error=ContentFilterError("blocked", body=None))
+    result = await executor(database_url, model).execute(request("test/image"))
+    assert json.loads(result.text)["generate_image"] == {
+        "error": "The image model refused that prompt."
+    }
+    assert result.images == []
 
 
-def fake_vision(answer="Image 1: a stage.", error: Exception | None = None, fallback=False):
-    seen = []
+async def test_parallel_calls_still_draw_at_most_max_images(database_url):
+    def respond(messages, info):
+        if len(messages) == 1:
+            # One response asking for three images at once: the tools run concurrently.
+            return ModelResponse(
+                parts=[
+                    ToolCallPart("generate_image", {"prompt": f"frog {i}"}, tool_call_id=str(i))
+                    for i in range(3)
+                ]
+            )
+        return ModelResponse(parts=[TextPart("here")])
 
-    def respond(messages, info: AgentInfo) -> ModelResponse:
-        seen.append((messages, info))
-        if error:
-            raise error
-        return ModelResponse(parts=[TextPart(answer)], provider_details={"cost": 0.002})
-
-    return Vision(FunctionModel(respond), "test/vision", fallback), seen
-
-
-async def read(db, vision_model, message_id=70, question=None, files=CDN_FILES):
-    return await images.read_image(
-        db, SCOPE, ROSTER, vision_model, message_id, question, transport=serve(files)
-    )
-
-
-async def test_reads_a_gallery_image_by_image_and_as_a_whole(db):
-    await add(db, 70, "opening night!!", GALLERY)
-    model, seen = fake_vision("Image 1: ...\nGallery: the whole show.")
-    result = await read(db, model, question="who is on stage?")
-    assert result["description"] == "Image 1: ...\nGallery: the whole show."
-    assert result["message"]["author"] == "u1 Alex"
-    assert result["message"]["url"] == "https://discord.com/channels/1/2/70"
-    assert [i.get("error") for i in result["images"]] == [None] * 4 + ["not hosted by Discord"]
-    assert model.cost == pytest.approx(0.002) and model.calls == 1
-
-    [(messages, info)] = seen
-    assert "Gallery:" in messages[0].instructions
-    parts = messages[0].parts[0].content
-    assert 'Message text: "opening night!!"' in parts[0]
-    assert "who is on stage?" in parts[0]
-    labels = [p for p in parts[1:] if isinstance(p, str)]
-    assert labels[:4] == [
-        "Image 1: a.png",
-        "Image 2: b.JPG",
-        'Image 3: c.webp (alt text: "a cat on a piano")',
-        "Image 4: linked image",
-    ]
-    assert "Image(s) 5 couldn't be loaded" in labels[-1]
-    assert [p.media_type for p in parts if isinstance(p, BinaryContent)] == [
-        "image/png",
-        "image/jpeg",
-        "image/webp",
-        "image/png",
-    ]
-    assert info.model_settings["max_tokens"] == 2200
-
-
-async def test_reads_a_single_image(db):
-    await add(db, 71, "", {"attachments": [attachment("a.png")]})
-    model, seen = fake_vision()
-    result = await read(db, model, 71)
-    assert result["description"] == "Image 1: a stage."
-    assert result["images"] == [{"image": 1, "name": "a.png"}]
-    assert "No message text." in seen[0][0][0].parts[0].content[0]
-
-
-async def test_explains_messages_it_cannot_read(db):
-    await add(db, 72, "no pictures", {"attachments": [attachment("notes.pdf", "text/plain")]})
-    await add(db, 73, "expired", {"attachments": [attachment("gone.png")]})
-    await add(db, 74, "elsewhere", {"attachments": [attachment("a.png")]}, guild=7)
-    model, seen = fake_vision()
-    assert await read(db, model, 72) == {"error": "that message has no images"}
-    assert (await read(db, model, 73))["error"] == "none of the images could be downloaded"
-    assert await read(db, model, 74) == {"error": "no such message in this server"}
-    assert await read(db, model, 999) == {"error": "no such message in this server"}
-    assert seen == []
-
-
-async def test_reads_only_messages_kiki_may_see(db):
-    await add(db, 78, "deleted", {"attachments": [attachment("a.png")]})
-    await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 78")
-    await add(db, 79, "ignored", {"attachments": [attachment("a.png")]}, author_id=200)
-    await db.execute("INSERT INTO ignored_authors (user_id) VALUES (200)")
-    model, seen = fake_vision()
-    assert await read(db, model, 78) == {"error": "no such message in this server"}
-    assert await read(db, model, 79) == {"error": "no such message in this server"}
-    assert seen == []
-
-
-@pytest.mark.parametrize(
-    ("status", "fallback", "expected"),
-    [
-        (404, True, "No vision model is configured (OPENROUTER_VISION_MODEL)"),
-        (400, False, "The image model test/vision rejected these images."),
-        (503, True, "The image model is unavailable right now"),
-        (429, False, "The image model is unavailable right now"),
-    ],
-)
-async def test_vision_failures_become_errors_for_kiki(db, status, fallback, expected):
-    await add(db, 75, "", {"attachments": [attachment("a.png")]})
-    error = ModelHTTPError(status, "test/vision", body={"message": "No endpoints support images"})
-    model, _ = fake_vision(error=error, fallback=fallback)
-    result = await read(db, model, 75)
-    assert expected in result["error"]
-    assert result["images"] == [{"image": 1, "name": "a.png"}]
-    assert model.cost == 0
-
-
-async def test_search_results_say_which_messages_have_images(db):
-    await add(db, 76, "plain", {})
-    await add(db, 77, "pics", GALLERY)
-    result = await retrieval.message_context(db, SCOPE, 76)
-    assert [m.get("images") for m in result["messages"]] == [None, 5]
+    model = FakeImageModel()
+    run = executor(database_url, model)
+    run.model = lambda name: FunctionModel(respond)
+    await job_row(database_url)
+    result = await run.execute(request("test/image"))
+    assert len(result.images) == MAX_IMAGES == len(model.prompts)

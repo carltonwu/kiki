@@ -158,6 +158,12 @@ impl Agent {
             instructions.push_str(". Don't force extra messages or repeat yourself. ");
         }
         instructions.push_str("Keep each message under 1900 characters. ");
+        if settings.image_generation {
+            instructions.push_str(
+                "You can draw with generate_image when someone asks for an image or one would clearly land better than words. \
+                 It's attached to your first message, so write that message as if the image is posted with it; never paste image links or markdown for it. ",
+            );
+        }
         instructions.push_str(if settings.chat_allow_silence {
             "You may choose silence whenever joining in would add little, especially in a busy chat where people are talking to each other. Being given a message does not mean it needs a response. If you choose silence, return exactly NO_REPLY."
         } else {
@@ -436,17 +442,14 @@ mod lingo_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::{Value, json};
-    use sqlx::{
-        Executor, PgPool,
-        postgres::{PgConnectOptions, PgPoolOptions},
-    };
+    use sqlx::PgPool;
 
     use crate::{
         agent::{Agent, host::Host},
@@ -458,28 +461,7 @@ mod tests {
     const GUILD: i64 = 9;
     const CHANNEL: i64 = 2;
 
-    /// A pool on a fresh schema with every migration applied, or `None` without
-    /// `TEST_DATABASE_URL` (as in the Python tests).
-    async fn database() -> Option<(PgPool, PgPool, String)> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("ingester_test_{nanos}");
-        let admin = PgPool::connect(&url).await.unwrap();
-        admin
-            .execute(format!("CREATE SCHEMA {schema}").as_str())
-            .await
-            .unwrap();
-        let options: PgConnectOptions = url.parse().unwrap();
-        let options = options.options([("search_path", format!("{schema},public"))]);
-        let db = PgPoolOptions::new().connect_with(options).await.unwrap();
-        crate::MIGRATOR.run(&db).await.unwrap();
-        Some((admin, db, schema))
-    }
-
-    fn agent(db: PgPool) -> Agent {
+    pub(in crate::agent) fn agent(db: PgPool) -> Agent {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = AgentConfig {
             host_url: Some("http://127.0.0.1:9".into()),
@@ -487,6 +469,7 @@ mod tests {
             host_timeout: Duration::from_secs(1),
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            image_model: "test/image".into(),
             emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
@@ -534,9 +517,10 @@ mod tests {
     /// The image markers count what `read_image` reads (`test_images.py` GALLERY).
     #[tokio::test]
     async fn message_columns_split_images_from_other_attachments() {
-        let Some((admin, db, schema)) = database().await else {
+        let Some(test) = crate::test_db::migrated("ingester_test").await else {
             return;
         };
+        let db = test.db.clone();
         let cdn = "https://cdn.discordapp.com/attachments/2/3";
         let attachment = |name: &str, content_type: Value| json!({"filename": name, "content_type": content_type, "url": format!("{cdn}/{name}")});
         let mut gallery = message(
@@ -588,18 +572,15 @@ mod tests {
         assert_eq!(rows[1].images.len(), 10, "read_image reads at most 10");
         assert_eq!(rows[1].images.last().unwrap(), "9.png");
 
-        db.close().await;
-        admin
-            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+        test.drop().await;
     }
 
     #[tokio::test]
     async fn prompt_is_cacheable_and_keyed_by_people() {
-        let Some((admin, db, schema)) = database().await else {
+        let Some(test) = crate::test_db::migrated("ingester_test").await else {
             return;
         };
+        let db = test.db.clone();
         let carlton = json!({"id": "101", "username": "carltonwu", "global_name": "Carlton"});
         let alex = json!({"id": "102", "username": "alex_99", "global_name": "A"});
         let bob = json!({"id": "103", "username": "bob", "global_name": null});
@@ -721,10 +702,6 @@ mod tests {
                 .contains("unrelated")
         );
 
-        db.close().await;
-        admin
-            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+        test.drop().await;
     }
 }

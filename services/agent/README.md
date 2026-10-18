@@ -29,6 +29,17 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   Images come from the stored message and are downloaded only from Discord's CDN and
   media proxy (`DISCORD_MEDIA_EXTRA_HOSTS` adds hosts, for the simulator). Search and
   context hits with images carry `images: n`.
+- `generate_image(prompt, aspect_ratio?)`: offered only when the request has
+  `image_model`. Runs a Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel`
+  (OpenRouter's Images API, `POST /api/v1/images`, same key), saves the PNG/JPEG/WebP/GIF
+  (≤ 8 MiB) in `agent_host_images` and lists it in the result's
+  `images`; Rust attaches it to the first Discord message. At most 2 per run, 60 s per
+  call, no client retries; refusals and provider errors go back to the model as tool
+  errors ([design](../../docs/image-generation.md)).
+- Shared image code is `vision.py` (Discord-only downloads, types from the bytes for
+  downloads and drawings alike, the vision call, `ImageRefused`, billed cost); reading
+  is `reading.py`, drawing `images.py`. `read_image` reads Kiki's own drawings
+  (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
 - `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
@@ -38,8 +49,9 @@ Emoji results carry the `<:name:id>` form to write in a reply. Descriptions come
 from `POST /v1/emojis/describe` (below).
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 tool calls and 6 model requests (a
-`read_image` vision call is separate and adds its cost to the reply's). Topic jobs have
+(already in the prompt). A run gets 4 lookup tool calls (`read_image` is one of them;
+drawings are capped separately) and 6 model requests; vision and image calls add their
+cost to the reply's. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all
@@ -90,11 +102,13 @@ the job request from Rust's `OPENROUTER_CHAT_MODEL` and `OPENROUTER_TOPIC_MODEL`
   "model": "provider/model",
   "messages": [{"role": "user", "content": "[u1 Alex] hello"}],
   "max_output_tokens": 2000,
-  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}]
+  "people": [{"ref": "u1", "user_id": "4", "label": "Alex", "names": ["Alex", "alex_99"]}],
+  "image_model": "openai/gpt-image-2.5-flare"
 }
 ```
 
-`kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
+`image_model` is optional (omitted: no `generate_image` tool); `images` defaults to
+empty, and each `id` is a row of `agent_host_images` for this job. `kind` is `reply` or `topic`. IDs are `reply:<run_id>` or
 `topic:<conversation_id>:<newest_message_id>`. Discord and conversation IDs are
 strings on the wire. A completed response is:
 
@@ -106,7 +120,8 @@ strings on the wire. A completed response is:
     "text": "A reply",
     "model": "provider/model",
     "steps": 1,
-    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001}
+    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0001},
+    "images": [{"id": 7, "mime_type": "image/png"}]
   },
   "error": null
 }
@@ -129,7 +144,8 @@ omit a reply if a crash happens before the send; it avoids blind duplicate posts
 Legacy runs already in progress when the migration runs are also failed.
 
 If the Python process dies before saving a result, inference may repeat on retry.
-Current tools only read; future tools with side effects or costs must tolerate replay.
+Search tools only read. `generate_image` costs money and saves a row, so a replay can
+bill again and leave an unreferenced image row; Rust only attaches the IDs in the saved result.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
 
