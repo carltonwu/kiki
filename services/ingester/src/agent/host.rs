@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use reqwest::{StatusCode, Url, header};
+use reqwest::{Response, StatusCode, Url, header};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -163,27 +163,11 @@ impl Host {
         tokio::time::timeout(self.timeout, async {
             let mut delay = Duration::from_secs(1);
             loop {
-                let response = self
-                    .http
-                    .post(self.emoji_endpoint.clone())
-                    .json(request)
-                    .send()
-                    .await;
-                match response {
-                    Err(error)
-                        if error.is_connect() || error.is_timeout() || error.is_request() => {}
-                    Err(error) => return Err(error).context("calling agent host"),
-                    Ok(response) if retryable(response.status()) => {}
-                    Ok(response) if response.status().is_success() => {
-                        return response
-                            .json()
-                            .await
-                            .context("parsing agent host emoji response");
-                    }
-                    Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
-                        bail!("agent host has no framework executor configured")
-                    }
-                    Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+                if let Ok(response) = self.attempt(&self.emoji_endpoint, request).await? {
+                    return response
+                        .json()
+                        .await
+                        .context("parsing agent host emoji response");
                 }
                 debug!(
                     guild_id = request.guild_id,
@@ -198,63 +182,68 @@ impl Host {
         .context("agent host deadline exceeded (including wake-up retries)")?
     }
 
+    /// One POST: the response, why to retry while the host wakes up or is busy
+    /// (reason and HTTP status, for logs), or an error retrying won't fix.
+    async fn attempt(
+        &self,
+        url: &Url,
+        body: &impl Serialize,
+    ) -> anyhow::Result<Result<Response, (&'static str, Option<u16>)>> {
+        match self.http.post(url.clone()).json(body).send().await {
+            Err(error) if error.is_timeout() => Ok(Err(("timeout", None))),
+            Err(error) if error.is_connect() || error.is_request() => Ok(Err(("connection", None))),
+            Err(error) => Err(error).context("calling agent host"),
+            Ok(response) if retryable(response.status()) => {
+                Ok(Err(("http", Some(response.status().as_u16()))))
+            }
+            Ok(response) if response.status().is_success() => Ok(Ok(response)),
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
+                bail!("agent host has no framework executor configured")
+            }
+            // Do not log bodies: they may contain prompts or secrets.
+            Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+        }
+    }
+
     async fn execute_with_retries(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
         let mut delay = Duration::from_secs(1);
         let mut attempt = 0;
         let mut warned = false;
         loop {
             attempt += 1;
-            let response = self.http.post(self.endpoint.clone()).json(job).send().await;
-            let (reason, status) = match response {
-                Err(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
-                    let reason = if error.is_timeout() {
-                        "timeout"
-                    } else {
-                        "connection"
-                    };
-                    (reason, None)
-                }
-                Err(error) => return Err(error).context("calling agent host"),
+            let (reason, status) = match self.attempt(&self.endpoint, job).await? {
+                Err(retry) => retry,
                 Ok(response) => {
                     let status = response.status();
-                    if retryable(status) {
-                        ("http", Some(status.as_u16()))
-                    } else if status.is_success() {
-                        let response: JobResponse = response
-                            .json()
-                            .await
-                            .context("parsing agent host response")?;
-                        if response.id != job.id {
-                            bail!("agent host returned a different job ID");
-                        }
-                        match response.status {
-                            JobStatus::Completed => {
-                                let result =
-                                    response.result.context("host completed without result")?;
-                                if result.text.trim().is_empty()
-                                    || result.steps < 0
-                                    || result.usage.prompt_tokens < 0
-                                    || result.usage.completion_tokens < 0
-                                    || result
-                                        .usage
-                                        .cost
-                                        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-                                {
-                                    bail!("agent host returned an invalid result");
-                                }
-                                return Ok(result);
+                    let response: JobResponse = response
+                        .json()
+                        .await
+                        .context("parsing agent host response")?;
+                    if response.id != job.id {
+                        bail!("agent host returned a different job ID");
+                    }
+                    match response.status {
+                        JobStatus::Completed => {
+                            let result =
+                                response.result.context("host completed without result")?;
+                            if result.text.trim().is_empty()
+                                || result.steps < 0
+                                || result.usage.prompt_tokens < 0
+                                || result.usage.completion_tokens < 0
+                                || result
+                                    .usage
+                                    .cost
+                                    .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+                            {
+                                bail!("agent host returned an invalid result");
                             }
-                            JobStatus::Failed => bail!(
-                                "agent host job failed: {}",
-                                response.error.as_deref().unwrap_or("unknown error")
-                            ),
-                            JobStatus::Running => ("running", Some(status.as_u16())),
+                            return Ok(result);
                         }
-                    } else if status == StatusCode::NOT_IMPLEMENTED {
-                        bail!("agent host has no framework executor configured");
-                    } else {
-                        // Do not log bodies: they may contain prompts or secrets.
-                        bail!("agent host returned HTTP {status}");
+                        JobStatus::Failed => bail!(
+                            "agent host job failed: {}",
+                            response.error.as_deref().unwrap_or("unknown error")
+                        ),
+                        JobStatus::Running => ("running", Some(status.as_u16())),
                     }
                 }
             };
@@ -432,5 +421,52 @@ mod tests {
             .unwrap();
         server.abort();
         assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn describe_emojis_retries_wake_up_then_parses() {
+        type Calls = Arc<Mutex<usize>>;
+        async fn handler(State(calls): State<Calls>) -> axum::response::Response {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                1 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                _ => Json(json!({"described": 2, "failed": 1, "remaining": 0, "cost": 0.01}))
+                    .into_response(),
+            }
+        }
+        let request = DescribeEmojis {
+            guild_id: "1".into(),
+            model: "test/vision".into(),
+            attempted_before_ms: 0,
+            redescribe: false,
+        };
+        for (status, calls) in [(None, 2), (Some(StatusCode::NOT_IMPLEMENTED), 1)] {
+            let counted = Calls::default();
+            let route = match status {
+                None => post(handler),
+                Some(status) => post(move |State(calls): State<Calls>| async move {
+                    *calls.lock().unwrap() += 1;
+                    status
+                }),
+            };
+            let (url, server) = server(
+                Router::new()
+                    .route("/v1/emojis/describe", route)
+                    .with_state(counted.clone()),
+            )
+            .await;
+            let result = host(url, Duration::from_secs(10))
+                .describe_emojis(&request)
+                .await;
+            server.abort();
+            match result {
+                Ok(described) => {
+                    assert_eq!((described.described, described.remaining), (2, 0));
+                }
+                Err(error) => assert!(error.to_string().contains("no framework executor")),
+            }
+            assert_eq!(*counted.lock().unwrap(), calls);
+        }
     }
 }
