@@ -111,10 +111,7 @@ impl RouterConfig {
                 .map(|k| k.trim().to_lowercase())
                 .filter(|k| !k.is_empty())
                 .collect(),
-            jev_api_key: std::env::var("OPENROUTER_DECISION_API_KEY")
-                .ok()
-                .map(|k| k.trim().to_owned())
-                .filter(|k| !k.is_empty()),
+            jev_api_key: optional_env("OPENROUTER_DECISION_API_KEY"),
             jev_model: std::env::var("OPENROUTER_DECISION_MODEL")
                 .unwrap_or_else(|_| "~typesafe/jev-latest".into()),
             jev_min_confidence: env_or("JEV_MIN_CONFIDENCE", 0.5)?,
@@ -174,10 +171,7 @@ impl AgentConfig {
             host_timeout: Duration::from_millis(timeout_ms),
             topic_model: std::env::var("OPENROUTER_TOPIC_MODEL")
                 .unwrap_or_else(|_| chat_model.clone()),
-            emoji_model: std::env::var("OPENROUTER_EMOJI_MODEL")
-                .map(|m| m.trim().to_owned())
-                .ok()
-                .filter(|m| !m.is_empty())
+            emoji_model: optional_env("OPENROUTER_EMOJI_MODEL")
                 .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".into()),
             chat_model,
             image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
