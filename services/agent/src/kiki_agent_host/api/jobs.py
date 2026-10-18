@@ -5,9 +5,9 @@ from collections.abc import Awaitable, Callable
 
 from psycopg.types.json import Jsonb
 
-from . import db
-from .contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
-from .executor import Executor, TransientError
+from .. import db
+from ..contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
+from ..executor import Executor, TransientError
 
 logger = logging.getLogger(__name__)
 

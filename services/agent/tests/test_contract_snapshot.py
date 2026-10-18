@@ -14,7 +14,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host import contracts
 from kiki_agent_host.agent.executor import PydanticExecutor
-from kiki_agent_host.app import create_app
+from kiki_agent_host.api.app import create_app
 from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import JobRequest
 

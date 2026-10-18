@@ -163,7 +163,7 @@ settings whose upper bound the operator can lower with an env var (see Bounds).
 | Constant | Value | Why |
 |---|---|---|
 | Retrieval ranking (`MIN_SIMILARITY` 0.25, `RECENCY_WEIGHT` 0.15, `HALF_LIFE_DAYS` 30, `CANDIDATES` 50, `RRF_K` 60) | | Tuned together for the embedding model; change only with evals |
-| Context neighbours (`retrieval.py`) | default 5, cap 10 | Model chooses within the cap; revisit with search evals |
+| Context neighbours (`chat/search.py`) | default 5, cap 10 | Model chooses within the cap; revisit with search evals |
 | `SNIPPET_CHARS`, `MAX_TOPIC_TOKENS`, `MAX_TOPIC_CHARS` | 1000, 400, 200 | Product choices with little per-server value; promote later if asked |
 | Roster (`MAX_PEOPLE`, `MAX_LABEL_CHARS`, `FORMER_USERNAMES`) | 200, 32, 2 | Prompt-shape choices, same reasoning |
 | Discord and infra (`MAX_MESSAGE_CHARS` 1900, `PAGE_SIZE` 100, backfill concurrency, lock keys, intervals, REST retries, embedding batch sizes) | | Protocol or operational |
@@ -244,7 +244,7 @@ Changes apply to the next pool or run.
 ### Agent host contract
 
 New `JobRequest` fields: `max_tool_calls`, `max_model_requests`, `search_results`. Durable retries
-compare the stored request with the new one (`jobs.py`, `extra="forbid"`), so:
+compare the stored request with the new one (`api/jobs.py`, `extra="forbid"`), so:
 
 1. **Deploy the host first.** The new fields are optional, defaulting to today's constants, so it
    still accepts old requests.

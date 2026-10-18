@@ -1,0 +1,7 @@
+{
+ "openrouter/client.py": {"doc": "OpenRouter's OpenAI-compatible API, for embeddings, images and chat.", "symbols": ["openrouter_client"]},
+ "openrouter/embeddings.py": {"doc": "Text embeddings from OpenRouter, as pgvector halfvec literals.", "symbols": ["EMBEDDING_MODEL", "DIMENSIONS", "QUERY_INSTRUCTION", "EMBED_BATCH", "Embedder"]},
+ "chat/scope.py": {"doc": "Who and where a job is about: its scope, the people in the prompt, and how\nnames, mentions and channels resolve to IDs within the scope.", "symbols": ["Scope", "Roster", "NO_ROSTER", "REF", "USER_ID", "MENTION", "CHANNEL_ID", "RESOLVE", "resolve_person", "resolve_channel", "channel_names", "speakers", "HEARD"]},
+ "chat/indexing.py": {"doc": "Message embeddings: computed lazily for the searched scope, or all at once by\n`kiki-agent-host index`.", "symbols": ["INDEX_LIMIT", "PENDING", "SAVE", "index_pending", "index_all"]},
+ "chat/search.py": {"doc": "Message search over Postgres, independent of the agent framework.\n\nHybrid: full text plus pgvector, fused by reciprocal rank with a small recency\nvote. Everything is scoped to one guild: Kiki knows every channel she can read.\n", "symbols": ["CANDIDATES", "RRF_K", "MIN_SIMILARITY", "RECENCY_WEIGHT", "HALF_LIFE_DAYS", "SNIPPET_CHARS", "Semantic", "SCOPE", "COLUMNS", "SEARCH", "search", "CONTEXT", "message_context", "cite_all", "image_count", "cite"]}
+}

@@ -1,0 +1,4 @@
+{
+ "media/fetch.py": {"doc": "Image downloads from the chat platform's media hosts only, with expired\nattachment links refreshed first. One set of image types, decided by the bytes\n(`sniff`), for downloads and generated images alike.", "symbols": ["MAX_BYTES", "DOWNLOAD_TIMEOUT_SECONDS", "REFRESH_BATCH", "client", "allowed", "expired", "refresh", "download", "sniff"]},
+ "media/vision.py": {"doc": "The vision model call shared by reading (`media/reading.py`), drawing\n(`media/drawing.py`) and custom emoji descriptions (`chat/emojis.py`). It maps\nprovider failures to `ImageRefused`, the one image error whose message is safe\nto show the chat model, and adds billed cost.", "symbols": ["viewer", "Vision", "ImageRefused", "look", "billed_cost"]}
+}

@@ -29,7 +29,7 @@ def main() -> None:
         dualstack_ipv6=True,
     ) as listener:
         uvicorn.run(
-            "kiki_agent_host.app:application",
+            "kiki_agent_host.api.app:application",
             factory=True,
             fd=listener.fileno(),
             workers=1,

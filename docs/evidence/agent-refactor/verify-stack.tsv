@@ -1,0 +1,8 @@
+branch	head	ruff	format	pytest	snapshot_vs_pin	src_lines	test_lines	diff_vs_parent
+origin/main	40e4ac2	ok	ok	81 passed	none	4250	2296	
+refactor/agent-pin	0a39088	ok	ok	82 passed	same	4250	2398	2 files changed, 2133 insertions(+)
+refactor/agent-foundation	eb1d0bd	ok	ok	82 passed	same	4263	2401	14 files changed, 121 insertions(+), 105 deletions(-)
+refactor/agent-chat	8725132	ok	ok	82 passed	same	4322	2409	19 files changed, 398 insertions(+), 331 deletions(-)
+refactor/agent-media	8b36b9c	ok	ok	82 passed	same	4340	2412	14 files changed, 258 insertions(+), 237 deletions(-)
+refactor/agent-toolsets	6f92a9d	ok	ok	85 passed	same	4442	2543	23 files changed, 1132 insertions(+), 899 deletions(-)
+refactor/agent-api	d3fb109	ok	ok	88 passed	same	4442	2648	15 files changed, 174 insertions(+), 36 deletions(-)

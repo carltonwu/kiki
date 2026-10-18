@@ -32,14 +32,18 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 
 | File | Contents |
 |---|---|
-| `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
-| `agent.py` | `PydanticExecutor`: agents, trusted deps, its function tools plus OpenRouter's web search/fetch server tools, message/usage mapping, transient-error mapping. |
-| `vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
-| `reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
-| `images.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)). |
-| `drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (in `agent.py`) only queues. |
-| `emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
-| `app.py` | Wires the executor when the key is set; startup and per-job logs. |
+| `chat/search.py`, `chat/indexing.py` | SDK-independent: index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
+| `chat/scope.py`, `chat/attachments.py` | The job's scope and people, name and channel resolution, and the images a stored message carries. |
+| `openrouter/embeddings.py` | The embedder: OpenRouter embeddings as `halfvec` literals, with their cost. |
+| `agent/executor.py` | `PydanticExecutor`: agents, message/usage mapping, transient-error mapping, image jobs and emoji descriptions. |
+| `agent/tools/` | One module per capability, each a `FunctionToolset` listed in `TOOLSETS`. Every tool runs through `agent/guard.py` (deadline, budget, log line). |
+| `agent/web.py`, `openrouter/chat.py` | OpenRouter's web search and fetch server tools, and the model subclass that maps fetch. |
+| `media/fetch.py`, `media/vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
+| `media/reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
+| `openrouter/images.py`, `media/generation.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)), and saving the result. |
+| `media/drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (`agent/tools/drawing.py`) only queues. |
+| `chat/emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
+| `api/app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
 
 Rust prompt changes, already made:
@@ -270,7 +274,7 @@ queries are an argument error returned to the model.
   `OPENROUTER_EMOJI_MODEL` (Rust's env, sent per request like the chat model;
   default `deepseek/deepseek-v4.1-flash-1017`) for one or two sentences on what it shows
   and when people use it. Download and model call are `read_image`'s
-  (`vision.py`): Discord hosts only, the type checked from the bytes, and a
+  (`media/fetch.py`, `media/vision.py`): Discord hosts only, the type checked from the bytes, and a
   provider error fails just that emoji. Each emoji is tried at most once per resync
   (`describe_attempted_at` against the round's start), so failures don't loop.
   `redescribe:true` also replaces older descriptions. Cost is shown in the command
