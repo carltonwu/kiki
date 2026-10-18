@@ -4,16 +4,17 @@ Status: implemented v1 after Opus 5.5 review, with the narrower scope below.
 
 ## Implemented v1
 
-The single Rust registry in `guild_settings.rs` defines 18 typed server settings, bounds,
+The single Rust registry in `guild_settings.rs` defines 22 typed server settings, bounds,
 descriptions and defaults. Existing env variables supply startup defaults; the remaining
 behavioral defaults are in the registry. Overrides live in `guild_settings`, keyed by guild and
 setting, with actor and timestamp. Missing rows inherit current defaults.
 
 The settings are `chat_model`, `keywords`, `pool_debounce`, `pool_max_wait`, `pool_max_messages`,
-`active_window`, `max_active_conversations`, `decide_min_confidence`, `stale_after`,
+`active_window`, `max_active_conversations`, `decide_min_confidence`,
+`decide_keyword_min_confidence`, `follow_up_window`, `follow_up_max_no_confidence`, `stale_after`,
 `stale_min_confidence`, `decide_recent_messages`, `decide_conversation_preview`, `history_messages`,
-`channel_context`, `channel_context_age`, `reply_max_tokens`, `topic_every_messages`, and
-`topic_sample_messages`. Duration inputs accept whole `ms`, `s`, `m`, `h`, or a bare number in
+`channel_context`, `channel_context_age`, `reply_max_tokens`, `topic_every_messages`,
+`topic_sample_messages`, and `lingo_nudge`. Duration inputs accept whole `ms`, `s`, `m`, `h`, or a bare number in
 the native unit displayed by `/kiki config` (pool timings in ms; other durations in seconds).
 Keywords are comma-separated, lowercased alphanumeric words. An empty list disables keyword
 triggers; `value:,` can be used to supply an empty list in Discord.
@@ -27,6 +28,38 @@ triggers; `value:,` can be used to supply an empty list in Discord.
   Chat models retain the existing OpenRouter catalog check for text and tool support. Topic and
   Decide models remain global; the topic default derives from the env chat model, not its guild
   override.
+
+`follow_up_window` (default 300 seconds, range 0–3600) controls two ways to
+continue an open conversation in the same channel. First, a direct follow-up
+bypasses Decide when Kiki's latest eligible reply answered this author within the
+window, no other non-bot/non-ignored person spoke between that reply and this
+pool, and a pooled message contains a question mark or second-person word such
+as `you` or `u`. Mentioning another person prevents this shortcut. The normal
+keyword or active-conversation admission check must still match. Such runs retain
+`via: decide`, but have no Decide response or Decide provider cost.
+
+Otherwise, keyword-triggered Decide calls use `decide_keyword_min_confidence`
+(default 0.25, range 0–1); other Decide calls use `decide_min_confidence`
+(default 0.5). An answer below its threshold, or `no` below
+`follow_up_max_no_confidence` (default 0.55, range 0–1), can continue the author's
+most recently answered open conversation within the window. A keyword at the
+start or end of a question/second-person message also takes this path when
+Decide says `no`, even at high confidence; if no recent conversation is found,
+that explicitly addressed message starts a new one. Other low-confidence
+answers become `no`. Provider errors/timeouts still mean `no` on the Decide path.
+
+Setting `follow_up_window` to 0 disables both recent-conversation shortcuts; it
+does not disable starting a new conversation for the explicitly addressed keyword
+case. All three settings use registry defaults and are editable through
+`/kiki config key:<choice> value:<text>`; no new subcommand is required.
+
+`lingo_nudge` is an integer percentage (default 35, range 0–100), exposed by
+`/kiki config key:lingo_nudge value:<percent>`. It controls the extra per-reply
+suggestion to use one manually curated phrase from this guild's `guild_lingo`
+rows. Selection derives from the trigger message ID and remains stable on retry.
+At 0 no suggestion is added; the complete guild phrase list still appears in the
+system prompt. An empty phrase list produces no suggestion at any percentage.
+This does not enable automatic learning or provide phrase-editing commands.
 
 The leader loads all configured guilds after acquiring leadership. Commands, router and agent
 share one cache. A writer mutex covers transaction commit and cache publication, preserving write

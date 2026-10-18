@@ -1,6 +1,6 @@
 # kiki-sim: a local Discord for testing Kiki — HLD
 
-2026-10-18 · **v1 in progress.** Revised after review (GPT-6.1-Sol): isolation is
+2026-10-18 · **v1 implemented.** Revised after review (GPT-6.1-Sol): isolation is
 enforced rather than assumed, stub answers are matched to requests rather than
 queued, assertions are split by pipeline stage, and v1 drops mixed live modes,
 judges and payload recording.
@@ -18,7 +18,7 @@ $ tools/sim/kiki-sim say --as alex --in general "kiki who talked about the relea
   routed: keyword → new (jev new 0.90), conversation 1 · run 1 done
 [general] Kiki ↩ alex: stub: kiki who talked about the release?
 $ tools/sim/kiki-sim test
-14 passed, 0 failed
+<passed> passed, 0 failed, <skipped> skipped
 ```
 
 It covers what this repo owns: the Gateway listener, storage, catch-up, routing
@@ -49,9 +49,10 @@ covering the listener, `store` and catch-up.
 
 - **Own Postgres.** `tools/sim/compose.yml` runs a separate container
   (project `kiki-sim`, port 54339). Before dropping or creating anything, the
-  CLI checks the server's `sim_marker` table, which only its own init script
-  creates. The database URL is built by the CLI and can't be overridden from
-  `.env`.
+  CLI checks the server's `sim_marker` table, created by its init script.
+  `KIKI_SIM_POSTGRES` can select another localhost-only server (as in CI), which
+  must also have that table. Service database URLs are built by the CLI; the
+  repository `.env` does not select the database.
 - **No inherited config.** Both services load `.env` (`dotenvy` in Rust,
   `python-dotenv` in Python) from their working directory and its parents. The
   CLI starts them with a scrubbed environment (`PATH`, `HOME`, the toolchain
@@ -64,7 +65,8 @@ covering the listener, `store` and catch-up.
   traffic can never reach real Discord. It logs a warning whenever they're set.
 - **Stub mode has no egress.** `OPENROUTER_BASE_URL` points at fakecord. Live
   mode (`--live`) leaves it unset and copies only `OPENROUTER_CHAT_API_KEY` and
-  `OPENROUTER_DECISION_API_KEY` from the repo `.env`. Discord stays fake.
+  `OPENROUTER_DECISION_API_KEY` from the environment or repo `.env` (environment
+  wins). Discord stays fake.
 
 ## Product changes (env-gated, default off)
 
@@ -166,12 +168,13 @@ stage has its own completion barrier:
 | `run` | the `agent_runs` row for the pool reaches `done`, `failed` or `superseded` | `run: done / failed / superseded / none` |
 | `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` |
 | `reactions` | eventually, within 5 s | `reaction: {emoji: 👀, present: false}` |
-| any | none | `prompt_contains`, `prompt_lacks` (last recorded chat request), `rest_calls` |
+| any | none | `prompt_contains`, `prompt_lacks` (last recorded chat request), `rest_calls`; `decide_contains`, `decide_lacks` (compact JSON of the message's recorded Decide state; fail if Decide was not called) |
 
 `expect` waits on the barrier of the latest stage it mentions, for the latest
 `say` by default or for a named step (`of: greet`). Steps can be non-blocking
 (`send` instead of `say`, or a `batch` of messages sent in quick succession), so
-pooling and edits within a pool can be tested.
+pooling and edits within a pool can be tested. An `exec: "SQL…"` step runs SQL against
+the sim database to set up state such as curated `guild_lingo` entries.
 
 ## Lifecycle and readiness
 
@@ -191,12 +194,14 @@ pooling and edits within a pool can be tested.
 
 | Command | Does |
 |---|---|
-| `up [--fixture F] [--live]` / `down` | Starts or stops the stack described above. |
+| `up [--fixture F] [--live] [--set NAME=VALUE]` | Starts the stack; repeat `--set` to override ingester settings. Run again after service changes. |
+| `down [--purge]` | Stops services; `--purge` also removes the local sim Postgres container and volume. |
+| `reset` | Fresh database and guild with the saved stack settings. |
 | `say --as U --in C [--reply-to ID\|kiki] [--age S] TEXT` | Sends a message, waits through `delivered` (or `classified` when it isn't routed), and prints the transcript lines, the classification, the run and the reply. |
 | `send …` | Same, without waiting. |
-| `slash --as U config key=chat_model value=sim/other` | Sends a `/kiki` interaction and prints the response. |
+| `slash --as U [--in C] SUBCOMMAND [name=value …]` | Sends a `/kiki` interaction and prints the response, e.g. `slash --as alex config key=chat_model value=sim/other` or `slash --as alex config key=history_messages value=50`. |
 | `transcript [--in C]`, `inspect MESSAGE_ID`, `logs [ingester\|agent\|fakecord]` | Inspection. |
-| `test [PATH…] [--live] [-k NAME]` | Runs scenarios (default `tools/sim/scenarios`). Exits non-zero on failure, printing the transcript, the unexpected calls and the last 50 log lines. |
+| `test [PATH…] [--live] [-k NAME]` | Runs scenarios (default `tools/sim/scenarios`). Exits non-zero on failure, printing the transcript, the unexpected calls and the last 30 ingester log lines. |
 
 ## Scenarios
 
@@ -205,19 +210,26 @@ name: a reply after the skulls still gets an answer
 steps:
   - say: {as: ethan, in: general, text: "kiki rate my lunch", id: start}
   - expect: {outcome: new, reply: true}
-  - say: {as: ethan, in: general, text: "💀💀💀"}
-    jev: {choice: no, confidence: 0.9}
-  - expect: {outcome: no, reply: false}
+  - say: {as: ethan, in: general, text: "💀💀💀", jev: {choice: "no", confidence: 0.9}}
+  - expect: {outcome: "no", reply: false}
   - say: {as: ethan, in: general, text: "Do I not have to reply to you to get a response"}
   - expect: {outcome: continue, conversation: {same_as: start}, reply: true}
 ```
 
 v1 scenarios cover: a mention, a reply to Kiki, a keyword with Jev, an active
-conversation, a non-addressed message, the 2026-10-18 misses (live-marked
-copies replay the real messages), pooling, an edit inside a pool, an ignored
+conversation, a non-addressed message, pooling, an edit inside a pool, an ignored
 author, eviction at `MAX_ACTIVE_CONVERSATIONS`, cross-channel search via a
-scripted tool call, `/kiki config`, catch-up beyond 100 messages, and a Gateway
-reconnect.
+scripted tool call, `/kiki config`, low-confidence keyword and participant
+follow-ups, direct-follow-up guards, explicitly addressed keywords overriding a
+Decide `no`, recorded Decide state, separate simultaneous conversations in one
+channel, ambiguous-person lookup, curated lingo in reply prompts, catch-up beyond 100 messages, and a
+Gateway reconnect.
+
+`live-2026-10-18.yaml` replays paraphrased real exchanges with real OpenRouter
+calls. It is marked `live: only`, so stub-mode CI skips it. To run it, start with
+`tools/sim/kiki-sim up --live`, then use
+`tools/sim/kiki-sim test --live -k live-2026-10-18`; read the printed transcript
+to assess reply style. Live runs require provider keys and incur charges.
 
 ## How agents use it
 

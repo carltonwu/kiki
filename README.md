@@ -5,8 +5,9 @@ Discord chat bot. Monorepo layout:
 | Path | What |
 |---|---|
 | `services/ingester/` | Rust service: Discord Gateway, message ingestion, conversation routing |
-| `services/agent/` | Python agent host: Pydantic AI, channel history search, durable results |
+| `services/agent/` | Python agent host: Pydantic AI, server history search, durable results |
 | `tools/backfill/` | Python one-off: backfill a guild's history into SQLite |
+| `tools/sim/` | Local Discord and OpenRouter simulator for end-to-end checks |
 | `.railway/railway.ts` | Railway infrastructure as code (Postgres + services) |
 | `docker-compose.yml` | Local Postgres (with pgvector) |
 
@@ -21,6 +22,31 @@ cargo run -p ingester                 # run; health check at http://localhost:80
 
 Add a migration: create `services/ingester/migrations/NNNN_description.sql`. Migrations are
 embedded in the binary and applied by `ingester migrate`, which Railway runs before each deploy.
+
+## Local simulator
+
+With Docker Compose, Rust and `uv` installed, run the real services against a fake
+Discord server and stub model responses, without production credentials:
+
+```sh
+tools/sim/kiki-sim up
+tools/sim/kiki-sim test
+tools/sim/kiki-sim say --as alex --in general "kiki hi"
+tools/sim/kiki-sim slash --as alex config key=history_messages
+tools/sim/kiki-sim down
+```
+
+The simulator uses its own Postgres on port 54339 and stores state and logs in
+`.sim/`. `up` rebuilds the ingester; each scenario resets the simulated database
+and guild. `down` retains the database container; `down --purge` removes it and
+its volume. `up --live` uses real OpenRouter keys and incurs provider charges,
+while Discord stays simulated. The optional `KIKI_SIM_POSTGRES` override must
+point to a localhost server with the simulator's `sim_marker` table.
+
+After changing `services/`, run `up` again, run the scenarios and the service
+checks in `.github/workflows/ci.yml`, and add a regression scenario. CI also runs
+the simulator in stub mode. See [the simulator design and CLI](docs/kiki-sim-hld.md)
+for fixtures, scripted responses, live mode and debugging commands.
 
 ## Deploying (Railway)
 
@@ -52,6 +78,15 @@ routed pools are queued in `agent_runs`. Messages older than `ROUTE_MAX_MESSAGE_
 classification time are never classified, so backfill and catch-up don't trigger responses.
 Each Jev request includes up to eight open conversations in the current channel, most recently
 active first, with no idle-time cutoff.
+A direct follow-up can continue without Jev when Kiki just answered its author,
+no other eligible human has spoken since, and the message asks a question or uses
+second-person language without mentioning someone else. Keyword-triggered Jev
+decisions use a lower confidence threshold (0.25 by default). An uncertain answer
+can continue a participant's conversation Kiki answered within the last five
+minutes. A trigger word at the start or end of a question or second-person message
+can also override Jev's `no`, continuing a recent conversation or starting one.
+Server admins can tune `decide_keyword_min_confidence`, `follow_up_window` and
+`follow_up_max_no_confidence` through `/kiki config`.
 
 The Rust dispatcher (`services/ingester/src/agent/`) claims queued `agent_runs`, builds
 context, and sends stable job IDs to the private Python agent host (`services/agent/`).
@@ -64,9 +99,10 @@ saving changes. This only affects the time shown in reply context; stored timest
 routing windows and search filters keep their existing behavior.
 
 The Python host runs Pydantic AI over OpenRouter once `OPENROUTER_CHAT_API_KEY` is set
-(without it, execution returns 501). Replies can search the destination channel's history:
-full text plus `qwen/qwen3-embedding-8b` vectors in pgvector, embedded lazily per searched
-channel. See [the host setup and contract](services/agent/README.md) for local startup,
+(without it, execution returns 501). Replies can search ingested history across the
+job's server, optionally narrowed to one channel: full text plus
+`qwen/qwen3-embedding-8b` vectors in pgvector, embedded lazily for that server. Results cite their source channel and message link. See
+[the host setup and contract](services/agent/README.md) for local startup,
 shared-token configuration, retries, migrations, and Railway sleeping, and
 [the agent tools HLD](docs/agent-tools-hld.md) for the design. No Railway resources are
 changed until the IaC is applied.
@@ -86,7 +122,12 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
-| `/kiki whois <user>` | Every name Kiki has seen for someone (nickname, display name, username) with first and last seen, plus their message and conversation counts. |
+| `/kiki users [period] [sort]` | Top 20 active people by cost (default), messages or conversations. Period: `24h`, `7d` (default) or `all`. Shows total messages, messages with Kiki, conversations and attributed LLM cost. |
+| `/kiki whois <user>` | Up to 15 recently seen names (nickname, display name, username), first/last seen, join and message dates, plus messages, conversations and attributed cost over 24 h, 7 d and all time. |
+
+Per-person cost splits reply cost across the triggering messages and includes Decide;
+it excludes topic summaries. `/kiki runs` accepts `pending`, `running`, `delivering`,
+`done`, `failed` or `superseded` as its status filter.
 
 The bot must be invited with the `applications.commands` scope for registration to succeed.
 
@@ -104,6 +145,14 @@ support text output and tools. Unset keys inherit startup env defaults, then bui
 New pools capture routing settings; new reply jobs capture context, model and token settings.
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
+
+Server phrases and custom emoji come from the manually curated `guild_lingo`
+table (migration 0014 seeds one server). Reply prompts include only that server's
+entries. `/kiki config key:lingo_nudge value:35` sets how often a reply gets an
+extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
+removes the extra suggestion; the phrase list remains in the prompt, so natural
+use is still possible. Selection is stable for the triggering message and retries.
+There is no automatic phrase learning or Discord command to edit the phrase list.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

@@ -1,6 +1,7 @@
 # Agent tools and message retrieval — HLD
 
-2026-10-17 · **MVP implemented, not deployed.** The host runs Pydantic AI once
+2026-10-17 · **MVP implemented; updated 2026-10-18 for server-wide retrieval.**
+The host runs Pydantic AI once
 `OPENROUTER_CHAT_API_KEY` is set; without it, jobs return 501.
 
 ## Decisions
@@ -17,16 +18,17 @@
   Postgres image ships pgvector 0.8.7; local and CI use
   `pgvector/pgvector:pg18-trixie`. No vector database, no local model, no new
   service.
-- **Scope: the destination channel only.** Cross-channel search waits for
-  permission data Kiki doesn't ingest.
+- **Scope: the job's guild.** Search covers ingested history across that server;
+  an optional channel argument narrows it. Guild boundaries come from trusted run
+  context. Retrieval does not apply the requesting member's channel permissions.
 
 ## Ownership
 
 Rust keeps Discord, routing, `agent_runs`, prompt snapshots, wake-up/retries,
 delivery and all migrations. Python's `Executor` is a Pydantic AI `Agent`, whose
 runner owns model turns and tool calls. The
-[HTTP contract](../services/agent/README.md) is unchanged: v1 scope comes from
-`scope.channel_id`.
+[HTTP contract](../services/agent/README.md) is unchanged: trusted `scope.guild_id`
+bounds retrieval, while `scope.channel_id` identifies the reply destination.
 
 | File | Contents |
 |---|---|
@@ -39,7 +41,8 @@ Rust prompt changes, already made:
 - "Other active conversations" is limited to the destination channel. It used
   to list every guild and channel, which leaked other channels to the reply's
   readers.
-- The capabilities line now says Kiki can search this channel and cites links.
+- The capabilities line says Kiki can search every channel in this server, with
+  an optional channel filter, and should cite message links.
 
 ## Tools
 
@@ -47,15 +50,16 @@ The trusted deps hold the connection, the scope (guild, channel, conversation),
 the embedder and the per-run counters. They come from the request, never from
 model arguments, and arguments can only narrow them.
 
-- `search_messages(query, person?, before?, after?, limit=10)` returns, for each
-  hit, an ID, author, time, Discord URL and the first 1,000 characters of text,
-  plus `semantic: "full" | "partial" | "off"`. `person` is a roster ref, an
+- `search_messages(query, person?, channel?, before?, after?, limit=10)` returns, for each
+  hit, an ID, author, source channel, time, Discord URL and the first 1,000
+  characters of text, plus `semantic: "full" | "partial" | "off"`. `person` is a roster ref, an
   @username or any name the person has had. It's resolved to user IDs
   ([identity-hld](identity-hld.md)), and authors are shown by their current
-  label.
+  label. `channel` accepts a name, channel mention or ID and only narrows search
+  within the guild.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
-  same channel (at most 10 on each side) and the reply parent if it's in the
-  same channel.
+  target message's own channel (at most 10 on each side) and the reply parent
+  if it is in the same guild.
 
 Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
@@ -75,7 +79,8 @@ All values are constants to tune from the logs.
    lexemes, so stopwords and unmatched words don't block hits:
    `replace(plainto_tsquery('english', q)::text, ' & ', ' | ')::tsquery`,
    matched against the `to_tsvector('english', content)` GIN index.
-2. **Semantic:** top 50 by cosine distance, as an exact scan within the channel,
+2. **Semantic:** top 50 by cosine distance, as an exact scan within the guild
+   (or selected channel),
    keeping only candidates with similarity ≥ `MIN_SIMILARITY` (0.25). Without a
    floor, nearest neighbors of a nonsense query still rank, and the recency
    bonus would promote recent noise.
@@ -112,12 +117,12 @@ queries are an argument error returned to the model.
   model's context, so there's no chunking.
 - **Query text** gets Qwen's instruction prefix; documents get none.
 - **When indexing happens:**
-  - When a reply job starts, the channel's 256 newest pending messages are
+  - When a reply job starts, the guild's 256 newest pending messages are
     embedded in the background, in batches of 64, while the model reads the
     prompt. The first search waits for this to finish; if the run ends without
-    a search, indexing is cancelled. If 256 were found, the channel reports
-    `"partial"`. A sleeping service does nothing, and only channels with
-    replies are indexed.
+    a search, indexing is cancelled. If 256 were found, the guild reports
+    `"partial"`. A sleeping service does nothing; a reply can index pending
+    messages from other channels in its guild.
   - History uses `kiki-agent-host index` (for example, through `railway ssh`).
     It walks all pending messages newest first with a keyset cursor, logs
     progress and cost, and exits. Rerun it any time.
@@ -148,16 +153,16 @@ queries are an argument error returned to the model.
 
 ## Next
 
-1. Deploy, set the key, run `index`, then set `AGENT_HOST_URL`. Read the cold-start
-   and memory log lines.
+1. For a new installation, set the key, optionally run `index`, then set
+   `AGENT_HOST_URL`. Read the cold-start and memory log lines.
 2. Build 30–50 real queries with expected message IDs, covering paraphrases,
    exact names, old exact versus recent weak matches, date filters,
    edits/deletes and outages. Calibrate `MIN_SIMILARITY` from logged
    similarities, then tune `w`, candidate counts and limits on recall@10,
    citation accuracy, latency and cost.
 3. **Later:**
-   - Cross-channel search: needs ingested permission overwrites and an optional
-     allowlist field in the contract.
+   - Member-specific channel permission filtering and optional allowlists;
+     current retrieval is bounded by guild, with an optional channel filter.
    - OpenRouter server tools: Pydantic's `WebSearchTool` maps to
      `openrouter:web_search` and the engine isn't selectable. Cap
      `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
