@@ -96,6 +96,15 @@ REF = re.compile(r"^u[0-9]+$")
 USER_ID = re.compile(r"^<@!?([0-9]+)>$|^([0-9]{15,20})$")
 MENTION = re.compile(r"<@!?([0-9]+)>")
 CHANNEL_ID = re.compile(r"^<#([0-9]+)>$|^([0-9]{15,20})$")
+MAX_ID = 2**63 - 1  # Postgres bigint
+
+
+def discord_id(text: str, match: re.Match) -> int:
+    """The ID a USER_ID/CHANNEL_ID match holds; bigger ones would fail a bigint cast."""
+    if (value := int(match[1] or match[2])) > MAX_ID:
+        raise ValueError(f"{text!r} is not a Discord ID")
+    return value
+
 
 RESOLVE = """
 SELECT n.user_id FROM user_names n
@@ -117,7 +126,7 @@ async def resolve_person(
             raise ValueError(f"{person} is not in this conversation's people list")
         return [roster.ids[person]]
     if match := USER_ID.match(person):
-        return [int(match[1] or match[2])]
+        return [discord_id(person, match)]
     username_only = person.startswith("@")
     cursor = await connection.execute(
         RESOLVE,
@@ -134,7 +143,7 @@ async def resolve_channel(connection: AsyncConnection, scope: Scope, channel: st
     """Channel IDs `channel` can mean: a <#mention>, an ID, or a name (with or without #)."""
     channel = channel.strip()
     if match := CHANNEL_ID.match(channel):
-        ids, names = [int(match[1] or match[2])], None
+        ids, names = [discord_id(channel, match)], None
     else:
         ids, names = None, channel.removeprefix("#").strip().lower()
     cursor = await connection.execute(

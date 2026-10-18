@@ -400,3 +400,13 @@ async def test_placement_skips_full_docs_but_never_falls_back_to_unrelated_ones(
     result = await remember(db, "u1", "works at the hospital " + "y " * 30, sources=["1"])
     assert "Not saved" in result["error"] and "'profile'" in result["error"]
     assert [d["doc"] for d in result["other_docs"]] == ["music"]
+
+
+async def test_out_of_range_ids_are_argument_errors(db):
+    for subject in ["99999999999999999999", "<@99999999999999999999>"]:
+        with pytest.raises(ValueError, match="not a Discord"):
+            await remember(db, subject, "likes tape")
+        with pytest.raises(ValueError, match="not a Discord"):
+            await recall(db, subject)
+    cursor = await db.execute("SELECT count(*) FROM memory_subjects")
+    assert (await cursor.fetchone())[0] == 0
