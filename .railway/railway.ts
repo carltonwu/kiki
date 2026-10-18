@@ -33,8 +33,8 @@ export default defineRailway(() => {
       AGENT_HOST_JOB_TIMEOUT_SECS: "120",
       // Chat and embeddings via OpenRouter; without it the host returns 501.
       OPENROUTER_CHAT_API_KEY: preserve(),
-      // read_image's model, e.g. anthropic/claude-haiku-5.5; unset falls back to the chat model.
-      OPENROUTER_VISION_MODEL: preserve(),
+      // read_image's model; unset falls back to the chat model.
+      OPENROUTER_VISION_MODEL: "deepseek/deepseek-v4.1-flash-1017",
     },
   });
 
@@ -66,6 +66,10 @@ export default defineRailway(() => {
       RUST_LOG: "info,sqlx=warn,twilight_http_ratelimiting=warn",
       DISCORD_BOT_TOKEN: preserve(), // secret: set with `railway variable set`
       OPENROUTER_DECISION_API_KEY: preserve(), // secret, for Jev (Decide) via OpenRouter; optional
+      OPENROUTER_DECISION_MODEL: "~typesafe/jev-latest",
+      OPENROUTER_CHAT_MODEL: "deepseek/deepseek-v4.1-flash-1017",
+      OPENROUTER_IMAGE_MODEL: "openai/gpt-image-2.5-flare", // generate_image
+      OPENROUTER_EMOJI_MODEL: "deepseek/deepseek-v4.1-flash-1017", // /kiki emojis resync:true
       // Set this to http://${{agent.RAILWAY_PRIVATE_DOMAIN}}:8081 once the agent
       // service has OPENROUTER_CHAT_API_KEY; unset, nothing is dispatched.
       AGENT_HOST_URL: preserve(),
