@@ -3,9 +3,9 @@
 import logging
 from collections.abc import Awaitable, Callable
 
-from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
+from . import db
 from .contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
 from .executor import Executor, TransientError
 
@@ -43,9 +43,7 @@ async def durable(
 ) -> JobResponse:
     """Runs a job at most once per ID: a retry gets the saved result or waits."""
     # A session lock survives short transactions and releases on disconnect.
-    async with await AsyncConnection.connect(
-        database_url, autocommit=True, connect_timeout=10
-    ) as connection:
+    async with await db.connect(database_url) as connection:
         cursor = await connection.execute(
             "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (request.id,)
         )

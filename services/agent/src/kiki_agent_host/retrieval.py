@@ -8,7 +8,6 @@ Embeddings are computed lazily for the searched guild, or all at once by
 
 import asyncio
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +16,9 @@ from typing import Literal
 from openai import AsyncOpenAI
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
+
+from . import db
+from .config import openrouter_base
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +60,6 @@ class Embedder:
             "[" + ",".join(f"{x:.5g}" for x in item.embedding[:DIMENSIONS]) + "]"
             for item in sorted(response.data, key=lambda item: item.index)
         ]
-
-
-def openrouter_base() -> str:
-    """OpenRouter's API root; `OPENROUTER_BASE_URL` points at the local simulator."""
-    return (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api").rstrip("/")
 
 
 def openrouter_client(api_key: str, **options) -> AsyncOpenAI:
@@ -425,7 +422,7 @@ def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str])
 async def index_all(database_url: str, api_key: str) -> None:
     """`kiki-agent-host index`: embeds every pending message, then exits."""
     embed, below, total = Embedder(openrouter_client(api_key)), None, 0
-    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+    async with await db.connect(database_url) as connection:
         while True:
             found, below = await index_pending(connection, embed, below=below)
             total += found

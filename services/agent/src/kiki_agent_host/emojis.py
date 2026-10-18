@@ -10,7 +10,6 @@ The model call is passed in; images are fetched like `read_image`'s
 
 import asyncio
 import logging
-import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -21,6 +20,7 @@ from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent
 
 from . import vision
+from .config import cdn_base
 from .retrieval import CANDIDATES, EMBED_BATCH, MIN_SIMILARITY, RRF_K, Embedder
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,6 @@ PROMPT = (
 Describe = Callable[[str, bool, BinaryContent], Awaitable[tuple[str, float | None]]]
 EMOJI = re.compile(r"^<(a?):(\w+):([0-9]+)>$")
 MAX_ID = 2**63 - 1  # Postgres bigint
-
-
-def cdn_base() -> str:
-    """Discord's CDN; `DISCORD_CDN_URL` points at the local simulator."""
-    return (os.getenv("DISCORD_CDN_URL") or "https://cdn.discordapp.com").rstrip("/")
 
 
 class ImageUnavailable(Exception):

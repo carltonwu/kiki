@@ -12,7 +12,8 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host import emojis, retrieval, vision
 from kiki_agent_host.agent import PydanticExecutor
-from kiki_agent_host.app import Settings, create_app
+from kiki_agent_host.app import create_app
+from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult
 
 GUILD, OTHER_GUILD = 1, 7

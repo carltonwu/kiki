@@ -35,7 +35,8 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import drawing, emojis, images, memory_tools, reading, retrieval
+from . import db, drawing, emojis, images, memory_tools, reading, retrieval
+from .config import cdn_base
 from .contracts import (
     AspectRatio,
     DescribeEmojisRequest,
@@ -597,9 +598,7 @@ class PydanticExecutor:
             if request.kind == "topic":
                 result = await plain.run(prompt, **options)
             else:
-                async with await AsyncConnection.connect(
-                    self.database_url, autocommit=True, connect_timeout=10
-                ) as connection:
+                async with await db.connect(self.database_url) as connection:
                     scope = retrieval.Scope(
                         int(request.scope.guild_id),
                         int(request.scope.channel_id),
@@ -695,12 +694,8 @@ class PydanticExecutor:
         note = prompt = ""
         references = []
         try:
-            async with await AsyncConnection.connect(
-                self.database_url, autocommit=True, connect_timeout=10
-            ) as connection:
-                gather = drawing.Gatherer(
-                    connection, scope, vision, emojis.cdn_base(), self.transport
-                )
+            async with await db.connect(self.database_url) as connection:
+                gather = drawing.Gatherer(connection, scope, vision, cdn_base(), self.transport)
                 found = await asyncio.gather(*(gather.find(s) for s in plan.subjects))
                 prompt, references, pictures = drawing.compose(plan, found)
                 try:
@@ -791,9 +786,7 @@ class PydanticExecutor:
 
         embed = retrieval.Embedder(self.embeddings)
         try:
-            async with await AsyncConnection.connect(
-                self.database_url, autocommit=True, connect_timeout=10
-            ) as connection:
+            async with await db.connect(self.database_url) as connection:
                 counts = await emojis.describe_pending(
                     connection,
                     describe,

@@ -9,7 +9,6 @@
 """
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
@@ -20,6 +19,8 @@ from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedMode
 from pydantic_ai.messages import BinaryContent, ModelResponse, UserContent
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
+
+from .config import discord_api, extra_media_hosts
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +60,7 @@ def client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClie
 def allowed(url: str) -> bool:
     """Discord's CDN and media proxy, plus `DISCORD_MEDIA_EXTRA_HOSTS` (the sim)."""
     parts = urlsplit(url)
-    extra = {h.strip() for h in os.getenv("DISCORD_MEDIA_EXTRA_HOSTS", "").split(",")} - {""}
+    extra = extra_media_hosts()
     if parts.netloc in extra:
         return parts.scheme in ("http", "https")
     host = parts.hostname or ""
@@ -76,11 +77,6 @@ def expired(url: str, now: float | None = None) -> bool:
     except (KeyError, ValueError):
         return False
     return expires <= (now or time.time()) + 60
-
-
-def discord_api() -> str:
-    """Discord's REST root; `DISCORD_API_URL` points at the local simulator."""
-    return (os.getenv("DISCORD_API_URL") or "https://discord.com/api/v10").rstrip("/")
 
 
 async def refresh(http: httpx.AsyncClient, token: str, urls: list[str]) -> dict[str, str]:

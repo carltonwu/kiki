@@ -4,7 +4,8 @@ import httpx
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from kiki_agent_host.app import Settings, create_app
+from kiki_agent_host.app import create_app
+from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult
 from kiki_agent_host.executor import TransientError
 

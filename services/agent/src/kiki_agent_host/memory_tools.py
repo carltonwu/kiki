@@ -12,7 +12,7 @@ from typing import Any, Literal
 from psycopg import AsyncConnection
 from pydantic_ai import Agent, RunContext
 
-from . import memory
+from . import db, memory
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +33,7 @@ class Session:
 
     async def connect(self) -> AsyncConnection:
         if self.connection is None:
-            self.connection = await AsyncConnection.connect(
-                self.database_url, autocommit=True, connect_timeout=10
-            )
+            self.connection = await db.connect(self.database_url)
         return self.connection
 
     async def close(self) -> None:
