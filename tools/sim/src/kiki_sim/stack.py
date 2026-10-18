@@ -3,18 +3,28 @@
 Isolation rules (docs/kiki-sim-hld.md): the sim's own Postgres (checked through
 `sim_marker` before anything is dropped), a scrubbed environment, and a working
 directory outside the repo so no `.env` is ever loaded.
+
+Several stacks run side by side, in one worktree or many: each has a name
+(`--stack`, `KIKI_SIM_STACK`), its own state directory, free ports picked at `up`,
+and its own database, named after the worktree and the stack.
 """
 
+import fcntl
 import hashlib
 import json
 import os
+import re
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,16 +33,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[4]
 SIM = ROOT / "tools/sim"
-STATE = ROOT / ".sim"
-LOGS = STATE / "logs"
 MIGRATIONS = ROOT / "services/ingester/migrations"
 DEFAULT_FIXTURE = SIM / "fixtures/minimal.yaml"
-
-FAKECORD_PORT = 8090
-HOST_PORT = 8091
-INGESTER_PORT = 8092
-DATABASE = "kiki_sim"
-TEMPLATE = "kiki_sim_template"
+# Shared by every worktree on this machine: built ingesters and the setup lock.
+CACHE = Path(os.getenv("XDG_CACHE_HOME") or Path.home() / ".cache") / "kiki-sim"
+# What the ingester binary is built from, besides `services/` (minus the agent).
+RUST_INPUTS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo"]
+KEPT_BUILDS = 8
 HOST_TOKEN = "sim-host-token"
 # Variables a toolchain needs; everything else is set explicitly per service.
 KEEP = [
@@ -61,6 +68,79 @@ class SimError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class Stack:
+    """One simulated deployment: its own processes, ports, logs and database."""
+
+    name: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,19}", self.name):
+            raise SimError(f"stack names are lowercase letters, digits and dashes: {self.name!r}")
+
+    @property
+    def state(self) -> Path:
+        return ROOT / ".sim" / self.name
+
+    @property
+    def logs(self) -> Path:
+        return self.state / "logs"
+
+    @property
+    def database(self) -> str:
+        """Unique on the shared server: the worktree's path and the stack's name."""
+        worktree = hashlib.sha1(str(ROOT).encode()).hexdigest()[:8]
+        return f"kiki_sim_{worktree}_{self.name.replace('-', '_')}"
+
+
+current = Stack(os.getenv("KIKI_SIM_STACK") or "main")
+
+
+def use(name: str) -> None:
+    """Points this process at stack `name`; every command works on one stack."""
+    global current, _config
+    current, _config = Stack(name), None
+
+
+def stacks() -> list[Stack]:
+    """This worktree's stacks that have state on disk."""
+    root = ROOT / ".sim"
+    if not root.exists():
+        return []
+    return [Stack(p.name) for p in sorted(root.iterdir()) if (p / "logs").is_dir()]
+
+
+@contextmanager
+def machine_lock():
+    """Serializes setup that every stack on this machine shares (the container,
+    the template database, the build cache)."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CACHE / "setup.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def free_port() -> int:
+    """A port free on IPv4 and IPv6: the services listen dual-stack."""
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        s.bind(("::", 0))
+        return s.getsockname()[1]
+
+
+@dataclass(frozen=True)
+class Ports:
+    fakecord: int
+    host: int
+    ingester: int
+
+    @classmethod
+    def pick(cls) -> "Ports":
+        while len(ports := {free_port() for _ in range(3)}) < 3:
+            pass
+        return cls(*sorted(ports))
+
+
 def admin_url() -> str:
     """The sim server. CI may point at its own service, but only on localhost."""
     url = os.getenv("KIKI_SIM_POSTGRES", "postgres://kiki:kiki@127.0.0.1:54339/postgres")
@@ -69,11 +149,11 @@ def admin_url() -> str:
     return url
 
 
-def database_url(name: str = DATABASE) -> str:
-    return urlparse(admin_url())._replace(path=f"/{name}").geturl()
+def database_url(name: str | None = None) -> str:
+    return urlparse(admin_url())._replace(path=f"/{name or current.database}").geturl()
 
 
-def connect(name: str = DATABASE, **kwargs) -> psycopg.Connection:
+def connect(name: str | None = None, **kwargs) -> psycopg.Connection:
     return psycopg.connect(database_url(name), autocommit=True, **kwargs)
 
 
@@ -94,7 +174,13 @@ def start_postgres() -> None:
         return
     except psycopg.OperationalError:
         pass
-    run(["docker", "compose", "-f", str(SIM / "compose.yml"), "up", "-d", "--wait"])
+    with machine_lock():
+        try:
+            check_marker()
+            return
+        except psycopg.OperationalError:
+            pass
+        run(["docker", "compose", "-f", str(SIM / "compose.yml"), "up", "-d", "--wait"])
     check_marker()
 
 
@@ -111,37 +197,79 @@ def migrations_hash() -> str:
     return digest.hexdigest()[:16]
 
 
+def sources_hash() -> str:
+    """The ingester's inputs as they are on disk, untracked files included."""
+    listed = subprocess.run(
+        ["git", "ls-files", "-co", "--exclude-standard", "-z", "--", *RUST_INPUTS, "services"],
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+    ).stdout.decode()
+    digest = hashlib.sha256()
+    for name in sorted(n for n in listed.split("\0") if n and not n.startswith("services/agent/")):
+        path = ROOT / name
+        if path.is_file():
+            digest.update(name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()[:20]
+
+
 def build_ingester() -> Path:
+    """The ingester built from this worktree's sources, from a cache shared by
+    every worktree: a fresh worktree with unchanged Rust skips cargo. The cache is
+    keyed by content, not file times, so one worktree never runs another's code."""
+    key = sources_hash()
+    cached = CACHE / "ingester" / key / "ingester"
+    if cached.exists():
+        os.utime(cached.parent)
+        return cached
     run(["cargo", "build", "--quiet", "-p", "ingester"], cwd=ROOT)
-    return ROOT / "target/debug/ingester"
+    if sources_hash() != key:
+        raise SimError("the Rust sources changed during the build; run `up` again")
+    with machine_lock():
+        if not cached.exists():
+            staging = cached.parent.with_name(f"{key}.{os.getpid()}")
+            staging.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / "target/debug/ingester", staging / "ingester")
+            staging.rename(cached.parent)
+        builds = sorted((CACHE / "ingester").iterdir(), key=lambda p: p.stat().st_mtime)
+        for old in builds[:-KEPT_BUILDS]:
+            shutil.rmtree(old, ignore_errors=True)
+    return cached
+
+
+def template_name() -> str:
+    """One migrated template per set of migrations, shared by every stack."""
+    return f"kiki_sim_template_{migrations_hash()}"
 
 
 def prepare_template(ingester: Path) -> None:
-    """A migrated template database, rebuilt when the migrations change."""
-    wanted = migrations_hash()
-    with psycopg.connect(admin_url(), autocommit=True) as c:
-        row = c.execute(
-            "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = %s",
-            (TEMPLATE,),
-        ).fetchone()
-        if row and row[0] == wanted:
+    template = template_name()
+    with machine_lock(), psycopg.connect(admin_url(), autocommit=True) as c:
+        if c.execute("SELECT 1 FROM pg_database WHERE datname = %s", (template,)).fetchone():
             return
-        c.execute(f"DROP DATABASE IF EXISTS {TEMPLATE} WITH (FORCE)")
-        c.execute(f"CREATE DATABASE {TEMPLATE}")
-    run(
-        [str(ingester), "migrate"],
-        env=service_env({"DATABASE_URL": database_url(TEMPLATE)}),
-        cwd=workdir(),
-    )
-    with psycopg.connect(admin_url(), autocommit=True) as c:
-        c.execute(f"COMMENT ON DATABASE {TEMPLATE} IS '{wanted}'")
+        staging = f"{template}_new"
+        c.execute(f"DROP DATABASE IF EXISTS {staging} WITH (FORCE)")
+        c.execute(f"CREATE DATABASE {staging}")
+        run(
+            [str(ingester), "migrate"],
+            env=service_env({"DATABASE_URL": database_url(staging)}),
+            cwd=workdir(),
+        )
+        c.execute(f"ALTER DATABASE {staging} RENAME TO {template}")
 
 
 def recreate_database() -> None:
     check_marker()
+    # CREATE DATABASE fails while another session reads the template.
+    with machine_lock(), psycopg.connect(admin_url(), autocommit=True) as c:
+        c.execute(f"DROP DATABASE IF EXISTS {current.database} WITH (FORCE)")
+        c.execute(f"CREATE DATABASE {current.database} TEMPLATE {template_name()}")
+
+
+def drop_database() -> None:
+    check_marker()
     with psycopg.connect(admin_url(), autocommit=True) as c:
-        c.execute(f"DROP DATABASE IF EXISTS {DATABASE} WITH (FORCE)")
-        c.execute(f"CREATE DATABASE {DATABASE} TEMPLATE {TEMPLATE}")
+        c.execute(f"DROP DATABASE IF EXISTS {current.database} WITH (FORCE)")
 
 
 def workdir() -> str:
@@ -173,27 +301,58 @@ def live_keys() -> dict[str, str]:
     return found
 
 
+_config: "Config | None" = None
+
+
 class Config:
     """What `up` decided; saved so later commands talk to the same stack."""
 
-    def __init__(self, fixture: Path, live: bool, env: dict | None = None):
+    def __init__(
+        self,
+        fixture: Path,
+        live: bool,
+        env: dict | None = None,
+        ports: Ports | None = None,
+        ingester: Path | None = None,
+    ):
         self.fixture = fixture
         self.live = live
         self.env = env or {}
+        self.ports = ports or Ports.pick()
+        self.ingester = ingester
 
     def save(self) -> None:
-        STATE.mkdir(exist_ok=True)
-        (STATE / "config.json").write_text(
-            json.dumps({"fixture": str(self.fixture), "live": self.live, "env": self.env})
+        global _config
+        current.state.mkdir(parents=True, exist_ok=True)
+        (current.state / "config.json").write_text(
+            json.dumps(
+                {
+                    "fixture": str(self.fixture),
+                    "live": self.live,
+                    "env": self.env,
+                    "ports": asdict(self.ports),
+                    "ingester": str(self.ingester),
+                }
+            )
         )
+        _config = self
 
     @classmethod
     def load(cls) -> "Config":
-        try:
-            data = json.loads((STATE / "config.json").read_text())
-        except FileNotFoundError as e:
-            raise SimError("the simulator isn't up: run `kiki-sim up` first") from e
-        return cls(Path(data["fixture"]), data["live"], data.get("env"))
+        global _config
+        if _config is None:
+            try:
+                data = json.loads((current.state / "config.json").read_text())
+            except FileNotFoundError as e:
+                raise SimError(f"stack {current.name} isn't up: run `kiki-sim up` first") from e
+            _config = cls(
+                Path(data["fixture"]),
+                data["live"],
+                data.get("env"),
+                Ports(**data["ports"]),
+                Path(data["ingester"]),
+            )
+        return _config
 
     def guild_id(self) -> str:
         return str(yaml.safe_load(self.fixture.read_text())["guild"]["id"])
@@ -201,21 +360,21 @@ class Config:
     def ingester_env(self, overrides: dict[str, str]) -> dict[str, str]:
         values = {
             "DATABASE_URL": database_url(),
-            "PORT": str(INGESTER_PORT),
+            "PORT": str(self.ports.ingester),
             "LOG_FORMAT": "json",
             "RUST_LOG": "info,ingester=debug,sqlx=warn,twilight_http_ratelimiting=warn",
             "DISCORD_BOT_TOKEN": "sim-token",
             "DISCORD_GUILD_IDS": self.guild_id(),
-            "DISCORD_API_PROXY": f"127.0.0.1:{FAKECORD_PORT}",
-            "DISCORD_GATEWAY_URL": f"ws://127.0.0.1:{FAKECORD_PORT}/gateway",
-            "AGENT_HOST_URL": f"http://127.0.0.1:{HOST_PORT}",
+            "DISCORD_API_PROXY": f"127.0.0.1:{self.ports.fakecord}",
+            "DISCORD_GATEWAY_URL": f"ws://127.0.0.1:{self.ports.fakecord}/gateway",
+            "AGENT_HOST_URL": f"http://127.0.0.1:{self.ports.host}",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
         }
         if self.live:
             values["OPENROUTER_DECISION_API_KEY"] = live_keys()["OPENROUTER_DECISION_API_KEY"]
         else:
             values |= {
-                "OPENROUTER_BASE_URL": f"http://127.0.0.1:{FAKECORD_PORT}/openrouter",
+                "OPENROUTER_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/openrouter",
                 "OPENROUTER_DECISION_API_KEY": "sim-key",
                 "OPENROUTER_CHAT_MODEL": "sim/chat",
                 "OPENROUTER_IMAGE_MODEL": "sim/image",
@@ -225,15 +384,15 @@ class Config:
     def host_env(self) -> dict[str, str]:
         values = {
             "DATABASE_URL": database_url(),
-            "PORT": str(HOST_PORT),
+            "PORT": str(self.ports.host),
             "LOG_FORMAT": "json",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
             # Attachments are served by fakecord, not Discord's CDN.
-            "DISCORD_MEDIA_EXTRA_HOSTS": f"127.0.0.1:{FAKECORD_PORT}",
+            "DISCORD_MEDIA_EXTRA_HOSTS": f"127.0.0.1:{self.ports.fakecord}",
             # The fake guild's emoji images and avatars, in live mode too.
-            "DISCORD_CDN_URL": f"http://127.0.0.1:{FAKECORD_PORT}/cdn",
+            "DISCORD_CDN_URL": f"http://127.0.0.1:{self.ports.fakecord}/cdn",
             # Expired attachment links are refreshed through fakecord's REST API.
-            "DISCORD_API_URL": f"http://127.0.0.1:{FAKECORD_PORT}/api/v10",
+            "DISCORD_API_URL": f"http://127.0.0.1:{self.ports.fakecord}/api/v10",
             "DISCORD_BOT_TOKEN": "sim-token",
         }
         if self.live:
@@ -243,7 +402,7 @@ class Config:
                 values["OPENROUTER_VISION_MODEL"] = keys["OPENROUTER_VISION_MODEL"]
         else:
             values |= {
-                "OPENROUTER_BASE_URL": f"http://127.0.0.1:{FAKECORD_PORT}/openrouter",
+                "OPENROUTER_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/openrouter",
                 "OPENROUTER_CHAT_API_KEY": "sim-key",
                 "OPENROUTER_VISION_MODEL": "sim/vision",
             }
@@ -254,15 +413,15 @@ class Config:
 
 
 def pid_path(name: str) -> Path:
-    return STATE / f"{name}.pid"
+    return current.state / f"{name}.pid"
 
 
 def log_path(name: str) -> Path:
-    return LOGS / f"{name}.log"
+    return current.logs / f"{name}.log"
 
 
 def start(name: str, cmd: list[str], env: dict[str, str]) -> None:
-    LOGS.mkdir(parents=True, exist_ok=True)
+    current.logs.mkdir(parents=True, exist_ok=True)
     with open(log_path(name), "ab") as out:
         out.write(f"\n--- start {time.strftime('%H:%M:%S')} ---\n".encode())
         out.flush()
@@ -300,18 +459,21 @@ def running(name: str) -> int | None:
     return pid
 
 
-def stop(name: str, timeout: float = 15) -> None:
-    pid = running(name)
-    if pid:
+def stop(*names: str, timeout: float = 15) -> None:
+    """Signals every named service at once, then waits for all of them."""
+    pids = {name: pid for name in names if (pid := running(name))}
+    for pid in pids.values():
         os.killpg(pid, signal.SIGTERM)
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and running(name):
-            time.sleep(0.1)
-        if running(name):
-            os.killpg(pid, signal.SIGKILL)
-            time.sleep(0.2)
-    pid_path(name).unlink(missing_ok=True)
-    CHILDREN.pop(name, None)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and any(running(n) for n in pids):
+        time.sleep(0.05)
+    if alive := [n for n in pids if running(n)]:
+        for name in alive:
+            os.killpg(pids[name], signal.SIGKILL)
+        time.sleep(0.2)
+    for name in names:
+        pid_path(name).unlink(missing_ok=True)
+        CHILDREN.pop(name, None)
 
 
 def http_ok(url: str) -> bool:
@@ -325,7 +487,7 @@ def http_ok(url: str) -> bool:
 def control(path: str, body: dict | None = None, method: str | None = None) -> dict:
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(
-        f"http://127.0.0.1:{FAKECORD_PORT}/_sim/{path}",
+        f"http://127.0.0.1:{Config.load().ports.fakecord}/_sim/{path}",
         data=data,
         method=method or ("POST" if data is not None else "GET"),
         headers={"Content-Type": "application/json"},
@@ -344,7 +506,7 @@ def wait_for(what: str, check, timeout: float, name: str | None = None) -> None:
             return
         if name and not running(name):
             raise SimError(f"{name} exited while waiting for {what}:\n{tail(name)}")
-        time.sleep(0.1)
+        time.sleep(0.05)
     raise SimError(f"timed out waiting for {what}" + (f":\n{tail(name)}" if name else ""))
 
 
@@ -376,8 +538,11 @@ def log_size(name: str) -> int:
 
 def up(config: Config) -> None:
     start_postgres()
-    ingester = build_ingester()
-    prepare_template(ingester)
+    config.ingester = build_ingester()
+    prepare_template(config.ingester)
+    if running("fakecord"):
+        # Already up: keep the ports its services were started with.
+        config.ports = Config.load().ports
     config.save()
     if not running("fakecord"):
         start(
@@ -387,7 +552,7 @@ def up(config: Config) -> None:
                 "-m",
                 "kiki_sim.fakecord",
                 "--port",
-                str(FAKECORD_PORT),
+                str(config.ports.fakecord),
                 "--fixture",
                 str(config.fixture),
             ],
@@ -395,7 +560,7 @@ def up(config: Config) -> None:
         )
         wait_for(
             "fakecord",
-            lambda: http_ok(f"http://127.0.0.1:{FAKECORD_PORT}/_sim/state"),
+            lambda: http_ok(f"http://127.0.0.1:{config.ports.fakecord}/_sim/state"),
             15,
             "fakecord",
         )
@@ -404,8 +569,7 @@ def up(config: Config) -> None:
 
 def reset(config: Config, env: dict[str, str] | None = None, fixture: Path | None = None) -> None:
     """A fresh database and guild, then both services, waiting until ready."""
-    stop("ingester")
-    stop("agent")
+    stop("ingester", "agent")
     recreate_database()
     control("reset", {"fixture": str(fixture or config.fixture)})
     history = sum(
@@ -426,8 +590,10 @@ def reset(config: Config, env: dict[str, str] | None = None, fixture: Path | Non
         config.host_env(),
     )
     since = log_size("ingester")
-    start("ingester", [str(ROOT / "target/debug/ingester")], config.ingester_env(env or {}))
-    wait_for("agent host", lambda: http_ok(f"http://127.0.0.1:{HOST_PORT}/health"), 60, "agent")
+    start("ingester", [str(config.ingester)], config.ingester_env(env or {}))
+    wait_for(
+        "agent host", lambda: http_ok(f"http://127.0.0.1:{config.ports.host}/health"), 60, "agent"
+    )
     wait_for("router", lambda: log_contains("ingester", "router listening", since), 30, "ingester")
     wait_for("GUILD_CREATE", lambda: control("state")["guild_creates"] > 0, 30, "ingester")
 
@@ -438,9 +604,15 @@ def reset(config: Config, env: dict[str, str] | None = None, fixture: Path | Non
     wait_for("fixture history", history_stored, 30, "ingester")
 
 
-def down(purge: bool = False) -> None:
-    for name in ("ingester", "agent", "fakecord"):
-        stop(name)
-    (STATE / "config.json").unlink(missing_ok=True)
-    if purge and not os.getenv("KIKI_SIM_POSTGRES"):
+def down() -> None:
+    """Stops this stack's services and drops its database; logs stay for reading."""
+    stop("ingester", "agent", "fakecord")
+    (current.state / "config.json").unlink(missing_ok=True)
+    with suppress(psycopg.OperationalError):  # the server is already gone
+        drop_database()
+
+
+def purge() -> None:
+    """Removes the sim Postgres container, and with it every stack's database."""
+    if not os.getenv("KIKI_SIM_POSTGRES"):
         run(["docker", "compose", "-f", str(SIM / "compose.yml"), "down", "-v"])
