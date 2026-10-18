@@ -40,6 +40,23 @@ class JobRequest(Contract):
     image_model: str | None = Field(default=None, min_length=1)
 
 
+class DescribeEmojisRequest(Contract):
+    """One batch of a server's undescribed custom emoji (`/kiki emojis resync:true`)."""
+
+    guild_id: str = Field(pattern=r"^[0-9]+$")
+    model: str = Field(min_length=1)
+    # Database clock, Unix ms: emoji already tried since then are skipped.
+    attempted_before_ms: int = Field(ge=0)
+    redescribe: bool = False
+
+
+class DescribeEmojisResult(Contract):
+    described: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+    cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
 class Usage(Contract):
     prompt_tokens: int = Field(default=0, ge=0, le=2147483647)
     completion_tokens: int = Field(default=0, ge=0, le=2147483647)

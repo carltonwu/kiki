@@ -11,6 +11,7 @@ mod chat;
 mod commands;
 mod config;
 mod conversation;
+mod emojis;
 mod gateway;
 mod guild_settings;
 mod health;
@@ -140,7 +141,7 @@ async fn ingest(
                 .collect::<Vec<_>>(),
         )
         .await?;
-    let settings = Settings::new(&router_config, &agent_config, guild_settings.clone());
+    let settings = Settings::new(&router_config, &agent_config, guild_settings.clone())?;
     let router = Arc::new(
         Router::new(
             pool.clone(),

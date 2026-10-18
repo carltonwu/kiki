@@ -13,9 +13,10 @@ use crate::{
     config::AgentConfig,
 };
 
-pub(super) struct Host {
+pub(crate) struct Host {
     http: reqwest::Client,
     endpoint: Url,
+    emoji_endpoint: Url,
     timeout: Duration,
 }
 
@@ -70,6 +71,28 @@ pub(super) struct JobResult {
     pub images: Vec<ImageRef>,
 }
 
+/// Describes a server's emoji that lack a description (`emojis.rs`): one
+/// bounded batch per call. Not a durable job: the host's writes are idempotent.
+#[derive(Serialize)]
+pub(crate) struct DescribeEmojis {
+    pub guild_id: String,
+    pub model: String,
+    /// Unix ms (database clock): emoji already tried since then are skipped,
+    /// so repeated calls make progress past failures.
+    pub attempted_before_ms: i64,
+    /// Also replace descriptions written before `attempted_before_ms`.
+    pub redescribe: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct EmojisDescribed {
+    pub described: i64,
+    pub failed: i64,
+    /// Still to try in this round.
+    pub remaining: i64,
+    pub cost: Option<f64>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum JobStatus {
@@ -94,6 +117,7 @@ impl Host {
             .context("AGENT_HOST_URL is required")?;
         let endpoint = Url::parse(&format!("{}/v1/jobs", base.trim_end_matches('/')))
             .context("invalid AGENT_HOST_URL")?;
+        let emoji_endpoint = endpoint.join("emojis/describe")?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -120,14 +144,58 @@ impl Host {
         Ok(Self {
             http,
             endpoint,
+            emoji_endpoint,
             timeout: config.host_timeout,
         })
     }
 
-    pub async fn execute(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
+    pub(super) async fn execute(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
         tokio::time::timeout(self.timeout, self.execute_with_retries(job))
             .await
             .context("agent host deadline exceeded (including wake-up retries)")?
+    }
+
+    /// One describe batch, retried like jobs while the host wakes up or is busy.
+    pub async fn describe_emojis(
+        &self,
+        request: &DescribeEmojis,
+    ) -> anyhow::Result<EmojisDescribed> {
+        tokio::time::timeout(self.timeout, async {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let response = self
+                    .http
+                    .post(self.emoji_endpoint.clone())
+                    .json(request)
+                    .send()
+                    .await;
+                match response {
+                    Err(error)
+                        if error.is_connect() || error.is_timeout() || error.is_request() => {}
+                    Err(error) => return Err(error).context("calling agent host"),
+                    Ok(response) if retryable(response.status()) => {}
+                    Ok(response) if response.status().is_success() => {
+                        return response
+                            .json()
+                            .await
+                            .context("parsing agent host emoji response");
+                    }
+                    Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
+                        bail!("agent host has no framework executor configured")
+                    }
+                    Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+                }
+                debug!(
+                    guild_id = request.guild_id,
+                    delay_ms = delay.as_millis() as u64,
+                    "retrying emoji descriptions"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        })
+        .await
+        .context("agent host deadline exceeded (including wake-up retries)")?
     }
 
     async fn execute_with_retries(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
@@ -250,6 +318,7 @@ mod tests {
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
             image_model: "test/image".into(),
+            emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
             topic_every_messages: 4,

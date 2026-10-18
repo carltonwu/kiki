@@ -32,14 +32,14 @@ Rust: reply job (+ image_model) ─▶ Python host: chat model calls generate_im
   cost is added to the run's `usage.cost`. Limits: 2 image calls per run (reserved before each call, so parallel
   calls can't exceed it), 60 s per call (Rust's host deadline,
   `AGENT_HOST_TIMEOUT_MS`, defaults to 180 s), no client retries since attempts may
-  be billed, and the call counts toward the 4 tool calls. A refusal, a missing
+  be billed, and image calls don't use the 4 lookup calls (searching can't block a drawing). A refusal, a missing
   image or a provider error becomes a tool error, so Kiki can say she couldn't draw
   it rather than failing the reply.
 - **Wire compatibility.** Rust omits `image_model` when off and the host saves
   requests without unset optional fields, so jobs saved before this change still
   match on retry. Deploy the host before (or with) the ingester: an older host
   rejects requests that carry `image_model`.
-- **Storage** (`0017_agent_host_images.sql`). Bytes stay out of the job result
+- **Storage** (`0018_agent_host_images.sql`). Bytes stay out of the job result
   JSON. Rows reference `agent_host_jobs` with `ON DELETE CASCADE`, so a future
   retention policy for jobs also removes images. There is no retention yet.
 - **Delivery** (`agent/discord.rs`). Rust loads only rows whose `job_id` matches the

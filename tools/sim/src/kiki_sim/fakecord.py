@@ -14,7 +14,9 @@ import json
 import logging
 import math
 import re
+import struct
 import time
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -87,6 +89,10 @@ class World:
             if channel["type"] in (10, 11, 12):
                 channel["thread_metadata"] = {"archived": False, "archive_timestamp": iso(0)}
             self.channels[name] = channel
+        # Custom emoji: `description` is what the stub vision model answers.
+        self.emojis: dict[str, dict] = {}
+        for name, e in (fixture.get("emojis") or {}).items():
+            self.add_emoji(name, e)
         self.messages: dict[str, dict] = {}  # id → payload, insertion (= id) order
         self.deleted: set[str] = set()
         self.reactions: list[dict] = []  # {message_id, emoji, action, at}
@@ -139,6 +145,23 @@ class World:
             "joined_at": iso(DISCORD_EPOCH_MS + 86400000),
             "permissions": str(ADMINISTRATOR if m["admin"] else 0),
         }
+
+    def add_emoji(self, name: str, spec: dict) -> dict:
+        emoji = {
+            "id": str(spec["id"]),
+            "name": name,
+            "animated": bool(spec.get("animated", False)),
+            "available": bool(spec.get("available", True)),
+            "require_colons": True,
+            "managed": False,
+            "roles": [],
+            "description": spec.get("description"),
+        }
+        self.emojis[emoji["id"]] = emoji
+        return emoji
+
+    def emoji_payloads(self) -> list[dict]:
+        return [{k: v for k, v in e.items() if k != "description"} for e in self.emojis.values()]
 
     # --- messages ----------------------------------------------------------
 
@@ -327,6 +350,8 @@ class Fakecord:
             return json_response(commands)
         if route == f"GET guilds/{g}":
             return json_response({**w.guild, "roles": self.roles()})
+        if route == f"GET guilds/{g}/emojis":
+            return json_response(w.emoji_payloads())
         if route == f"GET guilds/{g}/channels":
             return json_response([c for c in w.channels.values() if c["type"] not in (10, 11, 12)])
         if route == f"GET guilds/{g}/threads/active":
@@ -491,6 +516,14 @@ class Fakecord:
                 return entry
         return None
 
+    async def cdn(self, request: web.Request) -> web.StreamResponse:
+        """Discord's CDN, for emoji images: a small PNG per emoji."""
+        path = request.match_info["path"]
+        if (m := re.fullmatch(r"emojis/(\d+)\.png", path)) and m[1] in self.world.emojis:
+            return web.Response(body=png(int(m[1])), content_type="image/png")
+        self.world.unexpected.append({"method": request.method, "path": f"cdn/{path}"})
+        return web.Response(status=404)
+
     def jev(self, body: dict) -> dict:
         state = body["state"]
         new = state["new_messages"]
@@ -544,7 +577,15 @@ class Fakecord:
         w = self.world
         n = next(w.ids)
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
-        if record["kind"] == "topic":
+        if has_image(messages):
+            # Describing a custom emoji: the fixture's description, by name.
+            record["kind"] = "emoji"
+            prompt = " ".join(content_text(m.get("content")) for m in messages)
+            name = (re.search(r":(\w+):", prompt) or [None, ""])[1]
+            emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
+            text = emoji.get("description") or f"stub description of :{name}:"
+            message = {"role": "assistant", "content": text}
+        elif record["kind"] == "topic":
             message = {"role": "assistant", "content": "stub topic"}
         else:
             user = [m for m in messages if m["role"] == "user"]
@@ -667,6 +708,12 @@ class Fakecord:
             message["edited_timestamp"] = iso(time.time() * 1000)
             await self.dispatch("MESSAGE_UPDATE", message)
             return web.json_response(message)
+        if route == "POST emojis":
+            # A server admin adds an emoji (no Gateway event: Kiki resyncs by command).
+            return web.json_response(w.add_emoji(body["name"], body))
+        if m := re.fullmatch(r"DELETE emojis/(\w+)", route):
+            w.emojis = {k: e for k, e in w.emojis.items() if e["name"] != m[1]}
+            return web.json_response({"ok": True})
         if route == "POST interactions":
             return web.json_response(await self.interaction(body))
         raise web.HTTPNotFound(text=f"no control route {route}")
@@ -739,6 +786,7 @@ class Fakecord:
         app.router.add_get("/gateway/", self.gateway)
         app.router.add_route("*", "/api/v10/{path:.*}", self.rest)
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
+        app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
 
@@ -753,6 +801,33 @@ def content_text(content) -> str:
 
 def sniff(data: bytes) -> str:
     return "image/png" if data.startswith(b"\x89PNG") else "application/octet-stream"
+
+
+def has_image(messages: list[dict]) -> bool:
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for m in messages
+        if isinstance(m.get("content"), list)
+        for part in m["content"]
+    )
+
+
+def png(seed: int) -> bytes:
+    """A valid 8×8 single-color PNG, colored by `seed`."""
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(kind + data)
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+    color = bytes([seed % 251, seed // 251 % 251, 200])
+    rows = b"".join(b"\x00" + color * 8 for _ in range(8))
+    header = struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
 
 
 def trigger_line(prompt: str) -> str:

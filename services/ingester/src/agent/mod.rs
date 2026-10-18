@@ -13,7 +13,7 @@
 mod context;
 mod delivery;
 mod discord;
-mod host;
+pub(crate) mod host;
 mod people;
 mod topic;
 

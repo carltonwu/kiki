@@ -15,6 +15,11 @@ channels:
   lore: {id: 900000000000001002}
   staff: {id: 900000000000001003}
   general-thread: {id: 900000000000001004, type: 11, parent: general}
+# Custom emoji; `description` is what the stub vision model says about each.
+emojis:
+  huh: {id: 900000000000005001, description: "a cartoon face squinting in confusion, for when something makes no sense"}
+  monkeded: {id: 900000000000005002, description: "a monkey grinning sheepishly, for owning up to something a little embarrassing"}
+  tannah: {id: 900000000000005003, animated: true, description: "someone dancing in a loop, for hype and celebration"}
 history:
   - {in: lore, as: sam, text: "we shipped the release on friday, finally", days_ago: 6}
   - {in: lore, as: chris, text: "the lighting rig is held together with tape", days_ago: 5}

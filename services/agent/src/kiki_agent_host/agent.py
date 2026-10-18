@@ -16,6 +16,7 @@ from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -29,8 +30,16 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import images, retrieval
-from .contracts import Image, JobRequest, JobResult, Message, Usage
+from . import emojis, images, retrieval
+from .contracts import (
+    DescribeEmojisRequest,
+    DescribeEmojisResult,
+    Image,
+    JobRequest,
+    JobResult,
+    Message,
+    Usage,
+)
 from .executor import TransientError
 
 logger = logging.getLogger(__name__)
@@ -62,12 +71,19 @@ class Deps:
 
 
 async def guarded(
-    ctx: RunContext[Deps], name: str, work, timeout: float = TOOL_TIMEOUT_SECONDS
+    ctx: RunContext[Deps],
+    name: str,
+    work,
+    timeout: float = TOOL_TIMEOUT_SECONDS,
+    budgeted: bool = True,
 ) -> dict:
-    ctx.deps.tool_calls += 1
-    if ctx.deps.tool_calls > MAX_TOOL_CALLS:
-        logger.debug("tool budget exhausted job_id=%s tool=%s", ctx.deps.job_id, name)
-        return {"error": "Tool budget used up. Answer with what you have."}
+    """Runs a tool with a deadline. Lookups share MAX_TOOL_CALLS; `budgeted=False`
+    tools (generate_image) have their own cap, so searching can't block a drawing."""
+    if budgeted:
+        ctx.deps.tool_calls += 1
+        if ctx.deps.tool_calls > MAX_TOOL_CALLS:
+            logger.debug("tool budget exhausted job_id=%s tool=%s", ctx.deps.job_id, name)
+            return {"error": "Search budget used up. Answer with what you have."}
     started = time.monotonic()
     outcome = "ok"
     try:
@@ -90,7 +106,7 @@ async def guarded(
         ctx.deps.scope.channel_id,
         ctx.deps.scope.conversation_id,
         (time.monotonic() - started) * 1000,
-        len(result.get("messages", [])),
+        len(result.get("messages", result.get("emojis", []))),
         result.get("semantic", "-"),
         "error" if outcome == "ok" and "error" in result else outcome,
     )
@@ -223,7 +239,7 @@ async def generate_image(
         )
         return {"attached": True, "images_attached": len(deps.images)}
 
-    return await guarded(ctx, "generate_image", work, IMAGE_TIMEOUT_SECONDS)
+    return await guarded(ctx, "generate_image", work, IMAGE_TIMEOUT_SECONDS, budgeted=False)
 
 
 async def only_with_image_model(
@@ -231,6 +247,38 @@ async def only_with_image_model(
 ) -> ToolDefinition | None:
     """Offers `generate_image` only when the server has image generation on."""
     return tool_def if ctx.deps.image_model else None
+
+
+async def search_emojis(ctx: RunContext[Deps], query: str, limit: int = 5) -> dict:
+    """Find this server's custom emoji by mood, reaction or what they show.
+
+    To use one, write its `emoji` exactly as returned, like <:name:id>.
+
+    Args:
+        query: The feeling, reaction or subject, like "confused" or "laughing so hard".
+        limit: Maximum results, up to 10.
+    """
+
+    async def work():
+        return await emojis.search(
+            ctx.deps.connection, ctx.deps.embed, ctx.deps.scope.guild_id, query, limit
+        )
+
+    return await guarded(ctx, "search_emojis", work)
+
+
+async def find_emoji(ctx: RunContext[Deps], name: str) -> dict:
+    """Look up this server's custom emoji by name, or explain one someone used.
+
+    Args:
+        name: An emoji name like huh or :huh:, or an emoji as it appears in a
+            message, like <:huh:1085017182301339648>.
+    """
+
+    async def work():
+        return await emojis.find(ctx.deps.connection, ctx.deps.scope.guild_id, name)
+
+    return await guarded(ctx, "find_emoji", work)
 
 
 async def index_guild(deps: Deps) -> retrieval.Semantic:
@@ -272,6 +320,8 @@ chat = Agent(
     tools=[
         search_messages,
         get_message_context,
+        search_emojis,
+        find_emoji,
         Tool(generate_image, prepare=only_with_image_model),
     ],
 )
@@ -286,6 +336,18 @@ def history(messages: list[Message]) -> list[ModelMessage]:
         return ModelRequest(parts=[part])
 
     return [convert(m) for m in messages]
+
+
+def billed_cost(result) -> float | None:
+    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
+    billed = [
+        m.provider_details["cost"]
+        for m in result.new_messages()
+        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
+    ]
+    if billed:
+        return sum(billed)
+    return float(result.usage.cost) if result.usage.cost is not None else None
 
 
 class PydanticExecutor:
@@ -364,13 +426,7 @@ class PydanticExecutor:
             raise TransientError(type(e).__name__) from e
 
         usage = result.usage
-        # OpenRouter's billed cost per response; Pydantic's price table lags new models.
-        billed = [
-            m.provider_details["cost"]
-            for m in result.new_messages()
-            if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
-        ]
-        cost = sum(billed) if billed else (float(usage.cost) if usage.cost is not None else None)
+        cost = billed_cost(result)
         extra = embed.cost + (deps.image_cost if deps else 0)
         if extra:
             cost = (cost or 0) + extra
@@ -400,3 +456,37 @@ class PydanticExecutor:
             ),
             images=deps.images if deps else [],
         )
+
+    async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:
+        """Describes one batch of the guild's undescribed emoji with a vision model."""
+        model = self.model(request.model)
+
+        async def describe(name: str, animated: bool, image: bytes) -> tuple[str, float | None]:
+            prompt = emojis.PROMPT.format(
+                name=name, animated=" (animated; this is its first frame)" if animated else ""
+            )
+            result = await plain.run(
+                [prompt, BinaryContent(image, media_type="image/png")],
+                model=model,
+                model_settings={"max_tokens": 200, "openrouter_usage": {"include": True}},
+                usage_limits=UsageLimits(request_limit=1),
+            )
+            return result.output, billed_cost(result)
+
+        embed = retrieval.Embedder(self.embeddings)
+        try:
+            async with await AsyncConnection.connect(
+                self.database_url, autocommit=True, connect_timeout=10
+            ) as connection:
+                counts = await emojis.describe_pending(
+                    connection,
+                    describe,
+                    embed,
+                    guild_id=int(request.guild_id),
+                    model=request.model,
+                    attempted_before=emojis.epoch_ms(request.attempted_before_ms),
+                    redescribe=request.redescribe,
+                )
+        except OperationalError as e:
+            raise TransientError(type(e).__name__) from e
+        return DescribeEmojisResult(**counts)

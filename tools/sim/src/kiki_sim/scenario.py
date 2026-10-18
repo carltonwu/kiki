@@ -16,6 +16,8 @@
       - expect: {attachments: 1, attachment_type: image/png}   # files on the replies
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
+      - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
+      - remove_emoji: bruh                  # in fakecord; Kiki notices on resync
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
@@ -318,6 +320,10 @@ class Run:
             elif kind == "exec":
                 with stack.connect() as db:
                     db.execute(args)
+            elif kind == "add_emoji":
+                stack.control("emojis", args)
+            elif kind == "remove_emoji":
+                stack.control(f"emojis/{args}", None, "DELETE")
             elif kind == "drop_gateway":
                 self.drop_gateway()
             elif kind == "wait":
