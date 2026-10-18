@@ -1,0 +1,20 @@
+name: conversational judgment allows sitting out active chat and rejoining a request
+# Stub mode checks the supplied guidance and silence delivery, not model judgment.
+steps:
+  - say: {as: alex, in: general, text: "@kiki we're planning tonight", id: start}
+  - expect: {run: done, reply: true}
+  - say: {as: sam, in: general, text: "alex, i booked the table for seven", jev: {choice: conversation_latest, confidence: 0.99}, reply: {text: "NO_REPLY"}}
+  - expect:
+      run: done
+      reply: false
+      prompt_contains:
+        - "especially in a busy chat"
+        - "Being given a message does not mean it needs a response"
+        - "A correction is a chance to understand them better"
+        - "Recent chat helps interpret a request"
+        - "Treat genuine greetings, direct questions"
+      prompt_lacks:
+        - "Say things literally instead of with metaphors"
+        - "Looking people up is a core part of your job"
+  - say: {as: alex, in: general, text: "kiki can you remind me what time sam booked?", reply_to: kiki, reply: {text: "seven"}}
+  - expect: {run: done, reply: true, text_contains: "seven", prompt_contains: "i booked the table for seven", conversation: {same_as: start}}

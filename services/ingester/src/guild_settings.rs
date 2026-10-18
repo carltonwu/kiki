@@ -66,7 +66,7 @@ settings! { r, a;
     chat_min_messages: usize = 1, Kind::Integer(1, 8), "Preferred minimum messages per turn";
     chat_max_messages: usize = 3, Kind::Integer(1, 8), "Maximum planned messages per turn (Discord length splits may add more)";
     chat_max_delay: u64 = 3000, Kind::Duration(1, 0, 10_000), "Maximum pause between messages (ms; total capped at 8s)";
-    chat_allow_silence: bool = true, Kind::Bool, "Allow Kiki to leave acknowledgments unanswered";
+    chat_allow_silence: bool = true, Kind::Bool, "Allow Kiki to sit out when a reply would add little";
     chat_reply_reference: bool = false, Kind::Bool, "Attach and ping a Discord reply on the first message";
     status_reactions: bool = true, Kind::Bool, "Show routing and pending status reactions";
     reply_max_tokens: u32 = 2000, Kind::Integer(100, 4000), "Output tokens per model request";

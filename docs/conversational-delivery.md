@@ -2,9 +2,10 @@
 
 One request producing one immediate, referenced Discord reply makes Kiki feel
 mechanical. A useful answer may have several natural beats, with a pause between
-them; a laugh or acknowledgment sometimes needs no answer. Pending reactions also
-expose the machinery. Kiki now considers what to say and how to deliver it in the
-same model turn, without exposing a planning monologue or adding an inference call.
+them; sometimes leaving room for other people is the best contribution. Pending
+reactions also expose the machinery. Kiki now considers what to say and how to
+deliver it in the same model turn, without exposing a planning monologue or
+adding an inference call.
 
 Server settings are editable through `/kiki config key:<name> value:<value>`:
 
@@ -15,7 +16,8 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 - `chat_max_delay=3000` (milliseconds, 0–10000): cap each pause. Total pauses are
   capped at eight seconds, the first message has no added delay, and shutdown
   skips remaining pauses. Set `0` for immediate delivery.
-- `chat_allow_silence=true`: allow no answer for reactions and acknowledgments.
+- `chat_allow_silence=true`: let Kiki sit out when a reply would add little,
+  including substantive human-to-human exchanges in an active chat.
   Set `false` to instruct Kiki to answer each routed turn. A model that violates
   this instruction fails the run rather than posting the silence marker.
 - `chat_reply_reference=false`: attach and ping a Discord reply on the first

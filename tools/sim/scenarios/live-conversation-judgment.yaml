@@ -1,0 +1,19 @@
+name: conversational judgment and creative freedom, human-reviewed live samples
+# Read the transcript for interest in the song, uptake of corrections, room for
+# other people, and a natural return to creativity. No fixed wording is required.
+live: only
+steps:
+  - say: {as: ethan, in: general, text: "@kiki what do you think of the name Reeciana?"}
+  - expect: {run: done, reply: true}
+  - say: {as: ethan, in: general, text: "SOUNDS LIKE A YACHT"}
+  - say: {as: ethan, in: general, text: "kiki do u stream complacency"}
+  - say: {as: ethan, in: general, text: "no, Complacency is my song, i made it"}
+  - batch:
+      - {as: alex, in: general, text: "sam, i booked the table for seven"}
+      - {as: sam, in: general, text: "alex seven works, i'll bring the cake"}
+      - {as: alex, in: general, text: "perfect, see you there"}
+  - wait: 2
+  - say: {as: alex, in: general, text: "@kiki hiii"}
+  - expect: {run: done, reply: true}
+  - say: {as: ethan, in: general, text: "@kiki give me a ridiculous two-line hook for Complacency, bright hyperpop with an easy chant"}
+  - expect: {run: done, reply: true}
