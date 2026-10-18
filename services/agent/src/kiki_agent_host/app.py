@@ -15,7 +15,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import OperationalError
 
 from . import STARTED
-from .contracts import JobRequest, JobResponse
+from .contracts import DescribeEmojisRequest, DescribeEmojisResult, JobRequest, JobResponse
 from .executor import Executor, TransientError
 from .jobs import RequestConflict, run_job
 
@@ -112,6 +112,35 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=503, detail="job interrupted; retry the same ID"
             ) from None
+        finally:
+            slots.release()
+
+    @app.post(
+        "/v1/emojis/describe",
+        response_model=DescribeEmojisResult,
+        dependencies=[Depends(authenticate)],
+    )
+    async def describe_emojis(request: DescribeEmojisRequest):
+        """One batch of a server's custom emoji descriptions. Not durable: the
+        writes are idempotent, and Rust repeats the call until none are left."""
+        if executor is None:
+            raise HTTPException(
+                status_code=501, detail="agent framework executor is not configured"
+            )
+        try:
+            await asyncio.wait_for(slots.acquire(), timeout=0.1)
+        except TimeoutError:
+            raise HTTPException(status_code=503, detail="agent host is busy") from None
+        try:
+            async with asyncio.timeout(settings.job_timeout_seconds):
+                return await executor.describe_emojis(request)
+        except (OperationalError, TimeoutError, TransientError) as error:
+            logger.warning(
+                "emoji descriptions interrupted guild_id=%s error_type=%s; retry",
+                request.guild_id,
+                type(error).__name__,
+            )
+            raise HTTPException(status_code=503, detail="interrupted; retry") from None
         finally:
             slots.release()
 
