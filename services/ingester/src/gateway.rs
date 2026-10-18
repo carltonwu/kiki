@@ -1,4 +1,5 @@
-//! Discord Gateway listener: stores live message and channel events.
+//! Discord Gateway listener: stores live message and channel events, and hands
+//! slash commands to [`Commands`].
 //!
 //! twilight-gateway runs the protocol (identify, heartbeats, resume, reconnects);
 //! dispatch payloads are handled as raw JSON so `raw` stores exactly what Discord sent.
@@ -16,16 +17,17 @@ use twilight_model::id::Id;
 
 use crate::{
     catch_up::{CatchUp, snowflake},
+    commands::Commands,
     store,
 };
 
-/// How long to wait for Discord to acknowledge a close on shutdown.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Listener {
     pub db: PgPool,
     pub catch_up: Arc<CatchUp>,
     pub guild_ids: HashSet<i64>,
+    pub commands: Arc<Commands>,
 }
 
 impl Listener {
@@ -88,9 +90,12 @@ impl Listener {
             return;
         };
         if let Err(e) = self.dispatch(event, &payload["d"]).await {
-            // Losing one event isn't fatal: the next catch-up refetches messages.
             warn!(
                 event,
+                guild_id = payload["d"]["guild_id"].as_str(),
+                channel_id = payload["d"]["channel_id"].as_str(),
+                object_id = payload["d"]["id"].as_str(),
+                sequence = payload["s"].as_u64(),
                 error = format!("{e:#}"),
                 "failed to store Gateway event"
             );
@@ -98,8 +103,11 @@ impl Listener {
     }
 
     async fn dispatch(&self, event: &str, d: &Value) -> anyhow::Result<()> {
+        if event == "RESUMED" {
+            info!("Gateway session resumed");
+            return Ok(());
+        }
         if event == "READY" {
-            let session = d["session_id"].as_str().unwrap_or_default();
             let in_guilds: HashSet<i64> = d["guilds"]
                 .as_array()
                 .into_iter()
@@ -109,11 +117,10 @@ impl Listener {
             for id in self.guild_ids.difference(&in_guilds) {
                 warn!(guild_id = id, "the bot is not in an enabled guild");
             }
-            info!(session, "Gateway session ready");
+            info!(guilds = in_guilds.len(), "Gateway session ready");
             return Ok(());
         }
 
-        // Everything else is ingested only for enabled guilds.
         let guild_id = if event == "GUILD_CREATE" {
             &d["id"]
         } else {
@@ -131,6 +138,7 @@ impl Listener {
         }
 
         match event {
+            "INTERACTION_CREATE" => self.commands.spawn_handle(d.clone()),
             "MESSAGE_CREATE" => {
                 store::upsert_messages(&self.db, guild_id, std::slice::from_ref(d)).await?;
                 if let (Some(channel), Some(id)) =

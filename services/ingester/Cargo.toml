@@ -10,6 +10,8 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "migrate", "macros", "json"] }
@@ -19,3 +21,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 twilight-gateway = "0.17.1"
 twilight-http = "0.17.1"
 twilight-model = "0.17.1"
+twilight-util = { version = "0.17", features = ["builder"] }

@@ -12,8 +12,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  python:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18-trixie # Postgres 18 + pgvector, like Railway's image
+        env:
+          POSTGRES_USER: kiki
+          POSTGRES_PASSWORD: kiki
+          POSTGRES_DB: kiki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgres://kiki:kiki@localhost:5432/kiki
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.7"
+          enable-cache: true
+          cache-dependency-glob: services/agent/uv.lock
+      - run: uv sync --project services/agent --locked
+      - run: uv run --project services/agent --locked ruff check services/agent
+      - run: uv run --project services/agent --locked ruff format --check services/agent
+      - run: uv run --directory services/agent --locked pytest
+
   rust:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18-trixie
+        env:
+          POSTGRES_USER: kiki
+          POSTGRES_PASSWORD: kiki
+          POSTGRES_DB: kiki
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-retries 15
+    env:
+      TEST_DATABASE_URL: postgres://kiki:kiki@localhost:5432/kiki
     steps:
       - uses: actions/checkout@v7
       # rustup installs the toolchain pinned in rust-toolchain.toml.

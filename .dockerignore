@@ -3,5 +3,9 @@ target/
 tools/
 .railway/
 **/.env
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/.ruff_cache/
 # The image's Rust version is pinned by the base image; skip rustup's toolchain file.
 rust-toolchain.toml

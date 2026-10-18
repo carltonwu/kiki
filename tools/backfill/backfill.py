@@ -68,7 +68,7 @@ class Progress:
         self.index = 0
         self.count = 0
         self.completed = 0
-        self.position = ""  # date of the newest message fetched in the current channel
+        self.position = ""
         self.total = 0
         self.requests = 0
         self.wait_until = 0.0
@@ -159,11 +159,10 @@ class DiscordAPI:
             try:
                 r = self.http.get(path, params=params)
             except httpx.TransportError as e:
-                attempt = self._backoff(attempt, f"network error ({e!r})")
+                attempt = self._backoff(attempt, f"network error ({type(e).__name__}) on {path}")
                 continue
             self.progress.requests += 1
 
-            # Pre-emptively pause when this route's bucket is exhausted.
             if r.headers.get("X-RateLimit-Remaining") == "0":
                 reset_after = float(r.headers.get("X-RateLimit-Reset-After", 1))
                 self.route_reset[path] = time.monotonic() + reset_after
@@ -195,7 +194,9 @@ class DiscordAPI:
         if attempt >= MAX_RETRIES:
             raise RuntimeError(f"giving up after {attempt} retries: {reason}")
         delay = min(60.0, 2.0**attempt) * random.uniform(0.5, 1.0)
-        self.progress.log(f"{reason}; retry {attempt + 1}/{MAX_RETRIES}", style="yellow")
+        self.progress.log(
+            f"{reason}; retry {attempt + 1}/{MAX_RETRIES} in {delay:.1f}s", style="yellow"
+        )
         self.progress.sleep(delay, f"{reason}, retry {attempt + 1}/{MAX_RETRIES}")
         return attempt + 1
 
@@ -259,7 +260,6 @@ def backfill_channel(api: DiscordAPI, db: sqlite3.Connection, ch: dict, progress
         )
     cursor = db.execute("SELECT cursor FROM channels WHERE id = ?", (cid,)).fetchone()[0]
 
-    # Skip without a request if nothing new since the last run.
     last = ch.get("last_message_id")
     if last is None or int(last) <= cursor:
         return

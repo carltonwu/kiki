@@ -5,12 +5,18 @@
 //!   ingester           run the service
 //!   ingester migrate   apply database migrations and exit (Railway pre-deploy step)
 
+mod agent;
 mod catch_up;
+mod chat;
+mod commands;
 mod config;
+mod conversation;
 mod gateway;
 mod health;
+mod jev;
 mod leader;
 mod rest;
+mod router;
 mod store;
 
 use std::{sync::Arc, time::Duration};
@@ -18,12 +24,15 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, bail};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
+    agent::Agent,
     catch_up::CatchUp,
-    config::{Config, DiscordConfig},
+    commands::{Commands, Settings},
+    config::{AgentConfig, Config, DiscordConfig, RouterConfig},
     gateway::Listener,
+    router::Router,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -31,6 +40,7 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok(); // local development only; Railway sets real env vars
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Config::from_env()?;
     init_tracing(&config);
 
@@ -52,6 +62,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let discord = DiscordConfig::from_env()?;
+    let router_config = RouterConfig::from_env()?;
+    let agent_config = AgentConfig::from_env()?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -66,17 +78,20 @@ async fn main() -> anyhow::Result<()> {
         shutdown_rx.clone(),
     ));
 
-    // Only one instance may hold the Gateway connection. During a Railway deploy the
-    // new instance waits here until the old one shuts down and releases the lock.
     let Some(mut leader) = leader::acquire(&pool, shutdown_rx.clone()).await? else {
         info!("shut down before acquiring leadership");
         return Ok(());
     };
     info!("leader lock acquired");
 
-    let mut ingest = tokio::spawn(ingest(pool, discord, shutdown_rx.clone()));
+    let mut ingest = tokio::spawn(ingest(
+        pool,
+        discord,
+        router_config,
+        agent_config,
+        shutdown_rx.clone(),
+    ));
 
-    // `ingest` returns after shutdown, once the Gateway connection is closed.
     let result = tokio::select! {
         result = &mut ingest => joined(result),
         error = leader.watch() => Err(error),
@@ -93,14 +108,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Backfills every enabled guild over REST, then listens to the Gateway.
 async fn ingest(
     pool: sqlx::PgPool,
     discord: DiscordConfig,
+    router_config: RouterConfig,
+    agent_config: AgentConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let http = Arc::new(twilight_http::Client::new(discord.token.clone()));
-    let catch_up = Arc::new(CatchUp::new(http, pool.clone(), &discord.guild_ids));
+    let catch_up = Arc::new(CatchUp::new(http.clone(), pool.clone(), &discord.guild_ids));
 
     info!(
         guilds = discord.guild_ids.len(),
@@ -116,12 +132,52 @@ async fn ingest(
         _ = shutdown.wait_for(|stop| *stop) => return Ok(()),
     }
 
+    // The router starts before the Gateway so it sees every live message.
+    let pending_emoji = router_config.pending_emoji.clone();
+    let settings = Settings::new(&router_config, &agent_config);
+    let router = Arc::new(
+        Router::new(
+            pool.clone(),
+            http.clone(),
+            &discord.guild_ids,
+            router_config,
+        )
+        .await?,
+    );
+    let agent = match agent_config.host_url.clone() {
+        Some(_) => Some(Arc::new(Agent::new(
+            pool.clone(),
+            http.clone(),
+            agent_config,
+            router.bot_user_id(),
+            pending_emoji,
+        )?)),
+        None => {
+            warn!("AGENT_HOST_URL is not set: the agent is off and routed messages get no reply");
+            None
+        }
+    };
+    let commands =
+        Arc::new(Commands::new(pool.clone(), http.clone(), router.bot_user_id(), settings).await?);
+    commands.register(&discord.guild_ids).await;
     let listener = Listener {
+        commands,
         db: pool,
         catch_up,
         guild_ids: discord.guild_ids.iter().map(|id| id.get() as i64).collect(),
     };
-    listener.run(discord.token, shutdown).await
+    let agent_shutdown = shutdown.clone();
+    tokio::try_join!(
+        router.run(shutdown.clone()),
+        async move {
+            match agent {
+                Some(agent) => agent.run(agent_shutdown).await,
+                None => Ok(()),
+            }
+        },
+        listener.run(discord.token, shutdown),
+    )?;
+    Ok(())
 }
 
 fn joined(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {

@@ -8,7 +8,7 @@ use std::{future::IntoFuture, time::Duration};
 
 use anyhow::{Context, bail};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, warn};
 use twilight_http::{Error, Response, error::ErrorType};
 
 const MAX_RETRIES: u32 = 8;
@@ -22,7 +22,7 @@ where
 {
     let mut attempt = 0;
     loop {
-        let delay = match make().await {
+        let (delay, reason, status) = match make().await {
             Ok(response) => {
                 let bytes = response
                     .bytes()
@@ -34,25 +34,40 @@ where
             }
             Err(e) => match e.kind() {
                 ErrorType::Response { status, body, .. } => match status.get() {
-                    403 | 404 => return Ok(None),
-                    429 => retry_after(body).unwrap_or(Duration::from_secs(5)),
-                    s if s >= 500 => backoff(attempt),
+                    403 | 404 => {
+                        debug!(
+                            what,
+                            status = status.get(),
+                            "Discord resource inaccessible; skipping"
+                        );
+                        return Ok(None);
+                    }
+                    429 => (
+                        retry_after(body).unwrap_or(Duration::from_secs(5)),
+                        "rate_limit",
+                        Some(status.get()),
+                    ),
+                    s if s >= 500 => (backoff(attempt), "server", Some(s)),
                     _ => return Err(e).with_context(|| format!("requesting {what}")),
                 },
                 ErrorType::Unauthorized => bail!("Discord rejected the bot token (401)"),
                 ErrorType::RequestError
                 | ErrorType::RequestTimedOut
-                | ErrorType::RequestCanceled => backoff(attempt),
+                | ErrorType::RequestCanceled => (backoff(attempt), "network", None),
                 _ => return Err(e).with_context(|| format!("requesting {what}")),
             },
         };
         attempt += 1;
         if attempt > MAX_RETRIES {
-            bail!("giving up on {what} after {MAX_RETRIES} retries");
+            bail!(
+                "giving up on {what} after {MAX_RETRIES} retries (reason={reason}, status={status:?})"
+            );
         }
         warn!(
             what,
             attempt,
+            reason,
+            status,
             delay_ms = delay.as_millis() as u64,
             "Discord request failed; retrying"
         );

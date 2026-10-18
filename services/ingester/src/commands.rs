@@ -1,0 +1,1048 @@
+//! The `/kiki` slash command: conversations, stats, runs, config and whois.
+//!
+//! Registered as a guild command at startup (guild commands update instantly,
+//! global ones don't) and answered from `INTERACTION_CREATE` Gateway events.
+//! Only members with Manage Server see it by default, since it shows costs and
+//! topics from every channel; server admins can grant it to other roles under
+//! Server Settings → Integrations. Replies are ephemeral and scoped to the
+//! guild the command ran in.
+//!
+//! Discord markdown has no tables, so row-by-column data goes in code blocks:
+//! the one layout that lines up on every client. Mentions and `<t:…>`
+//! timestamps don't render inside code blocks, so those go in embed fields.
+
+use std::{fmt::Write, sync::Arc, time::Duration};
+
+use anyhow::Context;
+use serde_json::Value;
+use sqlx::{FromRow, PgPool};
+use tracing::{info, warn};
+use twilight_http::Client;
+use twilight_model::{
+    application::command::CommandType,
+    channel::message::{AllowedMentions, Embed, MessageFlags},
+    guild::Permissions,
+    http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
+    id::{
+        Id,
+        marker::{ApplicationMarker, GuildMarker},
+    },
+    util::Timestamp,
+};
+use twilight_util::builder::{
+    command::{CommandBuilder, IntegerBuilder, StringBuilder, SubCommandBuilder, UserBuilder},
+    embed::{EmbedBuilder, EmbedFieldBuilder, EmbedFooterBuilder, ImageSource},
+};
+
+use crate::{
+    catch_up::snowflake,
+    config::{AgentConfig, RouterConfig},
+    conversation,
+    rest::get_json,
+    router::unix_millis,
+};
+
+const APPLICATION_COMMAND: u64 = 2;
+const COLOR: u32 = 0xF4_72_B6;
+const ERROR_COLOR: u32 = 0xED_42_45;
+/// Embed limits (Discord rejects the whole message past any of them).
+const MAX_FIELDS: usize = 25;
+const MAX_FIELD_CHARS: usize = 1024;
+const MAX_DESCRIPTION_CHARS: usize = 4096;
+const RUN_STATUSES: [&str; 6] = [
+    "pending",
+    "running",
+    "delivering",
+    "done",
+    "failed",
+    "superseded",
+];
+
+pub struct Commands {
+    db: PgPool,
+    http: Arc<Client>,
+    application_id: Id<ApplicationMarker>,
+    bot_user_id: i64,
+    settings: Settings,
+}
+
+pub struct Settings {
+    /// `None` when the agent is off (no AGENT_HOST_URL).
+    chat_model: Option<String>,
+    topic_model: Option<String>,
+    decide_model: String,
+    decide_enabled: bool,
+    max_active_conversations: i64,
+    routing: Vec<(&'static str, String)>,
+    agent: Vec<(&'static str, String)>,
+}
+
+impl Settings {
+    pub fn new(router: &RouterConfig, agent: &AgentConfig) -> Self {
+        let enabled = agent.host_url.is_some();
+        let pending_emoji = if router.pending_emoji.is_empty() {
+            "off".to_owned()
+        } else {
+            router.pending_emoji.clone()
+        };
+        Self {
+            chat_model: enabled.then(|| agent.chat_model.clone()),
+            topic_model: enabled.then(|| agent.topic_model.clone()),
+            decide_model: router.jev_model.clone(),
+            decide_enabled: router.jev_api_key.is_some(),
+            max_active_conversations: router.max_active_conversations,
+            routing: vec![
+                ("ROUTE_KEYWORDS", router.keywords.join(", ")),
+                ("ROUTE_PENDING_EMOJI", pending_emoji),
+                ("ROUTE_ACTIVE_WINDOW_SECS", duration(router.active_window)),
+                ("ROUTE_MAX_MESSAGE_AGE_MS", duration(router.max_message_age)),
+                ("POOL_DEBOUNCE_MS", duration(router.pool_debounce)),
+                ("POOL_MAX_WAIT_MS", duration(router.pool_max_wait)),
+                ("POOL_MAX_MESSAGES", router.pool_max_messages.to_string()),
+                (
+                    "MAX_ACTIVE_CONVERSATIONS",
+                    router.max_active_conversations.to_string(),
+                ),
+                ("JEV_MIN_CONFIDENCE", router.jev_min_confidence.to_string()),
+                ("JEV_TIMEOUT_MS", duration(router.jev_timeout)),
+            ],
+            agent: vec![
+                (
+                    "AGENT_HOST_URL",
+                    if enabled { "set" } else { "not set" }.to_owned(),
+                ),
+                ("AGENT_HOST_TIMEOUT_MS", duration(agent.host_timeout)),
+                ("AGENT_HISTORY_MESSAGES", agent.history_messages.to_string()),
+                ("AGENT_RUN_MAX_AGE_SECS", duration(agent.run_max_age)),
+                (
+                    "TOPIC_EVERY_MESSAGES",
+                    agent.topic_every_messages.to_string(),
+                ),
+            ],
+        }
+    }
+}
+
+struct Invocation<'a> {
+    guild_id: i64,
+    subcommand: &'a str,
+    /// The subcommand's options: `[{name, type, value}]`.
+    options: &'a Value,
+    /// `data.resolved`: users and members referenced by options.
+    resolved: &'a Value,
+}
+
+impl Invocation<'_> {
+    fn option(&self, name: &str) -> Option<&Value> {
+        self.options
+            .as_array()?
+            .iter()
+            .find(|o| o["name"] == name)
+            .map(|o| &o["value"])
+    }
+}
+
+/// A failure the person running the command can fix, shown as-is.
+#[derive(Debug)]
+struct UserError(String);
+
+impl std::fmt::Display for UserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UserError {}
+
+impl Commands {
+    pub async fn new(
+        db: PgPool,
+        http: Arc<Client>,
+        bot_user_id: i64,
+        settings: Settings,
+    ) -> anyhow::Result<Self> {
+        let app = get_json("current application", || http.current_user_application())
+            .await?
+            .context("can't read the bot's application")?;
+        let application_id =
+            Id::new(snowflake(&app["id"]).context("application has no id")? as u64);
+        Ok(Self {
+            db,
+            http,
+            application_id,
+            bot_user_id,
+            settings,
+        })
+    }
+
+    /// Replaces the guild's commands with ours. Failure (e.g. the bot was invited
+    /// without the `applications.commands` scope) is logged, not fatal.
+    pub async fn register(&self, guild_ids: &[Id<GuildMarker>]) {
+        let commands = [definition().build()];
+        let interaction = self.http.interaction(self.application_id);
+        for &guild_id in guild_ids {
+            match interaction.set_guild_commands(guild_id, &commands).await {
+                Ok(_) => info!(guild_id = guild_id.get(), "slash commands registered"),
+                Err(e) => {
+                    warn!(guild_id = guild_id.get(), error = %e, "couldn't register slash commands")
+                }
+            }
+        }
+    }
+
+    /// Answers an `INTERACTION_CREATE` payload in the background. Defers first:
+    /// Discord drops interactions not acknowledged within 3 seconds, and the
+    /// stats queries can take longer on a cold database.
+    pub fn spawn_handle(self: &Arc<Self>, interaction: Value) {
+        if interaction["type"].as_u64() != Some(APPLICATION_COMMAND)
+            || interaction["data"]["name"].as_str() != Some("kiki")
+        {
+            return;
+        }
+        let commands = self.clone();
+        tokio::spawn(async move {
+            let subcommand = interaction["data"]["options"][0]["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if let Err(e) = commands.handle(&interaction).await {
+                warn!(
+                    subcommand,
+                    guild_id = interaction["guild_id"].as_str(),
+                    interaction_id = interaction["id"].as_str(),
+                    error = format!("{e:#}"),
+                    "couldn't answer slash command"
+                );
+            }
+        });
+    }
+
+    async fn handle(&self, interaction: &Value) -> anyhow::Result<()> {
+        let id = snowflake(&interaction["id"]).context("interaction has no id")?;
+        let token = interaction["token"]
+            .as_str()
+            .context("interaction has no token")?;
+        let client = self.http.interaction(self.application_id);
+        let deferred = InteractionResponse {
+            kind: InteractionResponseType::DeferredChannelMessageWithSource,
+            data: Some(InteractionResponseData {
+                flags: Some(MessageFlags::EPHEMERAL),
+                ..Default::default()
+            }),
+        };
+        client
+            .create_response(Id::new(id as u64), token, &deferred)
+            .await
+            .context("deferring interaction response")?;
+
+        let subcommand = &interaction["data"]["options"][0];
+        let embeds = match snowflake(&interaction["guild_id"]) {
+            None => vec![error_embed("`/kiki` only works in a server.")],
+            Some(guild_id) => {
+                let invocation = Invocation {
+                    guild_id,
+                    subcommand: subcommand["name"].as_str().unwrap_or_default(),
+                    options: &subcommand["options"],
+                    resolved: &interaction["data"]["resolved"],
+                };
+                match self.run(&invocation).await {
+                    Ok(embeds) => embeds,
+                    Err(e) => match e.downcast_ref::<UserError>() {
+                        Some(e) => vec![error_embed(&e.0)],
+                        None => {
+                            warn!(
+                                subcommand = invocation.subcommand,
+                                guild_id = invocation.guild_id,
+                                interaction_id = interaction["id"].as_str(),
+                                error = format!("{e:#}"),
+                                "slash command failed"
+                            );
+                            vec![error_embed(
+                                "Something went wrong. The ingester logs have the details.",
+                            )]
+                        }
+                    },
+                }
+            }
+        };
+        let no_pings = AllowedMentions::default();
+        client
+            .update_response(token)
+            .embeds(Some(&embeds))
+            .allowed_mentions(Some(&no_pings))
+            .await
+            .context("sending interaction response")?;
+        Ok(())
+    }
+
+    async fn run(&self, invocation: &Invocation<'_>) -> anyhow::Result<Vec<Embed>> {
+        let embed = match invocation.subcommand {
+            "conversations" => self.conversations(invocation.guild_id).await?,
+            "stats" => self.stats(invocation.guild_id).await?,
+            "runs" => self.runs(invocation).await?,
+            "config" => self.config().await?,
+            "whois" => self.whois(invocation).await?,
+            other => error_embed(&format!("Unknown subcommand `{other}`.")),
+        };
+        Ok(vec![embed])
+    }
+
+    async fn conversations(&self, guild_id: i64) -> anyhow::Result<Embed> {
+        let pool = conversation::active(&self.db, self.bot_user_id).await?;
+        let total = pool.len();
+        let here: Vec<_> = pool
+            .into_iter()
+            .filter(|c| c.guild_id == guild_id)
+            .collect();
+        let max = self.settings.max_active_conversations;
+        let footer = if here.len() == total {
+            format!("{total} of {max} slots in use")
+        } else {
+            format!("{total} of {max} slots in use across all servers")
+        };
+        let embed = EmbedBuilder::new()
+            .color(COLOR)
+            .title("Active conversations")
+            .footer(EmbedFooterBuilder::new(footer))
+            .timestamp(now());
+        if here.is_empty() {
+            return Ok(embed.description("No active conversations.").build());
+        }
+
+        let rows: Vec<Vec<String>> = here
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                vec![
+                    (i + 1).to_string(),
+                    channel_label(c.channel_name.as_deref(), c.channel_id),
+                    c.message_count.to_string(),
+                    c.participants.len().to_string(),
+                    ago(c.last_active_at_ms),
+                    usd(c.cost_usd),
+                ]
+            })
+            .collect();
+        let mut embed = embed.description(table(
+            &[
+                ("#", Align::Right),
+                ("Channel", Align::Left),
+                ("Msgs", Align::Right),
+                ("People", Align::Right),
+                ("Active", Align::Right),
+                ("Cost", Align::Right),
+            ],
+            &rows,
+        ));
+        for (i, c) in here.iter().enumerate().take(MAX_FIELDS) {
+            let people = if c.participants.is_empty() {
+                "nobody yet".to_owned()
+            } else {
+                c.participants
+                    .iter()
+                    .map(|p| format!("<@{}> ({})", p.id, p.messages))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let value = format!(
+                "**Topic:** {}\n**People:** {people}\n**Started:** <t:{}:R> · **Last message:** <t:{}:R>",
+                c.topic.as_deref().unwrap_or("*not summarized yet*"),
+                c.created_at_ms / 1000,
+                c.last_active_at_ms / 1000,
+            );
+            embed = embed.field(EmbedFieldBuilder::new(
+                format!(
+                    "{}. {}",
+                    i + 1,
+                    channel_label(c.channel_name.as_deref(), c.channel_id)
+                ),
+                truncate(&value, MAX_FIELD_CHARS),
+            ));
+        }
+        Ok(embed.build())
+    }
+
+    async fn stats(&self, guild_id: i64) -> anyhow::Result<Embed> {
+        #[derive(FromRow)]
+        struct Window {
+            conversations: i64,
+            messages: i64,
+            replies: i64,
+            failed: i64,
+            p50_ms: Option<f64>,
+            p95_ms: Option<f64>,
+            via_reply: i64,
+            via_mention: i64,
+            via_keyword: i64,
+            via_active: i64,
+            via_none: i64,
+            routed: i64,
+            chat_cost: f64,
+            decide_cost: f64,
+        }
+        #[derive(FromRow)]
+        struct Now {
+            pending: i64,
+            running: i64,
+            topic_cost: f64,
+        }
+        let windows: Vec<Window> = sqlx::query_as(
+            r#"
+            WITH w(n, since) AS (VALUES (0, now() - interval '24 hours'),
+                                        (1, now() - interval '7 days'),
+                                        (2, '-infinity'::timestamptz)),
+            conv AS (SELECT id, created_at FROM conversations WHERE guild_id = $1),
+            runs AS (SELECT r.status, r.latency_ms, r.cost_usd,
+                            coalesce(r.finished_at, r.created_at) AS at
+                     FROM agent_runs r JOIN conv ON conv.id = r.conversation_id),
+            cls AS (SELECT c.check_hit, c.outcome, c.jev_cost_usd, c.classified_at AS at
+                    FROM classifications c JOIN messages m ON m.id = c.message_id
+                    WHERE m.guild_id = $1),
+            tagged AS (SELECT cm.tagged_at AS at
+                       FROM conversation_messages cm JOIN conv ON conv.id = cm.conversation_id)
+            SELECT
+                (SELECT count(*) FROM conv WHERE created_at > w.since) AS conversations,
+                (SELECT count(*) FROM tagged WHERE at > w.since) AS messages,
+                (SELECT count(*) FROM runs WHERE status = 'done' AND at > w.since) AS replies,
+                (SELECT count(*) FROM runs WHERE status = 'failed' AND at > w.since) AS failed,
+                (SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY latency_ms)
+                 FROM runs WHERE status = 'done' AND at > w.since) AS p50_ms,
+                (SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms)
+                 FROM runs WHERE status = 'done' AND at > w.since) AS p95_ms,
+                (SELECT count(*) FROM cls WHERE check_hit = 'reply' AND at > w.since) AS via_reply,
+                (SELECT count(*) FROM cls WHERE check_hit = 'mention' AND at > w.since) AS via_mention,
+                (SELECT count(*) FROM cls WHERE check_hit = 'keyword' AND at > w.since) AS via_keyword,
+                (SELECT count(*) FROM cls WHERE check_hit = 'active_conversation' AND at > w.since)
+                    AS via_active,
+                (SELECT count(*) FROM cls WHERE check_hit = 'none' AND at > w.since) AS via_none,
+                (SELECT count(*) FROM cls WHERE outcome <> 'no' AND at > w.since) AS routed,
+                (SELECT coalesce(sum(cost_usd), 0) FROM runs WHERE at > w.since) AS chat_cost,
+                (SELECT coalesce(sum(jev_cost_usd), 0) FROM cls WHERE at > w.since) AS decide_cost
+            FROM w ORDER BY w.n
+            "#,
+        )
+        .bind(guild_id)
+        .fetch_all(&self.db)
+        .await?;
+        let current: Now = sqlx::query_as(
+            r#"
+            SELECT
+                count(*) FILTER (WHERE r.status = 'pending') AS pending,
+                count(*) FILTER (WHERE r.status IN ('running', 'delivering')) AS running,
+                (SELECT coalesce(sum(topic_cost_usd), 0) FROM conversations WHERE guild_id = $1)
+                    AS topic_cost
+            FROM agent_runs r JOIN conversations c ON c.id = r.conversation_id
+            WHERE c.guild_id = $1 AND r.status IN ('pending', 'running', 'delivering')
+            "#,
+        )
+        .bind(guild_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        let columns = [
+            ("", Align::Left),
+            ("24 h", Align::Right),
+            ("7 d", Align::Right),
+            ("All", Align::Right),
+        ];
+        let row = |label: &str, cell: &dyn Fn(&Window) -> String| -> Vec<String> {
+            std::iter::once(label.to_owned())
+                .chain(windows.iter().map(cell))
+                .collect()
+        };
+        let activity = [
+            row("Conversations", &|w| w.conversations.to_string()),
+            row("Messages", &|w| w.messages.to_string()),
+            row("Replies", &|w| w.replies.to_string()),
+            row("Failed runs", &|w| w.failed.to_string()),
+            row("Reply p50", &|w| seconds(w.p50_ms)),
+            row("Reply p95", &|w| seconds(w.p95_ms)),
+        ];
+        let routing = [
+            row("Reply to Kiki", &|w| w.via_reply.to_string()),
+            row("@Kiki", &|w| w.via_mention.to_string()),
+            row("Keyword", &|w| w.via_keyword.to_string()),
+            row("Active chat", &|w| w.via_active.to_string()),
+            row("No match", &|w| w.via_none.to_string()),
+            row("Routed", &|w| w.routed.to_string()),
+        ];
+        // Topic summaries aren't timestamped, so their cost only has an all-time total.
+        let topic_cell = |i: usize| {
+            if i == 2 {
+                usd(current.topic_cost)
+            } else {
+                "–".to_owned()
+            }
+        };
+        let mut cost = vec![
+            row("Chat", &|w| usd(w.chat_cost)),
+            row("Decide", &|w| usd(w.decide_cost)),
+        ];
+        cost.push(
+            std::iter::once("Topics".to_owned())
+                .chain((0..windows.len()).map(topic_cell))
+                .collect(),
+        );
+        cost.push(
+            std::iter::once("Total".to_owned())
+                .chain(windows.iter().enumerate().map(|(i, w)| {
+                    let topics = if i == 2 { current.topic_cost } else { 0.0 };
+                    usd(w.chat_cost + w.decide_cost + topics)
+                }))
+                .collect(),
+        );
+
+        let description = format!(
+            "**Activity**\n{}**Routing** · messages by the first check they matched\n{}**Cost** · USD\n{}\
+             Topic summaries have no timestamp, so their cost counts toward All only.",
+            table(&columns, &activity),
+            table(&columns, &routing),
+            table(&columns, &cost),
+        );
+        Ok(EmbedBuilder::new()
+            .color(COLOR)
+            .title("Kiki stats")
+            .description(truncate(&description, MAX_DESCRIPTION_CHARS))
+            .field(EmbedFieldBuilder::new("Queued runs", current.pending.to_string()).inline())
+            .field(EmbedFieldBuilder::new("Running", current.running.to_string()).inline())
+            .footer(EmbedFooterBuilder::new("This server only"))
+            .timestamp(now())
+            .build())
+    }
+
+    async fn runs(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        #[derive(FromRow)]
+        struct Run {
+            id: i64,
+            channel_id: i64,
+            channel_name: Option<String>,
+            status: String,
+            latency_ms: Option<i32>,
+            cost_usd: Option<f64>,
+            error: Option<String>,
+            created_at_ms: i64,
+        }
+        let status = invocation.option("status").and_then(Value::as_str);
+        if status.is_some_and(|s| !RUN_STATUSES.contains(&s)) {
+            return Err(
+                UserError(format!("Unknown status `{}`.", status.unwrap_or_default())).into(),
+            );
+        }
+        let limit = invocation
+            .option("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(10)
+            .clamp(1, 25);
+        let runs: Vec<Run> = sqlx::query_as(
+            r#"
+            SELECT r.id, c.channel_id, ch.name AS channel_name, r.status, r.latency_ms, r.cost_usd,
+                   r.error, (extract(epoch FROM r.created_at) * 1000)::bigint AS created_at_ms
+            FROM agent_runs r
+            JOIN conversations c ON c.id = r.conversation_id
+            LEFT JOIN channels ch ON ch.id = c.channel_id
+            WHERE c.guild_id = $1 AND ($2::text IS NULL OR r.status = $2)
+            ORDER BY r.id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(invocation.guild_id)
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.db)
+        .await?;
+
+        let title = match status {
+            Some(s) => format!("Agent runs · {s}"),
+            None => "Agent runs".to_owned(),
+        };
+        let embed = EmbedBuilder::new()
+            .color(COLOR)
+            .title(title)
+            .timestamp(now());
+        if runs.is_empty() {
+            return Ok(embed.description("No runs.").build());
+        }
+        let rows: Vec<Vec<String>> = runs
+            .iter()
+            .map(|r| {
+                vec![
+                    r.id.to_string(),
+                    channel_label(r.channel_name.as_deref(), r.channel_id),
+                    r.status.clone(),
+                    seconds(r.latency_ms.map(f64::from)),
+                    r.cost_usd.map_or("–".to_owned(), usd),
+                    ago(r.created_at_ms),
+                ]
+            })
+            .collect();
+        let mut embed = embed.description(table(
+            &[
+                ("Run", Align::Right),
+                ("Channel", Align::Left),
+                ("Status", Align::Left),
+                ("Time", Align::Right),
+                ("Cost", Align::Right),
+                ("Age", Align::Right),
+            ],
+            &rows,
+        ));
+        for r in runs.iter().filter(|r| r.error.is_some()).take(MAX_FIELDS) {
+            let error = r.error.as_deref().unwrap_or_default();
+            embed = embed.field(EmbedFieldBuilder::new(
+                format!("Run {} · {}", r.id, r.status),
+                code_block(&truncate(error, 300)),
+            ));
+        }
+        Ok(embed.build())
+    }
+
+    async fn config(&self) -> anyhow::Result<Embed> {
+        let (last_chat, last_decide): (Option<String>, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT model FROM agent_runs WHERE model IS NOT NULL ORDER BY id DESC LIMIT 1),
+                (SELECT jev_model FROM classifications WHERE jev_model IS NOT NULL
+                 ORDER BY classified_at DESC LIMIT 1)
+            "#,
+        )
+        .fetch_one(&self.db)
+        .await?;
+
+        let s = &self.settings;
+        let off = || "off".to_owned();
+        let models = [
+            vec![
+                "Chat".to_owned(),
+                s.chat_model.clone().unwrap_or_else(off),
+                last_chat.unwrap_or_else(|| "–".into()),
+            ],
+            vec![
+                "Topic".to_owned(),
+                s.topic_model.clone().unwrap_or_else(off),
+                "–".into(),
+            ],
+            vec![
+                "Decide".to_owned(),
+                if s.decide_enabled {
+                    s.decide_model.clone()
+                } else {
+                    off()
+                },
+                last_decide.unwrap_or_else(|| "–".into()),
+            ],
+        ];
+        let settings_table = |rows: &[(&'static str, String)]| {
+            let rows: Vec<Vec<String>> = rows
+                .iter()
+                .map(|(name, value)| vec![(*name).to_owned(), value.clone()])
+                .collect();
+            table(&[("Variable", Align::Left), ("Value", Align::Left)], &rows)
+        };
+        let mut notes = Vec::new();
+        if s.chat_model.is_none() {
+            notes.push("AGENT_HOST_URL is not set: routed messages get no reply.");
+        }
+        if !s.decide_enabled {
+            notes.push("OPENROUTER_DECISION_API_KEY is not set: Decide always answers no.");
+        }
+        let mut embed = EmbedBuilder::new()
+            .color(COLOR)
+            .title("Kiki config")
+            .field(EmbedFieldBuilder::new(
+                "Models",
+                truncate(
+                    &table(
+                        &[
+                            ("Role", Align::Left),
+                            ("Configured", Align::Left),
+                            ("Last answered", Align::Left),
+                        ],
+                        &models,
+                    ),
+                    MAX_FIELD_CHARS,
+                ),
+            ))
+            .field(EmbedFieldBuilder::new(
+                "Routing",
+                truncate(&settings_table(&s.routing), MAX_FIELD_CHARS),
+            ))
+            .field(EmbedFieldBuilder::new(
+                "Agent",
+                truncate(&settings_table(&s.agent), MAX_FIELD_CHARS),
+            ))
+            .footer(EmbedFooterBuilder::new(
+                "Read from environment variables at startup",
+            ));
+        if !notes.is_empty() {
+            embed = embed.description(notes.join("\n"));
+        }
+        Ok(embed.build())
+    }
+
+    async fn whois(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        #[derive(FromRow)]
+        struct Person {
+            username: Option<String>,
+            global_name: Option<String>,
+            nick: Option<String>,
+            bot: bool,
+            joined_at_s: Option<i64>,
+        }
+        #[derive(FromRow)]
+        struct Name {
+            kind: String,
+            name: String,
+            first_seen_ms: i64,
+            last_seen_ms: i64,
+        }
+        #[derive(FromRow)]
+        struct Activity {
+            messages: i64,
+            first_message_s: Option<i64>,
+            last_message_s: Option<i64>,
+            conversations: i64,
+            conversation_messages: i64,
+        }
+        let user_id = invocation
+            .option("user")
+            .and_then(snowflake)
+            .ok_or_else(|| UserError("Pick a user.".into()))?;
+        let guild_id = invocation.guild_id;
+
+        let person: Option<Person> = sqlx::query_as(
+            r#"
+            SELECT username, global_name, nick, bot,
+                   extract(epoch FROM joined_at)::bigint AS joined_at_s
+            FROM people WHERE guild_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(guild_id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(person) = person else {
+            return Ok(EmbedBuilder::new()
+                .color(COLOR)
+                .description(format!(
+                    "Kiki hasn't seen <@{user_id}> post or get mentioned in this server."
+                ))
+                .build());
+        };
+        let names: Vec<Name> = sqlx::query_as(
+            r#"
+            SELECT kind, name,
+                   (extract(epoch FROM first_seen) * 1000)::bigint AS first_seen_ms,
+                   (extract(epoch FROM last_seen) * 1000)::bigint AS last_seen_ms
+            FROM user_names WHERE guild_id = $1 AND user_id = $2
+            ORDER BY last_seen DESC, kind
+            LIMIT 15
+            "#,
+        )
+        .bind(guild_id)
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?;
+        let activity: Activity = sqlx::query_as(
+            r#"
+            SELECT count(*) AS messages,
+                   extract(epoch FROM min(m.created_at))::bigint AS first_message_s,
+                   extract(epoch FROM max(m.created_at))::bigint AS last_message_s,
+                   count(DISTINCT cm.conversation_id) AS conversations,
+                   count(cm.message_id) AS conversation_messages
+            FROM messages m
+            LEFT JOIN conversation_messages cm ON cm.message_id = m.id
+            WHERE m.guild_id = $1 AND m.author_id = $2 AND m.deleted_at IS NULL
+            "#,
+        )
+        .bind(guild_id)
+        .bind(user_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        let title = person
+            .nick
+            .as_deref()
+            .or(person.global_name.as_deref())
+            .or(person.username.as_deref())
+            .unwrap_or("Unknown user");
+        let mut description = format!("<@{user_id}> · `{user_id}`");
+        if person.bot {
+            description.push_str(" · bot");
+        }
+        let name_rows: Vec<Vec<String>> = names
+            .iter()
+            .map(|n| {
+                vec![
+                    match n.kind.as_str() {
+                        "global_name" => "display".to_owned(),
+                        other => other.to_owned(),
+                    },
+                    n.name.clone(),
+                    ago(n.first_seen_ms),
+                    ago(n.last_seen_ms),
+                ]
+            })
+            .collect();
+        let at = |s: Option<i64>, style: char| {
+            s.map_or("–".to_owned(), |s| format!("<t:{s}:{style}>"))
+        };
+
+        let mut embed = EmbedBuilder::new()
+            .color(COLOR)
+            .title(title)
+            .description(description)
+            .field(EmbedFieldBuilder::new("Messages", activity.messages.to_string()).inline())
+            .field(
+                EmbedFieldBuilder::new(
+                    "With Kiki",
+                    format!(
+                        "{} in {} conversations",
+                        activity.conversation_messages, activity.conversations
+                    ),
+                )
+                .inline(),
+            )
+            .field(EmbedFieldBuilder::new("Joined", at(person.joined_at_s, 'D')).inline())
+            .field(
+                EmbedFieldBuilder::new("First message", at(activity.first_message_s, 'R')).inline(),
+            )
+            .field(
+                EmbedFieldBuilder::new("Last message", at(activity.last_message_s, 'R')).inline(),
+            )
+            .field(EmbedFieldBuilder::new(
+                "Names seen",
+                truncate(
+                    &table(
+                        &[
+                            ("Kind", Align::Left),
+                            ("Name", Align::Left),
+                            ("First", Align::Right),
+                            ("Last", Align::Right),
+                        ],
+                        &name_rows,
+                    ),
+                    MAX_FIELD_CHARS,
+                ),
+            ));
+        if let Some(url) = avatar_url(invocation.resolved, user_id)
+            && let Ok(source) = ImageSource::url(url)
+        {
+            embed = embed.thumbnail(source);
+        }
+        Ok(embed.build())
+    }
+}
+
+fn definition() -> CommandBuilder {
+    CommandBuilder::new("kiki", "Inspect Kiki", CommandType::ChatInput)
+        .default_member_permissions(Permissions::MANAGE_GUILD)
+        .option(SubCommandBuilder::new(
+            "conversations",
+            "Active conversations: channel, topic, people, messages and cost",
+        ))
+        .option(SubCommandBuilder::new(
+            "stats",
+            "Activity, routing and LLM cost over 24 hours, 7 days and all time",
+        ))
+        .option(
+            SubCommandBuilder::new("runs", "Latest agent runs, with timing, cost and errors")
+                .option(
+                    StringBuilder::new("status", "Only runs with this status")
+                        .choices(RUN_STATUSES.map(|s| (s, s))),
+                )
+                .option(
+                    IntegerBuilder::new("limit", "How many runs to show (default 10)")
+                        .min_value(1)
+                        .max_value(25),
+                ),
+        )
+        .option(SubCommandBuilder::new(
+            "config",
+            "Models and routing and agent settings in effect",
+        ))
+        .option(
+            SubCommandBuilder::new("whois", "Every name Kiki has seen for someone")
+                .option(UserBuilder::new("user", "Who to look up").required(true)),
+        )
+}
+
+fn error_embed(message: &str) -> Embed {
+    EmbedBuilder::new()
+        .color(ERROR_COLOR)
+        .description(message)
+        .build()
+}
+
+fn avatar_url(resolved: &Value, user_id: i64) -> Option<String> {
+    let user = &resolved["users"][user_id.to_string()];
+    let hash = user["avatar"].as_str()?;
+    let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+    Some(format!(
+        "https://cdn.discordapp.com/avatars/{user_id}/{hash}.{ext}?size=128"
+    ))
+}
+
+fn now() -> Timestamp {
+    Timestamp::from_secs(unix_millis() / 1000).expect("current time is a valid timestamp")
+}
+
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
+fn table(columns: &[(&str, Align)], rows: &[Vec<String>]) -> String {
+    const GAP: &str = "  ";
+    let cell = |s: &str| s.replace('`', "ˋ").replace('\n', " ");
+    let rows: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|c| cell(c)).collect())
+        .collect();
+    let widths: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(i, (header, _))| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(|c| c.chars().count())
+                .chain([header.chars().count()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: &mut dyn Iterator<Item = &str>| {
+        let mut s = String::new();
+        for (i, c) in cells.enumerate() {
+            let (width, align) = (widths[i], columns[i].1);
+            if i > 0 {
+                s.push_str(GAP);
+            }
+            let _ = match align {
+                Align::Left => write!(s, "{c:<width$}"),
+                Align::Right => write!(s, "{c:>width$}"),
+            };
+        }
+        s.trim_end().to_owned()
+    };
+    let mut out = String::from("```\n");
+    out.push_str(&line(&mut columns.iter().map(|(h, _)| *h)));
+    out.push('\n');
+    for r in &rows {
+        out.push_str(&line(&mut r.iter().map(String::as_str)));
+        out.push('\n');
+    }
+    out.push_str("```\n");
+    out
+}
+
+fn code_block(text: &str) -> String {
+    format!("```\n{}\n```", text.replace("```", "ˋˋˋ"))
+}
+
+fn channel_label(name: Option<&str>, id: i64) -> String {
+    match name {
+        Some(name) => truncate(&format!("#{name}"), 16),
+        None => id.to_string(),
+    }
+}
+
+fn usd(amount: f64) -> String {
+    if amount > 0.0 && amount < 0.01 {
+        format!("${amount:.4}")
+    } else {
+        format!("${amount:.2}")
+    }
+}
+
+fn seconds(ms: Option<f64>) -> String {
+    match ms {
+        None => "–".to_owned(),
+        Some(ms) if ms < 10_000.0 => format!("{:.1}s", ms / 1000.0),
+        Some(ms) => format!("{:.0}s", ms / 1000.0),
+    }
+}
+
+fn duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    match ms {
+        _ if ms < 1000 || !ms.is_multiple_of(1000) => format!("{ms} ms"),
+        _ if ms.is_multiple_of(3_600_000) => format!("{} h", ms / 3_600_000),
+        _ if ms.is_multiple_of(60_000) => format!("{} min", ms / 60_000),
+        _ => format!("{} s", ms / 1000),
+    }
+}
+
+fn ago(unix_ms: i64) -> String {
+    let secs = (unix_millis() - unix_ms).max(0) / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86400 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86400),
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut s: String = text.chars().take(max - 1).collect();
+    s.push('…');
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{Align, definition, duration, seconds, table, truncate, usd};
+
+    #[test]
+    fn formats_cost() {
+        assert_eq!(usd(0.0), "$0.00");
+        assert_eq!(usd(0.000_123_4), "$0.0001");
+        assert_eq!(usd(1.234), "$1.23");
+    }
+
+    #[test]
+    fn formats_durations() {
+        assert_eq!(duration(Duration::from_millis(500)), "500 ms");
+        assert_eq!(duration(Duration::from_millis(1500)), "1500 ms");
+        assert_eq!(duration(Duration::from_secs(8)), "8 s");
+        assert_eq!(duration(Duration::from_secs(120)), "2 min");
+        assert_eq!(duration(Duration::from_secs(3600)), "1 h");
+        assert_eq!(seconds(Some(4_210.0)), "4.2s");
+        assert_eq!(seconds(Some(12_400.0)), "12s");
+        assert_eq!(seconds(None), "–");
+    }
+
+    #[test]
+    fn aligns_tables() {
+        let rows = vec![
+            vec!["Chat".to_owned(), "$1.20".to_owned()],
+            vec!["Decide".to_owned(), "$0.05".to_owned()],
+        ];
+        assert_eq!(
+            table(&[("", Align::Left), ("Cost", Align::Right)], &rows),
+            "```\n         Cost\nChat    $1.20\nDecide  $0.05\n```\n"
+        );
+    }
+
+    #[test]
+    fn table_cells_cannot_close_the_code_block() {
+        let rows = vec![vec!["a```b".to_owned()]];
+        assert!(!table(&[("x", Align::Left)], &rows).contains("a```"));
+    }
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        assert_eq!(truncate("héllo", 5), "héllo");
+        assert_eq!(truncate("héllo", 3), "hé…");
+    }
+
+    #[test]
+    fn command_is_valid() {
+        let _ = definition().validate().unwrap().build();
+    }
+}

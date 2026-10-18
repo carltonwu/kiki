@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -14,7 +14,7 @@ use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use twilight_http::Client;
 use twilight_model::{
     id::{Id, marker::GuildMarker},
@@ -28,7 +28,6 @@ use crate::{rest::get_json, store};
 const MESSAGE_CHANNEL_TYPES: &[i16] = &[0, 2, 5, 13, 10, 11, 12];
 /// Channel types that can have threads: text, announcement, forum, media.
 const THREAD_PARENT_TYPES: &[i64] = &[0, 5, 15, 16];
-/// Discord's maximum page size for message history.
 const PAGE_SIZE: u16 = 100;
 /// Channels fetched in parallel. Each channel has its own rate limit bucket.
 const CHANNEL_CONCURRENCY: usize = 4;
@@ -62,30 +61,30 @@ impl CatchUp {
         };
         let _guard = lock.lock().await;
         let gid = guild_id.get() as i64;
-        let started = SystemTime::now();
+        let started = Instant::now();
 
         self.discover(guild_id).await?;
 
         let behind = store::channels_behind(&self.db, gid, MESSAGE_CHANNEL_TYPES).await?;
         if behind.is_empty() {
-            info!(%guild_id, "catch-up: already up to date");
+            debug!(%guild_id, "catch-up: already up to date");
             return Ok(());
         }
         info!(%guild_id, channels = behind.len(), "catch-up: fetching missed messages");
 
-        let results: Vec<anyhow::Result<usize>> = stream::iter(behind)
-            .map(|ch| self.fetch_channel(gid, ch))
+        let results: Vec<(i64, anyhow::Result<usize>)> = stream::iter(behind)
+            .map(|ch| async move { (ch.id, self.fetch_channel(gid, ch).await) })
             .buffer_unordered(CHANNEL_CONCURRENCY)
             .collect()
             .await;
         let mut fetched = 0;
         let mut failed = 0;
-        for result in results {
+        for (channel_id, result) in results {
             match result {
                 Ok(n) => fetched += n,
                 Err(e) => {
                     failed += 1;
-                    warn!(%guild_id, error = format!("{e:#}"), "catch-up: channel failed");
+                    warn!(%guild_id, channel_id, error = format!("{e:#}"), "catch-up: channel failed");
                 }
             }
         }
@@ -93,14 +92,12 @@ impl CatchUp {
             %guild_id,
             fetched,
             failed,
-            secs = started.elapsed().unwrap_or_default().as_secs(),
+            latency_ms = started.elapsed().as_millis() as u64,
             "catch-up finished"
         );
         Ok(())
     }
 
-    /// Refresh the guild's channels and threads, including archived threads that
-    /// may have messages we haven't seen.
     async fn discover(&self, guild_id: Id<GuildMarker>) -> anyhow::Result<()> {
         let gid = guild_id.get() as i64;
         let started = unix_micros();
@@ -184,7 +181,6 @@ impl CatchUp {
         Ok(())
     }
 
-    /// Pages forward through one channel's history. Returns the number of messages fetched.
     async fn fetch_channel(&self, gid: i64, ch: store::Behind) -> anyhow::Result<usize> {
         let http = &*self.http;
         let channel_id = Id::new(ch.id as u64);
@@ -219,7 +215,7 @@ impl CatchUp {
                 let complete = newest.max(ch.last_message_id);
                 store::store_page(&self.db, gid, ch.id, &messages, complete).await?;
                 if fetched > 0 {
-                    info!(
+                    debug!(
                         channel = ch.name,
                         channel_id = ch.id,
                         fetched,
@@ -242,7 +238,6 @@ impl CatchUp {
     }
 }
 
-/// Discord sends snowflake ids as strings.
 pub fn snowflake(v: &Value) -> Option<i64> {
     v.as_str()?.parse().ok()
 }

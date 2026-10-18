@@ -153,7 +153,6 @@ pub async fn store_page(
     tx.commit().await
 }
 
-/// A channel with messages newer than its cursor.
 pub struct Behind {
     pub id: i64,
     pub name: Option<String>,
@@ -161,7 +160,6 @@ pub struct Behind {
     pub last_message_id: i64,
 }
 
-/// Channels (and threads) of these types whose newest known message is past their cursor.
 pub async fn channels_behind(
     db: &PgPool,
     guild_id: i64,

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["services/*"]
+exclude = ["services/agent"]
 
 [workspace.package]
 edition = "2024"

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Kiki temporal memory design</title>
+<style>
+*{box-sizing:border-box}body{margin:0;color:var(--foreground,#e6e8ed);font:14px/1.5 var(--font-sans,system-ui)}h2{font-size:19px;margin:0 0 6px}p{margin:5px 0 14px}.muted,small{color:var(--muted-foreground,#9da5b3)}.flow{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:18px 0}.box{padding:16px;border:1px solid var(--border,#344052);border-radius:var(--radius,10px);background:var(--card,#1c2430)}.box b{display:block}.wide{grid-column:1/-1}.step{font:11px var(--font-mono,monospace);color:var(--muted-foreground,#9da5b3);letter-spacing:.06em}.arrow{text-align:center;color:var(--muted-foreground,#9da5b3);grid-column:1/-1;line-height:1}.accent{border-left:3px solid var(--chart-2,#52c8b1)}.note{padding:12px 0;color:var(--muted-foreground,#9da5b3);border-bottom:1px solid var(--border,#344052);margin-bottom:23px}.controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:14px 0}select{font:inherit;background:var(--secondary,#283246);color:inherit;border:1px solid var(--border,#344052);padding:7px;border-radius:6px}label{display:flex;align-items:center;gap:7px}.timeline{display:grid;grid-template-columns:65px 1fr;gap:12px 10px;align-items:start}.date{font:12px var(--font-mono,monospace);padding-top:14px;color:var(--muted-foreground,#9da5b3)}.event{padding:13px 16px;border-left:3px solid var(--chart-2,#52c8b1);background:var(--card,#1c2430);border-radius:0 var(--radius,10px) var(--radius,10px) 0}.event.side{border-color:var(--chart-4,#b18df5)}.event.future{opacity:.38}.tag{font:11px var(--font-mono,monospace);color:var(--muted-foreground,#9da5b3)}.result{margin:17px 0 0;padding:16px;border:1px solid var(--border,#344052);border-radius:var(--radius,10px)}#answer{font-size:17px;font-weight:600}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:12px 0}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--chart-2,#52c8b1);margin-right:5px}.purple{background:var(--chart-4,#b18df5)}@media(max-width:440px){.flow{grid-template-columns:1fr}.wide{grid-column:auto}.timeline{grid-template-columns:48px 1fr}.controls{align-items:start;flex-direction:column}}
+.event b{display:block}
+</style></head><body>
+<h2>A conversation is an episode. A topic connects episodes.</h2>
+<p class="muted">Proposed architecture · group all chat independently of whether Kiki responds.</p>
+<div class="flow" aria-label="Memory architecture">
+<div class="box"><span class="step">INPUT</span><b>Live Discord events</b>Creates, edits, deletions</div>
+<div class="box"><span class="step">INPUT</span><b>Historical backfill</b>Coverage and source provenance</div>
+<div class="arrow">↓ same canonical write path ↓</div>
+<div class="box wide"><span class="step">SOURCE OF TRUTH</span><b>Messages + revisions + durable memory work</b>Message time ≠ observation time ≠ referenced event time</div>
+<div class="arrow">↓ chronological grouping and local repair ↓</div>
+<div class="box accent"><span class="step">EPISODIC MEMORY</span><b>Versioned conversations</b>Who · when · replies · decisions<br>Open → cooling → sealed</div>
+<div class="box"><span class="step">SEMANTIC ORGANIZATION</span><b>Learned topics</b>Many conversations ↔ many topics<br>Fast matching + slower consolidation</div>
+<div class="arrow">↓ hybrid search + context expansion + temporal filters ↓</div>
+<div class="box wide accent"><span class="step">PER REPLY</span><b>Grounded memory packet → model</b>Current turns + relevant episodes + changes + dated source links<br><small>Raw-message search remains a parallel route to evidence.</small></div>
+</div>
+<div class="note">A sealed version stays immutable. Late evidence publishes a replacement; normal new replies to old messages start a linked episode.</div>
+<h2>Try the timeline</h2>
+<p class="muted">Fictional example: two interleaved conversations and a later change of plan.</p>
+<div class="controls"><label for="cutoff">Answer as of <select id="cutoff"><option value="17">October 17</option><option value="12">October 12</option></select></label><label><input type="checkbox" id="late"> Repair with a late backfilled message</label></div>
+<div class="legend"><span><i class="dot"></i>Topic: group dinner</span><span><i class="dot purple"></i>Topic: Rust debugging</span></div>
+<div class="timeline">
+<div class="date">Oct 10</div><div class="event"><div class="tag" id="version">E17 · sealed v1 · 18:00–18:12Z · Alex, Bea</div><b>Cedar proposed and agreed</b><div id="repair" class="muted">Sources m101, m108</div></div>
+<div class="date">Oct 10</div><div class="event side"><div class="tag">E18 · 18:03–18:18Z · Cam, Dev</div><b>Debugging a Rust timeout</b><span class="muted">Same channel and overlapping time; separate episode and topic.</span></div>
+<div class="date">Oct 16</div><div class="event" id="later"><div class="tag">E42 · 20:05–20:15Z · Alex, Bea</div><b>Cedar full; Pine booked instead</b><span class="muted">Sources m902, m910 · explicitly replaces the earlier dinner plan</span></div>
+</div>
+<div class="result" aria-live="polite"><div class="tag">QUESTION: WHERE DID WE END UP BOOKING DINNER?</div><div id="answer"></div><p id="explain"></p><small id="backfill"></small></div>
+<script>
+const cutoff=document.getElementById('cutoff'),late=document.getElementById('late');
+function update(){const historical=cutoff.value==='12',repaired=late.checked;document.getElementById('later').classList.toggle('future',historical);document.getElementById('answer').textContent=historical?'Cedar was the agreed plan as of October 12.':'Pine is the confirmed booking as of October 17.';document.getElementById('explain').textContent=historical?'The October 16 change is outside this message-time cutoff. A full summary containing it must also be excluded.':'Retrieve the October 16 correction with the older proposal. Similarity to the original plan alone gives the wrong answer.';document.getElementById('version').textContent=repaired?'E17 · sealed v2 · 17:58–18:12Z · Alex, Bea':'E17 · sealed v1 · 18:00–18:12Z · Alex, Bea';document.getElementById('repair').textContent=repaired?'Added m099: Alex suggested dinner at 17:58Z. E17 v2 replaces v1; dependent summaries rebuild.':'Sources m101, m108';document.getElementById('backfill').textContent=repaired?'Backfill learned on October 17 belongs on October 10. It does not become the latest plan. A “known to Kiki as of Oct 12” query would exclude it.':'Choose a cutoff or add late evidence to see why event time, observation time, and versioned repair matter.';}
+cutoff.addEventListener('change',update);late.addEventListener('change',update);update();
+console.log('Initial timeline:',document.getElementById('answer').textContent);cutoff.value='12';late.checked=true;update();console.assert(document.getElementById('answer').textContent.includes('Cedar'),'Historical cutoff failed');console.assert(document.getElementById('version').textContent.includes('v2'),'Late repair failed');cutoff.value='17';late.checked=false;update();console.assert(document.getElementById('answer').textContent.includes('Pine'),'Current state failed');console.log('Timeline state checks passed');
+</script></body></html>

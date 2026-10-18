@@ -2,7 +2,7 @@
 name: kiki
 services:
   postgres:
-    image: postgres:18  # matches Railway's managed Postgres
+    image: pgvector/pgvector:pg18-trixie  # Postgres 18 + pgvector, like Railway's image
     environment:
       POSTGRES_USER: kiki
       POSTGRES_PASSWORD: kiki
