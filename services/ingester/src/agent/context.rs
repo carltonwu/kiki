@@ -88,6 +88,9 @@ pub(super) struct StoredMessage {
     /// A thread starter (type 21) shows nothing itself: this is the message it
     /// points to, which the prompt shows instead ([`Agent::thread_origin`]).
     pub starter_of: Option<i64>,
+    /// Discord's previews of Spotify links (title — description), unfurled by
+    /// Discord itself: Kiki never calls Spotify (docs/spotify-spike.md).
+    pub spotify: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +122,10 @@ pub(super) const MESSAGE_COLUMNS: &str = r#"
           ) images ORDER BY kind, i LIMIT 10) AS images,
     ARRAY(SELECT DISTINCT r FROM agent_runs ar, unnest(ar.reactions) r
           WHERE ar.reply_to_id = m.id AND ar.reactions <> '{}') AS reactions,
+    ARRAY(SELECT concat_ws(' — ', nullif(e->>'title', ''), nullif(e->>'description', ''))
+          FROM jsonb_array_elements(coalesce(m.raw->'embeds', '[]')) e
+          WHERE e->'provider'->>'name' = 'Spotify'
+            AND coalesce(nullif(e->>'title', ''), nullif(e->>'description', '')) IS NOT NULL) AS spotify,
     CASE WHEN m.type = 21 THEN (m.raw->'message_reference'->>'message_id')::bigint END AS starter_of
 "#;
 
@@ -838,6 +845,7 @@ pub(super) mod tests {
     use serde_json::{Value, json};
     use sqlx::PgPool;
 
+    use super::MESSAGE_COLUMNS;
     use crate::{
         agent::{Agent, host::Host},
         config::AgentConfig,
@@ -1291,6 +1299,41 @@ pub(super) mod tests {
         let last = &context.messages.last().unwrap().content;
         assert!(!last.contains("] Thread"), "{last}");
         assert!(context.messages[0].content.contains("channel #boba."));
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn spotify_previews_come_from_spotify_embeds_with_text() {
+        let Some(test) = crate::test_db::migrated("ingester_spotify_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let alex = json!({"id": "102", "username": "alex_99"});
+        let spotify = json!({"name": "Spotify", "url": "https://open.spotify.com"});
+        let mut m = message(20, alex, json!({}), "listen", json!([]));
+        m["embeds"] = json!([
+            {"title": "Padam Padam", "description": "Kylie Minogue · Song", "provider": spotify},
+            {"title": "Elsewhere", "provider": {"name": "Example"}},
+            {"title": "", "description": "Only a description", "provider": spotify},
+            {"title": "Only a title", "description": null, "provider": spotify},
+            {"title": "", "provider": spotify},
+            {"provider": spotify},
+        ]);
+        store::upsert_messages(&db, GUILD, &[m]).await.unwrap();
+        let (spotify,): (Vec<String>,) = sqlx::query_as(&format!(
+            "SELECT spotify FROM (SELECT {MESSAGE_COLUMNS} FROM messages m) s"
+        ))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            spotify,
+            [
+                "Padam Padam — Kylie Minogue · Song",
+                "Only a description",
+                "Only a title"
+            ]
+        );
         test.drop().await;
     }
 }
