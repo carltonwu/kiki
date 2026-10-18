@@ -1,0 +1,2031 @@
+{
+  "jobs": {
+    "reply": {
+      "model_settings": {
+        "extra_body": {
+          "max_tool_calls": 3
+        },
+        "max_tokens": 100,
+        "openrouter_usage": {
+          "include": true
+        }
+      },
+      "text": "ok",
+      "tools": [
+        {
+          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
+          "kind": "function",
+          "name": "search_messages",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent at or after this time (ISO 8601, UTC)."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent before this time (ISO 8601, UTC)."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages in this channel, like #general. Leave it out to\nsearch the whole server."
+              },
+              "limit": {
+                "default": 10,
+                "description": "Maximum results, up to 10.",
+                "type": "integer"
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so."
+              },
+              "query": {
+                "description": "What to look for, in natural language or keywords.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Fetch the messages around one message in its channel, plus what it replied to.",
+          "kind": "function",
+          "name": "get_message_context",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "default": 5,
+                "description": "Messages after it, up to 10.",
+                "type": "integer"
+              },
+              "before": {
+                "default": 5,
+                "description": "Messages before it, up to 10.",
+                "type": "integer"
+              },
+              "message_id": {
+                "description": "The `id` of a message from search results.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Look at the images in one message: a single image or a whole gallery.\n\nAnother model looks at them and describes each image in detail (with any\ntext in it), and a gallery as a whole.",
+          "kind": "function",
+          "name": "read_image",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "message_id": {
+                "description": "The message ID shown with its images, like \"[image: cat.png;\nmessage 123]\", or a message `id` from search results.",
+                "type": "string"
+              },
+              "question": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional: what you want to know about them, so the\ndescription covers it."
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>.",
+          "kind": "function",
+          "name": "search_emojis",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "default": 5,
+                "description": "Maximum results, up to 10.",
+                "type": "integer"
+              },
+              "query": {
+                "description": "The feeling, reaction or subject, like \"confused\" or \"laughing so hard\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Look up this server's custom emoji by name, or explain one someone used.",
+          "kind": "function",
+          "name": "find_emoji",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "An emoji name like huh or :huh:, or an emoji as it appears in a\nmessage, like <:huh:1085017182301339648>.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Read what you remember about a person or thing: their base profile, or one of their docs.\n\nThe result also lists all of the subject's docs (title, what belongs there, size), so\nyou can read a more specific one next.",
+          "kind": "function",
+          "name": "recall",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "doc": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Which doc to read. Leave it out for the base profile."
+              },
+              "subject": {
+                "description": "A person's ref like u2 (best), an @username or a name they've gone by; or\nthe name of a thing (a pet, a place, a game, an inside joke).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Search your memory docs about everyone and everything in this server, by keywords.",
+          "kind": "function",
+          "name": "search_memory",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "query": {
+                "description": "What to look for.",
+                "type": "string"
+              },
+              "subject": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only this person or thing's docs."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Save one thing you learned about a person or thing, so you know it in later conversations.\n\nOne claim per call, written so it makes sense on its own (\"works night shifts at the\nhospital\", \"thinks the Eras tour was overrated\"). Leave out `doc` to have it filed in\nthe subject's best-matching doc. The result names where it went and similar entries\nalready saved.\n\nChanging a saved entry (`replaces`) needs evidence in proportion to how settled it is:\nopinions change with one message; facts that have stood for months need several.\nWithout `sources`, the evidence is the subject's latest message in this conversation.",
+          "kind": "function",
+          "name": "remember",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "doc": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "A doc of the subject to put it in, from recall's list."
+              },
+              "kind": {
+                "description": "\"fact\" for things that are true of them (job, pets, history, relationships);\n\"opinion\" for views, tastes and feelings, theirs or the group's about them.",
+                "enum": [
+                  "fact",
+                  "opinion"
+                ],
+                "type": "string"
+              },
+              "replaces": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The ID (like e12) of an entry this corrects or updates. Same text\nconfirms that entry instead."
+              },
+              "sources": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Message IDs from search results that show it."
+              },
+              "subject": {
+                "description": "A person's ref like u2 (best), an @username or a name; or a thing's name.",
+                "type": "string"
+              },
+              "text": {
+                "description": "The claim, at most 60 words, in your own words.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "text",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Retire a saved entry that turned out wrong or outdated, or that someone asked you to forget.\n\nNeeds the same evidence as changing it (see remember), unless the person it's about\nasked you to forget it themselves in this conversation.",
+          "kind": "function",
+          "name": "forget",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "entry": {
+                "description": "The entry ID, like e12.",
+                "type": "string"
+              },
+              "sources": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Message IDs from search results showing it's wrong or outdated."
+              }
+            },
+            "required": [
+              "entry"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Make a new doc for a subject, moving entries into it from a full or crowded one.\n\nEach doc holds at most 1024 words; remember tells you when one is full and how to split.",
+          "kind": "function",
+          "name": "split_doc",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "from_doc": {
+                "default": "profile",
+                "description": "The doc to move them from.",
+                "type": "string"
+              },
+              "move_entries": {
+                "description": "Entry IDs (like e12) to move. Empty creates an empty doc.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "new_doc": {
+                "description": "Short lowercase slug, like \"music\" or \"work-history\". An existing doc of\nthe subject also works, if it has room.",
+                "type": "string"
+              },
+              "subject": {
+                "description": "The same subject as in remember.",
+                "type": "string"
+              },
+              "summary": {
+                "description": "One line saying what belongs in this doc; you'll find the doc by it later.",
+                "type": "string"
+              },
+              "title": {
+                "description": "Short title, like \"Alex's music taste\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "new_doc",
+              "title",
+              "summary",
+              "move_entries"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        }
+      ]
+    },
+    "reply_with_image_model": {
+      "model_settings": {
+        "extra_body": {
+          "max_tool_calls": 3
+        },
+        "max_tokens": 100,
+        "openrouter_usage": {
+          "include": true
+        }
+      },
+      "text": "ok",
+      "tools": [
+        {
+          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
+          "kind": "function",
+          "name": "search_messages",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent at or after this time (ISO 8601, UTC)."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent before this time (ISO 8601, UTC)."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages in this channel, like #general. Leave it out to\nsearch the whole server."
+              },
+              "limit": {
+                "default": 10,
+                "description": "Maximum results, up to 10.",
+                "type": "integer"
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so."
+              },
+              "query": {
+                "description": "What to look for, in natural language or keywords.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Fetch the messages around one message in its channel, plus what it replied to.",
+          "kind": "function",
+          "name": "get_message_context",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "default": 5,
+                "description": "Messages after it, up to 10.",
+                "type": "integer"
+              },
+              "before": {
+                "default": 5,
+                "description": "Messages before it, up to 10.",
+                "type": "integer"
+              },
+              "message_id": {
+                "description": "The `id` of a message from search results.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Look at the images in one message: a single image or a whole gallery.\n\nAnother model looks at them and describes each image in detail (with any\ntext in it), and a gallery as a whole.",
+          "kind": "function",
+          "name": "read_image",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "message_id": {
+                "description": "The message ID shown with its images, like \"[image: cat.png;\nmessage 123]\", or a message `id` from search results.",
+                "type": "string"
+              },
+              "question": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional: what you want to know about them, so the\ndescription covers it."
+              }
+            },
+            "required": [
+              "message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>.",
+          "kind": "function",
+          "name": "search_emojis",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "limit": {
+                "default": 5,
+                "description": "Maximum results, up to 10.",
+                "type": "integer"
+              },
+              "query": {
+                "description": "The feeling, reaction or subject, like \"confused\" or \"laughing so hard\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Look up this server's custom emoji by name, or explain one someone used.",
+          "kind": "function",
+          "name": "find_emoji",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "description": "An emoji name like huh or :huh:, or an emoji as it appears in a\nmessage, like <:huh:1085017182301339648>.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Make a picture. It's drawn after your reply and posted as its own message.\n\nUse it when someone asks for a picture, drawing, meme or visual, or when one\nwould clearly land better than words. Your reply goes out first and lets them\nknow it's on the way; the picture follows in about half a minute, replying to\ntheir message, with your caption. If drawing fails, you get to tell them.\n\nName every person, pet or thing whose real look matters in `subjects`: the\ndrawing step finds photos of them in the server's history (and people's\navatars), checks them, and gives them to the image model as numbered\nreferences with what to keep the same, so their likeness carries over.",
+          "kind": "function",
+          "name": "generate_image",
+          "parameters": {
+            "$defs": {
+              "Pictured": {
+                "description": "Someone or something in the picture.",
+                "properties": {
+                  "description": {
+                    "default": "",
+                    "description": "Who or what they are and what they look like, as far as you know from the chat or memory, like \"traumagotchi's dog, a small fluffy white mutt\".",
+                    "type": "string"
+                  },
+                  "me": {
+                    "default": false,
+                    "description": "True when it's you, Kiki.",
+                    "type": "boolean"
+                  },
+                  "name": {
+                    "description": "What to call them in the picture, like \"Ethan\" or \"Nougie\".",
+                    "type": "string"
+                  },
+                  "person": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null,
+                    "description": "Their ref, like u2, when it's someone in this server."
+                  },
+                  "photos": {
+                    "description": "IDs of messages whose images show them, when you or the people asking already picked some (like the message in [image: …; message 123]). Otherwise leave it empty: the drawing step finds their photos in the server's history.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "title": "Pictured",
+                "type": "object"
+              }
+            },
+            "additionalProperties": false,
+            "properties": {
+              "aspect_ratio": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "1:1",
+                      "3:2",
+                      "2:3",
+                      "4:3",
+                      "3:4",
+                      "16:9",
+                      "9:16",
+                      "21:9"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "3:4 or 4:3 for an everyday phone photo, 9:16 or 16:9 for\ntall or wide scenes, 1:1 for icons; square when left out."
+              },
+              "caption": {
+                "default": "",
+                "description": "Your words to post with the picture, written for it.",
+                "type": "string"
+              },
+              "edit": {
+                "default": false,
+                "description": "True to change a posted photo rather than make a new picture: put\nits message ID first in the first subject's photos, and the prompt\nsays only what to change; everything else is kept.",
+                "type": "boolean"
+              },
+              "prompt": {
+                "description": "The picture, self-contained and literal (the image model knows\nnothing of the chat or the joke). Say what kind of image it is first,\nthen the scene: who does what, where, with framing, gaze, hands and\nhow they interact with things (\"full body, looking down at the\nneedle\"); then camera and light as concrete cues (\"phone photo at eye\nlevel, harsh fluorescent light\") rather than mood words alone; then\nconstraints. Any text in it goes in quotes with where it sits and\n\"no other text\". Call subjects by their names. Get real-world details\nright (a lumbar puncture goes in the lower back between the\nvertebrae). To edit, say only what changes.",
+                "type": "string"
+              },
+              "style": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only when they asked for one or the joke needs it, like \"90s anime\"\nor \"oil painting\". Leave it out for the default: a real, candid\nphone-camera photo without retouching."
+              },
+              "subjects": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/$defs/Pictured"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The people, pets and things in it whose look matters, you\nincluded (me: true) when you're in it."
+              }
+            },
+            "required": [
+              "prompt"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Read what you remember about a person or thing: their base profile, or one of their docs.\n\nThe result also lists all of the subject's docs (title, what belongs there, size), so\nyou can read a more specific one next.",
+          "kind": "function",
+          "name": "recall",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "doc": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Which doc to read. Leave it out for the base profile."
+              },
+              "subject": {
+                "description": "A person's ref like u2 (best), an @username or a name they've gone by; or\nthe name of a thing (a pet, a place, a game, an inside joke).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Search your memory docs about everyone and everything in this server, by keywords.",
+          "kind": "function",
+          "name": "search_memory",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "query": {
+                "description": "What to look for.",
+                "type": "string"
+              },
+              "subject": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only this person or thing's docs."
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Save one thing you learned about a person or thing, so you know it in later conversations.\n\nOne claim per call, written so it makes sense on its own (\"works night shifts at the\nhospital\", \"thinks the Eras tour was overrated\"). Leave out `doc` to have it filed in\nthe subject's best-matching doc. The result names where it went and similar entries\nalready saved.\n\nChanging a saved entry (`replaces`) needs evidence in proportion to how settled it is:\nopinions change with one message; facts that have stood for months need several.\nWithout `sources`, the evidence is the subject's latest message in this conversation.",
+          "kind": "function",
+          "name": "remember",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "doc": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "A doc of the subject to put it in, from recall's list."
+              },
+              "kind": {
+                "description": "\"fact\" for things that are true of them (job, pets, history, relationships);\n\"opinion\" for views, tastes and feelings, theirs or the group's about them.",
+                "enum": [
+                  "fact",
+                  "opinion"
+                ],
+                "type": "string"
+              },
+              "replaces": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The ID (like e12) of an entry this corrects or updates. Same text\nconfirms that entry instead."
+              },
+              "sources": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Message IDs from search results that show it."
+              },
+              "subject": {
+                "description": "A person's ref like u2 (best), an @username or a name; or a thing's name.",
+                "type": "string"
+              },
+              "text": {
+                "description": "The claim, at most 60 words, in your own words.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "text",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Retire a saved entry that turned out wrong or outdated, or that someone asked you to forget.\n\nNeeds the same evidence as changing it (see remember), unless the person it's about\nasked you to forget it themselves in this conversation.",
+          "kind": "function",
+          "name": "forget",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "entry": {
+                "description": "The entry ID, like e12.",
+                "type": "string"
+              },
+              "sources": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Message IDs from search results showing it's wrong or outdated."
+              }
+            },
+            "required": [
+              "entry"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Make a new doc for a subject, moving entries into it from a full or crowded one.\n\nEach doc holds at most 1024 words; remember tells you when one is full and how to split.",
+          "kind": "function",
+          "name": "split_doc",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "from_doc": {
+                "default": "profile",
+                "description": "The doc to move them from.",
+                "type": "string"
+              },
+              "move_entries": {
+                "description": "Entry IDs (like e12) to move. Empty creates an empty doc.",
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "new_doc": {
+                "description": "Short lowercase slug, like \"music\" or \"work-history\". An existing doc of\nthe subject also works, if it has room.",
+                "type": "string"
+              },
+              "subject": {
+                "description": "The same subject as in remember.",
+                "type": "string"
+              },
+              "summary": {
+                "description": "One line saying what belongs in this doc; you'll find the doc by it later.",
+                "type": "string"
+              },
+              "title": {
+                "description": "Short title, like \"Alex's music taste\".",
+                "type": "string"
+              }
+            },
+            "required": [
+              "subject",
+              "new_doc",
+              "title",
+              "summary",
+              "move_entries"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        }
+      ]
+    },
+    "topic": {
+      "model_settings": {
+        "max_tokens": 100,
+        "openrouter_usage": {
+          "include": true
+        }
+      },
+      "text": "ok",
+      "tools": []
+    }
+  },
+  "routes": [
+    [
+      "/health",
+      [
+        "GET"
+      ]
+    ],
+    [
+      "/v1/emojis/describe",
+      [
+        "POST"
+      ]
+    ],
+    [
+      "/v1/images",
+      [
+        "POST"
+      ]
+    ],
+    [
+      "/v1/jobs",
+      [
+        "POST"
+      ]
+    ]
+  ],
+  "wire": {
+    "DescribeEmojisRequest": {
+      "additionalProperties": false,
+      "description": "One batch of a server's undescribed custom emoji (`/kiki emojis resync:true`).",
+      "properties": {
+        "attempted_before_ms": {
+          "minimum": 0,
+          "title": "Attempted Before Ms",
+          "type": "integer"
+        },
+        "guild_id": {
+          "pattern": "^[0-9]+$",
+          "title": "Guild Id",
+          "type": "string"
+        },
+        "model": {
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "redescribe": {
+          "default": false,
+          "title": "Redescribe",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "guild_id",
+        "model",
+        "attempted_before_ms"
+      ],
+      "title": "DescribeEmojisRequest",
+      "type": "object"
+    },
+    "DescribeEmojisResult": {
+      "additionalProperties": false,
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost"
+        },
+        "described": {
+          "minimum": 0,
+          "title": "Described",
+          "type": "integer"
+        },
+        "failed": {
+          "minimum": 0,
+          "title": "Failed",
+          "type": "integer"
+        },
+        "remaining": {
+          "minimum": 0,
+          "title": "Remaining",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "described",
+        "failed",
+        "remaining"
+      ],
+      "title": "DescribeEmojisResult",
+      "type": "object"
+    },
+    "ImageJobRequest": {
+      "$defs": {
+        "Drawing": {
+          "additionalProperties": false,
+          "description": "An image the reply queued: Rust posts the reply, then runs it as an image job.",
+          "properties": {
+            "aspect_ratio": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "1:1",
+                    "3:2",
+                    "2:3",
+                    "4:3",
+                    "3:4",
+                    "16:9",
+                    "9:16",
+                    "21:9"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Aspect Ratio"
+            },
+            "caption": {
+              "default": "",
+              "maxLength": 1500,
+              "title": "Caption",
+              "type": "string"
+            },
+            "edit": {
+              "default": false,
+              "title": "Edit",
+              "type": "boolean"
+            },
+            "prompt": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Prompt",
+              "type": "string"
+            },
+            "style": {
+              "anyOf": [
+                {
+                  "maxLength": 300,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Style"
+            },
+            "subjects": {
+              "items": {
+                "$ref": "#/$defs/Subject"
+              },
+              "maxItems": 6,
+              "title": "Subjects",
+              "type": "array"
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "title": "Drawing",
+          "type": "object"
+        },
+        "Scope": {
+          "additionalProperties": false,
+          "properties": {
+            "channel_id": {
+              "title": "Channel Id",
+              "type": "string"
+            },
+            "conversation_id": {
+              "title": "Conversation Id",
+              "type": "string"
+            },
+            "guild_id": {
+              "title": "Guild Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "guild_id",
+            "channel_id",
+            "conversation_id"
+          ],
+          "title": "Scope",
+          "type": "object"
+        },
+        "Subject": {
+          "additionalProperties": false,
+          "description": "Someone or something in a drawing, as the reply's generate_image call named it.\nThe image job finds reference images of it (docs/image-generation.md).",
+          "properties": {
+            "description": {
+              "default": "",
+              "maxLength": 600,
+              "title": "Description",
+              "type": "string"
+            },
+            "kiki": {
+              "default": false,
+              "title": "Kiki",
+              "type": "boolean"
+            },
+            "name": {
+              "maxLength": 100,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "photos": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Photos",
+              "type": "array"
+            },
+            "user_id": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "User Id"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "Subject",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "One queued drawing (`POST /v1/images`), with ID `image:<run>:<n>`.",
+      "properties": {
+        "ack": {
+          "default": "",
+          "maxLength": 10000,
+          "title": "Ack",
+          "type": "string"
+        },
+        "chat_model": {
+          "minLength": 1,
+          "title": "Chat Model",
+          "type": "string"
+        },
+        "drawing": {
+          "$ref": "#/$defs/Drawing"
+        },
+        "id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "image_model": {
+          "minLength": 1,
+          "title": "Image Model",
+          "type": "string"
+        },
+        "reply_job": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Reply Job",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "image_model",
+        "reply_job",
+        "chat_model",
+        "drawing"
+      ],
+      "title": "ImageJobRequest",
+      "type": "object"
+    },
+    "ImageJobResult": {
+      "$defs": {
+        "Image": {
+          "additionalProperties": false,
+          "description": "A generated image, saved in `agent_host_images`; Rust posts it.",
+          "properties": {
+            "id": {
+              "exclusiveMinimum": 0,
+              "title": "Id",
+              "type": "integer"
+            },
+            "mime_type": {
+              "title": "Mime Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "mime_type"
+          ],
+          "title": "Image",
+          "type": "object"
+        },
+        "Reference": {
+          "additionalProperties": false,
+          "description": "One reference image the image model saw, in order.",
+          "properties": {
+            "attachment_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Attachment Id"
+            },
+            "avatar_of": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Avatar Of"
+            },
+            "drawing_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Drawing Id"
+            },
+            "message_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message Id"
+            },
+            "subject": {
+              "title": "Subject",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subject"
+          ],
+          "title": "Reference",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "description": "A drawn image, or why not and the note Kiki wrote about it.",
+      "properties": {
+        "caption": {
+          "default": "",
+          "title": "Caption",
+          "type": "string"
+        },
+        "cost": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Cost"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "failure_note": {
+          "default": "",
+          "title": "Failure Note",
+          "type": "string"
+        },
+        "image": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Image"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "latency_ms": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Latency Ms",
+          "type": "integer"
+        },
+        "model": {
+          "title": "Model",
+          "type": "string"
+        },
+        "prompt": {
+          "default": "",
+          "title": "Prompt",
+          "type": "string"
+        },
+        "references": {
+          "items": {
+            "$ref": "#/$defs/Reference"
+          },
+          "title": "References",
+          "type": "array"
+        }
+      },
+      "required": [
+        "model"
+      ],
+      "title": "ImageJobResult",
+      "type": "object"
+    },
+    "JobRequest": {
+      "$defs": {
+        "Message": {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "title": "Content",
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "system",
+                "user",
+                "assistant"
+              ],
+              "title": "Role",
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "content"
+          ],
+          "title": "Message",
+          "type": "object"
+        },
+        "Person": {
+          "additionalProperties": false,
+          "properties": {
+            "label": {
+              "maxLength": 200,
+              "title": "Label",
+              "type": "string"
+            },
+            "names": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 20,
+              "title": "Names",
+              "type": "array"
+            },
+            "ref": {
+              "pattern": "^u[0-9]+$",
+              "title": "Ref",
+              "type": "string"
+            },
+            "user_id": {
+              "pattern": "^[0-9]+$",
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "ref",
+            "user_id",
+            "label"
+          ],
+          "title": "Person",
+          "type": "object"
+        },
+        "Scope": {
+          "additionalProperties": false,
+          "properties": {
+            "channel_id": {
+              "title": "Channel Id",
+              "type": "string"
+            },
+            "conversation_id": {
+              "title": "Conversation Id",
+              "type": "string"
+            },
+            "guild_id": {
+              "title": "Guild Id",
+              "type": "string"
+            }
+          },
+          "required": [
+            "guild_id",
+            "channel_id",
+            "conversation_id"
+          ],
+          "title": "Scope",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "image_model": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Image Model"
+        },
+        "kind": {
+          "enum": [
+            "reply",
+            "topic"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "max_output_tokens": {
+          "exclusiveMinimum": 0,
+          "maximum": 16000,
+          "title": "Max Output Tokens",
+          "type": "integer"
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/$defs/Message"
+          },
+          "maxItems": 200,
+          "minItems": 1,
+          "title": "Messages",
+          "type": "array"
+        },
+        "model": {
+          "minLength": 1,
+          "title": "Model",
+          "type": "string"
+        },
+        "people": {
+          "items": {
+            "$ref": "#/$defs/Person"
+          },
+          "maxItems": 500,
+          "title": "People",
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/Scope"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "scope",
+        "model",
+        "messages",
+        "max_output_tokens"
+      ],
+      "title": "JobRequest",
+      "type": "object"
+    },
+    "JobResponse": {
+      "$defs": {
+        "Drawing": {
+          "additionalProperties": false,
+          "description": "An image the reply queued: Rust posts the reply, then runs it as an image job.",
+          "properties": {
+            "aspect_ratio": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "1:1",
+                    "3:2",
+                    "2:3",
+                    "4:3",
+                    "3:4",
+                    "16:9",
+                    "9:16",
+                    "21:9"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Aspect Ratio"
+            },
+            "caption": {
+              "default": "",
+              "maxLength": 1500,
+              "title": "Caption",
+              "type": "string"
+            },
+            "edit": {
+              "default": false,
+              "title": "Edit",
+              "type": "boolean"
+            },
+            "prompt": {
+              "maxLength": 4000,
+              "minLength": 1,
+              "title": "Prompt",
+              "type": "string"
+            },
+            "style": {
+              "anyOf": [
+                {
+                  "maxLength": 300,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Style"
+            },
+            "subjects": {
+              "items": {
+                "$ref": "#/$defs/Subject"
+              },
+              "maxItems": 6,
+              "title": "Subjects",
+              "type": "array"
+            }
+          },
+          "required": [
+            "prompt"
+          ],
+          "title": "Drawing",
+          "type": "object"
+        },
+        "Image": {
+          "additionalProperties": false,
+          "description": "A generated image, saved in `agent_host_images`; Rust posts it.",
+          "properties": {
+            "id": {
+              "exclusiveMinimum": 0,
+              "title": "Id",
+              "type": "integer"
+            },
+            "mime_type": {
+              "title": "Mime Type",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "mime_type"
+          ],
+          "title": "Image",
+          "type": "object"
+        },
+        "ImageJobResult": {
+          "additionalProperties": false,
+          "description": "A drawn image, or why not and the note Kiki wrote about it.",
+          "properties": {
+            "caption": {
+              "default": "",
+              "title": "Caption",
+              "type": "string"
+            },
+            "cost": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cost"
+            },
+            "error": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Error"
+            },
+            "failure_note": {
+              "default": "",
+              "title": "Failure Note",
+              "type": "string"
+            },
+            "image": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Image"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "latency_ms": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Latency Ms",
+              "type": "integer"
+            },
+            "model": {
+              "title": "Model",
+              "type": "string"
+            },
+            "prompt": {
+              "default": "",
+              "title": "Prompt",
+              "type": "string"
+            },
+            "references": {
+              "items": {
+                "$ref": "#/$defs/Reference"
+              },
+              "title": "References",
+              "type": "array"
+            }
+          },
+          "required": [
+            "model"
+          ],
+          "title": "ImageJobResult",
+          "type": "object"
+        },
+        "JobResult": {
+          "additionalProperties": false,
+          "properties": {
+            "drawings": {
+              "items": {
+                "$ref": "#/$defs/Drawing"
+              },
+              "maxItems": 2,
+              "title": "Drawings",
+              "type": "array"
+            },
+            "images": {
+              "items": {
+                "$ref": "#/$defs/Image"
+              },
+              "maxItems": 10,
+              "title": "Images",
+              "type": "array"
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Model"
+            },
+            "steps": {
+              "default": 1,
+              "maximum": 2147483647,
+              "minimum": 0,
+              "title": "Steps",
+              "type": "integer"
+            },
+            "text": {
+              "maxLength": 100000,
+              "minLength": 1,
+              "title": "Text",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/Usage"
+            },
+            "web": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WebUse"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "title": "JobResult",
+          "type": "object"
+        },
+        "Reference": {
+          "additionalProperties": false,
+          "description": "One reference image the image model saw, in order.",
+          "properties": {
+            "attachment_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Attachment Id"
+            },
+            "avatar_of": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Avatar Of"
+            },
+            "drawing_id": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Drawing Id"
+            },
+            "message_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Message Id"
+            },
+            "subject": {
+              "title": "Subject",
+              "type": "string"
+            }
+          },
+          "required": [
+            "subject"
+          ],
+          "title": "Reference",
+          "type": "object"
+        },
+        "Subject": {
+          "additionalProperties": false,
+          "description": "Someone or something in a drawing, as the reply's generate_image call named it.\nThe image job finds reference images of it (docs/image-generation.md).",
+          "properties": {
+            "description": {
+              "default": "",
+              "maxLength": 600,
+              "title": "Description",
+              "type": "string"
+            },
+            "kiki": {
+              "default": false,
+              "title": "Kiki",
+              "type": "boolean"
+            },
+            "name": {
+              "maxLength": 100,
+              "minLength": 1,
+              "title": "Name",
+              "type": "string"
+            },
+            "photos": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Photos",
+              "type": "array"
+            },
+            "user_id": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9]+$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "User Id"
+            }
+          },
+          "required": [
+            "name"
+          ],
+          "title": "Subject",
+          "type": "object"
+        },
+        "Usage": {
+          "additionalProperties": false,
+          "properties": {
+            "completion_tokens": {
+              "default": 0,
+              "maximum": 2147483647,
+              "minimum": 0,
+              "title": "Completion Tokens",
+              "type": "integer"
+            },
+            "cost": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cost"
+            },
+            "prompt_tokens": {
+              "default": 0,
+              "maximum": 2147483647,
+              "minimum": 0,
+              "title": "Prompt Tokens",
+              "type": "integer"
+            }
+          },
+          "title": "Usage",
+          "type": "object"
+        },
+        "WebUse": {
+          "additionalProperties": false,
+          "description": "OpenRouter web tools used by the run (informational; Rust ignores it).",
+          "properties": {
+            "fetches": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Fetches",
+              "type": "integer"
+            },
+            "searches": {
+              "default": 0,
+              "minimum": 0,
+              "title": "Searches",
+              "type": "integer"
+            },
+            "sources": {
+              "items": {
+                "type": "string"
+              },
+              "title": "Sources",
+              "type": "array"
+            }
+          },
+          "title": "WebUse",
+          "type": "object"
+        }
+      },
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/JobResult"
+            },
+            {
+              "$ref": "#/$defs/ImageJobResult"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result"
+        },
+        "status": {
+          "enum": [
+            "running",
+            "completed",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "status"
+      ],
+      "title": "JobResponse",
+      "type": "object"
+    }
+  }
+}
