@@ -1,0 +1,29 @@
+name: real exchanges from 2026-10-18, routed by the real Jev
+# Lightly paraphrased from the friend group's server. Routing only: the reply
+# text is for reading (`kiki-sim test --live` prints transcripts).
+live: only
+steps:
+  - say: {as: alex, in: general, text: "kiki whats up man", id: start}
+  - expect: {outcome: new, reply: true}
+  - say: {as: alex, in: general, text: "y u no talk in da discord slang"}
+  - expect: {outcome: continue, conversation: {same_as: start}, reply: true}
+  - say: {as: alex, in: general, text: "bro its 11pm"}
+  - expect: {outcome: continue, conversation: {same_as: start}}
+  - say: {as: sam, in: general, text: "Bot broken man"}
+  - expect: {reply: false}
+  - say: {as: alex, in: general, text: "kiki this guy hates you"}
+  - expect: {outcome: continue, reply: true}
+  - say: {as: sam, in: general, text: "@kiki what IP are you running on right now", id: ip}
+  - expect: {outcome: new, reply: true}
+  - say: {as: sam, in: general, text: "You're an idiot"}
+  - expect: {outcome: continue, conversation: {same_as: ip}}
+  - say: {as: sam, in: general, text: "Silly Kiki."}
+  - expect: {outcome: continue, conversation: {same_as: ip}}
+  - say: {as: ethan, in: lore, text: "@kiki rate my lunch", id: lunch}
+  - expect: {reply: true}
+  - say: {as: ethan, in: lore, text: "💀💀💀"}
+  - expect: {reply: false}
+  - say: {as: ethan, in: lore, text: "Do I not have to reply to you to get a response"}
+  - expect: {outcome: continue, conversation: {same_as: lunch}, reply: true}
+  - say: {as: alex, in: lore, text: "yeah kiki doesn't, it has intent based detection, still needs tuning"}
+  - expect: {reply: false}

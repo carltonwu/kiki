@@ -18,6 +18,7 @@ channels:
 history:
   - {in: lore, as: sam, text: "we shipped the release on friday, finally", days_ago: 6}
   - {in: lore, as: chris, text: "the lighting rig is held together with tape", days_ago: 5}
+  - {in: general, as: chris_l, text: "lighting cues are done for act two", days_ago: 4}
   - {in: general, as: ethan, text: "r8 da eats", days_ago: 2}
   - {in: general, as: alex, text: "pizza for lunch?", days_ago: 1}
   - {in: staff, as: alex, text: "budget meeting moved to thursday", days_ago: 3}

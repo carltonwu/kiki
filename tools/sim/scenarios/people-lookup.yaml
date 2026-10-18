@@ -1,0 +1,5 @@
+name: looking up a name several people share says so
+steps:
+  - say: {as: alex, in: general, text: "kiki what does chris say about lighting"}
+    reply: {tool: {name: search_messages, args: {query: "lighting", person: "Chris"}}, text: "found {ids}"}
+  - expect: {reply: true, tool_called: search_messages, tool_result_contains: ["tape", "different people"]}

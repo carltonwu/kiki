@@ -1,0 +1,12 @@
+name: two people talking to Kiki in one channel keep separate conversations
+steps:
+  - say: {as: alex, in: general, text: "@kiki help me pick a movie", id: alex}
+  - say: {as: sam, in: general, text: "@kiki what should i cook tonight", id: sam}
+  - expect: {of: sam, reply: true}
+  - say: {as: alex, in: general, text: "something scary", id: alex2}
+    jev: {choice: conversation_latest, confidence: 0.3}
+  # conversation_latest is sam's, but Jev is unsure: alex's fresh follow-up
+  # continues alex's own conversation instead.
+  - expect: {of: alex2, outcome: continue, conversation: {same_as: alex}, reply: true}
+  - say: {as: sam, in: general, text: "kiki with chicken pls", id: sam2}
+  - expect: {of: sam2, outcome: continue, conversation: {same_as: sam}, reply: true}
