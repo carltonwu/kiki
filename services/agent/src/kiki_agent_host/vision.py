@@ -23,8 +23,6 @@ from pydantic_ai.usage import UsageLimits
 logger = logging.getLogger(__name__)
 
 MAX_BYTES = 5 * 1024 * 1024  # the strictest common provider limit per image
-# What vision models take and Discord shows inline; `sniff` recognizes exactly these.
-MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 DOWNLOAD_TIMEOUT_SECONDS = 10
 
 viewer = Agent()
@@ -95,7 +93,8 @@ async def download(
 
 
 def sniff(head: bytes) -> str | None:
-    """Which of `MIME_TYPES` these leading bytes start, if any."""
+    """Which image type these leading bytes start, if any: PNG, JPEG, GIF or
+    WebP, what vision models take and Discord shows inline."""
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):

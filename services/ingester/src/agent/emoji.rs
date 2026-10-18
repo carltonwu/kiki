@@ -19,7 +19,7 @@ use crate::emojis::Emoji;
 pub(super) const MAX_REACTIONS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Reaction {
+pub(crate) enum Reaction {
     Unicode(String),
     Custom {
         name: String,
@@ -133,7 +133,7 @@ pub(super) fn parse_line(line: &str) -> Option<Line> {
 
 /// `<:name:id>` or `<a:name:id>` at the start of `text`, tolerating the
 /// `<:name:id:>` models often write; returns its length in bytes.
-fn custom(text: &str) -> Option<(Reaction, usize)> {
+pub(super) fn custom(text: &str) -> Option<(Reaction, usize)> {
     let end = text.find('>')?;
     let inner = &text[1..end];
     let (animated, inner) = match inner.strip_prefix("a:") {
