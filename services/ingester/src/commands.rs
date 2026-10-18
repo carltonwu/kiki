@@ -450,7 +450,10 @@ impl Commands {
         })
         .await?
         .ok_or_else(|| UserError("Kiki can't read this server's emoji.".into()))?;
-        let listed = listed.as_array().map(Vec::as_slice).unwrap_or_default();
+        // Anything but a list would mark every emoji removed.
+        let listed = listed
+            .as_array()
+            .context("Discord's emoji list is not an array")?;
         let synced = emojis::sync(&self.db, guild_id, listed).await?;
         let mut summary = format!(
             "Synced {} emoji from Discord: {} new, {} renamed, {} removed.",

@@ -200,6 +200,9 @@ async def test_find_by_name_written_form_and_id(db):
     # Another server's emoji by ID falls back to the name here.
     assert await names("<:huh:21>") == ["huh"]
     assert "error" in await emojis.find(db, GUILD, "nothing")
+    # IDs too large for Postgres aren't Discord's: no query error.
+    assert await names("<:huh:99999999999999999999>") == ["huh"]
+    assert "error" in await emojis.find(db, GUILD, "99999999999999999999")
     with pytest.raises(ValueError):
         await emojis.find(db, GUILD, "::")
 
