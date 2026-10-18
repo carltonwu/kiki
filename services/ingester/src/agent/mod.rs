@@ -3,15 +3,19 @@
 //! ```text
 //! agent_runs INSERT ─NOTIFY→ dispatch (one task per conversation) → claim newest run
 //!     → context → Python host (HTTP) → reply in Discord → tag → refresh topic
+//!                                        └→ queued drawings, posted as follow-ups
 //! ```
 //!
 //! Runs of one conversation are answered one at a time. When several are pending
 //! (people kept talking while Kiki was replying), only the newest is answered and
 //! the others are marked `superseded`: their messages are in the history anyway.
+//! Drawings run on their own tasks ([`drawing`]), so the conversation carries on.
 
 mod context;
 mod delivery;
 mod discord;
+mod drawing;
+pub(crate) mod emoji;
 pub(crate) mod host;
 mod people;
 mod topic;
@@ -61,9 +65,14 @@ struct Claim {
 #[derive(Default)]
 struct RunRecord {
     reply_message_ids: Vec<i64>,
+    /// Reactions Discord accepted, as written in message text.
+    reactions: Vec<String>,
+    reacted_to: Option<i64>,
     model: Option<String>,
     steps: i32,
     usage: Usage,
+    /// Pictures the reply queued.
+    drawings: usize,
 }
 
 impl Agent {
@@ -117,6 +126,7 @@ impl Agent {
         if recovered > 0 {
             info!(runs = recovered, "requeued interrupted agent runs");
         }
+        self.recover_drawings().await?;
 
         let mut listener = PgListener::connect_with(&self.db).await?;
         listener.listen(NOTIFY_CHANNEL).await?;
@@ -136,8 +146,12 @@ impl Agent {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 },
-                // Also picks up runs queued before startup (first tick is immediate).
-                _ = poll.tick() => self.dispatch(&mut workers).await,
+                // Also picks up runs queued before startup (first tick is immediate),
+                // and drawings left pending by a restart.
+                _ = poll.tick() => {
+                    self.dispatch(&mut workers).await;
+                    self.spawn_drawings(None).await;
+                }
                 Some(done) = workers.tasks.join_next_with_id() => {
                     let id = match &done {
                         Ok((id, _)) => *id,
@@ -278,6 +292,7 @@ impl Agent {
                 conversation_id = claim.conversation_id,
                 channel_id = claim.channel_id,
                 reply_message_ids = ?record.reply_message_ids,
+                reactions = ?record.reactions,
                 model = record.model,
                 steps = record.steps,
                 prompt_tokens = record.usage.prompt_tokens,
@@ -291,6 +306,7 @@ impl Agent {
                 conversation_id = claim.conversation_id,
                 channel_id = claim.channel_id,
                 reply_message_ids = ?record.reply_message_ids,
+                reactions = ?record.reactions,
                 latency_ms,
                 error,
                 "agent run failed"
@@ -302,7 +318,21 @@ impl Agent {
         {
             warn!(run_id = claim.run_id, error = %e, "couldn't record agent run");
         }
-        self.clear_pending(claim.channel_id, &claim.trigger_message_ids);
+        // Keep the pending emoji where Kiki chose it as her reaction.
+        let mut pending = claim.trigger_message_ids.clone();
+        if record.reactions.contains(&self.pending_emoji) {
+            pending.retain(|&id| Some(id) != record.reacted_to);
+        }
+        // A queued picture nothing acknowledged: the pending emoji says it's
+        // coming until it's posted.
+        if record.drawings > 0 && record.reply_message_ids.is_empty() && record.reactions.is_empty()
+        {
+            pending.clear();
+        }
+        self.clear_pending(claim.channel_id, &pending);
+        if record.drawings > 0 {
+            self.spawn_drawings(Some(claim.run_id)).await;
+        }
         if result.is_ok() {
             self.spawn_topic_refresh(claim.conversation_id);
         }
@@ -337,6 +367,10 @@ impl Agent {
                     messages: context.messages.clone(),
                     max_output_tokens: context.settings.reply_max_tokens,
                     people: context.people.clone(),
+                    image_model: context
+                        .settings
+                        .image_generation
+                        .then(|| context.settings.image_model.clone()),
                 };
                 sqlx::query("UPDATE agent_runs SET host_request = $2 WHERE id = $1")
                     .bind(claim.run_id)
@@ -350,8 +384,24 @@ impl Agent {
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
-        let plan = delivery::plan(&result.text, &context.settings)?;
-        if plan.is_empty() {
+        let images = self.load_images(&request.id, &result.images).await?;
+        let mut plan = delivery::plan(&result.text, &context.settings)?;
+        emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
+        if !result.drawings.is_empty() {
+            // Kiki's own words: the heads-up that a picture is coming.
+            let ack: Vec<&str> = plan.messages.iter().map(|m| m.text.as_str()).collect();
+            self.queue_drawings(claim, &context, &request, &result.drawings, &ack.join("\n"))
+                .await?;
+            record.drawings = result.drawings.len();
+        }
+        if plan.messages.is_empty() && !images.is_empty() {
+            // Someone asked for the picture; don't drop it over a silence marker.
+            plan.messages.push(delivery::Message {
+                text: String::new(),
+                delay: Duration::ZERO,
+            });
+        }
+        if plan.messages.is_empty() && plan.reactions.is_empty() {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
@@ -362,8 +412,21 @@ impl Agent {
             .bind(context.reply_to)
             .execute(&self.db)
             .await?;
-        self.send(&context, claim.run_id, claim.conversation_id, &plan, record)
-            .await
+        self.react(&context, &plan.reactions, record).await;
+        if plan.messages.is_empty() {
+            debug!(run_id = claim.run_id, "agent only reacted");
+            return Ok(());
+        }
+        self.send(
+            &context,
+            claim.run_id,
+            claim.conversation_id,
+            &plan.messages,
+            &images,
+            context.settings.chat_reply_reference,
+            record,
+        )
+        .await
     }
 
     async fn finish(
@@ -377,7 +440,8 @@ impl Agent {
             r#"
             UPDATE agent_runs
             SET status = $2, error = $3, finished_at = now(), reply_message_ids = $4, model = $5,
-                steps = $6, prompt_tokens = $7, completion_tokens = $8, cost_usd = $9, latency_ms = $10
+                steps = $6, prompt_tokens = $7, completion_tokens = $8, cost_usd = $9, latency_ms = $10,
+                reactions = $11
             WHERE id = $1
             "#,
         )
@@ -391,6 +455,7 @@ impl Agent {
         .bind(record.usage.completion_tokens)
         .bind(record.usage.cost)
         .bind(latency_ms)
+        .bind(&record.reactions)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -418,12 +483,15 @@ impl Workers {
 }
 
 fn clean_reply(text: &str) -> String {
-    let text = text.trim();
-    let text = ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
+    fix_custom_emoji(strip_speaker(text.trim()).trim())
+}
+
+/// Drops a leading `Kiki:`, as models sometimes label their own lines.
+fn strip_speaker(text: &str) -> &str {
+    ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
         .iter()
         .find_map(|prefix| text.strip_prefix(prefix))
-        .unwrap_or(text);
-    fix_custom_emoji(text.trim())
+        .unwrap_or(text)
 }
 
 /// Models often write a custom emoji as `<:name:id:>`, which Discord shows as
@@ -431,23 +499,15 @@ fn clean_reply(text: &str) -> String {
 fn fix_custom_emoji(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find(":>") {
-        let (before, after) = rest.split_at(i);
-        let digits = before.len() - before.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-        let emoji = digits > 0
-            && before[..before.len() - digits].ends_with(':')
-            && before[..before.len() - digits]
-                .rfind('<')
-                .is_some_and(|start| {
-                    let inner = &before[start + 1..before.len() - digits - 1];
-                    let name = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
-                    name.is_some_and(|n| {
-                        !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    })
-                });
+    while let Some(i) = rest.find('<') {
+        let (before, at) = rest.split_at(i);
+        let (fixed, len) = match emoji::custom(at) {
+            Some((reaction, len)) if at[..len].ends_with(":>") => (reaction.to_string(), len),
+            _ => ("<".to_owned(), 1),
+        };
         out.push_str(before);
-        out.push_str(if emoji { ">" } else { ":>" });
-        rest = &after[2..];
+        out.push_str(&fixed);
+        rest = &at[len..];
     }
     out.push_str(rest);
     out
@@ -461,7 +521,7 @@ fn is_no_reply(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_reply, is_no_reply};
+    use super::{clean_reply, fix_custom_emoji, is_no_reply};
 
     #[test]
     fn recognizes_no_reply() {
@@ -484,5 +544,21 @@ mod tests {
             clean_reply("fine <:froge:81> :> 12:>"),
             "fine <:froge:81> :> 12:>"
         );
+    }
+
+    #[test]
+    fn fixes_custom_emoji() {
+        for (text, fixed) in [
+            (
+                "<a:ape_2:1444819174172922043:>!",
+                "<a:ape_2:1444819174172922043>!",
+            ),
+            ("a < b <:x:5:> c <:x:6> :>", "a < b <:x:5> c <:x:6> :>"),
+            ("<", "<"),
+            ("< :a:5:> <b:a:5:> <::5:>", "< :a:5:> <b:a:5:> <::5:>"),
+            ("é <:x:5:>", "é <:x:5>"),
+        ] {
+            assert_eq!(fix_custom_emoji(text), fixed, "{text}");
+        }
     }
 }

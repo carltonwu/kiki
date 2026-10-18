@@ -1,0 +1,4 @@
+{
+ "openrouter/images.py": {"doc": "OpenRouter's Images API as a Pydantic AI image model.", "symbols": ["OPENAI_QUALITY", "MAX_REFERENCES", "OpenRouterImageModel", "reference_url"]},
+ "media/generation.py": {"doc": "Image generation for a drawing job, and storage for Rust to post the result.", "symbols": ["MAX_IMAGE_BYTES", "MAX_PROMPT_CHARS", "generate", "save"]}
+}

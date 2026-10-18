@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use reqwest::{StatusCode, Url, header};
-use serde::{Deserialize, Serialize};
+use reqwest::{Response, StatusCode, Url, header};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use super::people::PersonRef;
@@ -16,15 +16,16 @@ use crate::{
 pub(crate) struct Host {
     http: reqwest::Client,
     endpoint: Url,
+    image_endpoint: Url,
     emoji_endpoint: Url,
     timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct Scope {
-    guild_id: String,
-    channel_id: String,
-    conversation_id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+    pub conversation_id: String,
 }
 
 impl Scope {
@@ -48,6 +49,17 @@ pub(super) struct JobRequest {
     /// The roster the messages refer to. Absent in requests saved before it existed.
     #[serde(default)]
     pub people: Vec<PersonRef>,
+    /// Offers the `generate_image` tool. Omitted when off, so requests saved
+    /// before it existed compare equal on retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_model: Option<String>,
+}
+
+/// An image the host saved in `agent_host_images` for this job (the row has
+/// its bytes and MIME type).
+#[derive(Deserialize)]
+pub(super) struct ImageRef {
+    pub id: i64,
 }
 
 #[derive(Deserialize)]
@@ -56,6 +68,42 @@ pub(super) struct JobResult {
     pub model: Option<String>,
     pub steps: i32,
     pub usage: Usage,
+    /// Drawn during the reply, by hosts from before drawings were queued.
+    #[serde(default)]
+    pub images: Vec<ImageRef>,
+    /// Pictures the reply queued (the host's `Drawing`, passed through as is):
+    /// each becomes an image job after the reply is posted.
+    #[serde(default)]
+    pub drawings: Vec<serde_json::Value>,
+}
+
+/// One queued drawing (`POST /v1/images`), ID `image:<run>:<n>`. Snapshotted in
+/// `agent_image_jobs` so retries send identical input.
+#[derive(Deserialize, Serialize)]
+pub(super) struct ImageJobRequest {
+    pub id: String,
+    pub scope: Scope,
+    pub image_model: String,
+    /// The reply job that queued it: the host writes a failure note from its prompt.
+    pub reply_job: String,
+    pub chat_model: String,
+    /// What Kiki posted when she queued it.
+    pub ack: String,
+    pub drawing: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImageJobResult {
+    pub image: Option<ImageRef>,
+    #[serde(default)]
+    pub caption: String,
+    pub cost: Option<f64>,
+    /// `refused` or `failed` when there's no image.
+    pub error: Option<String>,
+    /// Kiki's message about the failure, written by the chat model; empty if
+    /// even that failed.
+    #[serde(default)]
+    pub failure_note: String,
 }
 
 /// Describes a server's emoji that lack a description (`emojis.rs`): one
@@ -89,10 +137,10 @@ enum JobStatus {
 }
 
 #[derive(Deserialize)]
-struct JobResponse {
+struct JobResponse<T> {
     id: String,
     status: JobStatus,
-    result: Option<JobResult>,
+    result: Option<T>,
     error: Option<String>,
 }
 
@@ -105,6 +153,7 @@ impl Host {
         let endpoint = Url::parse(&format!("{}/v1/jobs", base.trim_end_matches('/')))
             .context("invalid AGENT_HOST_URL")?;
         let emoji_endpoint = endpoint.join("emojis/describe")?;
+        let image_endpoint = endpoint.join("images")?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -131,15 +180,50 @@ impl Host {
         Ok(Self {
             http,
             endpoint,
+            image_endpoint,
             emoji_endpoint,
             timeout: config.host_timeout,
         })
     }
 
     pub(super) async fn execute(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
-        tokio::time::timeout(self.timeout, self.execute_with_retries(job))
-            .await
-            .context("agent host deadline exceeded (including wake-up retries)")?
+        let result: JobResult = tokio::time::timeout(
+            self.timeout,
+            self.run_with_retries(&self.endpoint, &job.id, &job.kind, job),
+        )
+        .await
+        .context("agent host deadline exceeded (including wake-up retries)")??;
+        if result.text.trim().is_empty()
+            || result.steps < 0
+            || result.usage.prompt_tokens < 0
+            || result.usage.completion_tokens < 0
+            || result
+                .usage
+                .cost
+                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            bail!("agent host returned an invalid result");
+        }
+        Ok(result)
+    }
+
+    /// Draws a queued picture: the same durable job contract as replies, with
+    /// its own ID, so a retry gets the saved image instead of drawing again.
+    pub(super) async fn draw(&self, job: &ImageJobRequest) -> anyhow::Result<ImageJobResult> {
+        let result: ImageJobResult = tokio::time::timeout(
+            self.timeout,
+            self.run_with_retries(&self.image_endpoint, &job.id, "image", job),
+        )
+        .await
+        .context("agent host deadline exceeded (including wake-up retries)")??;
+        if result.image.is_none() == result.error.is_none()
+            || result
+                .cost
+                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            bail!("agent host returned an invalid image result");
+        }
+        Ok(result)
     }
 
     /// One describe batch, retried like jobs while the host wakes up or is busy.
@@ -150,27 +234,11 @@ impl Host {
         tokio::time::timeout(self.timeout, async {
             let mut delay = Duration::from_secs(1);
             loop {
-                let response = self
-                    .http
-                    .post(self.emoji_endpoint.clone())
-                    .json(request)
-                    .send()
-                    .await;
-                match response {
-                    Err(error)
-                        if error.is_connect() || error.is_timeout() || error.is_request() => {}
-                    Err(error) => return Err(error).context("calling agent host"),
-                    Ok(response) if retryable(response.status()) => {}
-                    Ok(response) if response.status().is_success() => {
-                        return response
-                            .json()
-                            .await
-                            .context("parsing agent host emoji response");
-                    }
-                    Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
-                        bail!("agent host has no framework executor configured")
-                    }
-                    Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+                if let Ok(response) = self.attempt(&self.emoji_endpoint, request).await? {
+                    return response
+                        .json()
+                        .await
+                        .context("parsing agent host emoji response");
                 }
                 debug!(
                     guild_id = request.guild_id,
@@ -185,79 +253,73 @@ impl Host {
         .context("agent host deadline exceeded (including wake-up retries)")?
     }
 
-    async fn execute_with_retries(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
+    /// One POST: the response, why to retry while the host wakes up or is busy
+    /// (reason and HTTP status, for logs), or an error retrying won't fix.
+    async fn attempt(
+        &self,
+        url: &Url,
+        body: &impl Serialize,
+    ) -> anyhow::Result<Result<Response, (&'static str, Option<u16>)>> {
+        match self.http.post(url.clone()).json(body).send().await {
+            Err(error) if error.is_timeout() => Ok(Err(("timeout", None))),
+            Err(error) if error.is_connect() || error.is_request() => Ok(Err(("connection", None))),
+            Err(error) => Err(error).context("calling agent host"),
+            Ok(response) if retryable(response.status()) => {
+                Ok(Err(("http", Some(response.status().as_u16()))))
+            }
+            Ok(response) if response.status().is_success() => Ok(Ok(response)),
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
+                bail!("agent host has no framework executor configured")
+            }
+            // Do not log bodies: they may contain prompts or secrets.
+            Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+        }
+    }
+
+    async fn run_with_retries<T: DeserializeOwned>(
+        &self,
+        url: &Url,
+        id: &str,
+        kind: &str,
+        job: &impl Serialize,
+    ) -> anyhow::Result<T> {
         let mut delay = Duration::from_secs(1);
         let mut attempt = 0;
         let mut warned = false;
         loop {
             attempt += 1;
-            let response = self.http.post(self.endpoint.clone()).json(job).send().await;
-            let (reason, status) = match response {
-                Err(error) if error.is_connect() || error.is_timeout() || error.is_request() => {
-                    let reason = if error.is_timeout() {
-                        "timeout"
-                    } else {
-                        "connection"
-                    };
-                    (reason, None)
-                }
-                Err(error) => return Err(error).context("calling agent host"),
+            let (reason, status) = match self.attempt(url, job).await? {
+                Err(retry) => retry,
                 Ok(response) => {
                     let status = response.status();
-                    if retryable(status) {
-                        ("http", Some(status.as_u16()))
-                    } else if status.is_success() {
-                        let response: JobResponse = response
-                            .json()
-                            .await
-                            .context("parsing agent host response")?;
-                        if response.id != job.id {
-                            bail!("agent host returned a different job ID");
+                    let response: JobResponse<T> = response
+                        .json()
+                        .await
+                        .context("parsing agent host response")?;
+                    if response.id != id {
+                        bail!("agent host returned a different job ID");
+                    }
+                    match response.status {
+                        JobStatus::Completed => {
+                            return response.result.context("host completed without result");
                         }
-                        match response.status {
-                            JobStatus::Completed => {
-                                let result =
-                                    response.result.context("host completed without result")?;
-                                if result.text.trim().is_empty()
-                                    || result.steps < 0
-                                    || result.usage.prompt_tokens < 0
-                                    || result.usage.completion_tokens < 0
-                                    || result
-                                        .usage
-                                        .cost
-                                        .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-                                {
-                                    bail!("agent host returned an invalid result");
-                                }
-                                return Ok(result);
-                            }
-                            JobStatus::Failed => bail!(
-                                "agent host job failed: {}",
-                                response.error.as_deref().unwrap_or("unknown error")
-                            ),
-                            JobStatus::Running => ("running", Some(status.as_u16())),
-                        }
-                    } else if status == StatusCode::NOT_IMPLEMENTED {
-                        bail!("agent host has no framework executor configured");
-                    } else {
-                        // Do not log bodies: they may contain prompts or secrets.
-                        bail!("agent host returned HTTP {status}");
+                        JobStatus::Failed => bail!(
+                            "agent host job failed: {}",
+                            response.error.as_deref().unwrap_or("unknown error")
+                        ),
+                        JobStatus::Running => ("running", Some(status.as_u16())),
                     }
                 }
             };
             if reason != "running" && !warned {
                 warn!(
-                    job_id = job.id,
-                    kind = job.kind,
-                    attempt,
-                    reason,
-                    status,
-                    "agent host unavailable; retrying the same job"
+                    job_id = id,
+                    kind, attempt, reason, status, "agent host unavailable; retrying the same job"
                 );
                 warned = true;
             }
             debug!(
-                job_id = job.id,
+                job_id = id,
                 attempt,
                 reason,
                 status,
@@ -304,6 +366,7 @@ mod tests {
             host_timeout: timeout,
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            image_model: "test/image".into(),
             emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
@@ -321,6 +384,7 @@ mod tests {
             messages: vec![Message::user("hello")],
             max_output_tokens: 100,
             people: Vec::new(),
+            image_model: None,
         }
     }
 
@@ -369,6 +433,102 @@ mod tests {
         assert_eq!(requests[0]["scope"]["guild_id"], "1");
     }
 
+    #[test]
+    fn image_model_is_omitted_when_off_and_images_default_to_none() {
+        let mut request = serde_json::to_value(job()).unwrap();
+        assert!(request.get("image_model").is_none());
+        let mut with_images = job();
+        with_images.image_model = Some("test/image".into());
+        request = serde_json::to_value(with_images).unwrap();
+        assert_eq!(request["image_model"], "test/image");
+
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }))
+        .unwrap();
+        assert!(result.images.is_empty());
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "images": [{"id": 7, "mime_type": "image/png"}],
+        }))
+        .unwrap();
+        assert_eq!(result.images[0].id, 7);
+    }
+
+    #[tokio::test]
+    async fn drawings_are_durable_jobs_on_their_own_endpoint() {
+        type Requests = Arc<Mutex<Vec<Value>>>;
+        async fn handler(
+            State(requests): State<Requests>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let mut requests = requests.lock().unwrap();
+            requests.push(body);
+            match requests.len() {
+                1 => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"id": "image:42:1", "status": "running"})),
+                )
+                    .into_response(),
+                2 => Json(
+                    json!({"id": "image:42:1", "status": "completed", "result": {
+                        "image": {"id": 7, "mime_type": "image/png"}, "caption": "da beach",
+                        "prompt": "…", "references": [], "model": "test/image", "cost": 0.05,
+                        "latency_ms": 12000, "error": null, "failure_note": "",
+                    }}),
+                )
+                .into_response(),
+                // Neither an image nor a reason: rejected.
+                _ => Json(
+                    json!({"id": "image:42:1", "status": "completed", "result": {
+                        "image": null, "model": "test/image", "error": null,
+                    }}),
+                )
+                .into_response(),
+            }
+        }
+        let requests = Requests::default();
+        let (url, server) = server(
+            Router::new()
+                .route("/v1/images", post(handler))
+                .with_state(requests.clone()),
+        )
+        .await;
+        let host = host(url, Duration::from_secs(10));
+        let job = ImageJobRequest {
+            id: "image:42:1".into(),
+            scope: Scope::new(1, 2, 3),
+            image_model: "test/image".into(),
+            reply_job: "reply:42".into(),
+            chat_model: "test/model".into(),
+            ack: "brb".into(),
+            drawing: json!({"prompt": "Nougie on a beach"}),
+        };
+        let drawn = host.draw(&job).await.unwrap();
+        assert_eq!(drawn.image.unwrap().id, 7);
+        assert_eq!(drawn.caption, "da beach");
+        assert!(host.draw(&job).await.is_err());
+        server.abort();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0], requests[1], "retries send identical input");
+        assert_eq!(requests[0]["drawing"]["prompt"], "Nougie on a beach");
+    }
+
+    #[test]
+    fn queued_drawings_pass_through_and_default_to_none() {
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "on it", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "drawings": [{"prompt": "x", "subjects": [{"name": "Nougie"}], "caption": "hi"}],
+        }))
+        .unwrap();
+        assert_eq!(result.drawings[0]["subjects"][0]["name"], "Nougie");
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }))
+        .unwrap();
+        assert!(result.drawings.is_empty());
+    }
+
     #[tokio::test]
     async fn unconfigured_executor_fails_without_retrying() {
         let (url, server) =
@@ -395,5 +555,52 @@ mod tests {
             .unwrap();
         server.abort();
         assert!(error.to_string().contains("deadline exceeded"));
+    }
+
+    #[tokio::test]
+    async fn describe_emojis_retries_wake_up_then_parses() {
+        type Calls = Arc<Mutex<usize>>;
+        async fn handler(State(calls): State<Calls>) -> axum::response::Response {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            match *calls {
+                1 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                _ => Json(json!({"described": 2, "failed": 1, "remaining": 0, "cost": 0.01}))
+                    .into_response(),
+            }
+        }
+        let request = DescribeEmojis {
+            guild_id: "1".into(),
+            model: "test/vision".into(),
+            attempted_before_ms: 0,
+            redescribe: false,
+        };
+        for (status, calls) in [(None, 2), (Some(StatusCode::NOT_IMPLEMENTED), 1)] {
+            let counted = Calls::default();
+            let route = match status {
+                None => post(handler),
+                Some(status) => post(move |State(calls): State<Calls>| async move {
+                    *calls.lock().unwrap() += 1;
+                    status
+                }),
+            };
+            let (url, server) = server(
+                Router::new()
+                    .route("/v1/emojis/describe", route)
+                    .with_state(counted.clone()),
+            )
+            .await;
+            let result = host(url, Duration::from_secs(10))
+                .describe_emojis(&request)
+                .await;
+            server.abort();
+            match result {
+                Ok(described) => {
+                    assert_eq!((described.described, described.remaining), (2, 0));
+                }
+                Err(error) => assert!(error.to_string().contains("no framework executor")),
+            }
+            assert_eq!(*counted.lock().unwrap(), calls);
+        }
     }
 }

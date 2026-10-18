@@ -2,9 +2,11 @@ import asyncio
 
 import httpx
 from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
 
-from kiki_agent_host.app import Settings, create_app
-from kiki_agent_host.contracts import JobRequest, JobResult
+from kiki_agent_host.api.app import application, create_app
+from kiki_agent_host.config import Settings
+from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult
 from kiki_agent_host.executor import TransientError
 
 TOKEN = "test-host-token"
@@ -63,6 +65,30 @@ async def test_result_survives_new_app_and_conflicting_input_is_rejected(databas
         assert (await http.post("/v1/jobs", json=changed, headers=HEADERS)).status_code == 409
 
 
+async def test_requests_saved_before_image_model_existed_still_match(database_url):
+    executor = FakeExecutor()
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        # A completed job saved by a host version without `image_model`.
+        await db.execute(
+            "INSERT INTO agent_host_jobs (id, request, status, result) "
+            "VALUES (%s, %s, 'completed', %s)",
+            (
+                "reply:42",
+                Jsonb({**job(), "people": []}),
+                Jsonb({"text": "saved", "model": None, "steps": 1, "usage": {}}),
+            ),
+        )
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert response.status_code == 200
+        assert response.json()["result"]["text"] == "saved"
+        assert executor.calls == 0
+        drawn = {**job("reply:43"), "image_model": "test/image"}
+        assert (await http.post("/v1/jobs", json=drawn, headers=HEADERS)).status_code == 200
+        assert (await http.post("/v1/jobs", json=drawn, headers=HEADERS)).status_code == 200
+        assert executor.calls == 1
+
+
 async def test_simultaneous_requests_execute_once_and_close_connections(database_url):
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -107,6 +133,35 @@ async def test_failure_is_durable_and_does_not_expose_provider_details(database_
     assert "job_id=reply:42" in failures[0].message
     assert "error_type=RuntimeError" in failures[0].message
     assert failures[0].exc_info is None
+
+
+async def test_image_jobs_are_durable_so_a_retry_does_not_draw_again(database_url):
+    class Drawer(FakeExecutor):
+        async def draw(self, request: ImageJobRequest) -> ImageJobResult:
+            self.calls += 1
+            return ImageJobResult(
+                model=request.image_model, error="refused", failure_note="nope, sorry"
+            )
+
+    executor = Drawer()
+    body = {
+        "id": "image:42:1",
+        "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "3"},
+        "image_model": "test/image",
+        "reply_job": "reply:42",
+        "chat_model": "test/model",
+        "ack": "brb",
+        "drawing": {"prompt": "a frog", "subjects": [{"name": "Nougie", "photos": ["7"]}]},
+    }
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        first = await http.post("/v1/images", json=body, headers=HEADERS)
+        second = await http.post("/v1/images", json=body, headers=HEADERS)
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        assert first.json()["result"]["failure_note"] == "nope, sorry"
+        assert executor.calls == 1
+        changed = {**body, "ack": "different"}
+        assert (await http.post("/v1/images", json=changed, headers=HEADERS)).status_code == 409
 
 
 async def test_timeout_releases_lock_and_same_job_can_be_recovered(database_url):
@@ -158,3 +213,14 @@ async def test_transient_failure_is_not_persisted_and_retry_runs_again(database_
         assert (await http.post("/v1/jobs", json=job(), headers=HEADERS)).status_code == 503
         response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
         assert response.json()["result"]["text"] == "recovered"
+
+
+async def test_the_factory_configures_an_executor_only_with_an_openrouter_key(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unreachable.invalid/kiki")
+    monkeypatch.setenv("AGENT_HOST_TOKEN", TOKEN)
+    monkeypatch.delenv("OPENROUTER_CHAT_API_KEY", raising=False)
+    async with client(application()) as http:
+        assert (await http.get("/health")).json()["executor_configured"] is False
+    monkeypatch.setenv("OPENROUTER_CHAT_API_KEY", "test-key")
+    async with client(application()) as http:
+        assert (await http.get("/health")).json()["executor_configured"] is True

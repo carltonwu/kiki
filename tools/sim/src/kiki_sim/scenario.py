@@ -13,6 +13,12 @@
       - slash: {as: alex, in: general, command: config,
                 options: {key: chat_model, value: sim/other}}
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
+      - expect: {attachments: 1, attachment_type: image/png}   # files on the replies
+      - expect: {followup: {status: done, attachments: 1, text_contains: "…"},
+                 image_references: [photo of nougie], image_prompt_contains: "…"}
+                 # a run's queued pictures, each posted later as a reply to the
+                 # request, and what the newest image model call got
+      - thread: {from: photo, name: Thread, as: alex}   # a thread on a message
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
@@ -20,9 +26,20 @@
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
-that channel), `age_s`, `embeds` (link previews, delivered like Discord's unfurler
-as a follow-up MESSAGE_UPDATE), and the sugar `jev: {choice, confidence}` and
-`reply: {text | tool}` to script the stub's answer to exactly this message.
+that channel), `age_s`, `embeds` (link previews, delivered like Discord's unfurler as a
+follow-up MESSAGE_UPDATE), `attachments` (`[{filename, label?, content_type?, expired?}]`;
+the stub vision model describes an image as its label, the drawing step's
+reference check turns down labels saying meme or screenshot, and an `expired`
+link only downloads after Discord's refresh), and the sugar
+`jev: {choice, confidence}` and `reply: {text | tool | tools | web}` to script the
+stub's answer to exactly this message. In tool arguments, `{image_message}` is the
+message ID from the trigger's image marker, else the newest one in the conversation.
+`tools` is a sequence of calls; an argument `"{entry_id}"` (or `"{entry_ids:N}"`)
+takes memory entry IDs from the previous call's result.
+`web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
+tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
+it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the
+last reply request (stub mode).
 """
 
 import json
@@ -37,6 +54,8 @@ from . import stack
 from .observe import Observation, observe, poll, render
 
 EVENTUALLY_S = 5
+# OpenRouter server tools, by the agent host's `web` result field that counts them.
+WEB_TOOLS = {"web_search": "searches", "web_fetch": "fetches"}
 
 
 @dataclass
@@ -73,6 +92,8 @@ class Run:
             body["age_s"] = args["age_s"]
         if "embeds" in args:
             body["embeds"] = args["embeds"]
+        if "attachments" in args:
+            body["attachments"] = args["attachments"]
         if reply_to := args.get("reply_to"):
             body["reply_to"] = self.resolve_reply(reply_to, args["in"])
         script = {}
@@ -201,16 +222,77 @@ class Run:
         for pattern in as_list(args.get("text_lacks")):
             if re.search(pattern, replies, re.IGNORECASE | re.S):
                 self.fail(step, f"{label}: reply matches {pattern!r}: {replies[:300]!r}")
+        files = [a for r in o.replies for a in r.get("attachments") or []]
+        if "attachments" in args and len(files) != args["attachments"]:
+            self.fail(step, f"{label}: {len(files)} attachments, expected {args['attachments']}")
+        if "attachment_type" in args and not all(
+            a.get("content_type") == args["attachment_type"] for a in files
+        ):
+            types = [a.get("content_type") for a in files]
+            self.fail(
+                step, f"{label}: attachment types {types}, expected {args['attachment_type']}"
+            )
         if (
             "tool_called" in args
+            or "tools_offered" in args
             or "tool_result_contains" in args
             or any(k in args for k in ("prompt_contains", "prompt_lacks"))
         ):
-            self.expect_llm(step, args, label)
+            self.expect_llm(step, args, o, label)
+        if "followup" in args:
+            self.expect_followup(step, args["followup"], o, message, label)
+        if any(k in args for k in ("image_references", "image_prompt_contains")):
+            self.expect_image_request(step, args, label)
         if "reaction" in args:
             self.expect_reaction(step, args["reaction"], message, label)
         if "decide_contains" in args or "decide_lacks" in args:
             self.expect_decide(step, args, message, label)
+
+    def expect_followup(
+        self, step: int, wanted: dict, o: Observation, message: dict, label: str
+    ) -> None:
+        """The pictures the run queued, each posted as its own message replying to
+        the request: `{count, status, attachments, text_contains, text_lacks}`."""
+        if len(o.drawings) != wanted.get("count", 1):
+            self.fail(
+                step, f"{label}: {len(o.drawings)} drawings, expected {wanted.get('count', 1)}"
+            )
+        for d in o.drawings:
+            posted = d["message"]
+            if "status" in wanted and d["status"] != wanted["status"]:
+                self.fail(step, f"{label}: drawing {d['status']} ({d['error']})")
+            if posted is None:
+                self.fail(step, f"{label}: drawing {d['status']} posted nothing ({d['error']})")
+                continue
+            reference = (posted.get("message_reference") or {}).get("message_id")
+            if reference != message["id"]:
+                self.fail(step, f"{label}: the follow-up replies to {reference}, not the request")
+            files = posted.get("attachments") or []
+            if "attachments" in wanted and len(files) != wanted["attachments"]:
+                self.fail(step, f"{label}: follow-up has {len(files)} attachments")
+            for needle in as_list(wanted.get("text_contains")):
+                if str(needle).lower() not in posted["content"].lower():
+                    self.fail(step, f"{label}: follow-up lacks {needle!r}: {posted['content']!r}")
+            for pattern in as_list(wanted.get("text_lacks")):
+                if re.search(pattern, posted["content"], re.IGNORECASE):
+                    self.fail(step, f"{label}: follow-up matches {pattern!r}")
+
+    def expect_image_request(self, step: int, args: dict, label: str) -> None:
+        """What the newest call to the image model got: reference images (by their
+        sim labels, in order) and the prompt."""
+        calls = [r for r in stack.control("state")["llm"] if r["kind"] == "image"]
+        if not calls:
+            self.fail(step, f"{label}: the image model wasn't called")
+            return
+        references, prompt = calls[-1]["references"], calls[-1]["prompt"]
+        wanted = as_list(args.get("image_references"))
+        if len(references) != len(wanted) or not all(
+            str(w).lower() in r.lower() for w, r in zip(wanted, references, strict=False)
+        ):
+            self.fail(step, f"{label}: image references {references}, expected {wanted}")
+        for needle in as_list(args.get("image_prompt_contains")):
+            if str(needle).lower() not in prompt.lower():
+                self.fail(step, f"{label}: image prompt lacks {needle!r}: {prompt[:400]!r}")
 
     def expect_decide(self, step: int, args: dict, message: dict, label: str) -> None:
         """What the router sent Jev for this message (JSON, compact)."""
@@ -240,11 +322,19 @@ class Run:
         if str(value) != str(args.get("equals")):
             self.fail(step, f"{args['sql']!r} is {value!r}, expected {args.get('equals')!r}")
 
-    def expect_llm(self, step: int, args: dict, label: str) -> None:
+    def expect_llm(self, step: int, args: dict, o: Observation, label: str) -> None:
         records = [r for r in stack.control("state")["llm"] if r["kind"] == "reply"]
-        name = args.get("tool_called")
-        if name and not any((r.get("tool_call") or {}).get("name") == name for r in records):
-            self.fail(step, f"{label}: no {name} tool call")
+        for name in as_list(args.get("tool_called")):
+            if name in WEB_TOOLS:
+                self.expect_web(step, name, o, label)
+            elif not any((r.get("tool_call") or {}).get("name") == name for r in records):
+                self.fail(step, f"{label}: no {name} tool call")
+        offered = set()
+        if records:
+            offered = {t.get("type") for t in records[-1]["request"].get("tools", [])}
+        for kind in as_list(args.get("tools_offered")):
+            if kind not in offered:
+                self.fail(step, f"{label}: the last reply request didn't offer {kind}")
         for needle in as_list(args.get("tool_result_contains")):
             results = " ".join(" ".join(r.get("tool_results", [])) for r in records)
             if str(needle).lower() not in results.lower():
@@ -258,6 +348,20 @@ class Run:
         for needle in as_list(args.get("prompt_lacks")):
             if str(needle).lower() in prompt.lower():
                 self.fail(step, f"{label}: prompt contains {needle!r}")
+
+    def expect_web(self, step: int, name: str, o: Observation, label: str) -> None:
+        """OpenRouter runs web tools itself, so the agent host's saved result (which
+        counts them from OpenRouter's usage) is the evidence, in stub and live modes."""
+        web = None
+        if o.run_id is not None:
+            with stack.connect() as db:
+                row = db.execute(
+                    "SELECT result->'web' FROM agent_host_jobs WHERE id = %s",
+                    (f"reply:{o.run_id}",),
+                ).fetchone()
+            web = row[0] if row else None
+        if not (web or {}).get(WEB_TOOLS[name]):
+            self.fail(step, f"{label}: no {name} call (web use: {web}) [{o.summary()}]")
 
     def expect_reaction(self, step: int, wanted: dict, message: dict, label: str) -> None:
         emoji, present = wanted.get("emoji", "👀"), wanted.get("present", False)
@@ -307,6 +411,14 @@ class Run:
                 stack.control(f"messages/{self.named[args['of']]['id']}", None, "DELETE")
             elif kind == "slash":
                 self.slash(args)
+            elif kind == "thread":
+                body = {
+                    "from": self.named[args["from"]]["id"],
+                    "name": args["name"],
+                    "as": args["as"],
+                }
+                stack.control("threads", body)
+                time.sleep(0.5)  # let the ingester store the thread before anyone talks in it
             elif kind == "expect":
                 self.expect(i, args)
             elif kind == "exec":

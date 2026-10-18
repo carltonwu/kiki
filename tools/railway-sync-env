@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Copy settings from a local dotenv file to the Railway services that read them.
+
+    tools/railway-sync-env            # dry run: show what would change
+    tools/railway-sync-env --apply    # set changed variables, then redeploy
+
+Secret values (tokens, keys, URLs with credentials) are never printed. Variables
+that only make sense locally (database URLs, ports, simulator overrides) are
+skipped. Run from the repo root with the Railway project linked.
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+AGENT = {
+    "AGENT_HOST_JOB_TIMEOUT_SECS",
+    "AGENT_HOST_MAX_CONCURRENT_JOBS",
+    "LOG_LEVEL",
+    "OPENROUTER_CHAT_API_KEY",
+    "OPENROUTER_VISION_MODEL",
+}
+INGESTER = {
+    "AGENT_HISTORY_MESSAGES",
+    "AGENT_HOST_TIMEOUT_MS",
+    "AGENT_RUN_MAX_AGE_SECS",
+    "DISCORD_BOT_TOKEN",
+    "DISCORD_GUILD_IDS",
+    "JEV_MIN_CONFIDENCE",
+    "JEV_TIMEOUT_MS",
+    "MAX_ACTIVE_CONVERSATIONS",
+    "OPENROUTER_CHAT_MODEL",
+    "OPENROUTER_DECISION_API_KEY",
+    "OPENROUTER_DECISION_MODEL",
+    "OPENROUTER_EMOJI_MODEL",
+    "OPENROUTER_IMAGE_MODEL",
+    "OPENROUTER_TOPIC_MODEL",
+    "POOL_DEBOUNCE_MS",
+    "POOL_MAX_MESSAGES",
+    "POOL_MAX_WAIT_MS",
+    "ROUTE_ACTIVE_WINDOW_SECS",
+    "ROUTE_KEYWORDS",
+    "ROUTE_MAX_MESSAGE_AGE_MS",
+    "ROUTE_PENDING_EMOJI",
+    "RUST_LOG",
+    "TOPIC_EVERY_MESSAGES",
+}
+# Railway wires these itself (references, private domains, the shared token) or
+# they point at local and simulator endpoints.
+LOCAL_ONLY = {
+    "AGENT_HOST_TOKEN",
+    "AGENT_HOST_URL",
+    "DATABASE_URL",
+    "DISCORD_API_PROXY",
+    "DISCORD_API_URL",
+    "DISCORD_CDN_URL",
+    "DISCORD_GATEWAY_URL",
+    "DISCORD_MEDIA_EXTRA_HOSTS",
+    "LOG_FORMAT",
+    "OPENROUTER_BASE_URL",
+    "PORT",
+    "TEST_DATABASE_URL",
+}
+SECRET = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|DATABASE_URL")
+
+
+def parse_dotenv(path: Path) -> dict[str, str]:
+    values = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ")
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def railway(*args: str, stdin: str | None = None) -> str:
+    result = subprocess.run(
+        ["railway", *args], input=stdin, capture_output=True, text=True, cwd=REPO
+    )
+    if result.returncode != 0:
+        sys.exit(f"railway {args[0]} {args[1] if len(args) > 1 else ''} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def show(key: str, value: str) -> str:
+    return "<secret>" if SECRET.search(key) else repr(value)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--file", type=Path, default=REPO / ".env")
+    parser.add_argument("--apply", action="store_true", help="set variables and redeploy")
+    args = parser.parse_args()
+
+    local = parse_dotenv(args.file)
+    remote = {
+        service: json.loads(railway("variable", "list", "--service", service, "--json"))
+        for service in ("ingester", "agent")
+    }
+
+    changes: dict[str, dict[str, str]] = {"ingester": {}, "agent": {}}
+    for key, value in sorted(local.items()):
+        if key in LOCAL_ONLY:
+            print(f"  skip   {key} (local only)")
+            continue
+        service = "agent" if key in AGENT else "ingester" if key in INGESTER else None
+        if service is None:
+            print(f"  ?      {key} (no service reads it; not synced)")
+            continue
+        if value == "":
+            print(f"  skip   {service}.{key} (empty locally)")
+            continue
+        current = remote[service].get(key)
+        if current == value:
+            print(f"  same   {service}.{key}")
+            continue
+        verb = "add" if current is None else "change"
+        print(f"  {verb:<6} {service}.{key} = {show(key, value)}")
+        changes[service][key] = value
+
+    if not args.apply:
+        print("\nDry run. Re-run with --apply to set these and redeploy.")
+        return
+    for service, values in changes.items():
+        if not values:
+            continue
+        for key, value in values.items():
+            railway("variable", "set", key, "--stdin", "--skip-deploys", "--service", service, stdin=value)
+        railway("redeploy", "--service", service, "--yes")
+        print(f"Set {len(values)} variable(s) on {service} and started a redeploy.")
+
+
+if __name__ == "__main__":
+    main()

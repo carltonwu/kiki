@@ -1,0 +1,26 @@
+{
+ "chat/attachments.py": {
+  "doc": "The images a stored message carries: its image attachments, then its image\nembeds, as links sized for a vision model.",
+  "symbols": [
+   "MAX_IMAGES",
+   "MAX_SIDE",
+   "IMAGE_NAME",
+   "Image",
+   "images_in",
+   "sized"
+  ]
+ },
+ "reading.py": {
+  "doc": "`read_image`: a Discord message's images, described by a vision model for Kiki\n(the common image code is `vision.py`).\n\nKiki's chat model may not see images, so another model looks at them and writes\na detailed description for her (agent to agent). A message with several images\nis a Discord gallery: it's read in one call, image by image and as a whole.\n\nImages come only from the stored message's own payload (attachments and image\nembeds), never from model arguments, and are downloaded only from Discord's\nmedia hosts (`vision.download`), so a message can't make the host fetch an\narbitrary URL.\n",
+  "symbols": [
+   "MAX_OUTPUT_TOKENS",
+   "DRAWING",
+   "INSTRUCTIONS",
+   "MESSAGE",
+   "read_image",
+   "DRAWINGS",
+   "drawings",
+   "stored"
+  ]
+ }
+}

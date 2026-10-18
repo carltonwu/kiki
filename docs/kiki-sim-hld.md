@@ -33,7 +33,7 @@ scope beyond the payloads Kiki reads.
   (up, say, test,             (Discord: Gateway,  ──REST /api/v10──▶  (unchanged)   (unchanged)
    inspect)                    REST; OpenRouter:  ◀── Jev, models ──┘          │
       │                        chat, embeddings)  ◀── chat, embeddings ────────┘
-      └──── SQL ───▶ sim Postgres (own container, port 54339, database kiki_sim)
+      └──── SQL ───▶ sim Postgres (own container, port 54339, one database per stack)
 ```
 
 The real ingester and agent host run with their Discord and OpenRouter base
@@ -72,9 +72,9 @@ covering the listener, `store` and catch-up.
 
 | Variable | Where | Effect |
 |---|---|---|
-| `DISCORD_API_PROXY=127.0.0.1:8090` | `main.rs` | `twilight_http::Client::builder().proxy(url, true).ratelimiter(None)`. Requests go to `http://127.0.0.1:8090/api/v10/…`. |
-| `DISCORD_GATEWAY_URL=ws://127.0.0.1:8090/gateway` | `gateway.rs` | `ConfigBuilder::proxy_url`. twilight connects to `…/gateway/?v=10&encoding=json&compress=zstd-stream`. |
-| `OPENROUTER_BASE_URL=http://127.0.0.1:8090/openrouter` | `jev.rs` (`/alpha/decisions`), `commands.rs` (`/v1/models`), agent host | The agent host builds `OpenRouterProvider(openai_client=AsyncOpenAI(base_url=…/v1))`, since the provider takes a client, not a URL. Embeddings use the same base. |
+| `DISCORD_API_PROXY=127.0.0.1:<fakecord port>` | `main.rs` | `twilight_http::Client::builder().proxy(url, true).ratelimiter(None)`. Requests go to `http://127.0.0.1:<port>/api/v10/…`. |
+| `DISCORD_GATEWAY_URL=ws://127.0.0.1:<fakecord port>/gateway` | `gateway.rs` | `ConfigBuilder::proxy_url`. twilight connects to `…/gateway/?v=10&encoding=json&compress=zstd-stream`. |
+| `OPENROUTER_BASE_URL=http://127.0.0.1:<fakecord port>/openrouter` | `jev.rs` (`/alpha/decisions`), `commands.rs` (`/v1/models`), agent host | The agent host builds `OpenRouterProvider(openai_client=AsyncOpenAI(base_url=…/v1))`, since the provider takes a client, not a URL. Embeddings use the same base. |
 
 ## fakecord
 
@@ -98,6 +98,7 @@ Discord does.
 | commands | `GET /applications/@me`, `PUT /applications/{a}/guilds/{g}/commands`, `POST /interactions/{id}/{token}/callback`, `PATCH /webhooks/{a}/{token}/messages/@original` |
 | catch-up | `GET /guilds/{g}`, `/guilds/{g}/channels`, `/guilds/{g}/threads/active`, `/channels/{c}/threads/archived/{public,private}`, `/channels/{c}/messages?after=&limit=` (paginated: fixtures can hold more than 100 messages per channel) |
 | router, agent | `PUT`/`DELETE /channels/{c}/messages/{m}/reactions/{emoji}/@me`, `POST /channels/{c}/messages` |
+| agent host | `POST /attachments/refresh-urls` (expired attachment links), CDN avatars and attachments |
 
 **Unknown calls fail tests.** The ingester treats some failures as "skip" (a
 404 means inaccessible in `rest.rs`), so a 404 alone proves nothing. fakecord
@@ -117,10 +118,13 @@ and permission bits (an admin for `/kiki config`), two members who share a
 name, Kiki's user and managed role, and seeded history.
 
 **Control API** (`/_sim/…`): `POST messages` (author, channel, content,
-reply_to, mentions, age_s → the minted message), `PATCH`/`DELETE
+reply_to, mentions, age_s, attachments → the minted message), `PATCH`/`DELETE
 messages/{id}`, `POST interactions`, `GET state` (messages, reactions,
 interaction responses, `unexpected`, recorded LLM requests), `POST script`
-(stub answers), `POST reset`, and `POST drop-gateway` (to test reconnects).
+(stub answers), `POST reset`, `POST drop-gateway` (to test reconnects), and
+`POST threads` (`from`, `name`, `as`: a thread started from a message, as Discord
+makes one: the thread has the message's ID, the parent gets a `THREAD_CREATED`
+notice and the thread opens with an empty thread starter message).
 
 ## Stub LLMs (default) and live mode
 
@@ -137,7 +141,29 @@ channels and background topic jobs can't take each other's answers.
   jobs always get `stub topic`. A reply-script entry matches on the trigger
   message and can make one tool call (`id`, JSON-string `arguments`), then
   answer with a template that may include the tool result's message IDs. By
-  default a reply job answers `stub: <trigger text>`.
+  default a reply job answers `stub: <trigger text>`. A `web:` entry stands in for
+  OpenRouter's web search/fetch server tools: if the request offered them, the
+  answer carries `server_tool_use_details` usage and `url_citation` annotations. A `{image_message}`
+  placeholder in tool arguments becomes the message ID in the trigger's image
+  marker, else the newest one in the conversation.
+- **Vision** (chat requests carrying images): `Image n: <label>` per image,
+  read back from a tEXt chunk in the 1×1 PNGs that fakecord serves for
+  attachments at `/cdn/…`, plus `Gallery: …` for several and the model used.
+  The agent host gets `OPENROUTER_VISION_MODEL=sim/vision` and may download from
+  fakecord (`DISCORD_MEDIA_EXTRA_HOSTS`). Live mode passes
+  `OPENROUTER_VISION_MODEL` through from the environment or the repo's dotenv
+  file when set. A drawing's reference check gets `Image n: <label> => yes`, or
+  `no` for labels saying meme or screenshot.
+- **Images** (`/v1/images`): a 1×1 PNG labeled with the prompt, or a 400 for
+  prompts containing "refuse". Reference images must be inline data URLs (it
+  rejects links, which expire on Discord); their labels are recorded in order for
+  `image_references`. A drawing's failure note (a tool-less request asking for
+  one) gets `stub note, in her words: <reason>`.
+- **Discord media**: `/cdn/avatars/{user}/{hash}.png` serves a fixture member's
+  `avatar` as a PNG labeled `avatar of <username>`. An attachment scripted with
+  `expired: true` has `ex=0` and is a 404 until the host refreshes it through
+  `POST /api/v10/attachments/refresh-urls` (the host gets `DISCORD_API_URL` and
+  `DISCORD_BOT_TOKEN` pointing at fakecord).
 - **Embeddings** (`/v1/embeddings`): 4096-dimensional vectors (the host keeps
   the first 1024) from a stable SHA-256 bag of words. They're never zero, and
   they're returned with `index`.
@@ -166,7 +192,8 @@ stage has its own completion barrier:
 | `stored` | the row exists in `messages` | `stored: true` |
 | `classified` | a `classifications` row, or proof it can't come (ignored author, bot, `age_s` > limit; or "settled": no row 3 s after `POOL_MAX_WAIT_MS`) | `check`, `outcome`, `jev`, `conversation: same_as <step>` / `new` |
 | `run` | the `agent_runs` row for the pool reaches `done`, `failed` or `superseded` | `run: done / failed / superseded / none` |
-| `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` |
+| `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` (`web_search`/`web_fetch` are read from the job's saved `web` result, so they work live too), `tools_offered` |
+| `drawn` | every `agent_image_jobs` row of the run is `done` or `failed` | `followup: {count, status, attachments, text_contains, text_lacks}` (each picture's follow-up must reply to the request), `image_references`, `image_prompt_contains` (the newest image model call) |
 | `reactions` | eventually, within 5 s | `reaction: {emoji: 👀, present: false}` |
 | any | none | `prompt_contains`, `prompt_lacks` (last recorded chat request), `rest_calls`; `decide_contains`, `decide_lacks` (compact JSON of the message's recorded Decide state; fail if Decide was not called) |
 
@@ -179,29 +206,63 @@ the sim database to set up state such as curated `guild_lingo` entries.
 ## Lifecycle and readiness
 
 - `up`: starts the sim Postgres container if needed, verifies `sim_marker`,
-  migrates a template database (`kiki_sim_template`, rebuilt when the
-  migrations' hash changes), builds the ingester and starts fakecord.
+  migrates a template database (`kiki_sim_template_<migrations hash>`, shared by
+  every stack), gets the ingester binary and starts fakecord. The binary comes
+  from `~/.cache/kiki-sim/ingester/<hash>/`, where the hash covers the content of
+  `services/` (minus the agent host), `Cargo.toml`, `Cargo.lock` and the
+  toolchain file. On a miss, `up` runs `cargo build` and stores the result. A
+  new worktree with unchanged Rust starts in about 2 s instead of a 20 s build.
+  The key is content, not file times: a shared cargo target directory judges
+  freshness by mtime, so one worktree could run another's ingester.
 - **Per scenario**: stop the ingester and agent host and wait for exit (which
-  frees the leader lock), recreate `kiki_sim` from the template, reset
-  fakecord, start both services, and wait until ready. Ready means the agent
+  frees the leader lock), recreate the stack's database from the template,
+  reset fakecord, start both services, and wait until ready. Ready means the agent
   host's `/health` is OK, the ingester log shows `router listening for new
   messages`, fakecord has sent GUILD_CREATE, and the fixture history count is
   in `messages`.
-- `down` stops everything. The container is kept, and `down --purge` removes
-  it.
+- `down` stops the stack and drops its database. The container is kept, and
+  `down --purge` removes it.
+
+## Stacks
+
+A stack is one fakecord, agent host, ingester and database. Several run side by
+side, in one worktree or in many, so parallel agents each own one.
+
+- **Name.** `--stack NAME` or `KIKI_SIM_STACK` picks it; the default is `main`.
+  State, pids and logs live in `.sim/<name>/`.
+- **Ports.** `up` picks three free ports and saves them in
+  `.sim/<name>/config.json`. Later commands read them from there.
+- **Database.** `kiki_sim_<worktree path hash>_<name>`, so two worktrees with a
+  `main` stack don't share one. Every stack shares the Postgres container.
+  Setup they share (the container, the template, the binary cache) runs under
+  `~/.cache/kiki-sim/setup.lock`.
+- **Capacity.** A stack holds about 15 connections. The container allows 500.
+  `up` refuses when the server lacks room for another stack, and says to stop
+  idle ones (`kiki-sim stacks`, `kiki-sim down --all`).
+- **Parallel tests.** `test -j N` runs scenarios from one queue, longest first
+  (durations from the last run in `.sim/durations.json`), on this stack and
+  `<name>-2` … `<name>-N`. It starts the extra stacks with the same settings and
+  leaves them up for the next run. Each scenario runs in its own
+  `kiki-sim --stack <worker> test` process.
+
+A reset can't get much below 1.2 s: twilight-gateway sleeps `2^attempt` seconds
+before every connect, the first one included (`shard.rs`, 1 s). Parallel stacks
+are what shorten a run.
 
 ## CLI (`tools/sim/kiki-sim`)
 
 | Command | Does |
 |---|---|
 | `up [--fixture F] [--live] [--set NAME=VALUE]` | Starts the stack; repeat `--set` to override ingester settings. Run again after service changes. |
-| `down [--purge]` | Stops services; `--purge` also removes the local sim Postgres container and volume. |
+| `--stack NAME …` | Runs any command against stack `NAME` (default `$KIKI_SIM_STACK` or `main`). |
+| `down [--all] [--purge]` | Stops the stack and drops its database; `--all` does every stack in this worktree; `--purge` also removes the local sim Postgres container. |
+| `stacks` | This worktree's stacks, their ports, what's running and their databases. |
 | `reset` | Fresh database and guild with the saved stack settings. |
 | `say --as U --in C [--reply-to ID\|kiki] [--age S] TEXT` | Sends a message, waits through `delivered` (or `classified` when it isn't routed), and prints the transcript lines, the classification, the run and the reply. |
 | `send …` | Same, without waiting. |
 | `slash --as U [--in C] SUBCOMMAND [name=value …]` | Sends a `/kiki` interaction and prints the response, e.g. `slash --as alex config key=chat_model value=sim/other` or `slash --as alex config key=history_messages value=50`. |
 | `transcript [--in C]`, `inspect MESSAGE_ID`, `logs [ingester\|agent\|fakecord]` | Inspection. |
-| `test [PATH…] [--live] [-k NAME]` | Runs scenarios (default `tools/sim/scenarios`). Exits non-zero on failure, printing the transcript, the unexpected calls and the last 30 ingester log lines. |
+| `test [PATH…] [--live] [-k NAME] [-j N]` | Runs scenarios (default `tools/sim/scenarios`), on N stacks with `-j`. Exits non-zero on failure, printing the transcript, the unexpected calls and the last 30 ingester log lines. |
 
 ## Scenarios
 
@@ -222,8 +283,9 @@ author, eviction at `MAX_ACTIVE_CONVERSATIONS`, cross-channel search via a
 scripted tool call, `/kiki config`, low-confidence keyword and participant
 follow-ups, direct-follow-up guards, explicitly addressed keywords overriding a
 Decide `no`, recorded Decide state, separate simultaneous conversations in one
-channel, ambiguous-person lookup, curated lingo in reply prompts, catch-up beyond 100 messages, and a
-Gateway reconnect.
+channel, ambiguous-person lookup, curated lingo in reply prompts, catch-up beyond 100 messages, a
+Gateway reconnect, and explicit and implicit web search and fetch
+(`web-tools.yaml`; `live-web-tools.yaml` checks real models).
 
 `live-2026-10-18.yaml` replays paraphrased real exchanges with real OpenRouter
 calls. It is marked `live: only`, so stub-mode CI skips it. To run it, start with
@@ -239,8 +301,11 @@ scenario that fails without the change. For prompt or behavior changes, also
 `kiki-sim up --live` and `say` a few messages, and quote the transcript in the
 summary.
 
-CI adds a `sim` job with its own Postgres service that runs `kiki-sim test` in
-stub mode.
+Agents working in parallel each take their own worktree, or their own
+`--stack` in a shared one. Their stacks share nothing but the container.
+
+CI adds a `sim` job with its own Postgres service that runs `kiki-sim test -j 4`
+in stub mode.
 
 ## Not in v1
 

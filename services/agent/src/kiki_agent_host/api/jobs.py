@@ -1,12 +1,13 @@
 """Durable results and session locks, with connections only during a job."""
 
 import logging
+from collections.abc import Awaitable, Callable
 
-from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from .contracts import JobRequest, JobResponse, JobResult
-from .executor import Executor, TransientError
+from .. import db
+from ..contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
+from ..executor import Executor, TransientError
 
 logger = logging.getLogger(__name__)
 
@@ -16,10 +17,33 @@ class RequestConflict(Exception):
 
 
 async def run_job(database_url: str, request: JobRequest, executor: Executor) -> JobResponse:
+    async def execute() -> JobResult:
+        result = JobResult.model_validate(await executor.execute(request))
+        if not result.text.strip():
+            raise ValueError("executor returned an empty reply")
+        return result
+
+    return await durable(database_url, request, request.kind, execute)
+
+
+async def run_image_job(
+    database_url: str, request: ImageJobRequest, executor: Executor
+) -> JobResponse:
+    async def execute() -> ImageJobResult:
+        return ImageJobResult.model_validate(await executor.draw(request))
+
+    return await durable(database_url, request, "image", execute)
+
+
+async def durable(
+    database_url: str,
+    request: JobRequest | ImageJobRequest,
+    kind: str,
+    execute: Callable[[], Awaitable[JobResult | ImageJobResult]],
+) -> JobResponse:
+    """Runs a job at most once per ID: a retry gets the saved result or waits."""
     # A session lock survives short transactions and releases on disconnect.
-    async with await AsyncConnection.connect(
-        database_url, autocommit=True, connect_timeout=10
-    ) as connection:
+    async with await db.connect(database_url) as connection:
         cursor = await connection.execute(
             "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (request.id,)
         )
@@ -28,7 +52,9 @@ async def run_job(database_url: str, request: JobRequest, executor: Executor) ->
             logger.debug("job already running job_id=%s", request.id)
             return JobResponse(id=request.id, status="running")
 
-        payload = request.model_dump(mode="json")
+        # Unset optional fields (image_model) are left out, as Rust omits them, so
+        # requests saved before a field existed still match on retry.
+        payload = request.model_dump(mode="json", exclude_none=True)
         cursor = await connection.execute(
             "SELECT request, status, result, error FROM agent_host_jobs WHERE id = %s",
             (request.id,),
@@ -43,7 +69,7 @@ async def run_job(database_url: str, request: JobRequest, executor: Executor) ->
                 return JobResponse(id=request.id, status=status, result=result, error=error)
             # The previous owner disconnected before saving a result. Inference
             # may repeat; Discord delivery remains solely Rust-owned.
-            logger.info("resuming interrupted job job_id=%s kind=%s", request.id, request.kind)
+            logger.info("resuming interrupted job job_id=%s kind=%s", request.id, kind)
         else:
             await connection.execute(
                 "INSERT INTO agent_host_jobs (id, request, status) VALUES (%s, %s, 'running')",
@@ -51,9 +77,7 @@ async def run_job(database_url: str, request: JobRequest, executor: Executor) ->
             )
 
         try:
-            result = JobResult.model_validate(await executor.execute(request))
-            if not result.text.strip():
-                raise ValueError("executor returned an empty reply")
+            result = await execute()
         except TransientError:
             raise  # not persisted: a retry of the same ID runs it again
         except Exception as error:  # noqa: BLE001 - isolate framework failures without leaking payloads
@@ -61,7 +85,7 @@ async def run_job(database_url: str, request: JobRequest, executor: Executor) ->
             logger.error(
                 "executor failed job_id=%s kind=%s channel_id=%s conversation_id=%s error_type=%s",
                 request.id,
-                request.kind,
+                kind,
                 request.scope.channel_id,
                 request.scope.conversation_id,
                 type(error).__name__,

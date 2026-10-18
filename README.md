@@ -139,6 +139,8 @@ Server settings persist in Postgres and apply without a restart. Examples:
 - `/kiki config key:history_messages value:50`
 - `/kiki config key:reply_max_tokens value:3000`
 - `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
+- `/kiki config key:image_model value:openai/gpt-image-2.5-flare` (from OpenRouter's image catalog)
+- `/kiki config key:image_generation value:false` (stop Kiki drawing images)
 - `/kiki config key:pool_debounce reset:true`
 
 Use `/kiki config key:chat_model` to view the chat model, or add `reset:true` to restore
@@ -147,6 +149,12 @@ support text output and tools. Unset keys inherit startup env defaults, then bui
 New pools capture routing settings; new reply jobs capture context, model and token settings.
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
+
+Kiki can draw: with `image_generation` on (the default), reply jobs get a
+`generate_image` tool backed by the server's `image_model`. Her reply goes out
+first; the picture follows as its own message, drawn from reference photos of its
+subjects found in the server. The agent host needs `DISCORD_BOT_TOKEN` to refresh
+expired attachment links. See [image generation](docs/image-generation.md).
 
 Server phrases and custom emoji come from the manually curated `guild_lingo`
 table (migration 0014 seeds one server). Reply prompts include only that server's
@@ -158,7 +166,7 @@ There is no automatic phrase learning or Discord command to edit the phrase list
 
 Every custom emoji of a server is also in `guild_emojis` (migration 0017), with a
 one- or two-sentence description written by a vision model (`OPENROUTER_EMOJI_MODEL`,
-default `google/gemini-2.5-flash-lite`, about $0.0001 per emoji). Replies can look
+default `deepseek/deepseek-v4.1-flash-1017`). Replies can look
 them up with the `search_emojis` (by mood or meaning) and `find_emoji` (by name, or
 to explain `<:name:id>` in a message) tools. The list only changes on
 `/kiki emojis resync:true`: run it after adding, renaming or deleting emoji. Each

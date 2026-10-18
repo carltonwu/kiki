@@ -742,10 +742,10 @@ impl Commands {
 
     async fn config(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
         if let Some((actor, key, value)) = config_change(invocation)? {
-            if key == "chat_model"
+            if matches!(key, "chat_model" | "image_model")
                 && let Some(model) = value.as_ref().and_then(Value::as_str)
             {
-                check_catalog_model(model).await?;
+                check_catalog_model(key, model).await?;
             }
             self.settings
                 .guilds
@@ -1201,16 +1201,22 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
     Ok(Some((actor, key, value)))
 }
 
-async fn check_catalog_model(model: &str) -> anyhow::Result<()> {
+async fn check_catalog_model(key: &str, model: &str) -> anyhow::Result<()> {
+    // Image models are served by OpenRouter's Images API, which has its own catalog.
+    let path = if key == "image_model" {
+        "v1/images/models"
+    } else {
+        "v1/models"
+    };
     let catalog: Value = reqwest::Client::new()
-                    .get(format!("{}/v1/models", crate::config::openrouter_base()))
+                    .get(format!("{}/{path}", crate::config::openrouter_base()))
                     .timeout(Duration::from_secs(10))
                     .send().await
                     .and_then(reqwest::Response::error_for_status)
                     .map_err(|_| UserError("Couldn't check OpenRouter's model catalog. Try again; your setting has not changed.".into()))?
                     .json().await
                     .map_err(|_| UserError("Couldn't read OpenRouter's model catalog. Try again; your setting has not changed.".into()))?;
-    validate_catalog_model(&catalog, model)?;
+    validate_catalog_model(&catalog, key, model)?;
     Ok(())
 }
 
@@ -1284,25 +1290,35 @@ fn config_embed(
     embed.build()
 }
 
-fn validate_catalog_model(catalog: &Value, model: &str) -> Result<(), UserError> {
+fn validate_catalog_model(catalog: &Value, key: &str, model: &str) -> Result<(), UserError> {
     let models = catalog["data"].as_array().ok_or_else(|| {
         UserError("Couldn't read OpenRouter's model catalog. Your setting has not changed.".into())
     })?;
     let entry = models
         .iter()
-        .find(|entry| entry["id"].as_str() == Some(model))
-        .ok_or_else(|| {
-            UserError(
-                "That model ID isn't in OpenRouter's catalog. Check the ID and try again.".into(),
-            )
-        })?;
-    let text_output = entry["architecture"]["output_modalities"]
-        .as_array()
-        .is_some_and(|values| values.iter().any(|v| v == "text"));
+        .find(|entry| entry["id"].as_str() == Some(model));
+    let outputs = |modality: &str| {
+        entry.is_some_and(|entry| {
+            entry["architecture"]["output_modalities"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|v| v == modality))
+        })
+    };
+    if key == "image_model" {
+        if !outputs("image") {
+            return Err(UserError(
+                "Choose a model from OpenRouter's image catalog that outputs images, such as openai/gpt-image-2.5-flare.".into(),
+            ));
+        }
+        return Ok(());
+    }
+    let entry = entry.ok_or_else(|| {
+        UserError("That model ID isn't in OpenRouter's catalog. Check the ID and try again.".into())
+    })?;
     let tools = entry["supported_parameters"]
         .as_array()
         .is_some_and(|values| values.iter().any(|v| v == "tools"));
-    if !text_output || !tools {
+    if !outputs("text") || !tools {
         return Err(UserError(
             "Choose a text model that supports tools; Kiki needs tools to search channel history."
                 .into(),
@@ -1741,10 +1757,14 @@ mod tests {
             {"id": "test/no-tools", "architecture": {"output_modalities": ["text"]}, "supported_parameters": []},
             {"id": "test/image", "architecture": {"output_modalities": ["image"]}, "supported_parameters": ["tools"]}
         ]});
-        assert!(validate_catalog_model(&catalog, "test/chat").is_ok());
+        assert!(validate_catalog_model(&catalog, "chat_model", "test/chat").is_ok());
         for model in ["test/unknown", "test/no-tools", "test/image"] {
-            assert!(validate_catalog_model(&catalog, model).is_err());
+            assert!(validate_catalog_model(&catalog, "chat_model", model).is_err());
         }
-        assert!(validate_catalog_model(&json!({}), "test/chat").is_err());
+        assert!(validate_catalog_model(&json!({}), "chat_model", "test/chat").is_err());
+        assert!(validate_catalog_model(&catalog, "image_model", "test/image").is_ok());
+        for model in ["test/unknown", "test/chat"] {
+            assert!(validate_catalog_model(&catalog, "image_model", model).is_err());
+        }
     }
 }

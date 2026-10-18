@@ -4,11 +4,17 @@ from types import SimpleNamespace
 
 import pytest
 from psycopg import AsyncConnection
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import retrieval
-from kiki_agent_host.agent import PydanticExecutor
+from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.tools import memory as memory_tools
+from kiki_agent_host.agent.tools.messages import OptionalTime
+from kiki_agent_host.chat.indexing import SAVE, index_pending
+from kiki_agent_host.chat.scope import Roster, Scope
+from kiki_agent_host.chat.search import message_context, search
 from kiki_agent_host.contracts import JobRequest
+from kiki_agent_host.openrouter.embeddings import Embedder
 
 GUILD, OTHER_GUILD, CHANNEL, OTHER_CHANNEL, CONVERSATION = 1, 7, 2, 9, 1
 TOPICS = [{"deploy", "release", "ship", "shipped"}, {"pizza", "lunch", "food"}]
@@ -35,10 +41,10 @@ class FakeEmbeddings:
 
 
 def embedder(fail=False):
-    return retrieval.Embedder(SimpleNamespace(embeddings=FakeEmbeddings(fail)))
+    return Embedder(SimpleNamespace(embeddings=FakeEmbeddings(fail)))
 
 
-SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
+SCOPE = Scope(GUILD, CHANNEL, CONVERSATION)
 
 
 @pytest.fixture
@@ -93,7 +99,7 @@ async def add(
 
 
 async def ids(db, query, **kwargs):
-    result = await retrieval.search(db, embedder(), SCOPE, query, **kwargs)
+    result = await search(db, embedder(), SCOPE, query, **kwargs)
     return [int(m["id"]) for m in result["messages"]]
 
 
@@ -111,7 +117,7 @@ async def test_hybrid_search_respects_scope_and_matches_paraphrases(db):
         (CONVERSATION,),
     )
     # Indexed, but never returned: the conversation is already in the prompt.
-    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (4, None)
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (4, None)
 
     # Lexical OR query: stopwords and unmatched words don't block a hit.
     assert (await ids(db, "what did alex say about the release"))[0] == 10
@@ -119,15 +125,15 @@ async def test_hybrid_search_respects_scope_and_matches_paraphrases(db):
     assert sorted(await ids(db, "release shipped")) == [10, 12]
     assert await ids(db, "release shipped", channel="#lore") == [12]
     assert await ids(db, "release shipped", channel=f"<#{CHANNEL}>") == [10]
-    result = await retrieval.search(db, embedder(), SCOPE, "release", channel="#random")
+    result = await search(db, embedder(), SCOPE, "release", channel="#random")
     assert "error" in result
-    [hit] = (await retrieval.search(db, embedder(), SCOPE, "release", channel="lore"))["messages"]
+    [hit] = (await search(db, embedder(), SCOPE, "release", channel="lore"))["messages"]
     assert hit["channel"] == "#lore"
     assert hit["url"] == f"https://discord.com/channels/{GUILD}/{OTHER_CHANNEL}/12"
     # Semantic only: no shared words with message 10.
     assert (await ids(db, "deploy"))[0] == 10
     assert (await ids(db, "food"))[0] == 11
-    result = await retrieval.search(db, embedder(), SCOPE, "release", person="sam")
+    result = await search(db, embedder(), SCOPE, "release", person="sam")
     assert "error" in result
 
 
@@ -149,44 +155,42 @@ async def test_people_are_found_by_id_whatever_they_were_called(db):
         author_id=106,
         display="Alex",
     )
-    roster = retrieval.Roster.of(
+    roster = Roster.of(
         [
             SimpleNamespace(ref="u1", user_id="106", label="Alex"),
             SimpleNamespace(ref="u2", user_id="101", label="Chris"),
         ]
     )
 
-    async def search(person):
-        return await retrieval.search(
-            db, embedder(), SCOPE, "lighting", person=person, roster=roster
-        )
+    async def lookup(person):
+        return await search(db, embedder(), SCOPE, "lighting", person=person, roster=roster)
 
     async def authors(person):
-        return sorted({m["author"] for m in (await search(person))["messages"]})
+        return sorted({m["author"] for m in (await lookup(person))["messages"]})
 
     # Similar names are different people.
     assert await authors("Chrissy") == ["Chrissy (@chrissy)"]
     assert await authors("nik") == ["nik"]
     assert await authors("Niko") == ["niko"]
     # A shared name finds everyone with it, and says so.
-    both = await search("chris")
+    both = await lookup("chris")
     assert {m["author"] for m in both["messages"]} == {"u2 Chris", "Chris (@chris.l)"}
     assert "2 different people" in both["note"]
     # Refs, mentions and any past username all mean the same account, shown by
     # its current name; mentions in results read as names.
     for person in ["u1", "@alexk_old", "ALEX_99", "<@106>"]:
         assert await authors(person) == ["u1 Alex"], person
-    hits = (await search("u1"))["messages"]
+    hits = (await lookup("u1"))["messages"]
     assert any(m["text"].endswith("@u2 Chris") for m in hits)
-    assert "error" in await search("Ethan")
+    assert "error" in await lookup("Ethan")
     with pytest.raises(ValueError):
-        await search("u9")
+        await lookup("u9")
 
 
 async def test_recency_breaks_near_ties_but_not_explicit_dates(db):
     await add(db, 20, "release release release plan", days_ago=400)
     await add(db, 21, "release plan", days_ago=1)
-    await retrieval.index_pending(db, embedder(), guild_id=GUILD)
+    await index_pending(db, embedder(), guild_id=GUILD)
     assert await ids(db, "release plan") == [21, 20]
     before = NOW - timedelta(days=30)
     assert await ids(db, "release plan", before=before) == [20]
@@ -195,26 +199,26 @@ async def test_recency_breaks_near_ties_but_not_explicit_dates(db):
 async def test_edits_and_deletes_invalidate_embeddings(db):
     await add(db, 30, "pizza")
     await add(db, 31, "lunch")
-    await retrieval.index_pending(db, embedder(), guild_id=GUILD)
+    await index_pending(db, embedder(), guild_id=GUILD)
     await db.execute("UPDATE messages SET content = 'release' WHERE id = 30")
     await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 31")
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 0
     # A vector computed for old text is not saved.
     [stale] = await embedder()(["pizza"])
-    await db.execute(retrieval.SAVE, ([30], ["md5-of-old-text"], [stale]))
+    await db.execute(SAVE, ([30], ["md5-of-old-text"], [stale]))
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 0
-    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (1, None)
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (1, None)
 
 
 async def test_embedding_outage_degrades_to_lexical(db):
     await add(db, 40, "release day")
-    result = await retrieval.search(db, embedder(fail=True), SCOPE, "release")
+    result = await search(db, embedder(fail=True), SCOPE, "release")
     assert result["semantic"] == "off"
     assert [m["id"] for m in result["messages"]] == ["40"]
     with pytest.raises(ValueError):
-        await retrieval.search(db, embedder(), SCOPE, "  ")
+        await search(db, embedder(), SCOPE, "  ")
 
 
 async def test_message_context_is_bounded_and_guild_scoped(db):
@@ -223,13 +227,13 @@ async def test_message_context_is_bounded_and_guild_scoped(db):
     await add(db, 70, "elsewhere", channel=OTHER_CHANNEL)
     await add(db, 71, "elsewhere, later", channel=OTHER_CHANNEL)
     await add(db, 72, "another server", guild=OTHER_GUILD, channel=50)
-    result = await retrieval.message_context(db, SCOPE, 55, before=2, after=1)
+    result = await message_context(db, SCOPE, 55, before=2, after=1)
     assert [m["id"] for m in result["messages"]] == ["53", "54", "55", "56"]
     assert result["messages"][0]["url"] == f"https://discord.com/channels/{GUILD}/{CHANNEL}/53"
     # Another channel of the guild: its own neighbors, not this channel's.
-    result = await retrieval.message_context(db, SCOPE, 70)
+    result = await message_context(db, SCOPE, 70)
     assert [m["id"] for m in result["messages"]] == ["70", "71"]
-    assert "error" in await retrieval.message_context(db, SCOPE, 72)
+    assert "error" in await message_context(db, SCOPE, 72)
 
 
 async def test_ignored_authors_are_never_read(db):
@@ -238,9 +242,9 @@ async def test_ignored_authors_are_never_read(db):
         db, 61, "release plan from the noisy bot", author="noisy", author_id=1358234666267578368
     )
     await add(db, 62, "release plan again")
-    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (2, None)
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (2, None)
     assert sorted(await ids(db, "release plan")) == [60, 62]
-    result = await retrieval.message_context(db, SCOPE, 60)
+    result = await message_context(db, SCOPE, 60)
     assert [m["id"] for m in result["messages"]] == ["60", "62"]
 
 
@@ -248,6 +252,8 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     await add(db, 80, "we shipped the release")
 
     class TestExecutor(PydanticExecutor):
+        web_tools = ()  # TestModel can't run OpenRouter's server tools (see test_web.py)
+
         def model(self, name):
             return TestModel()
 
@@ -271,9 +277,11 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # TestModel calls each tool once (with placeholder arguments), then answers
     # with their results.
     assert result.steps == 2
-    assert set(json.loads(result.text)) == {
+    # Memory tools are covered in test_memory; placeholder arguments only get errors.
+    assert set(json.loads(result.text)) - set(memory_tools.toolset.tools) == {
         "search_messages",
         "get_message_context",
+        "read_image",
         "search_emojis",
         "find_emoji",
     }
@@ -281,3 +289,14 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert result.usage.cost == pytest.approx(0.003)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1
+
+
+def test_blank_search_times_mean_no_bound():
+    # Models that fill every optional argument send "" for an unused bound.
+    times = TypeAdapter(OptionalTime)
+    assert times.validate_python("") is None
+    assert times.validate_python("  ") is None
+    assert times.validate_python(None) is None
+    assert times.validate_python("2026-10-18") == datetime(2026, 10, 18)
+    with pytest.raises(ValidationError):
+        times.validate_python("yesterday")
