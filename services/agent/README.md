@@ -48,6 +48,12 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
 Emoji results carry the `<:name:id>` form to write in a reply. Descriptions come
 from `POST /v1/emojis/describe` (below).
 
+Reply jobs also always offer OpenRouter's server tools `openrouter:web_search` and
+`openrouter:web_fetch`, which OpenRouter runs itself (at most 3 server-tool steps per
+model request; fetched pages are cut to about 6,000 tokens). Their fees are in the
+reply's cost, and the result adds `web: {searches, fetches, sources}` when they were
+used ([design](../../docs/agent-tools-hld.md#web-search-and-fetch-issue-1)).
+
 Results exclude deleted messages, bot messages, and the current conversation
 (already in the prompt). A run gets 4 lookup tool calls (`read_image` is one of them;
 drawings are capped separately) and 6 model requests; vision and image calls add their

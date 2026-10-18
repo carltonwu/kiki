@@ -23,9 +23,13 @@
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
 that channel), `age_s`, `attachments` (`[{filename, label?, content_type?}]`;
 the stub vision model describes an image as its label), and the sugar
-`jev: {choice, confidence}` and `reply: {text | tool}` to script the stub's
+`jev: {choice, confidence}` and `reply: {text | tool | web}` to script the stub's
 answer to exactly this message. In tool arguments, `{image_message}` is the
-message ID from the trigger's image marker.
+message ID from the trigger's image marker, else the newest one in the conversation.
+`web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
+tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
+it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the
+last reply request (stub mode).
 """
 
 import json
@@ -40,6 +44,8 @@ from . import stack
 from .observe import Observation, observe, poll, render
 
 EVENTUALLY_S = 5
+# OpenRouter server tools, by the agent host's `web` result field that counts them.
+WEB_TOOLS = {"web_search": "searches", "web_fetch": "fetches"}
 
 
 @dataclass
@@ -216,10 +222,11 @@ class Run:
             )
         if (
             "tool_called" in args
+            or "tools_offered" in args
             or "tool_result_contains" in args
             or any(k in args for k in ("prompt_contains", "prompt_lacks"))
         ):
-            self.expect_llm(step, args, label)
+            self.expect_llm(step, args, o, label)
         if "reaction" in args:
             self.expect_reaction(step, args["reaction"], message, label)
         if "decide_contains" in args or "decide_lacks" in args:
@@ -253,11 +260,19 @@ class Run:
         if str(value) != str(args.get("equals")):
             self.fail(step, f"{args['sql']!r} is {value!r}, expected {args.get('equals')!r}")
 
-    def expect_llm(self, step: int, args: dict, label: str) -> None:
+    def expect_llm(self, step: int, args: dict, o: Observation, label: str) -> None:
         records = [r for r in stack.control("state")["llm"] if r["kind"] == "reply"]
-        name = args.get("tool_called")
-        if name and not any((r.get("tool_call") or {}).get("name") == name for r in records):
-            self.fail(step, f"{label}: no {name} tool call")
+        for name in as_list(args.get("tool_called")):
+            if name in WEB_TOOLS:
+                self.expect_web(step, name, o, label)
+            elif not any((r.get("tool_call") or {}).get("name") == name for r in records):
+                self.fail(step, f"{label}: no {name} tool call")
+        offered = set()
+        if records:
+            offered = {t.get("type") for t in records[-1]["request"].get("tools", [])}
+        for kind in as_list(args.get("tools_offered")):
+            if kind not in offered:
+                self.fail(step, f"{label}: the last reply request didn't offer {kind}")
         for needle in as_list(args.get("tool_result_contains")):
             results = " ".join(" ".join(r.get("tool_results", [])) for r in records)
             if str(needle).lower() not in results.lower():
@@ -271,6 +286,20 @@ class Run:
         for needle in as_list(args.get("prompt_lacks")):
             if str(needle).lower() in prompt.lower():
                 self.fail(step, f"{label}: prompt contains {needle!r}")
+
+    def expect_web(self, step: int, name: str, o: Observation, label: str) -> None:
+        """OpenRouter runs web tools itself, so the agent host's saved result (which
+        counts them from OpenRouter's usage) is the evidence, in stub and live modes."""
+        web = None
+        if o.run_id is not None:
+            with stack.connect() as db:
+                row = db.execute(
+                    "SELECT result->'web' FROM agent_host_jobs WHERE id = %s",
+                    (f"reply:{o.run_id}",),
+                ).fetchone()
+            web = row[0] if row else None
+        if not (web or {}).get(WEB_TOOLS[name]):
+            self.fail(step, f"{label}: no {name} call (web use: {web}) [{o.summary()}]")
 
     def expect_reaction(self, step: int, wanted: dict, message: dict, label: str) -> None:
         emoji, present = wanted.get("emoji", "👀"), wanted.get("present", False)

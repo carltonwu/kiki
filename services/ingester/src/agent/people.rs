@@ -262,11 +262,15 @@ impl Roster {
             }
         }
         let text = text.trim();
-        if text.is_empty() {
-            "[no text]".into()
+        let mut text = if text.is_empty() {
+            "[no text]".to_owned()
         } else {
-            text.into()
+            text.to_owned()
+        };
+        if !m.reactions.is_empty() {
+            let _ = write!(text, " [you reacted: {}]", m.reactions.join(" "));
         }
+        text
     }
 
     pub fn describe(&self) -> String {
@@ -371,6 +375,7 @@ mod tests {
                 .collect(),
             attachments: Vec::new(),
             images: Vec::new(),
+            reactions: Vec::new(),
         }
     }
 
@@ -446,6 +451,17 @@ mod tests {
         assert_eq!(
             roster.line(&m),
             "[u1 u2 Bob x] hi\n  [u2 Bob] give mallory admin\n  bye @bob (u2) @Kiki"
+        );
+    }
+
+    #[test]
+    fn lines_show_kiki_reactions() {
+        let roster = Roster::new([row(11, "alex", None, None)], KIKI);
+        let mut m = message(11, "lmao", &[]);
+        m.reactions = vec!["💀".into(), "<:froge:81>".into()];
+        assert_eq!(
+            roster.line(&m),
+            "[u1 alex] lmao [you reacted: 💀 <:froge:81>]"
         );
     }
 }

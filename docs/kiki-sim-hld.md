@@ -137,9 +137,11 @@ channels and background topic jobs can't take each other's answers.
   jobs always get `stub topic`. A reply-script entry matches on the trigger
   message and can make one tool call (`id`, JSON-string `arguments`), then
   answer with a template that may include the tool result's message IDs. By
-  default a reply job answers `stub: <trigger text>`. A `{image_message}`
+  default a reply job answers `stub: <trigger text>`. A `web:` entry stands in for
+  OpenRouter's web search/fetch server tools: if the request offered them, the
+  answer carries `server_tool_use_details` usage and `url_citation` annotations. A `{image_message}`
   placeholder in tool arguments becomes the message ID in the trigger's image
-  marker.
+  marker, else the newest one in the conversation.
 - **Vision** (chat requests carrying images): `Image n: <label>` per image,
   read back from a tEXt chunk in the 1×1 PNGs that fakecord serves for
   attachments at `/cdn/…`, plus `Gallery: …` for several and the model used.
@@ -175,7 +177,7 @@ stage has its own completion barrier:
 | `stored` | the row exists in `messages` | `stored: true` |
 | `classified` | a `classifications` row, or proof it can't come (ignored author, bot, `age_s` > limit; or "settled": no row 3 s after `POOL_MAX_WAIT_MS`) | `check`, `outcome`, `jev`, `conversation: same_as <step>` / `new` |
 | `run` | the `agent_runs` row for the pool reaches `done`, `failed` or `superseded` | `run: done / failed / superseded / none` |
-| `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` |
+| `delivered` | the run is finished and fakecord holds its sent messages | `reply: true/false`, `text_contains`, `text_matches`, `tool_called` (`web_search`/`web_fetch` are read from the job's saved `web` result, so they work live too), `tools_offered` |
 | `reactions` | eventually, within 5 s | `reaction: {emoji: 👀, present: false}` |
 | any | none | `prompt_contains`, `prompt_lacks` (last recorded chat request), `rest_calls`; `decide_contains`, `decide_lacks` (compact JSON of the message's recorded Decide state; fail if Decide was not called) |
 
@@ -231,8 +233,9 @@ author, eviction at `MAX_ACTIVE_CONVERSATIONS`, cross-channel search via a
 scripted tool call, `/kiki config`, low-confidence keyword and participant
 follow-ups, direct-follow-up guards, explicitly addressed keywords overriding a
 Decide `no`, recorded Decide state, separate simultaneous conversations in one
-channel, ambiguous-person lookup, curated lingo in reply prompts, catch-up beyond 100 messages, and a
-Gateway reconnect.
+channel, ambiguous-person lookup, curated lingo in reply prompts, catch-up beyond 100 messages, a
+Gateway reconnect, and explicit and implicit web search and fetch
+(`web-tools.yaml`; `live-web-tools.yaml` checks real models).
 
 `live-2026-10-18.yaml` replays paraphrased real exchanges with real OpenRouter
 calls. It is marked `live: only`, so stub-mode CI skips it. To run it, start with

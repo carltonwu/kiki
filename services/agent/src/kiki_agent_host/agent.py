@@ -1,5 +1,5 @@
 """Pydantic AI executor: the SDK owns the loop, these tools search the guild and
-draw images."""
+the web and draw images."""
 
 import asyncio
 import contextlib
@@ -8,11 +8,12 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from openai import APIError, APIStatusError
 from psycopg import AsyncConnection, OperationalError
 from pydantic_ai import Agent, RunContext, Tool
+from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import (
@@ -24,8 +25,9 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
-from pydantic_ai.models import Model
+from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.openrouter import OpenRouterModel
+from pydantic_ai.native_tools import AbstractNativeTool, WebFetchTool, WebSearchTool
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
@@ -39,6 +41,7 @@ from .contracts import (
     JobResult,
     Message,
     Usage,
+    WebUse,
 )
 from .executor import TransientError
 from .vision import Vision, billed_cost, look
@@ -51,6 +54,11 @@ MAX_MODEL_REQUESTS = 6
 TOOL_TIMEOUT_SECONDS = 10
 VISION_TIMEOUT_SECONDS = 45  # downloads plus a vision model call
 EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
+# OpenRouter runs web search and fetch itself (server tools). This caps its steps per
+# model request (its default is 30); Kiki's own tool budget doesn't see them.
+MAX_WEB_STEPS = 3
+WEB_FETCH_MAX_TOKENS = 6000  # truncates long pages, which every later request re-reads
+WEB_SOURCES = 10  # citation URLs kept in the result
 MAX_IMAGES = 2
 IMAGE_TIMEOUT_SECONDS = 60  # image models are slow; still well inside the job timeout
 
@@ -342,6 +350,38 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
+class WebOpenRouterModel(OpenRouterModel):
+    """OpenRouter with its web fetch server tool, which Pydantic AI 2.57 maps only for
+    Anthropic and Google. Web search is mapped by the SDK (`openrouter:web_search`)."""
+
+    @classmethod
+    def supported_native_tools(cls) -> frozenset[type[AbstractNativeTool]]:
+        return super().supported_native_tools() | {WebFetchTool}
+
+    def _get_tool_choice(self, model_settings, model_request_parameters: ModelRequestParameters):
+        tools, tool_choice = super()._get_tool_choice(model_settings, model_request_parameters)
+        fetch = next(
+            (t for t in model_request_parameters.native_tools if isinstance(t, WebFetchTool)), None
+        )
+        if fetch is not None:
+            parameters: dict[str, Any] = {}
+            if fetch.max_uses is not None:
+                parameters["max_uses"] = fetch.max_uses
+            if fetch.max_content_tokens is not None:
+                parameters["max_content_tokens"] = fetch.max_content_tokens
+            if fetch.allowed_domains is not None:
+                parameters["allowed_domains"] = fetch.allowed_domains
+            if fetch.blocked_domains is not None:
+                parameters["blocked_domains"] = fetch.blocked_domains
+            tools.append({"type": "openrouter:web_fetch", "parameters": parameters})
+        return tools, tool_choice
+
+
+# Offered to every reply job; the model decides when the web helps.
+WEB_TOOLS = (
+    NativeTool(WebSearchTool()),
+    NativeTool(WebFetchTool(max_content_tokens=WEB_FETCH_MAX_TOKENS)),
+)
 chat = Agent(
     deps_type=Deps,
     tools=[
@@ -356,6 +396,23 @@ chat = Agent(
 plain = Agent()
 
 
+def web_use(responses: list[ModelResponse]) -> WebUse:
+    """Server tool use as OpenRouter reports it: searches, every server tool call (only
+    search and fetch are offered, so the rest are fetches), and cited URLs."""
+    searches = calls = 0
+    sources: list[str] = []
+    for response in responses:
+        details = response.provider_details or {}
+        used = details.get("server_tool_use") or {}
+        searches += used.get("web_search_requests") or 0
+        calls += used.get("tool_calls_executed") or 0
+        for annotation in details.get("annotations") or []:
+            url = (annotation.get("url_citation") or {}).get("url")
+            if url and url not in sources and len(sources) < WEB_SOURCES:
+                sources.append(url)
+    return WebUse(searches=searches, fetches=max(calls - searches, 0), sources=sources)
+
+
 def history(messages: list[Message]) -> list[ModelMessage]:
     def convert(m: Message) -> ModelMessage:
         if m.role == "assistant":
@@ -367,6 +424,8 @@ def history(messages: list[Message]) -> list[ModelMessage]:
 
 
 class PydanticExecutor:
+    web_tools = WEB_TOOLS
+
     def __init__(self, database_url: str, api_key: str, vision_model: str = ""):
         self.database_url = database_url
         # Without one, images go to the chat model, which may not read them.
@@ -386,7 +445,7 @@ class PydanticExecutor:
         )
 
     def model(self, name: str) -> Model:
-        return OpenRouterModel(name, provider=self.provider)
+        return WebOpenRouterModel(name, provider=self.provider)
 
     def image_model(self, name: str) -> ImageGenerationModel:
         return images.OpenRouterImageModel(name, self.images)
@@ -405,6 +464,8 @@ class PydanticExecutor:
             },
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
         }
+        if request.kind == "reply":
+            options["model_settings"]["extra_body"] = {"max_tool_calls": MAX_WEB_STEPS}
         embed = retrieval.Embedder(self.embeddings)
         vision_name = self.vision_model or request.model
         vision = Vision(self.model(vision_name), vision_name, not self.vision_model)
@@ -436,7 +497,9 @@ class PydanticExecutor:
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
-                        result = await chat.run(prompt, deps=deps, **options)
+                        result = await chat.run(
+                            prompt, deps=deps, capabilities=self.web_tools, **options
+                        )
                     finally:
                         await finish(deps.indexing)
         except ModelHTTPError as e:
@@ -447,15 +510,17 @@ class PydanticExecutor:
             raise TransientError(type(e).__name__) from e
 
         usage = result.usage
-        cost = billed_cost(result)
+        responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
+        web = web_use(responses)
+        cost = billed_cost(result)  # includes OpenRouter's web tool fees
         extra = embed.cost + vision.cost + (deps.image_cost if deps else 0)
         if extra:
             cost = (cost or 0) + extra
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
-            "requests=%d tool_calls=%d vision_calls=%d images=%d prompt_tokens=%d "
-            "completion_tokens=%d "
-            "cost_usd=%s latency_ms=%d",
+            "requests=%d tool_calls=%d vision_calls=%d web_searches=%d web_fetches=%d "
+            "web_sources=%d images=%d prompt_tokens=%d completion_tokens=%d cost_usd=%s "
+            "latency_ms=%d",
             request.id,
             request.kind,
             request.scope.channel_id,
@@ -464,6 +529,9 @@ class PydanticExecutor:
             usage.requests,
             usage.tool_calls,
             vision.calls,
+            web.searches,
+            web.fetches,
+            len(web.sources),
             len(deps.images) if deps else 0,
             usage.input_tokens,
             usage.output_tokens,
@@ -477,6 +545,7 @@ class PydanticExecutor:
             usage=Usage(
                 prompt_tokens=usage.input_tokens, completion_tokens=usage.output_tokens, cost=cost
             ),
+            web=web if web.searches or web.fetches or web.sources else None,
             images=deps.images if deps else [],
         )
 
