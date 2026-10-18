@@ -10,7 +10,8 @@
       - batch: [{as: ..., in: ..., text: ...}, ...]             # several, quickly
       - edit: {of: hi, text: "kiki hello"}
       - delete: {of: hi}
-      - slash: {as: alex, in: general, command: model, options: {model: sim/other}}
+      - slash: {as: alex, in: general, command: config,
+                options: {key: chat_model, value: sim/other}}
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database

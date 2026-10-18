@@ -111,7 +111,7 @@ can also set `age_s` on a live message to test the age boundaries.
 
 **Fixture** (`tools/sim/fixtures/minimal.yaml`): a guild, channels (general,
 lore, a private channel, a thread), members with usernames, global names, nicks
-and permission bits (an admin for `/kiki model`), two members who share a
+and permission bits (an admin for `/kiki config`), two members who share a
 name, Kiki's user and managed role, and seeded history.
 
 **Control API** (`/_sim/…`): `POST messages` (author, channel, content,
@@ -194,7 +194,7 @@ pooling and edits within a pool can be tested.
 | `up [--fixture F] [--live]` / `down` | Starts or stops the stack described above. |
 | `say --as U --in C [--reply-to ID\|kiki] [--age S] TEXT` | Sends a message, waits through `delivered` (or `classified` when it isn't routed), and prints the transcript lines, the classification, the run and the reply. |
 | `send …` | Same, without waiting. |
-| `slash --as U "model model:test/chat"` | Sends a `/kiki` interaction and prints the response. |
+| `slash --as U config key=chat_model value=sim/other` | Sends a `/kiki` interaction and prints the response. |
 | `transcript [--in C]`, `inspect MESSAGE_ID`, `logs [ingester\|agent\|fakecord]` | Inspection. |
 | `test [PATH…] [--live] [-k NAME]` | Runs scenarios (default `tools/sim/scenarios`). Exits non-zero on failure, printing the transcript, the unexpected calls and the last 50 log lines. |
 
@@ -216,7 +216,7 @@ v1 scenarios cover: a mention, a reply to Kiki, a keyword with Jev, an active
 conversation, a non-addressed message, the 2026-10-18 misses (live-marked
 copies replay the real messages), pooling, an edit inside a pool, an ignored
 author, eviction at `MAX_ACTIVE_CONVERSATIONS`, cross-channel search via a
-scripted tool call, `/kiki model`, catch-up beyond 100 messages, and a Gateway
+scripted tool call, `/kiki config`, catch-up beyond 100 messages, and a Gateway
 reconnect.
 
 ## How agents use it

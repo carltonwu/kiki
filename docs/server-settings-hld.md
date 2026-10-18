@@ -22,7 +22,7 @@ triggers; `value:,` can be used to supply an empty list in Discord.
   global models/timeouts. `key:<choice>` inspects one value and its reset default.
 - `/kiki config key:<choice> value:<text>` changes one setting.
 - `/kiki config key:<choice> reset:true` removes one override.
-- `/kiki model` is retained as an alias, using the same storage and validation.
+- Chat models use `/kiki config key:chat_model` for inspection, changes and resets.
 - Manage Server is checked at runtime for every write, before catalog requests or database work.
   Chat models retain the existing OpenRouter catalog check for text and tool support. Topic and
   Decide models remain global; the topic default derives from the env chat model, not its guild

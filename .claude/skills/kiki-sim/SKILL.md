@@ -23,7 +23,7 @@ touches production. Design: `docs/kiki-sim-hld.md`.
      classification (check, outcome, Jev choice and confidence, conversation),
      the run, and Kiki's reply.
    - `transcript`, `inspect <message id>`, `logs ingester|agent|fakecord`,
-     `slash --as alex model model=sim/other`.
+     `slash --as alex config key=chat_model value=sim/other`.
    - Fixture members: alex (admin), sam, ethan, chris, chrissy, chris_l, pilz
      (a bot); channels general, lore, staff, general-thread.
 5. For prompt or tone changes, also check real model output:

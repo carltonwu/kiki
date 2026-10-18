@@ -86,7 +86,6 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
-| `/kiki model [model]` | View this server's chat model. Set `model` to an OpenRouter ID to change it, or `default` to restore `OPENROUTER_CHAT_MODEL`. Changes require Manage Server. |
 | `/kiki whois <user>` | Every name Kiki has seen for someone (nickname, display name, username) with first and last seen, plus their message and conversation counts. |
 
 The bot must be invited with the `applications.commands` scope for registration to succeed.
@@ -99,7 +98,8 @@ Server settings persist in Postgres and apply without a restart. Examples:
 - `/kiki config key:chat_model value:deepseek/deepseek-v4.1-flash-1017`
 - `/kiki config key:pool_debounce reset:true`
 
-`/kiki model` remains an alias for `chat_model`. Model IDs must be listed by OpenRouter and
+Use `/kiki config key:chat_model` to view the chat model, or add `reset:true` to restore
+the current default. Model IDs must be listed by OpenRouter and
 support text output and tools. Unset keys inherit startup env defaults, then built-in defaults.
 New pools capture routing settings; new reply jobs capture context, model and token settings.
 In-flight jobs retain their saved model input. Topic summaries and Decide keep their global

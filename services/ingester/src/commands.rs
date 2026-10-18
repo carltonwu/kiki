@@ -1,4 +1,4 @@
-//! The `/kiki` slash command: inspection and server chat-model selection.
+//! The `/kiki` slash command: inspection and server settings.
 //!
 //! Registered as a guild command at startup (guild commands update instantly,
 //! global ones don't) and answered from `INTERACTION_CREATE` Gateway events.
@@ -296,7 +296,6 @@ impl Commands {
             "stats" => self.stats(invocation.guild_id).await?,
             "runs" => self.runs(invocation).await?,
             "config" => self.config(invocation).await?,
-            "model" => self.model(invocation).await?,
             "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
             other => error_embed(&format!("Unknown subcommand `{other}`.")),
@@ -607,54 +606,6 @@ impl Commands {
             ));
         }
         Ok(embed.build())
-    }
-
-    async fn model(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
-        // Check permissions before catalog or database work, even if an admin
-        // granted the overall /kiki command to a role without Manage Server.
-        let change = model_change(invocation)?;
-        let default = self
-            .settings
-            .chat_model
-            .as_deref()
-            .ok_or_else(|| UserError("The agent is off: AGENT_HOST_URL is not set.".into()))?;
-        if let Some((actor, model)) = change {
-            if let Some(model) = model {
-                check_catalog_model(model).await?;
-            }
-            self.settings
-                .guilds
-                .change(
-                    invocation.guild_id,
-                    "chat_model",
-                    model.map(|m| Value::String(m.to_owned())),
-                    actor,
-                )
-                .await
-                .map_err(|e| UserError(e.to_string()))?;
-            info!(
-                guild_id = invocation.guild_id,
-                actor, model, "server chat model changed"
-            );
-        }
-        let effective = self
-            .settings
-            .guilds
-            .snapshot(invocation.guild_id)
-            .chat_model
-            .clone();
-        let detail = if change.is_some() {
-            "Applies to new replies. Jobs already in progress keep their original model."
-        } else {
-            "Use `/kiki model model:<provider/model>` to change it, or `model:default` to reset."
-        };
-        Ok(EmbedBuilder::new()
-            .color(COLOR)
-            .title("Server chat model")
-            .description(format!(
-                "Chat model: `{effective}`\nDefault: `{default}`\n\n{detail}"
-            ))
-            .build())
     }
 
     async fn config(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
@@ -1107,24 +1058,6 @@ fn config_embed(
     embed.build()
 }
 
-/// Read access can be delegated, but model changes always require Manage Server.
-fn model_change<'a>(
-    invocation: &Invocation<'a>,
-) -> Result<Option<(i64, Option<&'a str>)>, UserError> {
-    let Some(value) = invocation.option("model") else {
-        return Ok(None);
-    };
-    let actor = require_manage_server(invocation)?;
-    let model = value.as_str().unwrap_or_default().trim();
-    if model == "default" {
-        return Ok(Some((actor, None)));
-    }
-    if !guild_settings::valid_model_id(model) {
-        return Err(UserError("Use an OpenRouter model ID like `deepseek/deepseek-v4.1-flash-1017`, or `default` to reset.".into()));
-    }
-    Ok(Some((actor, Some(model))))
-}
-
 fn validate_catalog_model(catalog: &Value, model: &str) -> Result<(), UserError> {
     let models = catalog["data"].as_array().ok_or_else(|| {
         UserError("Couldn't read OpenRouter's model catalog. Your setting has not changed.".into())
@@ -1192,20 +1125,6 @@ fn definition() -> CommandBuilder {
                     "reset",
                     "Reset the selected key to its current default",
                 )),
-        )
-        .option(
-            SubCommandBuilder::new(
-                "model",
-                "View or change this server's chat model (Manage Server to change)",
-            )
-            .option(
-                StringBuilder::new(
-                    "model",
-                    "OpenRouter model ID, or default to reset; omit to view",
-                )
-                .min_length(3)
-                .max_length(200),
-            ),
         )
         .option(
             SubCommandBuilder::new("users", "Messages, conversations and LLM cost per person")
@@ -1404,57 +1323,27 @@ mod tests {
 
     #[test]
     fn command_is_valid() {
-        let _ = definition().validate().unwrap().build();
-    }
-
-    #[test]
-    fn model_edits_require_permissions_even_when_read_access_is_delegated() {
-        use super::{Invocation, Permissions, model_change};
-        use serde_json::{Value, json};
-        let options = json!([{"name": "model", "value": "test/model"}]);
-        let mut member = json!({"user": {"id": "42"}, "permissions": "0"});
-        fn invoke<'a>(member: &'a Value, options: &'a Value) -> Invocation<'a> {
-            Invocation {
-                guild_id: 1,
-                member,
-                subcommand: "model",
-                options,
-                resolved: &Value::Null,
-            }
-        }
-        assert!(model_change(&invoke(&member, &options)).is_err());
+        let command = definition().validate().unwrap().build();
+        assert!(!command.options.iter().any(|option| option.name == "model"));
+        let config = command
+            .options
+            .iter()
+            .find(|option| option.name == "config")
+            .unwrap();
+        let key = config
+            .options
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|option| option.name == "key")
+            .unwrap();
         assert!(
-            model_change(&invoke(&member, &Value::Null))
+            key.choices
+                .as_ref()
                 .unwrap()
-                .is_none()
+                .iter()
+                .any(|choice| choice.name == "chat_model")
         );
-        for bits in [
-            Permissions::MANAGE_GUILD.bits(),
-            Permissions::ADMINISTRATOR.bits(),
-        ] {
-            member["permissions"] = json!(bits.to_string());
-            assert_eq!(
-                model_change(&invoke(&member, &options)).unwrap(),
-                Some((42, Some("test/model")))
-            );
-        }
-        for value in [
-            "bad",
-            "test/",
-            "/model",
-            "test/model with spaces",
-            "test/`model",
-            "",
-        ] {
-            let options = json!([{"name": "model", "value": value}]);
-            assert!(model_change(&invoke(&member, &options)).is_err());
-        }
-        let options = json!([{"name": "model", "value": "default"}]);
-        assert_eq!(
-            model_change(&invoke(&member, &options)).unwrap(),
-            Some((42, None))
-        );
-        assert!(model_change(&invoke(&Value::Null, &options)).is_err());
     }
 
     #[test]
@@ -1479,6 +1368,29 @@ mod tests {
             config_change(&invoke(&allowed, &options)).unwrap(),
             Some((42, "pool_debounce", Some(json!(2000))))
         );
+        let model = json!([{"name": "key", "value": "chat_model"}, {"name": "value", "value": "test/model"}]);
+        assert!(config_change(&invoke(&denied, &model)).is_err());
+        for permissions in [Permissions::MANAGE_GUILD, Permissions::ADMINISTRATOR] {
+            let member =
+                json!({"user": {"id": "42"}, "permissions": permissions.bits().to_string()});
+            assert_eq!(
+                config_change(&invoke(&member, &model)).unwrap(),
+                Some((42, "chat_model", Some(json!("test/model"))))
+            );
+        }
+        for value in [
+            "bad",
+            "test/",
+            "/model",
+            "test/model with spaces",
+            "test/`model",
+            "",
+            "default",
+        ] {
+            let options =
+                json!([{"name": "key", "value": "chat_model"}, {"name": "value", "value": value}]);
+            assert!(config_change(&invoke(&allowed, &options)).is_err());
+        }
         let read = json!([{"name": "key", "value": "chat_model"}]);
         assert!(config_change(&invoke(&denied, &read)).unwrap().is_none());
         let reset =

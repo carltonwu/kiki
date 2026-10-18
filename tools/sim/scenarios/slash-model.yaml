@@ -1,9 +1,0 @@
-name: /kiki model needs Manage Server to change, and validates the catalog
-steps:
-  - slash: {as: sam, in: general, command: model, options: {model: sim/other}}
-  - expect: {response_contains: "manage server"}
-  - slash: {as: alex, in: general, command: model, options: {model: sim/other}}
-  - expect: {response_contains: "sim/other"}
-  - say: {as: alex, in: general, text: "@kiki hi"}
-  - expect: {reply: true}
-  - expect: {sql: "SELECT model FROM agent_runs ORDER BY id DESC LIMIT 1", equals: sim/other}

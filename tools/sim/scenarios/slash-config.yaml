@@ -1,0 +1,24 @@
+name: /kiki config manages the chat model with permissions, catalog validation and reset
+steps:
+  - slash: {as: alex, in: general, command: model}
+  - expect: {response_contains: "Unknown subcommand"}
+  - slash: {as: sam, in: general, command: config, options: {key: chat_model}}
+  - expect: {response_contains: "sim/chat"}
+  - slash: {as: sam, in: general, command: config, options: {key: chat_model, value: sim/other}}
+  - expect: {response_contains: "manage server"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, value: sim/missing}}
+  - expect: {response_contains: "isn't in OpenRouter's catalog"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model}}
+  - expect: {response_contains: "sim/chat"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, value: sim/other}}
+  - expect: {response_contains: "sim/other"}
+  - say: {as: alex, in: general, text: "@kiki hi"}
+  - expect: {reply: true}
+  - expect: {sql: "SELECT model FROM agent_runs ORDER BY id DESC LIMIT 1", equals: sim/other}
+  - slash: {as: sam, in: general, command: config, options: {key: chat_model, reset: true}}
+  - expect: {response_contains: "manage server"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, reset: true}}
+  - expect: {response_contains: "sim/chat"}
+  - say: {as: alex, in: general, text: "@kiki hello again"}
+  - expect: {reply: true}
+  - expect: {sql: "SELECT model FROM agent_runs ORDER BY id DESC LIMIT 1", equals: sim/chat}
