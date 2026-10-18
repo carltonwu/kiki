@@ -7,8 +7,9 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import images, retrieval
-from kiki_agent_host.images import Image, Vision, allowed, images_in, sized
+from kiki_agent_host import images, retrieval, vision
+from kiki_agent_host.images import images_in, sized
+from kiki_agent_host.vision import Vision, allowed
 
 GUILD, CHANNEL, CONVERSATION = 1, 2, 1
 SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
@@ -90,7 +91,7 @@ def serve(routes: dict[str, tuple[int, bytes, str]]):
 
 
 async def test_download_checks_status_size_and_format(monkeypatch):
-    monkeypatch.setattr(images, "MAX_BYTES", 10)
+    monkeypatch.setattr(vision, "MAX_BYTES", 10)
     transport = serve(
         {
             "/ok.png": (200, PNG[:9], "image/png"),
@@ -105,9 +106,7 @@ async def test_download_checks_status_size_and_format(monkeypatch):
     async with httpx.AsyncClient(transport=transport) as client:
 
         async def get(path, media_type=None):
-            return await images.download(
-                client, Image("x", f"https://cdn.discordapp.com{path}", media_type)
-            )
+            return await vision.download(client, f"https://cdn.discordapp.com{path}", media_type)
 
         ok = await get("/ok.png")
         assert isinstance(ok, BinaryContent) and ok.media_type == "image/png"
@@ -119,7 +118,7 @@ async def test_download_checks_status_size_and_format(monkeypatch):
         assert await get("/page.png", "image/png") == "unsupported format (text/html)"
         assert await get("/svg", "image/svg+xml") == "unsupported format (image/svg+xml)"
         assert await get("/down.png") == "download failed (HTTP 503)"
-        assert await images.download(client, Image("x", "https://example.com/a.png")) == (
+        assert await vision.download(client, "https://example.com/a.png") == (
             "not hosted by Discord"
         )
 
@@ -155,7 +154,7 @@ CDN_FILES = {
 }
 
 
-def vision(answer="Image 1: a stage.", error: Exception | None = None, fallback=False):
+def fake_vision(answer="Image 1: a stage.", error: Exception | None = None, fallback=False):
     seen = []
 
     def respond(messages, info: AgentInfo) -> ModelResponse:
@@ -175,7 +174,7 @@ async def read(db, vision_model, message_id=70, question=None, files=CDN_FILES):
 
 async def test_reads_a_gallery_image_by_image_and_as_a_whole(db):
     await add(db, 70, "opening night!!", GALLERY)
-    model, seen = vision("Image 1: ...\nGallery: the whole show.")
+    model, seen = fake_vision("Image 1: ...\nGallery: the whole show.")
     result = await read(db, model, question="who is on stage?")
     assert result["description"] == "Image 1: ...\nGallery: the whole show."
     assert result["message"]["author"] == "u1 Alex"
@@ -207,7 +206,7 @@ async def test_reads_a_gallery_image_by_image_and_as_a_whole(db):
 
 async def test_reads_a_single_image(db):
     await add(db, 71, "", {"attachments": [attachment("a.png")]})
-    model, seen = vision()
+    model, seen = fake_vision()
     result = await read(db, model, 71)
     assert result["description"] == "Image 1: a stage."
     assert result["images"] == [{"image": 1, "name": "a.png"}]
@@ -218,7 +217,7 @@ async def test_explains_messages_it_cannot_read(db):
     await add(db, 72, "no pictures", {"attachments": [attachment("notes.pdf", "text/plain")]})
     await add(db, 73, "expired", {"attachments": [attachment("gone.png")]})
     await add(db, 74, "elsewhere", {"attachments": [attachment("a.png")]}, guild=7)
-    model, seen = vision()
+    model, seen = fake_vision()
     assert await read(db, model, 72) == {"error": "that message has no images"}
     assert (await read(db, model, 73))["error"] == "none of the images could be downloaded"
     assert await read(db, model, 74) == {"error": "no such message in this server"}
@@ -231,7 +230,7 @@ async def test_reads_only_messages_kiki_may_see(db):
     await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 78")
     await add(db, 79, "ignored", {"attachments": [attachment("a.png")]}, author_id=200)
     await db.execute("INSERT INTO ignored_authors (user_id) VALUES (200)")
-    model, seen = vision()
+    model, seen = fake_vision()
     assert await read(db, model, 78) == {"error": "no such message in this server"}
     assert await read(db, model, 79) == {"error": "no such message in this server"}
     assert seen == []
@@ -249,7 +248,7 @@ async def test_reads_only_messages_kiki_may_see(db):
 async def test_vision_failures_become_errors_for_kiki(db, status, fallback, expected):
     await add(db, 75, "", {"attachments": [attachment("a.png")]})
     error = ModelHTTPError(status, "test/vision", body={"message": "No endpoints support images"})
-    model, _ = vision(error=error, fallback=fallback)
+    model, _ = fake_vision(error=error, fallback=fallback)
     result = await read(db, model, 75)
     assert expected in result["error"]
     assert result["images"] == [{"image": 1, "name": "a.png"}]

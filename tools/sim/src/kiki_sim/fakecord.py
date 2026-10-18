@@ -86,6 +86,10 @@ class World:
             if channel["type"] in (10, 11, 12):
                 channel["thread_metadata"] = {"archived": False, "archive_timestamp": iso(0)}
             self.channels[name] = channel
+        # Custom emoji: `description` is what the stub vision model answers.
+        self.emojis: dict[str, dict] = {}
+        for name, e in (fixture.get("emojis") or {}).items():
+            self.add_emoji(name, e)
         self.messages: dict[str, dict] = {}  # id → payload, insertion (= id) order
         self.deleted: set[str] = set()
         self.reactions: list[dict] = []  # {message_id, emoji, action, at}
@@ -144,6 +148,23 @@ class World:
             "joined_at": iso(DISCORD_EPOCH_MS + 86400000),
             "permissions": str(ADMINISTRATOR if m["admin"] else 0),
         }
+
+    def add_emoji(self, name: str, spec: dict) -> dict:
+        emoji = {
+            "id": str(spec["id"]),
+            "name": name,
+            "animated": bool(spec.get("animated", False)),
+            "available": bool(spec.get("available", True)),
+            "require_colons": True,
+            "managed": False,
+            "roles": [],
+            "description": spec.get("description"),
+        }
+        self.emojis[emoji["id"]] = emoji
+        return emoji
+
+    def emoji_payloads(self) -> list[dict]:
+        return [{k: v for k, v in e.items() if k != "description"} for e in self.emojis.values()]
 
     # --- messages ----------------------------------------------------------
 
@@ -274,14 +295,6 @@ class Fakecord:
     def media_base(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
-    async def cdn(self, request: web.Request) -> web.StreamResponse:
-        """Attachment downloads; `?ex=` is ignored, like an unexpired signed URL."""
-        found = self.world.files.get(request.match_info["path"])
-        if found is None:
-            return web.Response(status=404, text="This content is no longer available.")
-        body, content_type = found
-        return web.Response(body=body, content_type=content_type)
-
     # --- Gateway -----------------------------------------------------------
 
     async def gateway(self, request: web.Request) -> web.WebSocketResponse:
@@ -392,6 +405,8 @@ class Fakecord:
             return json_response(commands)
         if route == f"GET guilds/{g}":
             return json_response({**w.guild, "roles": self.roles()})
+        if route == f"GET guilds/{g}/emojis":
+            return json_response(w.emoji_payloads())
         if route == f"GET guilds/{g}/channels":
             return json_response([c for c in w.channels.values() if c["type"] not in (10, 11, 12)])
         if route == f"GET guilds/{g}/threads/active":
@@ -491,6 +506,19 @@ class Fakecord:
                 return entry
         return None
 
+    async def cdn(self, request: web.Request) -> web.StreamResponse:
+        """Discord's CDN: emoji images, and attachments (`?ex=` is ignored, like an
+        unexpired signed URL). Images are PNGs labeled for the stub vision model."""
+        path = request.match_info["path"]
+        if (m := re.fullmatch(r"emojis/(\d+)\.png", path)) and m[1] in self.world.emojis:
+            emoji = self.world.emojis[m[1]]
+            return web.Response(body=png(f"emoji :{emoji['name']}:"), content_type="image/png")
+        if found := self.world.files.get(path):
+            body, content_type = found
+            return web.Response(body=body, content_type=content_type)
+        self.world.unexpected.append({"method": request.method, "path": f"cdn/{path}"})
+        return web.Response(status=404, text="This content is no longer available.")
+
     def jev(self, body: dict) -> dict:
         state = body["state"]
         new = state["new_messages"]
@@ -546,7 +574,16 @@ class Fakecord:
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
         if pictures := image_parts(messages):
             record["kind"] = "vision"
-            message = {"role": "assistant", "content": describe(pictures, body.get("model"))}
+            prompt = " ".join(content_text(m.get("content")) for m in messages)
+            if "custom Discord emoji" in prompt:
+                # Describing a custom emoji: the fixture's description, by name.
+                record["kind"] = "emoji"
+                name = (re.search(r":(\w+):", prompt) or [None, ""])[1]
+                emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
+                text = emoji.get("description") or f"stub description of :{name}:"
+            else:
+                text = describe(pictures, body.get("model"))
+            message = {"role": "assistant", "content": text}
         elif record["kind"] == "topic":
             message = {"role": "assistant", "content": "stub topic"}
         else:
@@ -666,6 +703,12 @@ class Fakecord:
             message["edited_timestamp"] = iso(time.time() * 1000)
             await self.dispatch("MESSAGE_UPDATE", message)
             return web.json_response(message)
+        if route == "POST emojis":
+            # A server admin adds an emoji (no Gateway event: Kiki resyncs by command).
+            return web.json_response(w.add_emoji(body["name"], body))
+        if m := re.fullmatch(r"DELETE emojis/(\w+)", route):
+            w.emojis = {k: e for k, e in w.emojis.items() if e["name"] != m[1]}
+            return web.json_response({"ok": True})
         if route == "POST interactions":
             return web.json_response(await self.interaction(body))
         raise web.HTTPNotFound(text=f"no control route {route}")
@@ -738,8 +781,8 @@ class Fakecord:
         app.router.add_get("/gateway/", self.gateway)
         app.router.add_route("*", "/api/v10/{path:.*}", self.rest)
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
+        app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
-        app.router.add_get("/cdn/{path:.*}", self.cdn)
         return app
 
 

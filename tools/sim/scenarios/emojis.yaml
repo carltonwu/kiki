@@ -1,0 +1,24 @@
+name: /kiki emojis resyncs and describes custom emoji, and Kiki finds them with her tools
+steps:
+  - slash: {as: alex, in: general, command: emojis}
+  - expect: {response_contains: "no custom emoji synced yet"}
+  - slash: {as: sam, in: general, command: emojis, options: {resync: true}}
+  - expect: {response_contains: "manage server"}
+  - slash: {as: alex, in: general, command: emojis, options: {resync: true}}
+  - expect: {response_contains: "3 new, 0 renamed, 0 removed"}
+  - expect: {response_contains: "described 3 ("}
+  - expect: {response_contains: "<a:tannah:900000000000005003>"}
+  - expect: {sql: "SELECT count(*) FROM guild_emojis WHERE description LIKE '%confusion%' AND embedding IS NOT NULL", equals: 1}
+  # Only the new emoji is described on the next resync; a deleted one is marked removed.
+  - add_emoji: {name: bruh, id: 900000000000005004, description: "a deadpan stare, for an unimpressed bruh"}
+  - remove_emoji: monkeded
+  - slash: {as: alex, in: general, command: emojis, options: {resync: true}}
+  - expect: {response_contains: "1 new, 0 renamed, 1 removed"}
+  - expect: {response_contains: "described 1 ("}
+  - expect: {sql: "SELECT count(*) FROM guild_emojis WHERE removed_at IS NULL AND description IS NOT NULL", equals: 3}
+  - say: {as: alex, in: general, text: "kiki how do you feel about mondays"}
+    reply: {tool: {name: search_emojis, args: {query: "unimpressed"}}, text: "mondays {result}"}
+  - expect: {reply: true, tool_called: search_emojis, prompt_contains: "search_emojis", text_contains: "<:bruh:900000000000005004>"}
+  - say: {as: sam, in: general, text: "kiki what does <:huh:900000000000005001> mean"}
+    reply: {tool: {name: find_emoji, args: {name: "<:huh:900000000000005001>"}}, text: "found it"}
+  - expect: {reply: true, tool_called: find_emoji, tool_result_contains: "squinting in confusion"}

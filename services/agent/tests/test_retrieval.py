@@ -271,7 +271,14 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # TestModel calls each tool once (with placeholder arguments), then answers
     # with their results.
     assert result.steps == 2
-    assert set(json.loads(result.text)) == {"search_messages", "get_message_context", "read_image"}
-    assert result.usage.cost == pytest.approx(0.002)  # indexing + query embedding
+    assert set(json.loads(result.text)) == {
+        "search_messages",
+        "get_message_context",
+        "read_image",
+        "search_emojis",
+        "find_emoji",
+    }
+    # Message indexing plus the two searches' query embeddings.
+    assert result.usage.cost == pytest.approx(0.003)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1

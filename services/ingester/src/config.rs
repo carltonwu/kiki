@@ -137,6 +137,9 @@ pub struct AgentConfig {
     pub host_timeout: Duration,
     pub chat_model: String,
     pub topic_model: String,
+    /// `OPENROUTER_EMOJI_MODEL`: the vision model that describes custom emoji
+    /// (`/kiki emojis resync:true`).
+    pub emoji_model: String,
     /// `AGENT_HISTORY_MESSAGES`: conversation messages sent with each run.
     pub history_messages: i64,
     /// `AGENT_RUN_MAX_AGE_SECS`: runs queued longer ago than this get no reply
@@ -169,6 +172,11 @@ impl AgentConfig {
             host_timeout: Duration::from_millis(timeout_ms),
             topic_model: std::env::var("OPENROUTER_TOPIC_MODEL")
                 .unwrap_or_else(|_| chat_model.clone()),
+            emoji_model: std::env::var("OPENROUTER_EMOJI_MODEL")
+                .map(|m| m.trim().to_owned())
+                .ok()
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "google/gemini-2.5-flash-lite".into()),
             chat_model,
             history_messages,
             run_max_age: Duration::from_secs(env_or("AGENT_RUN_MAX_AGE_SECS", 120)?),

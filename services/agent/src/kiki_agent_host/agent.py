@@ -12,6 +12,7 @@ from psycopg import AsyncConnection, OperationalError
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
+    BinaryContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
@@ -24,9 +25,17 @@ from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
 
-from . import images, retrieval
-from .contracts import JobRequest, JobResult, Message, Usage
+from . import emojis, images, retrieval
+from .contracts import (
+    DescribeEmojisRequest,
+    DescribeEmojisResult,
+    JobRequest,
+    JobResult,
+    Message,
+    Usage,
+)
 from .executor import TransientError
+from .vision import Vision, billed_cost, look
 
 logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
@@ -46,7 +55,7 @@ class Deps:
     scope: retrieval.Scope
     embed: retrieval.Embedder
     roster: retrieval.Roster
-    vision: images.Vision
+    vision: Vision
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
@@ -78,7 +87,7 @@ async def guarded(
         ctx.deps.scope.channel_id,
         ctx.deps.scope.conversation_id,
         (time.monotonic() - started) * 1000,
-        len(result.get("messages", result.get("images", []))),
+        len(result.get("messages", result.get("images", result.get("emojis", [])))),
         result.get("semantic", "-"),
         "error" if outcome == "ok" and "error" in result else outcome,
     )
@@ -179,6 +188,38 @@ async def read_image(ctx: RunContext[Deps], message_id: str, question: str | Non
     return await guarded(ctx, "read_image", work, VISION_TIMEOUT_SECONDS)
 
 
+async def search_emojis(ctx: RunContext[Deps], query: str, limit: int = 5) -> dict:
+    """Find this server's custom emoji by mood, reaction or what they show.
+
+    To use one, write its `emoji` exactly as returned, like <:name:id>.
+
+    Args:
+        query: The feeling, reaction or subject, like "confused" or "laughing so hard".
+        limit: Maximum results, up to 10.
+    """
+
+    async def work():
+        return await emojis.search(
+            ctx.deps.connection, ctx.deps.embed, ctx.deps.scope.guild_id, query, limit
+        )
+
+    return await guarded(ctx, "search_emojis", work)
+
+
+async def find_emoji(ctx: RunContext[Deps], name: str) -> dict:
+    """Look up this server's custom emoji by name, or explain one someone used.
+
+    Args:
+        name: An emoji name like huh or :huh:, or an emoji as it appears in a
+            message, like <:huh:1085017182301339648>.
+    """
+
+    async def work():
+        return await emojis.find(ctx.deps.connection, ctx.deps.scope.guild_id, name)
+
+    return await guarded(ctx, "find_emoji", work)
+
+
 async def index_guild(deps: Deps) -> retrieval.Semantic:
     try:
         found, more = await retrieval.index_pending(
@@ -213,7 +254,10 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-chat = Agent(deps_type=Deps, tools=[search_messages, get_message_context, read_image])
+chat = Agent(
+    deps_type=Deps,
+    tools=[search_messages, get_message_context, read_image, search_emojis, find_emoji],
+)
 plain = Agent()
 
 
@@ -261,7 +305,7 @@ class PydanticExecutor:
         }
         embed = retrieval.Embedder(self.embeddings)
         vision_name = self.vision_model or request.model
-        vision = images.Vision(self.model(vision_name), vision_name, not self.vision_model)
+        vision = Vision(self.model(vision_name), vision_name, not self.vision_model)
         try:
             if request.kind == "topic":
                 result = await plain.run(prompt, **options)
@@ -297,13 +341,7 @@ class PydanticExecutor:
             raise TransientError(type(e).__name__) from e
 
         usage = result.usage
-        # OpenRouter's billed cost per response; Pydantic's price table lags new models.
-        billed = [
-            m.provider_details["cost"]
-            for m in result.new_messages()
-            if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
-        ]
-        cost = sum(billed) if billed else (float(usage.cost) if usage.cost is not None else None)
+        cost = billed_cost(result)
         if embed.cost or vision.cost:
             cost = (cost or 0) + embed.cost + vision.cost
         logger.info(
@@ -331,3 +369,36 @@ class PydanticExecutor:
                 prompt_tokens=usage.input_tokens, completion_tokens=usage.output_tokens, cost=cost
             ),
         )
+
+    async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:
+        """Describes one batch of the guild's undescribed emoji with a vision model."""
+        # The same model call as read_image; the model is Rust's OPENROUTER_EMOJI_MODEL.
+        vision = Vision(self.model(request.model), request.model)
+
+        async def describe(
+            name: str, animated: bool, image: BinaryContent
+        ) -> tuple[str, float | None]:
+            prompt = emojis.PROMPT.format(
+                name=name, animated=" (animated; this is its first frame)" if animated else ""
+            )
+            spent = vision.cost
+            text = await look(vision, [prompt, image], max_tokens=200)
+            return text, vision.cost - spent
+
+        embed = retrieval.Embedder(self.embeddings)
+        try:
+            async with await AsyncConnection.connect(
+                self.database_url, autocommit=True, connect_timeout=10
+            ) as connection:
+                counts = await emojis.describe_pending(
+                    connection,
+                    describe,
+                    embed,
+                    guild_id=int(request.guild_id),
+                    model=request.model,
+                    attempted_before=emojis.epoch_ms(request.attempted_before_ms),
+                    redescribe=request.redescribe,
+                )
+        except OperationalError as e:
+            raise TransientError(type(e).__name__) from e
+        return DescribeEmojisResult(**counts)

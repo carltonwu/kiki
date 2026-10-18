@@ -124,6 +124,7 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
 | `/kiki users [period] [sort]` | Top 20 active people by cost (default), messages or conversations. Period: `24h`, `7d` (default) or `all`. Shows total messages, messages with Kiki, conversations and attributed LLM cost. |
+| `/kiki emojis [resync] [redescribe]` | The server's custom emoji with Kiki's description of each. `resync:true` copies the list from Discord, marks deleted emoji removed, and has a vision model describe new ones; `redescribe:true` also replaces existing descriptions. Resyncing requires Manage Server. |
 | `/kiki whois <user>` | Up to 15 recently seen names (nickname, display name, username), first/last seen, join and message dates, plus messages, conversations and attributed cost over 24 h, 7 d and all time. |
 
 Per-person cost splits reply cost across the triggering messages and includes Decide;
@@ -154,6 +155,15 @@ extra suggestion to use one phrase (default 35%, range 0–100). Setting it to 0
 removes the extra suggestion; the phrase list remains in the prompt, so natural
 use is still possible. Selection is stable for the triggering message and retries.
 There is no automatic phrase learning or Discord command to edit the phrase list.
+
+Every custom emoji of a server is also in `guild_emojis` (migration 0017), with a
+one- or two-sentence description written by a vision model (`OPENROUTER_EMOJI_MODEL`,
+default `google/gemini-2.5-flash-lite`, about $0.0001 per emoji). Replies can look
+them up with the `search_emojis` (by mood or meaning) and `find_emoji` (by name, or
+to explain `<:name:id>` in a message) tools. The list only changes on
+`/kiki emojis resync:true`: run it after adding, renaming or deleting emoji. Each
+resync describes only emoji without a description, and tries each at most once;
+run it again to retry failures.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

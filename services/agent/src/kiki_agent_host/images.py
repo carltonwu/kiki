@@ -6,12 +6,11 @@ is a Discord gallery: it's read in one call, image by image and as a whole.
 
 Images come only from the stored message's own payload (attachments and image
 embeds), never from model arguments, and are downloaded only from Discord's
-media hosts, so a message can't make the host fetch an arbitrary URL.
+media hosts (`vision.download`), so a message can't make the host fetch an
+arbitrary URL.
 """
 
 import asyncio
-import logging
-import os
 import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -19,19 +18,13 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import BinaryContent, ModelResponse, UserContent
-from pydantic_ai.models import Model
+from pydantic_ai.messages import UserContent
 
 from .retrieval import HEARD, MENTION, Roster, Scope, channel_names, speakers
-
-logger = logging.getLogger(__name__)
+from .vision import MAX_BYTES, Vision, VisionError, client, download, look
 
 MAX_IMAGES = 10  # Discord's attachment limit per message
-MAX_BYTES = 5 * 1024 * 1024  # the strictest common provider limit per image
 MAX_SIDE = 1568  # larger images are downscaled by Discord's media proxy
-DOWNLOAD_TIMEOUT_SECONDS = 10
 MAX_OUTPUT_TOKENS = 3000
 # Same test as the prompt's image markers (Rust `context::MESSAGE_COLUMNS`).
 IMAGE_NAME = re.compile(r"\.(png|jpe?g|gif|webp)$", re.IGNORECASE)
@@ -67,8 +60,6 @@ Image 2: <description>
 Gallery: <only for several images: how they relate (a sequence, story, \
 comparison, before and after, variations), what they add up to together, and \
 anything that only makes sense across them>"""
-
-reader = Agent(instructions=INSTRUCTIONS)
 
 
 @dataclass(frozen=True)
@@ -115,73 +106,11 @@ def sized(media: dict, proxied: bool = False) -> str | None:
     return parts._replace(query=urlencode(query + list(size.items()))).geturl()
 
 
-def allowed(url: str) -> bool:
-    """Discord's CDN and media proxy, plus `DISCORD_MEDIA_EXTRA_HOSTS` (the sim)."""
-    parts = urlsplit(url)
-    extra = {h.strip() for h in os.getenv("DISCORD_MEDIA_EXTRA_HOSTS", "").split(",")} - {""}
-    if parts.netloc in extra:
-        return parts.scheme in ("http", "https")
-    host = parts.hostname or ""
-    discord = host.endswith((".discordapp.com", ".discordapp.net", ".discord.com"))
-    return parts.scheme == "https" and discord and parts.port is None
-
-
-async def download(client: httpx.AsyncClient, image: Image) -> BinaryContent | str:
-    """The image, or why it couldn't be read."""
-    if not allowed(image.url):
-        return "not hosted by Discord"
-    try:
-        async with client.stream("GET", image.url) as response:
-            if response.status_code in (403, 404, 410):
-                return "no longer available (deleted, or an expired Discord link)"
-            if response.status_code != 200:
-                return f"download failed (HTTP {response.status_code})"
-            header = response.headers.get("content-type", "").split(";")[0].strip().lower()
-            data = bytearray()
-            async for chunk in response.aiter_bytes():
-                data += chunk
-                if len(data) > MAX_BYTES:
-                    return "too large"
-    except httpx.HTTPError as error:
-        return f"download failed ({type(error).__name__})"
-    # The bytes decide: a renamed file (a JPEG saved as .png) or a mislabeled
-    # response would otherwise be sent under the wrong type, and providers reject
-    # an image whose bytes don't match its declared type.
-    media_type = sniff(bytes(data[:12]))
-    if media_type is None:
-        return f"unsupported format ({header or image.media_type or 'unknown'})"
-    return BinaryContent(bytes(data), media_type=media_type)
-
-
-def sniff(head: bytes) -> str | None:
-    """The supported image type these leading bytes start, if any."""
-    if head.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if head.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if head.startswith((b"GIF87a", b"GIF89a")):
-        return "image/gif"
-    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
-        return "image/webp"
-    return None
-
-
 MESSAGE = f"""
 SELECT m.id, m.channel_id, m.author_id, m.author_name, m.content, m.raw
 FROM messages m
 WHERE m.id = %(id)s AND m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {HEARD}
 """
-
-
-@dataclass
-class Vision:
-    """The model that reads images; `fallback` means it's the chat model."""
-
-    model: Model
-    name: str
-    fallback: bool
-    cost: float = 0.0
-    calls: int = 0
 
 
 async def read_image(
@@ -203,10 +132,10 @@ async def read_image(
     if not images:
         return {"error": "that message has no images"}
 
-    async with httpx.AsyncClient(
-        timeout=DOWNLOAD_TIMEOUT_SECONDS, follow_redirects=False, transport=transport
-    ) as client:
-        downloads = await asyncio.gather(*(download(client, image) for image in images))
+    async with client(transport) as http:
+        downloads = await asyncio.gather(
+            *(download(http, image.url, image.media_type) for image in images)
+        )
 
     mentioned = {int(i) for i in MENTION.findall(m["content"])}
     names = await speakers(connection, scope, roster, {m["author_id"], *mentioned})
@@ -248,58 +177,13 @@ async def read_image(
         skipped = ", ".join(str(n) for n, got in enumerate(downloads, 1) if isinstance(got, str))
         prompt.append(f"(Image(s) {skipped} couldn't be loaded; describe the rest.)")
 
-    description = await describe(vision, prompt, len(readable))
-    if isinstance(description, dict):
-        return result | description
-    return result | {"description": description}
-
-
-async def describe(vision: Vision, prompt: list[UserContent], count: int) -> str | dict:
-    """The vision model's description, or an error for Kiki."""
-    vision.calls += 1
     try:
-        run = await reader.run(
+        description = await look(
+            vision,
             prompt,
-            model=vision.model,
-            model_settings={
-                "max_tokens": min(MAX_OUTPUT_TOKENS, 600 + 400 * count),
-                "openrouter_usage": {"include": True},
-            },
+            instructions=INSTRUCTIONS,
+            max_tokens=min(MAX_OUTPUT_TOKENS, 600 + 400 * len(readable)),
         )
-    except ModelHTTPError as error:
-        logger.warning(
-            "vision call failed model=%s fallback=%s status=%d",
-            vision.name,
-            vision.fallback,
-            error.status_code,
-        )
-        if error.status_code == 429 or error.status_code >= 500:
-            return {"error": "The image model is unavailable right now; try again later."}
-        if vision.fallback:
-            return {
-                "error": "No vision model is configured (OPENROUTER_VISION_MODEL), and the "
-                f"chat model {vision.name} can't read images. Tell them you can't see "
-                "images right now."
-            }
-        return {"error": f"The image model {vision.name} rejected these images."}
-    except (ModelAPIError, UnexpectedModelBehavior) as error:
-        logger.warning(
-            "vision call failed model=%s error_type=%s", vision.name, type(error).__name__
-        )
-        return {"error": "The image model is unavailable right now; try again later."}
-    vision.cost += billed_cost(run.new_messages(), run.usage)
-    if not run.output.strip():
-        return {"error": "The image model returned no description."}
-    return run.output.strip()
-
-
-def billed_cost(messages, usage) -> float:
-    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
-    billed = [
-        m.provider_details["cost"]
-        for m in messages
-        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
-    ]
-    if billed:
-        return float(sum(billed))
-    return float(usage.cost) if getattr(usage, "cost", None) is not None else 0.0
+    except VisionError as error:
+        return result | {"error": str(error)}
+    return result | {"description": description}

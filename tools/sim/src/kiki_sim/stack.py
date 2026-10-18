@@ -229,6 +229,8 @@ class Config:
             "AGENT_HOST_TOKEN": HOST_TOKEN,
             # Attachments are served by fakecord, not Discord's CDN.
             "DISCORD_MEDIA_EXTRA_HOSTS": f"127.0.0.1:{FAKECORD_PORT}",
+            # The fake guild's emoji images, in live mode too.
+            "DISCORD_CDN_URL": f"http://127.0.0.1:{FAKECORD_PORT}/cdn",
         }
         if self.live:
             keys = live_keys()

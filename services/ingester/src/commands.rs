@@ -11,7 +11,11 @@
 //! the one layout that lines up on every client. Mentions and `<t:…>`
 //! timestamps don't render inside code blocks, so those go in embed fields.
 
-use std::{fmt::Write, sync::Arc, time::Duration};
+use std::{
+    fmt::Write,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use serde_json::Value;
@@ -38,9 +42,10 @@ use twilight_util::builder::{
 };
 
 use crate::{
+    agent::host::{DescribeEmojis, EmojisDescribed, Host},
     catch_up::snowflake,
     config::{AgentConfig, RouterConfig},
-    conversation, guild_settings,
+    conversation, emojis, guild_settings,
     rest::get_json,
     router::unix_millis,
 };
@@ -71,6 +76,9 @@ const WINDOW_COLUMNS: [(&str, Align); 4] = [
     (WINDOWS[2].1, Align::Right),
 ];
 const MAX_USER_ROWS: usize = 20;
+/// A resync describes emoji until done or this long has passed; the
+/// interaction token that answers it lasts 15 minutes.
+const DESCRIBE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// How per-person cost is attributed.
 const COST_NOTE: &str = "Cost: replies split across the messages that triggered them, plus Decide; topic summaries excluded";
 
@@ -103,6 +111,8 @@ pub struct Settings {
     decide_enabled: bool,
     global: Vec<(&'static str, String)>,
     guilds: Arc<guild_settings::Store>,
+    /// The agent host and vision model that describe emoji; `None` without a host.
+    describer: Option<(Host, String)>,
 }
 
 impl Settings {
@@ -110,9 +120,12 @@ impl Settings {
         router: &RouterConfig,
         agent: &AgentConfig,
         guilds: Arc<guild_settings::Store>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let enabled = agent.host_url.is_some();
-        Self {
+        let describer = enabled
+            .then(|| anyhow::Ok((Host::new(agent)?, agent.emoji_model.clone())))
+            .transpose()?;
+        Ok(Self {
             chat_model: enabled.then(|| agent.chat_model.clone()),
             topic_model: enabled.then(|| agent.topic_model.clone()),
             decide_model: router.jev_model.clone(),
@@ -130,9 +143,18 @@ impl Settings {
                 ("Decide timeout", duration(router.jev_timeout)),
                 ("Host timeout", duration(agent.host_timeout)),
                 ("Run max age", duration(agent.run_max_age)),
+                (
+                    "Emoji model",
+                    if enabled {
+                        agent.emoji_model.clone()
+                    } else {
+                        "off".into()
+                    },
+                ),
             ],
             guilds,
-        }
+            describer,
+        })
     }
 }
 
@@ -299,6 +321,7 @@ impl Commands {
             "config" => self.config(invocation).await?,
             "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
+            "emojis" => self.emojis(invocation).await?,
             other => error_embed(&format!("Unknown subcommand `{other}`.")),
         };
         Ok(vec![embed])
@@ -403,6 +426,87 @@ impl Commands {
             .description(description)
             .timestamp(now())
             .build())
+    }
+
+    /// `/kiki emojis`: the server's custom emoji and Kiki's descriptions of them.
+    /// `resync:true` copies the list from Discord and describes new ones;
+    /// `redescribe:true` also replaces existing descriptions.
+    async fn emojis(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        let flag = |name| {
+            invocation
+                .option(name)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (resync, redescribe) = (flag("resync"), flag("redescribe"));
+        let guild_id = invocation.guild_id;
+        if !resync && !redescribe {
+            let list = emojis::list(&self.db, guild_id).await?;
+            return Ok(emojis_embed(&list, None));
+        }
+        let actor = require_manage_server(invocation, "resync emoji")?;
+        let listed = get_json("guild emojis", || {
+            self.http.emojis(Id::new(guild_id as u64))
+        })
+        .await?
+        .ok_or_else(|| UserError("Kiki can't read this server's emoji.".into()))?;
+        // Anything but a list would mark every emoji removed.
+        let listed = listed
+            .as_array()
+            .context("Discord's emoji list is not an array")?;
+        let synced = emojis::sync(&self.db, guild_id, listed).await?;
+        let mut summary = format!(
+            "Synced {} emoji from Discord: {} new, {} renamed, {} removed.",
+            synced.total, synced.added, synced.renamed, synced.removed
+        );
+        let mut described = EmojisDescribed::default();
+        match &self.settings.describer {
+            None => summary.push_str(" Describing them needs the agent host (`AGENT_HOST_URL`)."),
+            Some((host, model)) => {
+                let request = DescribeEmojis {
+                    guild_id: guild_id.to_string(),
+                    model: model.clone(),
+                    attempted_before_ms: emojis::now_ms(&self.db).await?,
+                    redescribe,
+                };
+                let failed = describe_all(host, &request, &mut described).await.err();
+                let _ = write!(
+                    summary,
+                    " Described {}{} ({}).",
+                    described.described,
+                    match described.failed {
+                        0 => String::new(),
+                        n => format!(", {n} failed"),
+                    },
+                    usd(described.cost.unwrap_or(0.0)),
+                );
+                if let Some(e) = failed {
+                    warn!(
+                        guild_id,
+                        error = format!("{e:#}"),
+                        "describing emoji failed"
+                    );
+                    summary.push_str(" The agent host stopped answering; resync again to finish.");
+                } else if described.remaining > 0 {
+                    summary.push_str(" Out of time; resync again to finish.");
+                } else if described.failed > 0 {
+                    summary.push_str(" Resync again to retry the failed ones.");
+                }
+            }
+        }
+        info!(
+            guild_id,
+            actor,
+            ?synced,
+            described = described.described,
+            failed = described.failed,
+            remaining = described.remaining,
+            cost_usd = described.cost,
+            redescribe,
+            "emoji resynced"
+        );
+        let list = emojis::list(&self.db, guild_id).await?;
+        Ok(emojis_embed(&list, Some(&summary)))
     }
 
     async fn stats(&self, guild_id: i64) -> anyhow::Result<Embed> {
@@ -976,6 +1080,79 @@ impl Commands {
     }
 }
 
+/// Describe batches until none are left, nothing progresses, or the deadline.
+async fn describe_all(
+    host: &Host,
+    request: &DescribeEmojis,
+    total: &mut EmojisDescribed,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + DESCRIBE_DEADLINE;
+    loop {
+        let batch = host.describe_emojis(request).await?;
+        total.described += batch.described;
+        total.failed += batch.failed;
+        total.remaining = batch.remaining;
+        if let Some(cost) = batch.cost {
+            *total.cost.get_or_insert(0.0) += cost;
+        }
+        if batch.remaining == 0 || batch.described + batch.failed == 0 || Instant::now() > deadline
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// One line per emoji (rendered, so admins can check each description), as
+/// many as fit in the embed.
+fn emojis_embed(list: &[emojis::Emoji], summary: Option<&str>) -> Embed {
+    const DESCRIPTION_CHARS: usize = 100;
+    let described = list.iter().filter(|e| e.description.is_some()).count();
+    let mut text = String::new();
+    if let Some(summary) = summary {
+        text.push_str(summary);
+        text.push_str("\n\n");
+    }
+    if list.is_empty() {
+        text.push_str("No custom emoji synced yet. Use `resync:true` to copy them from Discord.");
+    }
+    for (i, emoji) in list.iter().enumerate() {
+        let description = emoji.description.as_deref().map_or_else(
+            || "*not described yet*".to_owned(),
+            |d| truncate(&d.replace('\n', " "), DESCRIPTION_CHARS),
+        );
+        let line = format!(
+            "{} `{}` {}{}\n",
+            emoji.mention(),
+            emoji.name,
+            description,
+            if emoji.available {
+                ""
+            } else {
+                " *(unavailable)*"
+            }
+        );
+        let more = format!("…and {} more.", list.len() - i);
+        if text.chars().count() + line.chars().count() + more.chars().count()
+            > MAX_DESCRIPTION_CHARS
+        {
+            text.push_str(&more);
+            break;
+        }
+        text.push_str(&line);
+    }
+    EmbedBuilder::new()
+        .color(COLOR)
+        .title("Custom emoji")
+        .description(truncate(&text, MAX_DESCRIPTION_CHARS))
+        .footer(EmbedFooterBuilder::new(format!(
+            "{} emoji · {described} described · Kiki finds them with her emoji tools. \
+             Use resync:true after adding emoji.",
+            list.len()
+        )))
+        .timestamp(now())
+        .build()
+}
+
 fn require_manage_server(invocation: &Invocation<'_>, action: &str) -> Result<i64, UserError> {
     let permissions = snowflake(&invocation.member["permissions"])
         .map(|bits| Permissions::from_bits_truncate(bits as u64))
@@ -1195,6 +1372,17 @@ fn definition() -> CommandBuilder {
                         ("Conversations", "conversations"),
                     ]),
                 ),
+        )
+        .option(
+            SubCommandBuilder::new("emojis", "Custom emoji and Kiki's descriptions of them")
+                .option(BooleanBuilder::new(
+                    "resync",
+                    "Copy the emoji list from Discord and describe new emoji",
+                ))
+                .option(BooleanBuilder::new(
+                    "redescribe",
+                    "Resync and describe every emoji again (costs more)",
+                )),
         )
         .option(
             SubCommandBuilder::new("whois", "Someone's names, messages, conversations and cost")
@@ -1511,6 +1699,37 @@ mod tests {
                     .sum::<usize>();
             assert!(size <= 6000, "embed has {size} characters");
         }
+    }
+
+    #[test]
+    fn emoji_list_fits_the_embed_and_says_how_many_are_left_out() {
+        use super::emojis_embed;
+        use crate::emojis::Emoji;
+        let list: Vec<Emoji> = (0..300)
+            .map(|i| Emoji {
+                id: 1_000_000_000_000_000_000 + i,
+                name: format!("emoji_{i}_{}", "x".repeat(20)),
+                animated: i % 2 == 0,
+                available: i % 3 != 0,
+                description: (i % 5 != 0).then(|| "a long\ndescription ".repeat(20)),
+            })
+            .collect();
+        let embed = emojis_embed(&list, Some(&"s".repeat(300)));
+        let description = embed.description.unwrap();
+        assert!(description.chars().count() <= 4096);
+        assert!(description.ends_with("more."), "{description}");
+        assert!(description.contains("<a:emoji_0_"));
+        assert!(description.contains("*not described yet*"));
+        assert!(!description.contains("long\ndescription"));
+        assert!(
+            embed
+                .footer
+                .unwrap()
+                .text
+                .starts_with("300 emoji · 240 described")
+        );
+        let empty = emojis_embed(&[], None).description.unwrap();
+        assert!(empty.contains("resync:true"));
     }
 
     #[test]

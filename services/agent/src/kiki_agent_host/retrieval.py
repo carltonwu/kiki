@@ -47,9 +47,11 @@ class Embedder:
         self.client = client
         self.cost = 0.0
 
-    async def __call__(self, texts: list[str], *, query: bool = False) -> list[str]:
+    async def __call__(
+        self, texts: list[str], *, query: bool = False, instruction: str = QUERY_INSTRUCTION
+    ) -> list[str]:
         if query:
-            texts = [QUERY_INSTRUCTION + t for t in texts]
+            texts = [instruction + t for t in texts]
         response = await self.client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
         self.cost += float(getattr(response.usage, "cost", None) or 0)
         return [
