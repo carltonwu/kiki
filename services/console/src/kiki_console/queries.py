@@ -21,7 +21,18 @@ COSTS = """
     UNION ALL
     SELECT 'console', guild_id, created_at, cost_usd
     FROM console_chat_messages WHERE cost_usd IS NOT NULL
+    UNION ALL
+    SELECT 'drawing', c.guild_id, coalesce(j.finished_at, j.created_at), j.cost_usd
+    FROM agent_image_jobs j JOIN agent_runs r ON r.id = j.run_id
+    JOIN conversations c ON c.id = r.conversation_id
+    WHERE j.cost_usd IS NOT NULL
+    UNION ALL
+    SELECT 'emoji', guild_id, coalesce(described_at, synced_at), describe_cost_usd
+    FROM guild_emojis WHERE describe_cost_usd IS NOT NULL
 """
+
+# Cost kinds, in chart order (charts.SERIES).
+COST_KINDS = ("chat", "decide", "console", "drawing", "emoji")
 
 
 async def rows(db: AsyncConnection, query: str, params=()) -> list[dict]:
@@ -64,12 +75,14 @@ async def windows(db: AsyncConnection, guild_id: int) -> list[dict]:
                  FROM runs WHERE status = 'done' AND at > {since}) AS p95_ms,
               (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'chat') AS chat_cost,
               (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'decide') AS decide_cost,
-              (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'console') AS console_cost
+              (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'console') AS console_cost,
+              (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'drawing') AS drawing_cost,
+              (SELECT coalesce(sum(cost), 0) FROM cost WHERE kind = 'emoji') AS emoji_cost
             """,
             {"g": guild_id, "interval": interval},
         )
         row["label"] = label
-        row["total_cost"] = row["chat_cost"] + row["decide_cost"] + row["console_cost"]
+        row["total_cost"] = sum(row[f"{kind}_cost"] for kind in COST_KINDS)
         out.append(row)
     topics = await one(
         db,
@@ -83,8 +96,8 @@ async def windows(db: AsyncConnection, guild_id: int) -> list[dict]:
 
 
 async def daily_costs(db: AsyncConnection, guild_id: int | None, days: int = 30) -> list[dict]:
-    """One row per day (UTC), oldest first, with chat/decide/console cost."""
-    return await rows(
+    """One row per day (UTC), oldest first, with each kind's cost and the total."""
+    found = await rows(
         db,
         f"""
         WITH d AS (SELECT generate_series(current_date - (%(days)s - 1), current_date,
@@ -95,12 +108,17 @@ async def daily_costs(db: AsyncConnection, guild_id: int | None, days: int = 30)
         SELECT d.day,
                coalesce(sum(c.cost) FILTER (WHERE c.kind = 'chat'), 0) AS chat,
                coalesce(sum(c.cost) FILTER (WHERE c.kind = 'decide'), 0) AS decide,
-               coalesce(sum(c.cost) FILTER (WHERE c.kind = 'console'), 0) AS console
+               coalesce(sum(c.cost) FILTER (WHERE c.kind = 'console'), 0) AS console,
+               coalesce(sum(c.cost) FILTER (WHERE c.kind = 'drawing'), 0) AS drawing,
+               coalesce(sum(c.cost) FILTER (WHERE c.kind = 'emoji'), 0) AS emoji
         FROM d LEFT JOIN c ON c.day = d.day
         GROUP BY d.day ORDER BY d.day
         """,
         {"g": guild_id, "days": days},
     )
+    for day in found:
+        day["total"] = sum(day[kind] for kind in COST_KINDS)
+    return found
 
 
 async def routing(db: AsyncConnection, guild_id: int) -> list[dict]:
@@ -200,6 +218,12 @@ async def run_detail(db: AsyncConnection, guild_id: int, run_id: int) -> dict | 
         WHERE m.id = ANY(%s) AND m.guild_id = %s ORDER BY m.id
         """,
         (run["trigger_message_ids"], guild_id),
+    )
+    run["drawings"] = await rows(
+        db,
+        "SELECT position, status, error, cost_usd, latency_ms, request->'drawing'->>'prompt' AS prompt "
+        "FROM agent_image_jobs WHERE run_id = %s ORDER BY position",
+        (run_id,),
     )
     run["replies"] = await rows(
         db,

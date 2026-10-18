@@ -6,7 +6,13 @@ a <title> for hover, and every chart sits next to a table with the same data.
 
 from html import escape
 
-SERIES = (("chat", "Chat"), ("decide", "Decide"), ("console", "Console"))
+SERIES = (
+    ("chat", "Chat"),
+    ("decide", "Decide"),
+    ("console", "Console"),
+    ("drawing", "Drawings"),
+    ("emoji", "Emoji descriptions"),
+)
 
 
 def usd(amount: float | None) -> str:

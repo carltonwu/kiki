@@ -314,10 +314,22 @@ async def test_dashboard_runs_and_run_detail(env):
         "(9, 7, '{501}', 'done', 0.02, 1500, 'sim/chat', '{502}', now(), %s)",
         (json.dumps({"messages": [{"role": "system", "content": "You are Kiki <system>"}]}),),
     )
+    await db.execute(
+        "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status, cost_usd, "
+        "finished_at) VALUES (9, 0, 501, %s, 'done', 0.04, now())",
+        (json.dumps({"drawing": {"prompt": "a cat in a top hat"}}),),
+    )
+    await db.execute(
+        "INSERT INTO guild_emojis (id, guild_id, name, raw, described_at, describe_cost_usd) "
+        "VALUES (77, %s, 'bruh', '{}', now(), 0.005), (78, %s, 'other', '{}', now(), 9)",
+        (GUILD_A, GUILD_B),
+    )
     await login(client, "code-admin")
     dashboard = await client.get("/g/100")
     assert dashboard.status_code == 200
-    assert "$0.0300" in dashboard.text  # chat + Decide, 24 h
+    # Chat + Decide + drawing + emoji descriptions, 24 h; Beta's emoji isn't counted.
+    assert "$0.0750" in dashboard.text
+    assert "Drawings" in dashboard.text and "Emoji descriptions" in dashboard.text
     assert "keyword" in dashboard.text and "greetings" in dashboard.text
     assert "<svg" in dashboard.text and "sam" in dashboard.text
     runs = await client.get("/g/100/runs", params={"status": "done"})
@@ -328,6 +340,7 @@ async def test_dashboard_runs_and_run_detail(env):
     assert "kiki &lt;b&gt;hi&lt;/b&gt;" in detail.text
     assert "You are Kiki &lt;system&gt;" in detail.text
     assert "hey sam" in detail.text
+    assert "a cat in a top hat" in detail.text
 
 
 async def test_settings_go_through_the_ingester_and_are_audited(env):

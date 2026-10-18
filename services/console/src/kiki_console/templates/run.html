@@ -8,6 +8,7 @@
     <tr><th>Latency</th><td>{{ run.latency_ms | ms }}</td><th>Model calls</th><td>{{ run.steps or "–" }}</td></tr>
     <tr><th>Tokens in/out</th><td>{{ run.prompt_tokens or "–" }} / {{ run.completion_tokens or "–" }}</td><th>Cost</th><td>{{ usd(run.cost_usd) }}</td></tr>
     <tr><th>Topic</th><td colspan="3">{{ run.topic or "–" }}</td></tr>
+    {% if run.reactions %}<tr><th>Reactions</th><td colspan="3">{{ run.reactions | join(" ") }}</td></tr>{% endif %}
   </table>
   {% if run.error %}<div class="error">{{ run.error }}</div>{% endif %}
 </div>
@@ -21,6 +22,19 @@
     {% endfor %}
   </table>
 </div>
+{% if run.drawings %}
+<div class="card">
+  <h2>Drawings</h2>
+  <table>
+    <tr><th>#</th><th>Status</th><th>Prompt</th><th class="num">Time</th><th class="num">Cost</th></tr>
+    {% for d in run.drawings %}
+    <tr><td>{{ d.position }}</td><td class="status-{{ d.status }}">{{ d.status }}</td>
+        <td class="small">{{ d.prompt or "–" }}{% if d.error %}<div class="status-failed">{{ d.error }}</div>{% endif %}</td>
+        <td class="num">{{ d.latency_ms | ms }}</td><td class="num">{{ usd(d.cost_usd) }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
 {% if run.replies %}
 <div class="card"><h2>Kiki's messages</h2>{% for m in run.replies %}<pre>{{ m.content }}</pre>{% endfor %}</div>
 {% elif run.host_result %}

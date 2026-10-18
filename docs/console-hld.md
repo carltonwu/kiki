@@ -26,6 +26,8 @@ Almost everything a dashboard needs is already written to Postgres by the pipeli
 | Model output | `agent_host_jobs.result` | keyed by the run's job ID |
 | Decide (Jev) cost, latency, choice, confidence, error | `classifications` | per message; the pool's newest row counts the cost once |
 | Topic summary cost | `conversations.topic_cost_usd` | no timestamp (all-time only) |
+| Drawing cost | `agent_image_jobs.cost_usd` | per queued picture, separate from the run's cost |
+| Emoji description cost | `guild_emojis.describe_cost_usd` | vision model, per described emoji |
 | Routing checks | `classifications.check_hit`, `outcome` | |
 | Conversations, participants | `conversations`, `conversation_messages` | |
 | People and names | `people`, `user_names` | |

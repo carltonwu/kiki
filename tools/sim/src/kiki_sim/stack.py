@@ -641,7 +641,8 @@ def purge() -> None:
 
 def admin(config: "Config", method: str, path: str, body=None) -> tuple[int, dict]:
     """Calls the ingester's admin API; `{guild}` in the path is the fixture guild."""
-    url = f"http://127.0.0.1:{INGESTER_PORT}/admin/v1{path.replace('{guild}', config.guild_id())}"
+    port = config.ports.ingester
+    url = f"http://127.0.0.1:{port}/admin/v1{path.replace('{guild}', config.guild_id())}"
     request = urllib.request.Request(
         url,
         data=None if body is None else json.dumps(body).encode(),

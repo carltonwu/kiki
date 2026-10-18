@@ -22,6 +22,8 @@
     <tr><td>Chat cost</td>{% for x in windows %}<td class="num">{{ usd(x.chat_cost) }}</td>{% endfor %}</tr>
     <tr><td>Decide cost</td>{% for x in windows %}<td class="num">{{ usd(x.decide_cost) }}</td>{% endfor %}</tr>
     <tr><td>Console chat cost</td>{% for x in windows %}<td class="num">{{ usd(x.console_cost) }}</td>{% endfor %}</tr>
+    <tr><td>Drawings</td>{% for x in windows %}<td class="num">{{ usd(x.drawing_cost) }}</td>{% endfor %}</tr>
+    <tr><td>Emoji descriptions</td>{% for x in windows %}<td class="num">{{ usd(x.emoji_cost) }}</td>{% endfor %}</tr>
     <tr><td>Topic summaries</td>{% for x in windows %}<td class="num">{{ usd(x.topic_cost) if x.topic_cost is defined else "–" }}</td>{% endfor %}</tr>
     <tr><th>Total</th>{% for x in windows %}<th class="num">{{ usd(x.total_cost) }}</th>{% endfor %}</tr>
   </table>
