@@ -139,6 +139,12 @@ impl Agent {
             instructions.push_str(". Don't force extra messages or repeat yourself. ");
         }
         instructions.push_str("Keep each message under 1900 characters. ");
+        if settings.image_generation {
+            instructions.push_str(
+                "You can draw with generate_image when someone asks for an image or one would clearly land better than words. \
+                 It's attached to your first message, so write that message as if the image is posted with it; never paste image links or markdown for it. ",
+            );
+        }
         instructions.push_str(if settings.chat_allow_silence {
             "You may choose silence whenever joining in would add little, especially in a busy chat where people are talking to each other. Being given a message does not mean it needs a response. If you choose silence, return exactly NO_REPLY."
         } else {
@@ -416,7 +422,7 @@ mod lingo_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::{
         sync::Arc,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -440,7 +446,7 @@ mod tests {
 
     /// A pool on a fresh schema with every migration applied, or `None` without
     /// `TEST_DATABASE_URL` (as in the Python tests).
-    async fn database() -> Option<(PgPool, PgPool, String)> {
+    pub(in crate::agent) async fn database() -> Option<(PgPool, PgPool, String)> {
         let url = std::env::var("TEST_DATABASE_URL").ok()?;
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -448,6 +454,19 @@ mod tests {
             .as_nanos();
         let schema = format!("ingester_test_{nanos}");
         let admin = PgPool::connect(&url).await.unwrap();
+        // On a fresh database (CI), the first migration would install the
+        // database-wide vector extension into its own test schema, hiding it from
+        // concurrent tests and dropping it with that schema. Install it in public
+        // once, serialized across tests and processes.
+        let mut setup = admin.acquire().await.unwrap();
+        for statement in [
+            "SELECT pg_advisory_lock(7317001)",
+            "CREATE EXTENSION IF NOT EXISTS vector SCHEMA public",
+            "SELECT pg_advisory_unlock(7317001)",
+        ] {
+            setup.execute(statement).await.unwrap();
+        }
+        drop(setup);
         admin
             .execute(format!("CREATE SCHEMA {schema}").as_str())
             .await
@@ -459,7 +478,7 @@ mod tests {
         Some((admin, db, schema))
     }
 
-    fn agent(db: PgPool) -> Agent {
+    pub(in crate::agent) fn agent(db: PgPool) -> Agent {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = AgentConfig {
             host_url: Some("http://127.0.0.1:9".into()),
@@ -467,6 +486,7 @@ mod tests {
             host_timeout: Duration::from_secs(1),
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            image_model: "test/image".into(),
             emoji_model: "test/vision".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
