@@ -1,6 +1,6 @@
 // Railway infrastructure for Kiki. Review changes with `railway config plan`,
 // then apply with `railway config apply`.
-import { defineRailway, github, postgres, preserve, project, service } from "railway/iac";
+import { defineRailway, github, postgres, preserve, project, service, volume } from "railway/iac";
 
 const REPO = "carltonwu/kiki";
 // Railway's US East (Ashburn, Virginia). Keep every service next to Postgres.
@@ -8,6 +8,7 @@ const REGION = "iad";
 
 export default defineRailway(() => {
   const db = postgres("postgres", { region: REGION });
+  const dbVolume = volume("postgres-volume", { sizeMB: 5000, region: REGION });
 
   const agent = service("agent", {
     source: github(REPO, { branch: "main", checkSuites: true }),
@@ -71,5 +72,5 @@ export default defineRailway(() => {
     },
   });
 
-  return project("kiki", { resources: [db, agent, ingester] });
+  return project("kiki", { resources: [db, dbVolume, agent, ingester] });
 });
