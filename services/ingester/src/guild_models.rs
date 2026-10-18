@@ -67,7 +67,13 @@ mod tests {
         let options: PgConnectOptions = url.parse().unwrap();
         let options = options.options([("search_path", format!("{schema},public"))]);
         let db = PgPool::connect_with(options.clone()).await.unwrap();
-        crate::MIGRATOR.run(&db).await.unwrap();
+        // This setting has no dependency on ingestion or retrieval tables.
+        // Applying just its migration avoids installing the database-wide vector
+        // extension into a competing test's temporary schema on a fresh CI DB.
+        sqlx::raw_sql(include_str!("../migrations/0011_guild_chat_models.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
         assert_eq!(
             effective(&db, 1, "test/default").await.unwrap(),
             "test/default"
