@@ -93,8 +93,13 @@ async fn main() -> anyhow::Result<()> {
         let store = guild_settings.clone();
         let shutdown = shutdown_rx.clone();
         async move {
-            if let Err(e) = store.listen(shutdown).await {
-                warn!(error = %e, "settings listener stopped; other writers' changes apply after a restart");
+            // Retried: without it, other writers' changes would wait for a restart.
+            while let Err(e) = store.clone().listen(shutdown.clone()).await {
+                warn!(error = %e, "settings listener failed; retrying in 5 s");
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             }
         }
     });

@@ -9,7 +9,7 @@ import httpx
 import pytest
 from psycopg import AsyncConnection
 
-from kiki_console import auth
+from kiki_console import auth, chat
 from kiki_console.app import create_app
 from kiki_console.config import Settings
 
@@ -479,3 +479,96 @@ async def test_chat_threads_costs_and_failures(env):
         "/g/100/chat", data={"csrf": token, "thread": thread, "message": "mine?"}
     )
     assert taken.status_code == 422
+
+
+async def test_removed_operator_loses_every_server(env):
+    client, db, fakes = env
+    await login(client, "code-operator")
+    token = client.cookies["kiki_session"]
+    settings = Settings(
+        database_url="postgres://unused",
+        console_url="http://localhost:8095",
+        discord_client_id="cid",
+        discord_client_secret="csecret",
+        ingester_admin_url="",
+        admin_api_token="",
+        operator_ids=frozenset(),
+        discord_api="https://discord.test",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fakes.handler)) as mock:
+        discord = auth.Discord(settings, mock)
+        # Removed from CONSOLE_OPERATOR_IDS and manages nothing: the session ends.
+        assert await auth.load_session(db, discord, token) is None
+        await login(client, "code-operator")
+        fakes.guilds[str(OPERATOR)] = [{"id": str(GUILD_B), "permissions": "32"}]
+        session = await auth.load_session(db, discord, client.cookies["kiki_session"])
+    assert session is not None and not session.operator
+    assert session.guild_ids == {GUILD_B}
+    cursor = await db.execute("SELECT operator, guild_ids FROM console_sessions")
+    assert await cursor.fetchall() == [(False, [GUILD_B])]
+
+
+def test_chat_turns_skip_broken_exchanges():
+    def row(i, role, content, error=None):
+        return (i, role, content, None, None, None, error, None)
+
+    rows = [
+        row(1, "user", "hi"),
+        row(2, "assistant", "hey"),
+        row(3, "user", "crashed, never answered"),
+        row(4, "user", "failed", "host down"),
+        row(5, "user", "blank answer"),
+        row(6, "assistant", "  "),
+        row(7, "user", "long"),
+        row(8, "assistant", "x" * (chat.TURN_CHARS + 5)),
+        row(9, "user", "now"),
+    ]
+    turns = chat.turns(rows, 9)
+    assert [t["content"][:5] for t in turns] == ["hi", "hey", "long", "xxxxx", "now"]
+    assert [t["role"] for t in turns] == ["user", "assistant", "user", "assistant", "user"]
+    assert len(turns[3]["content"]) == chat.TURN_CHARS
+    many = [row(i, "user" if i % 2 else "assistant", f"m{i}") for i in range(1, 102)]
+    window = chat.turns(many, 101)
+    assert len(window) == chat.TURNS and window[0]["role"] == "user"
+    assert window[-1]["content"] == "m101"
+
+
+async def test_chat_rejects_a_second_message_while_answering(env):
+    client, db, fakes = env
+    await login(client, "code-admin")
+    page = await client.get("/g/100/chat")
+    token = csrf(page)
+    thread = re.search(r'name="thread" value="([^"]+)"', page.text).group(1)
+    # A message still being answered (another request, or a crashed one).
+    await db.execute(
+        "INSERT INTO console_chat_messages (thread_id, guild_id, user_id, role, content) "
+        "VALUES (%s, %s, %s, 'user', 'first')",
+        (thread, GUILD_A, ADMIN),
+    )
+    busy = await client.post(
+        "/g/100/chat", data={"csrf": token, "thread": thread, "message": "second"}
+    )
+    assert busy.status_code == 422 and "still answering" in busy.text
+    # Once it's stale it no longer holds the thread, and it isn't resent.
+    await db.execute(
+        "UPDATE console_chat_messages SET created_at = now() - make_interval(secs => %s)",
+        (chat.PENDING_SECONDS + 1,),
+    )
+    sent = await client.post(
+        "/g/100/chat", data={"csrf": token, "thread": thread, "message": "second"}
+    )
+    assert sent.status_code == 303
+    assert [m["content"] for m in fakes.ingester_calls[-1][2]["messages"]] == ["second"]
+
+
+async def test_saving_the_default_prompt_keeps_following_it(env):
+    client, db, _ = env
+    await login(client, "code-admin")
+    token = csrf(await client.get("/g/100/prompts"))
+    saved = await client.post(
+        "/g/100/prompts",
+        data={"csrf": token, "part": "persona", "body": "Where you are: default persona.\r\n"},
+    )
+    assert saved.status_code == 200 and "reset to the default" in saved.text
+    cursor = await db.execute("SELECT count(*) FROM guild_prompts")
+    assert (await cursor.fetchone())[0] == 0

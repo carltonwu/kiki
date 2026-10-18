@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from psycopg import AsyncConnection
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 from . import auth, chat, content, queries
 from .auth import Discord, DiscordAuthError, Session
@@ -78,9 +79,13 @@ def create_app(settings: Settings, http: httpx.AsyncClient | None = None) -> Fas
     async def login_required(request: Request, _: LoginRequired):
         return RedirectResponse("/login", status_code=303)
 
+    # Daily buckets and "today" are UTC whatever the database's default.
+    options = conninfo_to_dict(settings.database_url).get("options") or ""
+    conninfo = make_conninfo(settings.database_url, options=f"{options} -c TimeZone=UTC".strip())
+
     async def database() -> AsyncIterator[AsyncConnection]:
         async with await AsyncConnection.connect(
-            settings.database_url, autocommit=True, connect_timeout=10
+            conninfo, autocommit=True, connect_timeout=10
         ) as connection:
             yield connection
 
@@ -367,6 +372,15 @@ def create_app(settings: Settings, http: httpx.AsyncClient | None = None) -> Fas
         body: Annotated[str, Form()] = "",
         reset: Annotated[str, Form()] = "",
     ):
+        if not reset and part in content.PROMPT_PARTS:
+            # The editor starts from the default: saving it unchanged keeps following
+            # the built-in text (and its future updates) rather than freezing a copy.
+            try:
+                default = (await ingester.prompt(guild_id, session.user_name))[f"{part}_default"]
+            except (IngesterError, KeyError):
+                default = None
+            if default is not None and content.same_text(body, default):
+                reset = "1"
         try:
             await content.set_prompt(db, guild_id, session.user_id, part, None if reset else body)
         except content.Invalid as e:

@@ -170,6 +170,13 @@ async def load_session(db: AsyncConnection, discord: Discord, token: str | None)
     if not row:
         return None
     user_id, user_name, operator, guild_ids, access_token, csrf, since_check = row
+    if operator and user_id not in discord.settings.operator_ids:
+        # Removed from CONSOLE_OPERATOR_IDS: from now on, only the servers they manage.
+        operator = False
+        since_check = RECHECK_GRACE + RECHECK
+        await db.execute(
+            "UPDATE console_sessions SET operator = false WHERE token_hash = %s", (token_hash,)
+        )
     if operator:
         # Access follows the user ID; the server list follows the database.
         guild_ids = await known_guilds(db)

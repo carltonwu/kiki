@@ -17,13 +17,22 @@ class Invalid(Exception):
     pass
 
 
+def normalize(value: str | None) -> str:
+    return (value or "").replace("\r\n", "\n").strip()
+
+
 def text(value: str | None, name: str, limit: int) -> str:
-    value = (value or "").replace("\r\n", "\n").strip()
+    value = normalize(value)
     if not value:
         raise Invalid(f"{name} can't be empty.")
     if len(value) > limit:
         raise Invalid(f"{name} is limited to {limit} characters.")
     return value
+
+
+def same_text(a: str | None, b: str | None) -> bool:
+    """Equal after the normalization `text` applies."""
+    return normalize(a) == normalize(b)
 
 
 async def audit(

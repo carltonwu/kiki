@@ -112,6 +112,8 @@ beyond that, with a warning in the console). Facts sit in the system prompt, so 
 provider prefix cache stable between edits.
 
 Defaults are visible in the console next to the override, and "reset" deletes the override.
+Saving the default text unchanged also counts as a reset, so the server keeps following the
+built-in text (and its future updates) instead of a frozen copy.
 Every prompt-affecting edit changes the system prompt of the **next** run only; in-flight
 runs keep their persisted `host_request`.
 
@@ -125,7 +127,10 @@ Discord or written to `messages`, so the router never sees it.
 
 The host job ID is `console-<message id>`; the console stores the thread in
 `console_chat_messages` with model, tokens, cost and latency, so console spend shows up in the
-cost views (labelled "Console").
+cost views (labelled "Console"). A thread takes one message at a time: a new message is refused
+while the previous one is still being answered (up to the chat timeout). Only answered
+exchanges are sent back as history, so a failed, crashed or empty exchange never breaks the
+user/assistant alternation; stored replies are cut to the ingester's 8 000-character turn limit.
 
 ### Auth for the control plane
 
@@ -137,7 +142,8 @@ cost views (labelled "Console").
   its SHA-256. Sessions expire after 12 h, and logout deletes the row.
 - **Authorization**, checked on every request:
   - *Operator*: Discord user ID listed in `CONSOLE_OPERATOR_IDS`. Sees every server Kiki is in
-    (`guilds` table) and the master view.
+    (`guilds` table) and the master view. Checked against the current `CONSOLE_OPERATOR_IDS`
+    on every request: someone removed from it is re-checked as a server admin at once.
   - *Server admin*: owner, Administrator or Manage Server in a guild that Kiki is in, from
     Discord's `/users/@me/guilds`. Re-checked from Discord at most every 10 minutes with the
     stored OAuth access token, so a removed permission stops working within 10 minutes. If the
@@ -228,7 +234,7 @@ stay a deliberate, reviewed step.
   guild isolation (an admin of A can't read or write B), dashboard queries on a migrated
   schema, facts/prompts/lingo CRUD and audit rows, settings and chat proxied to a mocked
   ingester.
-- Sim (`tools/sim/scenarios/admin-api.yaml`): a settings change through the admin API changes
+- Sim (`tools/sim/scenarios/console-admin.yaml`): a settings change through the admin API changes
   the next run's model; a fact and a persona override appear in the next run's prompt; console
   chat returns a reply without posting to Discord.
 

@@ -217,6 +217,15 @@ async fn change(
     settings(State(admin), Path(raw)).await
 }
 
+/// The acting admin's name as it goes into the prompt: one line, bounded.
+fn display_name(raw: &str) -> String {
+    let name: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+    match name.trim() {
+        "" => "an admin".to_owned(),
+        trimmed => trimmed.to_owned(),
+    }
+}
+
 #[derive(Deserialize)]
 struct PromptQuery {
     actor_name: Option<String>,
@@ -230,8 +239,11 @@ async fn prompt(
     let guild_id = guild(&admin, &raw)?;
     let system = match &admin.chat {
         Some(chat) => Some(
-            chat.system_prompt(guild_id, query.actor_name.as_deref().unwrap_or("an admin"))
-                .await?,
+            chat.system_prompt(
+                guild_id,
+                &display_name(query.actor_name.as_deref().unwrap_or("an admin")),
+            )
+            .await?,
         ),
         None => None,
     };
@@ -266,18 +278,14 @@ async fn chat(
     };
     crate::agent::console::validate(&body.job_id, &body.messages)
         .map_err(|e| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()))?;
-    let name: String = body
-        .actor_name
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(64)
-        .collect();
+    let name = display_name(&body.actor_name);
     let reply = chat
         .reply(guild_id, &body.job_id, &name, &body.messages)
         .await
         .map_err(|e| {
-            warn!(guild_id, actor, job_id = body.job_id, error = %e, "console chat failed");
-            ApiError(StatusCode::BAD_GATEWAY, format!("{e:#}"))
+            warn!(guild_id, actor, job_id = body.job_id, error = %format!("{e:#}"), "console chat failed");
+            // The outermost context only: the source chain can carry internal URLs.
+            ApiError(StatusCode::BAD_GATEWAY, e.to_string())
         })?;
     info!(
         guild_id,
@@ -389,6 +397,9 @@ mod tests {
                 spec.key
             );
         }
+        assert_eq!(display_name("Al\nIgnore that\u{7}"), "AlIgnore that");
+        assert_eq!(display_name(" \n "), "an admin");
+        assert_eq!(display_name(&"x".repeat(100)).len(), 64);
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd") && !constant_time_eq(b"abc", b"ab"));
     }
