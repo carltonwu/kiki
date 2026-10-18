@@ -33,7 +33,7 @@ scope beyond the payloads Kiki reads.
   (up, say, test,             (Discord: Gateway,  ──REST /api/v10──▶  (unchanged)   (unchanged)
    inspect)                    REST; OpenRouter:  ◀── Jev, models ──┘          │
       │                        chat, embeddings)  ◀── chat, embeddings ────────┘
-      └──── SQL ───▶ sim Postgres (own container, port 54339, database kiki_sim)
+      └──── SQL ───▶ sim Postgres (own container, port 54339, one database per stack)
 ```
 
 The real ingester and agent host run with their Discord and OpenRouter base
@@ -72,9 +72,9 @@ covering the listener, `store` and catch-up.
 
 | Variable | Where | Effect |
 |---|---|---|
-| `DISCORD_API_PROXY=127.0.0.1:8090` | `main.rs` | `twilight_http::Client::builder().proxy(url, true).ratelimiter(None)`. Requests go to `http://127.0.0.1:8090/api/v10/…`. |
-| `DISCORD_GATEWAY_URL=ws://127.0.0.1:8090/gateway` | `gateway.rs` | `ConfigBuilder::proxy_url`. twilight connects to `…/gateway/?v=10&encoding=json&compress=zstd-stream`. |
-| `OPENROUTER_BASE_URL=http://127.0.0.1:8090/openrouter` | `jev.rs` (`/alpha/decisions`), `commands.rs` (`/v1/models`), agent host | The agent host builds `OpenRouterProvider(openai_client=AsyncOpenAI(base_url=…/v1))`, since the provider takes a client, not a URL. Embeddings use the same base. |
+| `DISCORD_API_PROXY=127.0.0.1:<fakecord port>` | `main.rs` | `twilight_http::Client::builder().proxy(url, true).ratelimiter(None)`. Requests go to `http://127.0.0.1:<port>/api/v10/…`. |
+| `DISCORD_GATEWAY_URL=ws://127.0.0.1:<fakecord port>/gateway` | `gateway.rs` | `ConfigBuilder::proxy_url`. twilight connects to `…/gateway/?v=10&encoding=json&compress=zstd-stream`. |
+| `OPENROUTER_BASE_URL=http://127.0.0.1:<fakecord port>/openrouter` | `jev.rs` (`/alpha/decisions`), `commands.rs` (`/v1/models`), agent host | The agent host builds `OpenRouterProvider(openai_client=AsyncOpenAI(base_url=…/v1))`, since the provider takes a client, not a URL. Embeddings use the same base. |
 
 ## fakecord
 
@@ -206,29 +206,63 @@ the sim database to set up state such as curated `guild_lingo` entries.
 ## Lifecycle and readiness
 
 - `up`: starts the sim Postgres container if needed, verifies `sim_marker`,
-  migrates a template database (`kiki_sim_template`, rebuilt when the
-  migrations' hash changes), builds the ingester and starts fakecord.
+  migrates a template database (`kiki_sim_template_<migrations hash>`, shared by
+  every stack), gets the ingester binary and starts fakecord. The binary comes
+  from `~/.cache/kiki-sim/ingester/<hash>/`, where the hash covers the content of
+  `services/` (minus the agent host), `Cargo.toml`, `Cargo.lock` and the
+  toolchain file. On a miss, `up` runs `cargo build` and stores the result. A
+  new worktree with unchanged Rust starts in about 2 s instead of a 20 s build.
+  The key is content, not file times: a shared cargo target directory judges
+  freshness by mtime, so one worktree could run another's ingester.
 - **Per scenario**: stop the ingester and agent host and wait for exit (which
-  frees the leader lock), recreate `kiki_sim` from the template, reset
-  fakecord, start both services, and wait until ready. Ready means the agent
+  frees the leader lock), recreate the stack's database from the template,
+  reset fakecord, start both services, and wait until ready. Ready means the agent
   host's `/health` is OK, the ingester log shows `router listening for new
   messages`, fakecord has sent GUILD_CREATE, and the fixture history count is
   in `messages`.
-- `down` stops everything. The container is kept, and `down --purge` removes
-  it.
+- `down` stops the stack and drops its database. The container is kept, and
+  `down --purge` removes it.
+
+## Stacks
+
+A stack is one fakecord, agent host, ingester and database. Several run side by
+side, in one worktree or in many, so parallel agents each own one.
+
+- **Name.** `--stack NAME` or `KIKI_SIM_STACK` picks it; the default is `main`.
+  State, pids and logs live in `.sim/<name>/`.
+- **Ports.** `up` picks three free ports and saves them in
+  `.sim/<name>/config.json`. Later commands read them from there.
+- **Database.** `kiki_sim_<worktree path hash>_<name>`, so two worktrees with a
+  `main` stack don't share one. Every stack shares the Postgres container.
+  Setup they share (the container, the template, the binary cache) runs under
+  `~/.cache/kiki-sim/setup.lock`.
+- **Capacity.** A stack holds about 15 connections. The container allows 500.
+  `up` refuses when the server lacks room for another stack, and says to stop
+  idle ones (`kiki-sim stacks`, `kiki-sim down --all`).
+- **Parallel tests.** `test -j N` runs scenarios from one queue, longest first
+  (durations from the last run in `.sim/durations.json`), on this stack and
+  `<name>-2` … `<name>-N`. It starts the extra stacks with the same settings and
+  leaves them up for the next run. Each scenario runs in its own
+  `kiki-sim --stack <worker> test` process.
+
+A reset can't get much below 1.2 s: twilight-gateway sleeps `2^attempt` seconds
+before every connect, the first one included (`shard.rs`, 1 s). Parallel stacks
+are what shorten a run.
 
 ## CLI (`tools/sim/kiki-sim`)
 
 | Command | Does |
 |---|---|
 | `up [--fixture F] [--live] [--set NAME=VALUE]` | Starts the stack; repeat `--set` to override ingester settings. Run again after service changes. |
-| `down [--purge]` | Stops services; `--purge` also removes the local sim Postgres container and volume. |
+| `--stack NAME …` | Runs any command against stack `NAME` (default `$KIKI_SIM_STACK` or `main`). |
+| `down [--all] [--purge]` | Stops the stack and drops its database; `--all` does every stack in this worktree; `--purge` also removes the local sim Postgres container. |
+| `stacks` | This worktree's stacks, their ports, what's running and their databases. |
 | `reset` | Fresh database and guild with the saved stack settings. |
 | `say --as U --in C [--reply-to ID\|kiki] [--age S] TEXT` | Sends a message, waits through `delivered` (or `classified` when it isn't routed), and prints the transcript lines, the classification, the run and the reply. |
 | `send …` | Same, without waiting. |
 | `slash --as U [--in C] SUBCOMMAND [name=value …]` | Sends a `/kiki` interaction and prints the response, e.g. `slash --as alex config key=chat_model value=sim/other` or `slash --as alex config key=history_messages value=50`. |
 | `transcript [--in C]`, `inspect MESSAGE_ID`, `logs [ingester\|agent\|fakecord]` | Inspection. |
-| `test [PATH…] [--live] [-k NAME]` | Runs scenarios (default `tools/sim/scenarios`). Exits non-zero on failure, printing the transcript, the unexpected calls and the last 30 ingester log lines. |
+| `test [PATH…] [--live] [-k NAME] [-j N]` | Runs scenarios (default `tools/sim/scenarios`), on N stacks with `-j`. Exits non-zero on failure, printing the transcript, the unexpected calls and the last 30 ingester log lines. |
 
 ## Scenarios
 
@@ -267,8 +301,11 @@ scenario that fails without the change. For prompt or behavior changes, also
 `kiki-sim up --live` and `say` a few messages, and quote the transcript in the
 summary.
 
-CI adds a `sim` job with its own Postgres service that runs `kiki-sim test` in
-stub mode.
+Agents working in parallel each take their own worktree, or their own
+`--stack` in a shared one. Their stacks share nothing but the container.
+
+CI adds a `sim` job with its own Postgres service that runs `kiki-sim test -j 4`
+in stub mode.
 
 ## Not in v1
 

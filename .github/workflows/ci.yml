@@ -102,14 +102,14 @@ jobs:
       - run: uv run --project tools/sim --locked ruff check tools/sim
       - run: uv run --project tools/sim --locked ruff format --check tools/sim
       - run: tools/sim/kiki-sim up
-      - run: tools/sim/kiki-sim test
+      - run: tools/sim/kiki-sim test -j 4
       - if: always()
-        run: tools/sim/kiki-sim down
+        run: tools/sim/kiki-sim down --all
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: sim-logs
-          path: .sim/logs/
+          path: .sim/*/logs/
 
   iac:
     runs-on: ubuntu-latest
