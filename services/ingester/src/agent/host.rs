@@ -47,6 +47,17 @@ pub(super) struct JobRequest {
     /// The roster the messages refer to. Absent in requests saved before it existed.
     #[serde(default)]
     pub people: Vec<PersonRef>,
+    /// Offers the `generate_image` tool. Omitted when off, so requests saved
+    /// before it existed compare equal on retry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_model: Option<String>,
+}
+
+/// An image the host saved in `agent_host_images` for this job (the row has
+/// its bytes and MIME type).
+#[derive(Deserialize)]
+pub(super) struct ImageRef {
+    pub id: i64,
 }
 
 #[derive(Deserialize)]
@@ -55,6 +66,8 @@ pub(super) struct JobResult {
     pub model: Option<String>,
     pub steps: i32,
     pub usage: Usage,
+    #[serde(default)]
+    pub images: Vec<ImageRef>,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +249,7 @@ mod tests {
             host_timeout: timeout,
             chat_model: "test/model".into(),
             topic_model: "test/model".into(),
+            image_model: "test/image".into(),
             history_messages: 30,
             run_max_age: Duration::from_secs(120),
             topic_every_messages: 4,
@@ -252,6 +266,7 @@ mod tests {
             messages: vec![Message::user("hello")],
             max_output_tokens: 100,
             people: Vec::new(),
+            image_model: None,
         }
     }
 
@@ -298,6 +313,28 @@ mod tests {
         assert_eq!(requests.len(), 3);
         assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
         assert_eq!(requests[0]["scope"]["guild_id"], "1");
+    }
+
+    #[test]
+    fn image_model_is_omitted_when_off_and_images_default_to_none() {
+        let mut request = serde_json::to_value(job()).unwrap();
+        assert!(request.get("image_model").is_none());
+        let mut with_images = job();
+        with_images.image_model = Some("test/image".into());
+        request = serde_json::to_value(with_images).unwrap();
+        assert_eq!(request["image_model"], "test/image");
+
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }))
+        .unwrap();
+        assert!(result.images.is_empty());
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "images": [{"id": 7, "mime_type": "image/png"}],
+        }))
+        .unwrap();
+        assert_eq!(result.images[0].id, 7);
     }
 
     #[tokio::test]

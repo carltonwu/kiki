@@ -1,15 +1,17 @@
-"""Pydantic AI executor: the SDK owns the loop, these tools search the guild."""
+"""Pydantic AI executor: the SDK owns the loop, these tools search the guild and
+draw images."""
 
 import asyncio
 import contextlib
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
+from openai import APIError, APIStatusError, AsyncOpenAI
 from psycopg import AsyncConnection, OperationalError
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -22,10 +24,11 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import retrieval
-from .contracts import JobRequest, JobResult, Message, Usage
+from . import images, retrieval
+from .contracts import Image, JobRequest, JobResult, Message, Usage
 from .executor import TransientError
 
 logger = logging.getLogger(__name__)
@@ -35,6 +38,8 @@ MAX_TOOL_CALLS = 4
 MAX_MODEL_REQUESTS = 6
 TOOL_TIMEOUT_SECONDS = 10
 EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
+MAX_IMAGES = 2
+IMAGE_TIMEOUT_SECONDS = 60  # image models are slow; still well inside the job timeout
 
 
 @dataclass
@@ -48,21 +53,30 @@ class Deps:
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
+    image_model: str | None = None
+    image_client: AsyncOpenAI | None = None
+    images: list[Image] = field(default_factory=list)
+    image_cost: float = 0.0
 
 
-async def guarded(ctx: RunContext[Deps], name: str, work) -> dict:
+async def guarded(
+    ctx: RunContext[Deps], name: str, work, timeout: float = TOOL_TIMEOUT_SECONDS
+) -> dict:
     ctx.deps.tool_calls += 1
     if ctx.deps.tool_calls > MAX_TOOL_CALLS:
         logger.debug("tool budget exhausted job_id=%s tool=%s", ctx.deps.job_id, name)
-        return {"error": "Search budget used up. Answer with what you have."}
+        return {"error": "Tool budget used up. Answer with what you have."}
     started = time.monotonic()
     outcome = "ok"
     try:
-        async with asyncio.timeout(TOOL_TIMEOUT_SECONDS):
+        async with asyncio.timeout(timeout):
             result = await work()
     except TimeoutError:
         outcome = "timeout"
         result = {"error": "Timed out."}
+    except images.ImageRefused as e:
+        outcome = "refused"
+        result = {"error": str(e)}
     except ValueError as e:
         outcome = "invalid_arguments"
         result = {"error": str(e)}
@@ -151,6 +165,66 @@ async def get_message_context(
     return await guarded(ctx, "get_message_context", work)
 
 
+async def generate_image(ctx: RunContext[Deps], prompt: str) -> dict:
+    """Draw an image and attach it to your reply.
+
+    Use it when someone asks for a picture, drawing, meme or edit-free visual, or
+    when one would clearly land better than words. The image is attached to your
+    first message automatically: don't paste links or markdown for it; just write
+    your message as if it's posted with the image.
+
+    Args:
+        prompt: A complete, self-contained description of the image: subject,
+            style, composition and any text it should contain. The image model
+            can't see this conversation or people's faces, so describe what
+            matters instead of referring to it.
+    """
+
+    async def work():
+        deps = ctx.deps
+        if len(deps.images) >= MAX_IMAGES:
+            return {"error": f"At most {MAX_IMAGES} images per reply. Answer with what you have."}
+        try:
+            data, mime_type, cost = await images.generate(
+                deps.image_client, deps.image_model, prompt
+            )
+        except APIStatusError as e:
+            # Content-policy refusals are 4xx; tell the model rather than failing the reply.
+            logger.warning(
+                "image generation failed job_id=%s status=%d", deps.job_id, e.status_code
+            )
+            return {"error": f"The image model failed (HTTP {e.status_code}). Don't retry."}
+        except APIError as e:
+            logger.warning(
+                "image generation failed job_id=%s error_type=%s", deps.job_id, type(e).__name__
+            )
+            return {"error": "The image model is unreachable. Don't retry."}
+        deps.image_cost += cost
+        image = Image(
+            id=await images.save(deps.connection, deps.job_id, mime_type, data),
+            mime_type=mime_type,
+        )
+        deps.images.append(image)
+        logger.info(
+            "image generated job_id=%s image_id=%d mime_type=%s bytes=%d cost_usd=%s",
+            deps.job_id,
+            image.id,
+            mime_type,
+            len(data),
+            cost,
+        )
+        return {"attached": True, "images_attached": len(deps.images)}
+
+    return await guarded(ctx, "generate_image", work, IMAGE_TIMEOUT_SECONDS)
+
+
+async def only_with_image_model(
+    ctx: RunContext[Deps], tool_def: ToolDefinition
+) -> ToolDefinition | None:
+    """Offers `generate_image` only when the server has image generation on."""
+    return tool_def if ctx.deps.image_model and ctx.deps.image_client else None
+
+
 async def index_guild(deps: Deps) -> retrieval.Semantic:
     try:
         found, more = await retrieval.index_pending(
@@ -185,7 +259,14 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-chat = Agent(deps_type=Deps, tools=[search_messages, get_message_context])
+chat = Agent(
+    deps_type=Deps,
+    tools=[
+        search_messages,
+        get_message_context,
+        Tool(generate_image, prepare=only_with_image_model),
+    ],
+)
 plain = Agent()
 
 
@@ -211,6 +292,10 @@ class PydanticExecutor:
         self.embeddings = retrieval.openrouter_client(
             api_key, timeout=EMBEDDING_TIMEOUT_SECONDS, max_retries=0
         )
+        # No retries: each attempt may be billed, and the tool has its own deadline.
+        self.images = retrieval.openrouter_client(
+            api_key, timeout=IMAGE_TIMEOUT_SECONDS, max_retries=0
+        )
 
     def model(self, name: str) -> Model:
         return OpenRouterModel(name, provider=self.provider)
@@ -230,6 +315,7 @@ class PydanticExecutor:
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
         }
         embed = retrieval.Embedder(self.embeddings)
+        deps = None
         try:
             if request.kind == "topic":
                 result = await plain.run(prompt, **options)
@@ -248,6 +334,8 @@ class PydanticExecutor:
                         embed,
                         retrieval.Roster.of(request.people),
                         job_id=request.id,
+                        image_model=request.image_model,
+                        image_client=self.images,
                     )
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.
@@ -271,11 +359,12 @@ class PydanticExecutor:
             if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
         ]
         cost = sum(billed) if billed else (float(usage.cost) if usage.cost is not None else None)
-        if embed.cost:
-            cost = (cost or 0) + embed.cost
+        extra = embed.cost + (deps.image_cost if deps else 0)
+        if extra:
+            cost = (cost or 0) + extra
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
-            "requests=%d tool_calls=%d prompt_tokens=%d completion_tokens=%d "
+            "requests=%d tool_calls=%d images=%d prompt_tokens=%d completion_tokens=%d "
             "cost_usd=%s latency_ms=%d",
             request.id,
             request.kind,
@@ -284,6 +373,7 @@ class PydanticExecutor:
             request.model,
             usage.requests,
             usage.tool_calls,
+            len(deps.images) if deps else 0,
             usage.input_tokens,
             usage.output_tokens,
             cost,
@@ -296,4 +386,5 @@ class PydanticExecutor:
             usage=Usage(
                 prompt_tokens=usage.input_tokens, completion_tokens=usage.output_tokens, cost=cost
             ),
+            images=deps.images if deps else [],
         )

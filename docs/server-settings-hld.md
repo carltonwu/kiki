@@ -9,7 +9,7 @@ descriptions and defaults. Existing env variables supply startup defaults; the r
 behavioral defaults are in the registry. Overrides live in `guild_settings`, keyed by guild and
 setting, with actor and timestamp. Missing rows inherit current defaults.
 
-The settings are `chat_model`, `keywords`, `pool_debounce`, `pool_max_wait`, `pool_max_messages`,
+The settings are `chat_model`, `image_generation`, `image_model`, `keywords`, `pool_debounce`, `pool_max_wait`, `pool_max_messages`,
 `active_window`, `max_active_conversations`, `decide_min_confidence`,
 `decide_keyword_min_confidence`, `follow_up_window`, `follow_up_max_no_confidence`, `stale_after`,
 `stale_min_confidence`, `decide_recent_messages`, `decide_conversation_preview`, `history_messages`,
@@ -27,7 +27,8 @@ triggers; `value:,` can be used to supply an empty list in Discord.
 - Manage Server is checked at runtime for every write, before catalog requests or database work.
   Chat models retain the existing OpenRouter catalog check for text and tool support. Topic and
   Decide models remain global; the topic default derives from the env chat model, not its guild
-  override.
+  override. `image_model` gets the same catalog check, requiring image output; its default is
+  env `OPENROUTER_IMAGE_MODEL` ([image generation](image-generation.md)).
 
 `follow_up_window` (default 300 seconds, range 0–3600) controls two ways to
 continue an open conversation in the same channel. First, a direct follow-up

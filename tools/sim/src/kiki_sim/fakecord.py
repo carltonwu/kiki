@@ -7,6 +7,7 @@ The CLI drives it through `/_sim/…`; see docs/kiki-sim-hld.md.
 
 import argparse
 import asyncio
+import base64
 import hashlib
 import itertools
 import json
@@ -27,6 +28,11 @@ EMBEDDING_DIMENSIONS = 1024
 ADMINISTRATOR = 1 << 3
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
+STUB_IMAGE_MODELS = ["sim/image"]
+# A 1×1 transparent PNG: what the stub image model "draws".
+STUB_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+)
 
 
 def iso(ms: int) -> str:
@@ -144,6 +150,7 @@ class World:
         *,
         at_ms: float | None = None,
         reply_to: str | None = None,
+        attachments: list[dict] | None = None,
     ) -> dict:
         m = self.member(author)
         c = self.channel(channel)
@@ -172,7 +179,7 @@ class World:
             "mention_everyone": False,
             "mentions": mentions,
             "mention_roles": [],
-            "attachments": [],
+            "attachments": attachments or [],
             "embeds": [],
             "pinned": False,
             "type": 0,
@@ -296,7 +303,11 @@ class Fakecord:
     async def rest(self, request: web.Request) -> web.StreamResponse:
         w = self.world
         path = request.match_info["path"].rstrip("/")
-        body = await request.json() if request.can_read_body else None
+        files: list[dict] = []
+        if request.content_type == "multipart/form-data":
+            body, files = await self.multipart(request)
+        else:
+            body = await request.json() if request.can_read_body else None
         call = {"method": request.method, "path": path, "query": dict(request.query)}
         w.calls.append({**call, "body": body})
         route = f"{request.method} {path}"
@@ -342,7 +353,13 @@ class Fakecord:
         if m := re.fullmatch(r"POST channels/(\d+)/messages", route):
             reference = (body.get("message_reference") or {}).get("message_id")
             reply_to = reference if reference in w.messages else None
-            message = w.create_message("kiki", m[1], body.get("content", ""), reply_to=reply_to)
+            message = w.create_message(
+                "kiki",
+                m[1],
+                body.get("content", ""),
+                reply_to=reply_to,
+                attachments=self.attachments(m[1], body, files),
+            )
             # Discord echoes our own message over the Gateway, usually a bit later.
             asyncio.get_running_loop().call_later(
                 0.05, lambda: asyncio.ensure_future(self.dispatch("MESSAGE_CREATE", message))
@@ -367,6 +384,47 @@ class Fakecord:
         log.warning("unexpected Discord call: %s", route)
         w.unexpected.append(call)
         return json_response({"message": "Unknown (kiki-sim)", "code": 0}, status=404)
+
+    async def multipart(self, request: web.Request) -> tuple[dict, list[dict]]:
+        """Discord uploads: `payload_json` plus `files[n]` parts."""
+        body, files = {}, []
+        reader = await request.multipart()
+        while part := await reader.next():
+            data = await part.read()
+            if part.name == "payload_json":
+                body = json.loads(data)
+            elif part.name and part.name.startswith("files["):
+                files.append(
+                    {
+                        "id": part.name[len("files[") : -1],
+                        "filename": part.filename,
+                        "content_type": part.headers.get("Content-Type"),
+                        "data": bytes(data),
+                    }
+                )
+        return body, files
+
+    def attachments(self, channel_id: str, body: dict, files: list[dict]) -> list[dict]:
+        """Discord's attachment objects for uploaded files, declared in `attachments`."""
+        declared = {str(a["id"]): a for a in body.get("attachments") or []}
+        if set(declared) != {f["id"] for f in files}:
+            raise web.HTTPBadRequest(text="uploaded files don't match payload attachments")
+        found = []
+        for f in files:
+            id = self.world.snowflake(time.time() * 1000)
+            url = f"https://cdn.discordapp.com/attachments/{channel_id}/{id}/{f['filename']}"
+            found.append(
+                {
+                    "id": id,
+                    "filename": declared[f["id"]].get("filename") or f["filename"],
+                    "size": len(f["data"]),
+                    "url": url,
+                    "proxy_url": url,
+                    "content_type": f["content_type"] or sniff(f["data"]),
+                    "sha256": hashlib.sha256(f["data"]).hexdigest(),
+                }
+            )
+        return found
 
     def page(self, channel_id: str, query) -> list[dict]:
         w = self.world
@@ -397,11 +455,23 @@ class Fakecord:
                         }
                         for model in STUB_MODELS
                     ]
+                    + [
+                        {
+                            "id": model,
+                            "name": model,
+                            "architecture": {"output_modalities": ["image", "text"]},
+                            "supported_parameters": [],
+                            "pricing": {"prompt": "0", "completion": "0"},
+                        }
+                        for model in STUB_IMAGE_MODELS
+                    ]
                 }
             )
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
+            if "image" in (body.get("modalities") or []):
+                return web.json_response(self.image(body))
             return web.json_response(self.chat(body))
         if request.method == "POST" and path == "v1/embeddings":
             return web.json_response(embeddings(body))
@@ -536,6 +606,40 @@ class Fakecord:
             },
         }
 
+    def image(self, body: dict) -> dict:
+        """An image model: draws STUB_PNG, or refuses prompts containing "refuse"."""
+        w = self.world
+        n = next(w.ids)
+        prompt = content_text(body["messages"][-1]["content"])
+        message = {"role": "assistant", "content": "stub image"}
+        if not re.search(r"\brefuse\b", prompt, re.IGNORECASE):
+            url = "data:image/png;base64," + base64.b64encode(STUB_PNG).decode()
+            message["images"] = [{"type": "image_url", "image_url": {"url": url}}]
+        w.llm.append(
+            {"kind": "image", "request": body, "prompt": prompt, "drew": "images" in message}
+        )
+        return {
+            "id": f"gen-sim-{n}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.get("model", "sim/image"),
+            "provider": "Sim",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "logprobs": None,
+                    "message": {"refusal": None, **message},
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 1290,
+                "total_tokens": 1300,
+                "cost": 0.04,
+            },
+        }
+
     # --- control API -------------------------------------------------------
 
     async def control(self, request: web.Request) -> web.StreamResponse:
@@ -659,6 +763,10 @@ def content_text(content) -> str:
     if isinstance(content, list):
         return "\n".join(p.get("text", "") for p in content if isinstance(p, dict))
     return "" if content is None else str(content)
+
+
+def sniff(data: bytes) -> str:
+    return "image/png" if data.startswith(b"\x89PNG") else "application/octet-stream"
 
 
 def trigger_line(prompt: str) -> str:

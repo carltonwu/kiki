@@ -137,6 +137,8 @@ pub struct AgentConfig {
     pub host_timeout: Duration,
     pub chat_model: String,
     pub topic_model: String,
+    /// `OPENROUTER_IMAGE_MODEL`: default model for the `generate_image` tool.
+    pub image_model: String,
     /// `AGENT_HISTORY_MESSAGES`: conversation messages sent with each run.
     pub history_messages: i64,
     /// `AGENT_RUN_MAX_AGE_SECS`: runs queued longer ago than this get no reply
@@ -170,6 +172,8 @@ impl AgentConfig {
             topic_model: std::env::var("OPENROUTER_TOPIC_MODEL")
                 .unwrap_or_else(|_| chat_model.clone()),
             chat_model,
+            image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
+                .unwrap_or_else(|_| "google/gemini-2.5-flash-image".into()),
             history_messages,
             run_max_age: Duration::from_secs(env_or("AGENT_RUN_MAX_AGE_SECS", 120)?),
             topic_every_messages: env_or("TOPIC_EVERY_MESSAGES", 4)?,
