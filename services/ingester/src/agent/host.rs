@@ -161,7 +161,6 @@ impl Host {
         request: &DescribeEmojis,
     ) -> anyhow::Result<EmojisDescribed> {
         tokio::time::timeout(self.timeout, async {
-            let mut delay = Duration::from_secs(1);
             loop {
                 if let Ok(response) = self.attempt(&self.emoji_endpoint, request).await? {
                     return response
@@ -171,11 +170,10 @@ impl Host {
                 }
                 debug!(
                     guild_id = request.guild_id,
-                    delay_ms = delay.as_millis() as u64,
+                    delay_ms = RETRY_DELAY.as_millis() as u64,
                     "retrying emoji descriptions"
                 );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(5));
+                tokio::time::sleep(RETRY_DELAY).await;
             }
         })
         .await
@@ -206,7 +204,6 @@ impl Host {
     }
 
     async fn execute_with_retries(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
-        let mut delay = Duration::from_secs(1);
         let mut attempt = 0;
         let mut warned = false;
         loop {
@@ -263,14 +260,18 @@ impl Host {
                 attempt,
                 reason,
                 status,
-                delay_ms = delay.as_millis() as u64,
+                delay_ms = RETRY_DELAY.as_millis() as u64,
                 "retrying agent host job"
             );
-            tokio::time::sleep(delay).await;
-            delay = (delay * 2).min(Duration::from_secs(5));
+            tokio::time::sleep(RETRY_DELAY).await;
         }
     }
 }
+
+/// Constant: wake-up retries cross the private network and cost almost nothing,
+/// and a busy host queues jobs itself, so backing off only adds idle wait. An
+/// in-progress duplicate (202 running) is also polled at this rate.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 fn retryable(status: StatusCode) -> bool {
     matches!(
@@ -468,5 +469,45 @@ mod tests {
             }
             assert_eq!(*counted.lock().unwrap(), calls);
         }
+    }
+
+    /// The host answers `status` until `ready_after`, then completes. Returns
+    /// how long `execute` took.
+    async fn time_until_ready(status: StatusCode, ready_after: Duration) -> Duration {
+        let started = tokio::time::Instant::now();
+        let handler = move || async move {
+            if started.elapsed() < ready_after {
+                return status.into_response();
+            }
+            Json(json!({"id":"reply:42", "status":"completed", "result": {
+                "text":"hello", "model":"test/model", "steps":1,
+                "usage":{"prompt_tokens":1,"completion_tokens":1}
+            }}))
+            .into_response()
+        };
+        let (url, server) = server(Router::new().route("/v1/jobs", post(handler))).await;
+        host(url, Duration::from_secs(20))
+            .execute(&job())
+            .await
+            .unwrap();
+        server.abort();
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn busy_host_is_retried_every_second() {
+        // Attempts at 0, 1 and 2 s; doubling would wait until 3 s.
+        let elapsed =
+            time_until_ready(StatusCode::SERVICE_UNAVAILABLE, Duration::from_millis(1200)).await;
+        println!("503 until 1.2 s: execute took {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(2600), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn waking_host_is_retried_every_second() {
+        // Attempts at 0, 1, 2, 3 and 4 s; doubling would wait until 7 s.
+        let elapsed = time_until_ready(StatusCode::BAD_GATEWAY, Duration::from_millis(3200)).await;
+        println!("502 until 3.2 s: execute took {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(4600), "{elapsed:?}");
     }
 }

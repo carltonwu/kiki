@@ -563,41 +563,89 @@ impl Router {
         active: &[Value],
     ) -> anyhow::Result<Value> {
         let first = pool.message_ids.iter().min().copied().unwrap_or_default();
+        // Spelled out so Jev needn't infer them: which of the offered conversations
+        // the author is in, and how fresh Kiki's last answer to them is.
+        let offered: Vec<i64> = active.iter().filter_map(|c| c["id"].as_i64()).collect();
+        // Independent reads, so they run concurrently (5 of the pool's connections).
         #[allow(clippy::type_complexity)]
-        let recent: Vec<(
-            i64,
-            Option<String>,
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-        )> = sqlx::query_as(
-            r#"
-            SELECT m.author_id, m.author_name, m.content, cm.conversation_id,
-                   r.author_id, r.author_name
-            FROM messages m
-            LEFT JOIN conversation_messages cm ON cm.message_id = m.id
-            LEFT JOIN messages r ON r.id = coalesce(m.reply_to_id, (
-                SELECT ar.reply_to_id FROM agent_runs ar
-                WHERE ar.conversation_id = cm.conversation_id AND ar.reply_message_ids @> ARRAY[m.id]
-                ORDER BY ar.id DESC LIMIT 1
-            ))
-            WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
-            ORDER BY m.id DESC LIMIT $3
-            "#,
-        )
-        .bind(key.channel_id)
-        .bind(first)
-        .bind(pool.settings.decide_recent_messages)
-        .fetch_all(&self.db)
-        .await?;
-        let author: Option<String> =
+        let (recent, author, latest, theirs, answered): (
+            Vec<(
+                i64,
+                Option<String>,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            )>,
+            Option<Option<String>>,
+            Vec<(i64, i64, Option<String>, String)>,
+            Vec<i64>,
+            Option<Option<i64>>,
+        ) = tokio::try_join!(
+            sqlx::query_as(
+                r#"
+                SELECT m.author_id, m.author_name, m.content, cm.conversation_id,
+                       r.author_id, r.author_name
+                FROM messages m
+                LEFT JOIN conversation_messages cm ON cm.message_id = m.id
+                LEFT JOIN messages r ON r.id = coalesce(m.reply_to_id, (
+                    SELECT ar.reply_to_id FROM agent_runs ar
+                    WHERE ar.conversation_id = cm.conversation_id AND ar.reply_message_ids @> ARRAY[m.id]
+                    ORDER BY ar.id DESC LIMIT 1
+                ))
+                WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+                ORDER BY m.id DESC LIMIT $3
+                "#,
+            )
+            .bind(key.channel_id)
+            .bind(first)
+            .bind(pool.settings.decide_recent_messages)
+            .fetch_all(&self.db),
             sqlx::query_scalar("SELECT author_name FROM messages WHERE id = $1")
                 .bind(first)
-                .fetch_optional(&self.db)
-                .await?
-                .flatten();
+                .fetch_optional(&self.db),
+            sqlx::query_as(
+                r#"
+                SELECT c.id, p.author_id, p.author_name, p.content
+                FROM unnest($1::bigint[]) c(id)
+                CROSS JOIN LATERAL (
+                    SELECT m.id, m.author_id, m.author_name, m.content
+                    FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
+                    WHERE cm.conversation_id = c.id AND m.deleted_at IS NULL
+                    ORDER BY m.id DESC LIMIT $2
+                ) p
+                ORDER BY c.id, p.id
+                "#,
+            )
+            .bind(&offered)
+            .bind(pool.settings.decide_conversation_preview)
+            .fetch_all(&self.db),
+            sqlx::query_scalar(
+                "SELECT DISTINCT cm.conversation_id FROM conversation_messages cm \
+                 JOIN messages m ON m.id = cm.message_id \
+                 WHERE m.author_id = $1 AND cm.conversation_id = ANY($2) ORDER BY 1",
+            )
+            .bind(key.user_id)
+            .bind(&offered)
+            .fetch_all(&self.db),
+            sqlx::query_scalar(
+                r#"
+                SELECT extract(epoch FROM now() - k.created_at)::bigint
+                FROM messages k
+                JOIN agent_runs ar ON ar.reply_message_ids @> ARRAY[k.id]
+                JOIN messages r ON r.id = ar.reply_to_id
+                WHERE k.channel_id = $1 AND k.author_id = $2 AND r.author_id = $3 AND k.id < $4
+                ORDER BY k.id DESC LIMIT 1
+                "#,
+            )
+            .bind(key.channel_id)
+            .bind(self.bot_user_id)
+            .bind(key.user_id)
+            .bind(first)
+            .fetch_optional(&self.db),
+        )?;
+        let (author, answered) = (author.flatten(), answered.flatten());
 
         let recent: Vec<Value> = recent
             .into_iter()
@@ -614,26 +662,6 @@ impl Router {
                 m
             })
             .collect();
-        // Spelled out so Jev needn't infer them: which of the offered conversations
-        // the author is in, and how fresh Kiki's last answer to them is.
-        let offered: Vec<i64> = active.iter().filter_map(|c| c["id"].as_i64()).collect();
-        let latest: Vec<(i64, i64, Option<String>, String)> = sqlx::query_as(
-            r#"
-            SELECT c.id, p.author_id, p.author_name, p.content
-            FROM unnest($1::bigint[]) c(id)
-            CROSS JOIN LATERAL (
-                SELECT m.id, m.author_id, m.author_name, m.content
-                FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
-                WHERE cm.conversation_id = c.id AND m.deleted_at IS NULL
-                ORDER BY m.id DESC LIMIT $2
-            ) p
-            ORDER BY c.id, p.id
-            "#,
-        )
-        .bind(&offered)
-        .bind(pool.settings.decide_conversation_preview)
-        .fetch_all(&self.db)
-        .await?;
         let mut conversations = active.to_vec();
         for c in &mut conversations {
             c["latest_messages"] = json!([]);
@@ -646,32 +674,6 @@ impl Router {
                     .push(json!({ "from": self.display_name(author, name), "text": content }));
             }
         }
-        let theirs: Vec<i64> = sqlx::query_scalar(
-            "SELECT DISTINCT cm.conversation_id FROM conversation_messages cm \
-             JOIN messages m ON m.id = cm.message_id \
-             WHERE m.author_id = $1 AND cm.conversation_id = ANY($2) ORDER BY 1",
-        )
-        .bind(key.user_id)
-        .bind(&offered)
-        .fetch_all(&self.db)
-        .await?;
-        let answered: Option<i64> = sqlx::query_scalar(
-            r#"
-            SELECT extract(epoch FROM now() - k.created_at)::bigint
-            FROM messages k
-            JOIN agent_runs ar ON ar.reply_message_ids @> ARRAY[k.id]
-            JOIN messages r ON r.id = ar.reply_to_id
-            WHERE k.channel_id = $1 AND k.author_id = $2 AND r.author_id = $3 AND k.id < $4
-            ORDER BY k.id DESC LIMIT 1
-            "#,
-        )
-        .bind(key.channel_id)
-        .bind(self.bot_user_id)
-        .bind(key.user_id)
-        .bind(first)
-        .fetch_optional(&self.db)
-        .await?
-        .flatten();
         Ok(json!({
             "recent_channel_messages": recent,
             "conversations": conversations,
@@ -885,8 +887,45 @@ mod tests {
         assert!(!addresses_you("youtube is down"));
     }
 
-    /// Jev's state for a pool in a channel with two open conversations (plus a
-    /// closed one, and an open one in another channel that must not show).
+    /// A router over `db` with Kiki as user 1 and no Jev client.
+    fn test_router(db: &sqlx::PgPool) -> super::Router {
+        let settings = std::sync::Arc::new(
+            crate::guild_settings::Store::new(
+                db.clone(),
+                crate::guild_settings::tests::defaults(),
+                5000,
+            )
+            .unwrap(),
+        );
+        super::Router {
+            db: db.clone(),
+            http: std::sync::Arc::new(twilight_http::Client::new("unused".into())),
+            config: crate::config::RouterConfig {
+                max_message_age: Duration::from_secs(5),
+                pool_debounce: Duration::from_millis(500),
+                pool_max_wait: Duration::from_secs(8),
+                pool_max_messages: 10,
+                keywords: vec!["kiki".into()],
+                jev_api_key: None,
+                jev_model: "test/jev".into(),
+                jev_min_confidence: 0.5,
+                jev_timeout: Duration::from_secs(5),
+                pending_emoji: String::new(),
+                max_active_conversations: 8,
+                active_window: Duration::from_secs(3600),
+            },
+            settings,
+            jev: None,
+            guild_ids: Default::default(),
+            bot_user_id: 1,
+            bot_role_ids: Default::default(),
+            channel_locks: Default::default(),
+        }
+    }
+
+    /// Jev's whole state for a pool in a channel with two open conversations
+    /// (plus a closed one, and an open one in another channel that must not
+    /// show): order, replying_to via an agent run, deleted messages left out.
     #[tokio::test]
     async fn decide_state_lists_this_channels_open_conversations() {
         let Some(test) = crate::test_db::migrated("ingester_test").await else {
@@ -926,6 +965,7 @@ mod tests {
             message(16, 2, 103, "old news"),
             message(30, 3, 101, "elsewhere"),
             message(17, 2, 101, "you there?"),
+            message(18, 2, 104, "nvm found them"),
         ];
         crate::store::upsert_messages(&db, 9, &messages)
             .await
@@ -939,54 +979,29 @@ mod tests {
                 (3, 9, 3, 101, 'Elsewhere'), (4, 9, 2, 103, 'Closed');
             INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES
                 (10, 1, 'mention'), (11, 1, 'agent'), (12, 1, 'decide'), (13, 1, 'decide'),
-                (14, 2, 'mention'), (15, 2, 'agent'), (16, 4, 'mention'), (30, 3, 'mention');
+                (14, 2, 'mention'), (15, 2, 'agent'), (16, 4, 'mention'), (30, 3, 'mention'),
+                (18, 2, 'decide');
             UPDATE conversations SET last_active_at = now() - interval '100.2 seconds',
                                      last_reply_at = now() - interval '50.2 seconds' WHERE id = 1;
             UPDATE conversations SET last_active_at = now() - interval '300.2 seconds',
                                      last_reply_at = NULL WHERE id = 2;
             UPDATE conversations SET last_active_at = now() - interval '10 seconds' WHERE id = 3;
             UPDATE conversations SET last_active_at = now(), closed_at = now() WHERE id = 4;
+            INSERT INTO agent_runs (conversation_id, trigger_message_ids, status, reply_to_id,
+                                    reply_message_ids)
+            VALUES (1, ARRAY[10], 'done', 10, ARRAY[11]);
+            UPDATE messages SET created_at = now() - interval '60.2 seconds' WHERE id = 11;
+            UPDATE messages SET deleted_at = now() WHERE id IN (16, 18);
             "#,
         )
         .execute(&db)
         .await
         .unwrap();
-        let settings = std::sync::Arc::new(
-            crate::guild_settings::Store::new(
-                db.clone(),
-                crate::guild_settings::tests::defaults(),
-                5000,
-            )
-            .unwrap(),
-        );
-        let router = super::Router {
-            db: db.clone(),
-            http: std::sync::Arc::new(twilight_http::Client::new("unused".into())),
-            config: crate::config::RouterConfig {
-                max_message_age: Duration::from_secs(5),
-                pool_debounce: Duration::from_millis(500),
-                pool_max_wait: Duration::from_secs(8),
-                pool_max_messages: 10,
-                keywords: vec!["kiki".into()],
-                jev_api_key: None,
-                jev_model: "test/jev".into(),
-                jev_min_confidence: 0.5,
-                jev_timeout: Duration::from_secs(5),
-                pending_emoji: String::new(),
-                max_active_conversations: 8,
-                active_window: Duration::from_secs(3600),
-            },
-            settings: settings.clone(),
-            jev: None,
-            guild_ids: Default::default(),
-            bot_user_id: 1,
-            bot_role_ids: Default::default(),
-            channel_locks: Default::default(),
-        };
+        let router = test_router(&db);
         let now = tokio::time::Instant::now();
         let pool = super::Pool {
             guild_id: 9,
-            settings: settings.snapshot(9),
+            settings: router.settings.snapshot(9),
             message_ids: vec![17],
             first_at: now,
             deadline: now,
@@ -1020,12 +1035,23 @@ mod tests {
                 ],
             },
         ]);
-        assert_eq!(state["conversations"], conversations, "{state:#}");
-        assert_eq!(state["new_messages"]["author_in_conversations"], json!([1]));
-        assert_eq!(
-            state["recent_channel_messages"].as_array().unwrap().len(),
-            7
-        );
+        let recent = json!([
+            {"conversation_id": 1, "from": "alex", "text": "who runs lights?"},
+            {"conversation_id": 1, "from": "Kiki", "replying_to": "alex", "text": "Chris does"},
+            {"conversation_id": 1, "from": "alex", "text": "and sound?"},
+            {"conversation_id": 1, "from": "bob", "text": "Nik"},
+            {"conversation_id": 2, "from": "carl", "text": "anyone seen my keys"},
+            {"conversation_id": 2, "from": "Kiki", "text": "check the green room"},
+        ]);
+        let expected = json!({
+            "conversations": conversations,
+            "recent_channel_messages": recent,
+            "new_messages": {
+                "from": "alex", "texts": ["you there?"], "author_in_conversations": [1],
+                "kiki_last_answered_author_seconds_ago": 60,
+            },
+        });
+        assert_eq!(state, expected, "{state:#}");
 
         test.drop().await;
     }

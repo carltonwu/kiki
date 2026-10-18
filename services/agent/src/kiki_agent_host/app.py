@@ -28,6 +28,10 @@ class Settings:
     token: str
     max_concurrent_jobs: int = 2
     job_timeout_seconds: float = 120
+    # How long a job waits for a busy slot before 503. Kept well under Rust's
+    # request timeout minus job_timeout_seconds, so a request Rust has given up
+    # on never starts inference later.
+    slot_wait_seconds: float = 30
     openrouter_api_key: str = ""
     openrouter_vision_model: str = ""
 
@@ -73,7 +77,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 status_code=501, detail="agent framework executor is not configured"
             )
         try:
-            await asyncio.wait_for(slots.acquire(), timeout=0.1)
+            await asyncio.wait_for(slots.acquire(), timeout=settings.slot_wait_seconds)
         except TimeoutError:
             raise HTTPException(status_code=503, detail="agent host is busy") from None
         started = time.monotonic()
@@ -124,7 +128,8 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
     )
     async def describe_emojis(request: DescribeEmojisRequest):
         """One batch of a server's custom emoji descriptions. Not durable: the
-        writes are idempotent, and Rust repeats the call until none are left."""
+        writes are idempotent, and Rust repeats the call until none are left.
+        Background work, so it doesn't queue for a slot ahead of replies."""
         if executor is None:
             raise HTTPException(
                 status_code=501, detail="agent framework executor is not configured"

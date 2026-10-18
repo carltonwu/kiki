@@ -148,7 +148,7 @@ must not send messages to Discord.
 
 Rust owns queue polling, wake-up retries, prompt snapshots, and Discord delivery.
 It retries cold-start 502s, temporary 503/504s, 429s and in-progress responses
-within `AGENT_HOST_TIMEOUT_MS` (180000 by default). Startup resumes interrupted
+every second within `AGENT_HOST_TIMEOUT_MS` (180000 by default). Startup resumes interrupted
 execution from the saved request. Before a Discord send, it records `delivering`;
 interrupted deliveries are failed rather than automatically resent. This can
 omit a reply if a crash happens before the send; it avoids blind duplicate posts.
@@ -179,7 +179,8 @@ description, then embeds the described ones. The response is
 `{"described", "failed", "remaining", "cost"}`; Rust repeats the call until
 `remaining` is 0 or nothing progresses. A failed emoji (download or model) waits
 for the next resync. It's not a durable job: writes are idempotent, so a retry
-after 503 simply continues. It shares the job concurrency slots and timeout.
+after 503 simply continues. It shares the job concurrency slots and timeout, but
+returns 503 if no slot frees within 0.1 s, so it never queues ahead of a reply.
 
 ## Railway and idle resources
 
@@ -200,8 +201,8 @@ or telemetry exporter. Connections open during requests and close afterwards.
 contacting Postgres. Avoid external uptime probes that keep the service awake.
 Rust wakes it only for actual jobs, never for periodic health checks.
 
-`AGENT_HOST_MAX_CONCURRENT_JOBS` defaults to 2; extra requests return 503 for Rust
-to retry. `AGENT_HOST_JOB_TIMEOUT_SECS` defaults to 120. Railway sleeping and
+`AGENT_HOST_MAX_CONCURRENT_JOBS` defaults to 2; an extra job waits up to 30 s for
+a slot (so it starts as soon as one frees), then returns 503 for Rust to retry. `AGENT_HOST_JOB_TIMEOUT_SECS` defaults to 120. Railway sleeping and
 cold-start behavior should be verified after deployment from the startup log line.
 Locally, startup takes about 0.6 s and 90 MB RSS with the SDK loaded.
 
