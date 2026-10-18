@@ -10,20 +10,23 @@ is set.
 
 ## Tools and search
 
-Reply jobs get two tools, scoped to the job's channel by trusted run context, never
-by model arguments ([design](../../docs/agent-tools-hld.md)):
+Reply jobs get two tools, scoped to the job's guild (every channel Kiki can read) by
+trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
-- `search_messages(query, person?, before?, after?, limit)`: `person` is a roster ref
-  (`u2`), an @username or a name, resolved to user IDs by exact normalized match
+- `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
+  name like `#general`, a `<#mention>` or an ID) narrows to one channel. Results carry
+  their `channel` and link. `person` is a roster ref (`u2`), an @username or a name,
+  resolved to user IDs by exact normalized match
   ([people design](../../docs/identity-hld.md)). Search itself is full text (English, OR
   of terms) plus `qwen/qwen3-embedding-8b` vectors (first 1024 dims, pgvector
   `halfvec`). The two rankings are fused by reciprocal rank, with a recency bonus
   that halves every 30 days. Date filters turn the bonus off.
-- `get_message_context(message_id, before, after)`: neighbors and the reply parent.
+- `get_message_context(message_id, before, after)`: neighbors in the message's own
+  channel and the reply parent.
 
 Results exclude deleted messages, bot messages, and the current conversation
 (already in the prompt). A run gets 4 tool calls and 6 model requests. Topic jobs have
-no tools. When a reply job starts, the channel's 256 newest pending messages are
+no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all
 pending history, then exits; rerun it any time. Embeddings cost about $0.01 per

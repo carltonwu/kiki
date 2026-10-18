@@ -10,7 +10,7 @@ from kiki_agent_host import retrieval
 from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.contracts import JobRequest
 
-GUILD, CHANNEL, OTHER_CHANNEL, CONVERSATION = 1, 2, 9, 1
+GUILD, OTHER_GUILD, CHANNEL, OTHER_CHANNEL, CONVERSATION = 1, 7, 2, 9, 1
 TOPICS = [{"deploy", "release", "ship", "shipped"}, {"pizza", "lunch", "food"}]
 NOW = datetime.now(UTC)
 
@@ -45,6 +45,11 @@ SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
 async def db(database_url):
     async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
         await connection.execute(
+            "INSERT INTO channels (id, guild_id, name, type)"
+            " VALUES (%s, %s, 'general', 0), (%s, %s, 'lore', 0)",
+            (CHANNEL, GUILD, OTHER_CHANNEL, GUILD),
+        )
+        await connection.execute(
             "INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (%s, %s, %s, 5)",
             (CONVERSATION, GUILD, CHANNEL),
         )
@@ -57,6 +62,7 @@ async def add(
     content,
     *,
     days_ago=0,
+    guild=GUILD,
     channel=CHANNEL,
     author="alex",
     author_id=100,
@@ -74,7 +80,7 @@ async def add(
         " content, created_at, raw) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (
             id,
-            GUILD,
+            guild,
             channel,
             author_id,
             author,
@@ -94,7 +100,8 @@ async def ids(db, query, **kwargs):
 async def test_hybrid_search_respects_scope_and_matches_paraphrases(db):
     await add(db, 10, "we shipped the release on friday", days_ago=40)
     await add(db, 11, "pizza for lunch?", days_ago=1)
-    await add(db, 12, "the release is shipped", channel=OTHER_CHANNEL)
+    await add(db, 12, "the release is shipped", channel=OTHER_CHANNEL, days_ago=60)
+    await add(db, 16, "release shipped in another server", guild=OTHER_GUILD, channel=50)
     await add(db, 13, "release shipped, says the bot", bot=True)
     await add(db, 14, "release shipped, then deleted")
     await add(db, 15, "release notes in this conversation")
@@ -104,10 +111,19 @@ async def test_hybrid_search_respects_scope_and_matches_paraphrases(db):
         (CONVERSATION,),
     )
     # Indexed, but never returned: the conversation is already in the prompt.
-    assert await retrieval.index_pending(db, embedder(), channel_id=CHANNEL) == (3, None)
+    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (4, None)
 
     # Lexical OR query: stopwords and unmatched words don't block a hit.
     assert (await ids(db, "what did alex say about the release"))[0] == 10
+    # Every channel of the guild, and only this guild.
+    assert sorted(await ids(db, "release shipped")) == [10, 12]
+    assert await ids(db, "release shipped", channel="#lore") == [12]
+    assert await ids(db, "release shipped", channel=f"<#{CHANNEL}>") == [10]
+    result = await retrieval.search(db, embedder(), SCOPE, "release", channel="#random")
+    assert "error" in result
+    [hit] = (await retrieval.search(db, embedder(), SCOPE, "release", channel="lore"))["messages"]
+    assert hit["channel"] == "#lore"
+    assert hit["url"] == f"https://discord.com/channels/{GUILD}/{OTHER_CHANNEL}/12"
     # Semantic only: no shared words with message 10.
     assert (await ids(db, "deploy"))[0] == 10
     assert (await ids(db, "food"))[0] == 11
@@ -170,7 +186,7 @@ async def test_people_are_found_by_id_whatever_they_were_called(db):
 async def test_recency_breaks_near_ties_but_not_explicit_dates(db):
     await add(db, 20, "release release release plan", days_ago=400)
     await add(db, 21, "release plan", days_ago=1)
-    await retrieval.index_pending(db, embedder(), channel_id=CHANNEL)
+    await retrieval.index_pending(db, embedder(), guild_id=GUILD)
     assert await ids(db, "release plan") == [21, 20]
     before = NOW - timedelta(days=30)
     assert await ids(db, "release plan", before=before) == [20]
@@ -179,7 +195,7 @@ async def test_recency_breaks_near_ties_but_not_explicit_dates(db):
 async def test_edits_and_deletes_invalidate_embeddings(db):
     await add(db, 30, "pizza")
     await add(db, 31, "lunch")
-    await retrieval.index_pending(db, embedder(), channel_id=CHANNEL)
+    await retrieval.index_pending(db, embedder(), guild_id=GUILD)
     await db.execute("UPDATE messages SET content = 'release' WHERE id = 30")
     await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 31")
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
@@ -189,7 +205,7 @@ async def test_edits_and_deletes_invalidate_embeddings(db):
     await db.execute(retrieval.SAVE, ([30], ["md5-of-old-text"], [stale]))
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 0
-    assert await retrieval.index_pending(db, embedder(), channel_id=CHANNEL) == (1, None)
+    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (1, None)
 
 
 async def test_embedding_outage_degrades_to_lexical(db):
@@ -201,14 +217,19 @@ async def test_embedding_outage_degrades_to_lexical(db):
         await retrieval.search(db, embedder(), SCOPE, "  ")
 
 
-async def test_message_context_is_bounded_and_channel_scoped(db):
+async def test_message_context_is_bounded_and_guild_scoped(db):
     for i in range(50, 60):
         await add(db, i, f"message {i}")
     await add(db, 70, "elsewhere", channel=OTHER_CHANNEL)
+    await add(db, 71, "elsewhere, later", channel=OTHER_CHANNEL)
+    await add(db, 72, "another server", guild=OTHER_GUILD, channel=50)
     result = await retrieval.message_context(db, SCOPE, 55, before=2, after=1)
     assert [m["id"] for m in result["messages"]] == ["53", "54", "55", "56"]
     assert result["messages"][0]["url"] == f"https://discord.com/channels/{GUILD}/{CHANNEL}/53"
-    assert "error" in await retrieval.message_context(db, SCOPE, 70)
+    # Another channel of the guild: its own neighbors, not this channel's.
+    result = await retrieval.message_context(db, SCOPE, 70)
+    assert [m["id"] for m in result["messages"]] == ["70", "71"]
+    assert "error" in await retrieval.message_context(db, SCOPE, 72)
 
 
 async def test_ignored_authors_are_never_read(db):
@@ -217,7 +238,7 @@ async def test_ignored_authors_are_never_read(db):
         db, 61, "release plan from the noisy bot", author="noisy", author_id=1358234666267578368
     )
     await add(db, 62, "release plan again")
-    assert await retrieval.index_pending(db, embedder(), channel_id=CHANNEL) == (2, None)
+    assert await retrieval.index_pending(db, embedder(), guild_id=GUILD) == (2, None)
     assert sorted(await ids(db, "release plan")) == [60, 62]
     result = await retrieval.message_context(db, SCOPE, 60)
     assert [m["id"] for m in result["messages"]] == ["60", "62"]

@@ -1,8 +1,9 @@
 """Message search over Postgres, independent of the agent framework.
 
 Hybrid: full text plus pgvector, fused by reciprocal rank with a small recency
-vote. Everything is scoped to one channel. Embeddings are computed lazily for
-the searched channel, or all at once by `kiki-agent-host index`.
+vote. Everything is scoped to one guild: Kiki knows every channel she can read.
+Embeddings are computed lazily for the searched guild, or all at once by
+`kiki-agent-host index`.
 """
 
 import asyncio
@@ -86,13 +87,14 @@ NO_ROSTER = Roster()
 REF = re.compile(r"^u[0-9]+$")
 USER_ID = re.compile(r"^<@!?([0-9]+)>$|^([0-9]{15,20})$")
 MENTION = re.compile(r"<@!?([0-9]+)>")
+CHANNEL_ID = re.compile(r"^<#([0-9]+)>$|^([0-9]{15,20})$")
 
 RESOLVE = """
 SELECT n.user_id FROM user_names n
 WHERE n.guild_id = %(guild)s AND n.name_norm = name_norm(%(name)s) AND n.name_norm <> ''
   AND (NOT %(username_only)s OR n.kind = 'username')
   AND EXISTS (SELECT 1 FROM messages m WHERE m.author_id = n.user_id
-              AND m.channel_id = %(channel)s AND m.deleted_at IS NULL AND NOT m.author_bot)
+              AND m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot)
 GROUP BY n.user_id ORDER BY n.user_id
 """
 
@@ -113,12 +115,36 @@ async def resolve_person(
         RESOLVE,
         {
             "guild": scope.guild_id,
-            "channel": scope.channel_id,
             "name": person.removeprefix("@"),
             "username_only": username_only,
         },
     )
     return [row[0] for row in await cursor.fetchall()]
+
+
+async def resolve_channel(connection: AsyncConnection, scope: Scope, channel: str) -> list[int]:
+    """Channel IDs `channel` can mean: a <#mention>, an ID, or a name (with or without #)."""
+    channel = channel.strip()
+    if match := CHANNEL_ID.match(channel):
+        ids, names = [int(match[1] or match[2])], None
+    else:
+        ids, names = None, channel.removeprefix("#").strip().lower()
+    cursor = await connection.execute(
+        "SELECT id FROM channels WHERE guild_id = %s AND (id = ANY(%s) OR lower(name) = %s)"
+        " ORDER BY id",
+        (scope.guild_id, ids or [], names),
+    )
+    return [row[0] for row in await cursor.fetchall()]
+
+
+async def channel_names(
+    connection: AsyncConnection, scope: Scope, channel_ids: set[int]
+) -> dict[int, str]:
+    cursor = await connection.execute(
+        "SELECT id, name FROM channels WHERE guild_id = %s AND id = ANY(%s) AND name IS NOT NULL",
+        (scope.guild_id, list(channel_ids)),
+    )
+    return {channel_id: name for channel_id, name in await cursor.fetchall()}
 
 
 async def speakers(
@@ -143,7 +169,7 @@ HEARD = "NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_
 
 PENDING = f"""
 SELECT m.id, m.content, md5(m.content) AS hash FROM messages m
-WHERE (%(channel)s::bigint IS NULL OR m.channel_id = %(channel)s)
+WHERE (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
   AND (%(below)s::bigint IS NULL OR m.id < %(below)s)
   AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD} AND btrim(m.content) <> ''
   AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
@@ -166,7 +192,7 @@ async def index_pending(
     connection: AsyncConnection,
     embed: Embedder,
     *,
-    channel_id: int | None = None,
+    guild_id: int | None = None,
     below: int | None = None,
     limit: int = INDEX_LIMIT,
 ) -> tuple[int, int | None]:
@@ -175,9 +201,7 @@ async def index_pending(
     Returns how many were found and, if that filled the limit, the lowest ID
     seen: more may be pending below it.
     """
-    cursor = await connection.execute(
-        PENDING, {"channel": channel_id, "below": below, "limit": limit}
-    )
+    cursor = await connection.execute(PENDING, {"guild": guild_id, "below": below, "limit": limit})
     rows = await cursor.fetchall()
     batches = [rows[i : i + EMBED_BATCH] for i in range(0, len(rows), EMBED_BATCH)]
     vectors = await asyncio.gather(*(embed([r[1] for r in batch]) for batch in batches))
@@ -187,7 +211,8 @@ async def index_pending(
 
 
 SCOPE = f"""
-m.channel_id = %(channel)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
+m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
+AND (%(channels)s::bigint[] IS NULL OR m.channel_id = ANY(%(channels)s))
 AND (%(authors)s::bigint[] IS NULL OR m.author_id = ANY(%(authors)s))
 AND (%(after)s::timestamptz IS NULL OR m.created_at >= %(after)s)
 AND (%(before)s::timestamptz IS NULL OR m.created_at < %(before)s)
@@ -195,7 +220,7 @@ AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
                 WHERE cm.message_id = m.id AND cm.conversation_id = %(conversation)s)
 """
 
-COLUMNS = "m.id, m.author_name, m.author_id, m.content, m.created_at"
+COLUMNS = "m.id, m.channel_id, m.author_name, m.author_id, m.content, m.created_at"
 
 SEARCH = f"""
 WITH lexical AS (
@@ -233,20 +258,26 @@ async def search(
     query: str,
     *,
     person: str | None = None,
+    channel: str | None = None,
     roster: Roster = NO_ROSTER,
     before: datetime | None = None,
     after: datetime | None = None,
     limit: int = 10,
     semantic: Semantic = "full",
 ) -> dict:
-    """`semantic` is the coverage of the channel's embeddings going in."""
+    """`semantic` is the coverage of the guild's embeddings going in."""
     if not query.strip():
         raise ValueError("query must not be empty")
     authors = None
     if person and person.strip():
         authors = await resolve_person(connection, scope, roster, person)
         if not authors:
-            return {"error": f"No one named {person!r} has written in this channel."}
+            return {"error": f"No one named {person!r} has written in this server."}
+    channels = None
+    if channel and channel.strip():
+        channels = await resolve_channel(connection, scope, channel)
+        if not channels:
+            return {"error": f"There's no channel named {channel!r} in this server."}
     try:
         [vector] = await embed([query], query=True)
     except Exception as error:  # noqa: BLE001 - lexical fallback without logging provider payloads
@@ -259,7 +290,8 @@ async def search(
         )
         vector, semantic = None, "off"
     params = {
-        "channel": scope.channel_id,
+        "guild": scope.guild_id,
+        "channels": channels,
         "conversation": scope.conversation_id,
         "authors": authors,
         "before": before,
@@ -297,20 +329,22 @@ async def search(
     return result
 
 
+# The target's own channel, wherever in the guild it is.
 CONTEXT = f"""
+WITH t AS (SELECT id, channel_id FROM messages
+           WHERE id = %(id)s AND guild_id = %(guild)s AND deleted_at IS NULL)
 SELECT * FROM (
-    (SELECT {COLUMNS} FROM messages m WHERE m.channel_id = %(channel)s AND m.deleted_at IS NULL
-       AND {HEARD} AND m.id < %(id)s ORDER BY m.id DESC LIMIT %(before)s)
+    (SELECT {COLUMNS} FROM messages m JOIN t ON m.channel_id = t.channel_id
+     WHERE m.deleted_at IS NULL AND {HEARD} AND m.id < t.id ORDER BY m.id DESC LIMIT %(before)s)
     UNION
-    (SELECT {COLUMNS} FROM messages m WHERE m.channel_id = %(channel)s AND m.deleted_at IS NULL
-       AND {HEARD} AND m.id >= %(id)s ORDER BY m.id LIMIT %(after)s + 1)
+    (SELECT {COLUMNS} FROM messages m JOIN t ON m.channel_id = t.channel_id
+     WHERE m.deleted_at IS NULL AND {HEARD} AND m.id >= t.id ORDER BY m.id LIMIT %(after)s + 1)
     UNION
     SELECT {COLUMNS.replace("m.", "p.")} FROM messages m JOIN messages p ON p.id = m.reply_to_id
-    WHERE m.id = %(id)s AND p.channel_id = %(channel)s AND p.deleted_at IS NULL
+    WHERE m.id = %(id)s AND p.guild_id = %(guild)s AND p.deleted_at IS NULL
       AND {HEARD.replace("m.", "p.")}
 ) around
-WHERE EXISTS (SELECT 1 FROM messages t WHERE t.id = %(id)s
-              AND t.channel_id = %(channel)s AND t.deleted_at IS NULL)
+WHERE EXISTS (SELECT 1 FROM t)
 ORDER BY id
 """
 
@@ -327,7 +361,7 @@ async def message_context(
     await cursor.execute(
         CONTEXT,
         {
-            "channel": scope.channel_id,
+            "guild": scope.guild_id,
             "id": message_id,
             "before": max(0, min(before, 10)),
             "after": max(0, min(after, 10)),
@@ -335,7 +369,7 @@ async def message_context(
     )
     rows = await cursor.fetchall()
     if not rows:
-        return {"error": "no such message in this channel"}
+        return {"error": "no such message in this server"}
     return {"messages": await cite_all(connection, scope, roster, rows)}
 
 
@@ -347,10 +381,11 @@ async def cite_all(
     for m in rows:
         ids.update(int(i) for i in MENTION.findall(m["content"]))
     names = await speakers(connection, scope, roster, ids)
-    return [cite(scope, m, names) for m in rows]
+    channels = await channel_names(connection, scope, {m["channel_id"] for m in rows})
+    return [cite(scope, m, names, channels) for m in rows]
 
 
-def cite(scope: Scope, m: dict, names: dict[int, str]) -> dict:
+def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str]) -> dict:
     def mention(match: re.Match) -> str:
         user_id = int(match[1])
         return "@" + names.get(user_id, match[0])
@@ -358,8 +393,9 @@ def cite(scope: Scope, m: dict, names: dict[int, str]) -> dict:
     return {
         "id": str(m["id"]),
         "author": names.get(m["author_id"]) or m["author_name"] or str(m["author_id"]),
+        "channel": "#" + channels.get(m["channel_id"], str(m["channel_id"])),
         "time": m["created_at"].isoformat(timespec="minutes"),
-        "url": f"https://discord.com/channels/{scope.guild_id}/{scope.channel_id}/{m['id']}",
+        "url": f"https://discord.com/channels/{scope.guild_id}/{m['channel_id']}/{m['id']}",
         "text": MENTION.sub(mention, m["content"])[:SNIPPET_CHARS],
     }
 

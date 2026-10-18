@@ -1,4 +1,4 @@
-"""Pydantic AI executor: the SDK owns the loop, these tools search the channel."""
+"""Pydantic AI executor: the SDK owns the loop, these tools search the guild."""
 
 import asyncio
 import contextlib
@@ -85,11 +85,12 @@ async def search_messages(
     ctx: RunContext[Deps],
     query: str,
     person: str | None = None,
+    channel: str | None = None,
     before: datetime | None = None,
     after: datetime | None = None,
     limit: int = 10,
 ) -> dict:
-    """Search this channel's message history (by meaning and by keywords).
+    """Search the message history of every channel in this server (by meaning and by keywords).
 
     Recent matches rank slightly higher unless `before`/`after` is given. Older
     messages already shown to you in this conversation are not returned.
@@ -99,6 +100,8 @@ async def search_messages(
         person: Only messages written by this person: a ref like u2 (best), an
             @username, or a name they've gone by. Names match exactly, so "Chris"
             won't find "Chrissy"; if several people share the name, results say so.
+        channel: Only messages in this channel, like #general. Leave it out to
+            search the whole server.
         before: Only messages sent before this time (ISO 8601, UTC).
         after: Only messages sent at or after this time (ISO 8601, UTC).
         limit: Maximum results, up to 10.
@@ -107,7 +110,7 @@ async def search_messages(
     async def work():
         deps = ctx.deps
         if deps.indexing is None:
-            deps.indexing = asyncio.create_task(index_channel(deps))
+            deps.indexing = asyncio.create_task(index_guild(deps))
         # Shielded: a search timing out must not cancel indexing for the next one.
         semantic = await asyncio.shield(deps.indexing)
         return await retrieval.search(
@@ -116,6 +119,7 @@ async def search_messages(
             deps.scope,
             query,
             person=person,
+            channel=channel,
             roster=deps.roster,
             before=before,
             after=after,
@@ -129,7 +133,7 @@ async def search_messages(
 async def get_message_context(
     ctx: RunContext[Deps], message_id: str, before: int = 5, after: int = 5
 ) -> dict:
-    """Fetch the messages around one message in this channel, plus what it replied to.
+    """Fetch the messages around one message in its channel, plus what it replied to.
 
     Args:
         message_id: The `id` of a message from search results.
@@ -147,25 +151,25 @@ async def get_message_context(
     return await guarded(ctx, "get_message_context", work)
 
 
-async def index_channel(deps: Deps) -> retrieval.Semantic:
+async def index_guild(deps: Deps) -> retrieval.Semantic:
     try:
         found, more = await retrieval.index_pending(
-            deps.connection, deps.embed, channel_id=deps.scope.channel_id
+            deps.connection, deps.embed, guild_id=deps.scope.guild_id
         )
     except OperationalError:
         raise
     except Exception as error:  # noqa: BLE001 - preserve search without logging provider payloads
         logger.warning(
-            "indexing failed job_id=%s channel_id=%s error_type=%s; using partial index",
+            "indexing failed job_id=%s guild_id=%s error_type=%s; using partial index",
             deps.job_id,
-            deps.scope.channel_id,
+            deps.scope.guild_id,
             type(error).__name__,
         )
         return "partial"
     logger.debug(
-        "indexed channel job_id=%s channel_id=%s messages=%d more_pending=%s",
+        "indexed guild job_id=%s guild_id=%s messages=%d more_pending=%s",
         deps.job_id,
-        deps.scope.channel_id,
+        deps.scope.guild_id,
         found,
         more is not None,
     )
@@ -244,7 +248,7 @@ class PydanticExecutor:
                     )
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.
-                    deps.indexing = asyncio.create_task(index_channel(deps))
+                    deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
                         result = await chat.run(prompt, deps=deps, **options)
                     finally:
