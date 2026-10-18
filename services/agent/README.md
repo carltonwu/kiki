@@ -10,7 +10,7 @@ is set.
 
 ## Tools and search
 
-Reply jobs get search, emoji and memory tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get search, emoji, image and memory tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -23,6 +23,12 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- `read_image(message_id, question?)`: a vision model describes the message's images
+  for Kiki, each one and a gallery as a whole. The model is `OPENROUTER_VISION_MODEL`,
+  or the chat model when unset (the tool reports an error if it can't read images).
+  Images come from the stored message and are downloaded only from Discord's CDN and
+  media proxy (`DISCORD_MEDIA_EXTRA_HOSTS` adds hosts, for the simulator). Search and
+  context hits with images carry `images: n`.
 - `generate_image(prompt, aspect_ratio?)`: offered only when the request has
   `image_model`. Runs a Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel`
   (OpenRouter's Images API, `POST /api/v1/images`, same key), saves the PNG/JPEG/WebP/GIF
@@ -30,6 +36,10 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   `images`; Rust attaches it to the first Discord message. At most 2 per run, 60 s per
   call, no client retries; refusals and provider errors go back to the model as tool
   errors ([design](../../docs/image-generation.md)).
+- Shared image code is `vision.py` (Discord-only downloads, types from the bytes for
+  downloads and drawings alike, the vision call, `ImageRefused`, billed cost); reading
+  is `reading.py`, drawing `images.py`. `read_image` reads Kiki's own drawings
+  (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
 - `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
@@ -50,7 +60,9 @@ things in the guild (a base profile each, plus sub docs of at most 1024 words).
 Changes to saved entries need cited evidence in proportion to how settled they are.
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 lookup tool calls (images and memory are capped separately) and 10 model requests. Topic jobs have
+(already in the prompt). A run gets 4 lookup tool calls (`read_image` is one of them;
+drawings and memory are capped separately) and 10 model requests; vision and image calls add their
+cost to the reply's. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all

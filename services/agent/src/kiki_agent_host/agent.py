@@ -32,7 +32,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import emojis, images, memory_tools, retrieval
+from . import emojis, images, memory_tools, reading, retrieval
 from .contracts import (
     DescribeEmojisRequest,
     DescribeEmojisResult,
@@ -44,6 +44,7 @@ from .contracts import (
     WebUse,
 )
 from .executor import TransientError
+from .vision import Vision, billed_cost, look
 
 logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
@@ -51,6 +52,7 @@ os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 MAX_TOOL_CALLS = 4
 MAX_MODEL_REQUESTS = 10  # room for memory tools: a failed write, a split and a retry
 TOOL_TIMEOUT_SECONDS = 10
+VISION_TIMEOUT_SECONDS = 45  # downloads plus a vision model call
 EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
 # OpenRouter runs web search and fetch itself (server tools). This caps its steps per
 # model request (its default is 30); Kiki's own tool budget doesn't see them.
@@ -69,6 +71,7 @@ class Deps:
     scope: retrieval.Scope
     embed: retrieval.Embedder
     roster: retrieval.Roster
+    vision: Vision
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
@@ -92,7 +95,7 @@ async def guarded(
         ctx.deps.tool_calls += 1
         if ctx.deps.tool_calls > MAX_TOOL_CALLS:
             logger.debug("tool budget exhausted job_id=%s tool=%s", ctx.deps.job_id, name)
-            return {"error": "Search budget used up. Answer with what you have."}
+            return {"error": "Tool budget used up. Answer with what you have."}
     started = time.monotonic()
     outcome = "ok"
     try:
@@ -115,7 +118,7 @@ async def guarded(
         ctx.deps.scope.channel_id,
         ctx.deps.scope.conversation_id,
         (time.monotonic() - started) * 1000,
-        len(result.get("messages", result.get("emojis", []))),
+        len(result.get("messages", result.get("images", result.get("emojis", [])))),
         result.get("semantic", "-"),
         "error" if outcome == "ok" and "error" in result else outcome,
     )
@@ -190,6 +193,30 @@ async def get_message_context(
         )
 
     return await guarded(ctx, "get_message_context", work)
+
+
+async def read_image(ctx: RunContext[Deps], message_id: str, question: str | None = None) -> dict:
+    """Look at the images in one message: a single image or a whole gallery.
+
+    Another model looks at them and describes each image in detail (with any
+    text in it), and a gallery as a whole.
+
+    Args:
+        message_id: The message ID shown with its images, like "[image: cat.png;
+            message 123]", or a message `id` from search results.
+        question: Optional: what you want to know about them, so the
+            description covers it.
+    """
+
+    async def work():
+        if not message_id.strip().isdigit():
+            raise ValueError("message_id must be the ID of a message with images")
+        deps = ctx.deps
+        return await reading.read_image(
+            deps.connection, deps.scope, deps.roster, deps.vision, int(message_id), question
+        )
+
+    return await guarded(ctx, "read_image", work, VISION_TIMEOUT_SECONDS)
 
 
 async def generate_image(
@@ -361,6 +388,7 @@ chat = Agent(
     tools=[
         search_messages,
         get_message_context,
+        read_image,
         search_emojis,
         find_emoji,
         Tool(generate_image, prepare=only_with_image_model),
@@ -397,23 +425,13 @@ def history(messages: list[Message]) -> list[ModelMessage]:
     return [convert(m) for m in messages]
 
 
-def billed_cost(result) -> float | None:
-    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
-    billed = [
-        m.provider_details["cost"]
-        for m in result.new_messages()
-        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
-    ]
-    if billed:
-        return sum(billed)
-    return float(result.usage.cost) if result.usage.cost is not None else None
-
-
 class PydanticExecutor:
     web_tools = WEB_TOOLS
 
-    def __init__(self, database_url: str, api_key: str):
+    def __init__(self, database_url: str, api_key: str, vision_model: str = ""):
         self.database_url = database_url
+        # Without one, images go to the chat model, which may not read them.
+        self.vision_model = vision_model
         if os.getenv("OPENROUTER_BASE_URL"):
             self.provider = OpenRouterProvider(openai_client=retrieval.openrouter_client(api_key))
         else:
@@ -451,6 +469,8 @@ class PydanticExecutor:
         if request.kind == "reply":
             options["model_settings"]["extra_body"] = {"max_tool_calls": MAX_WEB_STEPS}
         embed = retrieval.Embedder(self.embeddings)
+        vision_name = self.vision_model or request.model
+        vision = Vision(self.model(vision_name), vision_name, not self.vision_model)
         deps = None
         try:
             if request.kind == "topic":
@@ -469,6 +489,7 @@ class PydanticExecutor:
                         scope,
                         embed,
                         retrieval.Roster.of(request.people),
+                        vision,
                         job_id=request.id,
                         image_model=self.image_model(request.image_model)
                         if request.image_model
@@ -496,13 +517,14 @@ class PydanticExecutor:
         responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
         web = web_use(responses)
         cost = billed_cost(result)  # includes OpenRouter's web tool fees
-        extra = embed.cost + (deps.image_cost if deps else 0)
+        extra = embed.cost + vision.cost + (deps.image_cost if deps else 0)
         if extra:
             cost = (cost or 0) + extra
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
-            "requests=%d tool_calls=%d web_searches=%d web_fetches=%d web_sources=%d images=%d "
-            "prompt_tokens=%d completion_tokens=%d cost_usd=%s latency_ms=%d",
+            "requests=%d tool_calls=%d vision_calls=%d web_searches=%d web_fetches=%d "
+            "web_sources=%d images=%d prompt_tokens=%d completion_tokens=%d cost_usd=%s "
+            "latency_ms=%d",
             request.id,
             request.kind,
             request.scope.channel_id,
@@ -510,6 +532,7 @@ class PydanticExecutor:
             request.model,
             usage.requests,
             usage.tool_calls,
+            vision.calls,
             web.searches,
             web.fetches,
             len(web.sources),
@@ -532,19 +555,18 @@ class PydanticExecutor:
 
     async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:
         """Describes one batch of the guild's undescribed emoji with a vision model."""
-        model = self.model(request.model)
+        # The same model call as read_image; the model is Rust's OPENROUTER_EMOJI_MODEL.
+        vision = Vision(self.model(request.model), request.model)
 
-        async def describe(name: str, animated: bool, image: bytes) -> tuple[str, float | None]:
+        async def describe(
+            name: str, animated: bool, image: BinaryContent
+        ) -> tuple[str, float | None]:
             prompt = emojis.PROMPT.format(
                 name=name, animated=" (animated; this is its first frame)" if animated else ""
             )
-            result = await plain.run(
-                [prompt, BinaryContent(image, media_type="image/png")],
-                model=model,
-                model_settings={"max_tokens": 200, "openrouter_usage": {"include": True}},
-                usage_limits=UsageLimits(request_limit=1),
-            )
-            return result.output, billed_cost(result)
+            spent = vision.cost
+            text = await look(vision, [prompt, image], max_tokens=200)
+            return text, vision.cost - spent
 
         embed = retrieval.Embedder(self.embeddings)
         try:

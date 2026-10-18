@@ -46,8 +46,12 @@ Rust: reply job (+ image_model) ─▶ Python host: chat model calls generate_im
   run's job and that the saved result lists, then attaches them (`kiki-<id>.png`)
   to the first planned message. If the model generated an image but returned
   `NO_REPLY` (with `chat_allow_silence` on), the image is still posted alone.
-  Later prompts show it as `[attachment: kiki-<id>.png]` in Kiki's history, like
-  other attachments.
+  Later prompts show it as `[image: kiki-<id>.png; message <id>]` in Kiki's history,
+  like other images, and `read_image` reads it back from `agent_host_images` (scoped
+  to the guild through the job), not from Discord's expiring CDN link.
+- **Shared image code** (`vision.py`, with read-image #2): the returned file's type
+  is decided by its bytes, as for images Kiki reads, and refusals are the same
+  `ImageRefused` error.
 
 ## Trade-offs
 

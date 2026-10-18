@@ -6,8 +6,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 from psycopg import AsyncConnection
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import emojis, retrieval
+from kiki_agent_host import emojis, retrieval, vision
+from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.app import Settings, create_app
 from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult
 
@@ -38,16 +42,21 @@ def embedder(fail=False):
     return retrieval.Embedder(SimpleNamespace(embeddings=FakeEmbeddings(fail)))
 
 
-def cdn(missing=()):
-    """Discord's CDN: a PNG for every emoji except `missing`."""
+def cdn(missing=(), html=()):
+    """Discord's CDN: a PNG for every emoji except `missing` (404) and `html`."""
+    return httpx.AsyncClient(transport=cdn_transport(missing, html))
 
+
+def cdn_transport(missing=(), html=()):
     def handle(request: httpx.Request) -> httpx.Response:
         emoji_id = int(request.url.path.rsplit("/", 1)[1].removesuffix(".png"))
         if emoji_id in missing:
             return httpx.Response(404)
+        if emoji_id in html:
+            return httpx.Response(200, content=b"<html>", headers={"content-type": "image/png"})
         return httpx.Response(200, content=PNG)
 
-    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    return httpx.MockTransport(handle)
 
 
 @pytest.fixture
@@ -88,7 +97,7 @@ async def test_describes_each_pending_emoji_once_per_round(db):
 
     async def describe(name, animated, image):
         asked.append(name)
-        assert image == PNG
+        assert image.data == PNG and image.media_type == "image/png"
         return {"huh": "a confused face, what?", "dead": "laughing so hard, crying"}[name], 0.01
 
     started = await database_now(db)
@@ -234,3 +243,40 @@ async def test_describe_endpoint_needs_auth_and_executor_and_reports_counts():
     async with httpx.AsyncClient(transport=transport, base_url="http://host") as http:
         response = await http.post("/v1/emojis/describe", json=body, headers=headers)
         assert response.status_code == 501
+
+
+async def test_emoji_images_are_fetched_and_described_like_read_image(
+    database_url, db, monkeypatch
+):
+    """The executor's describer is `vision.look`, downloads are `vision.download`."""
+    await add(db, 11, "huh")
+    await add(db, 12, "fake")  # the CDN answers with a page, not an image
+    await add(db, 13, "busy")  # the model is rate limited for this one
+    monkeypatch.setattr(
+        vision, "client", lambda: httpx.AsyncClient(transport=cdn_transport(html={12}))
+    )
+    prompts = []
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        [text, image] = messages[0].parts[0].content
+        prompts.append(text)
+        assert image.media_type == "image/png"
+        if ":busy:" in text:
+            raise ModelHTTPError(429, "test/vision")
+        return ModelResponse(parts=[TextPart("a confused face")], provider_details={"cost": 0.002})
+
+    class TestExecutor(PydanticExecutor):
+        def model(self, name):
+            assert name == "test/vision"
+            return FunctionModel(respond)
+
+    executor = TestExecutor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    result = await executor.describe_emojis(
+        DescribeEmojisRequest(guild_id="1", model="test/vision", attempted_before_ms=0)
+    )
+    assert (result.described, result.failed) == (1, 2)
+    assert result.cost == pytest.approx(0.003)  # one description plus its embedding
+    assert len(prompts) == 2 and all("custom Discord emoji" in p for p in prompts)
+    cursor = await db.execute("SELECT description FROM guild_emojis WHERE id = 11")
+    assert (await cursor.fetchone())[0] == "a confused face"

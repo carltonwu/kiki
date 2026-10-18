@@ -8,9 +8,15 @@ steps:
   - expect: {sql: "SELECT jsonb_array_length(m.raw->'attachments') FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[2] ORDER BY r.id DESC LIMIT 1", equals: 0}
   - expect: {sql: "SELECT count(*) FROM agent_host_images WHERE job_id = (SELECT 'reply:' || max(id) FROM agent_runs)", equals: 1}
   - expect: {sql: "SELECT cost_usd > 0.04 FROM agent_runs ORDER BY id DESC LIMIT 1", equals: true}
-  # Kiki sees her own picture in later turns' history.
-  - say: {as: alex, in: general, text: "kiki love it"}
-  - expect: {run: done, reply: true, prompt_contains: "[attachment: kiki-"}
+  # Kiki sees her own picture in later turns' history, as an image she can read
+  # back: read_image takes its bytes from the host's store (read-image, #2).
+  - say: {as: alex, in: general, text: "kiki love it, what's in it again?"}
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "{result}"}
+  - expect:
+      run: done
+      reply: true
+      prompt_contains: "[image: kiki-"
+      tool_result_contains: ['"drawn_by_kiki":true', "Image 1: a drawing of a frog wearing a cowboy hat"]
   # A refusal reaches the model as a tool error; the reply goes out without a file.
   - say: {as: alex, in: general, text: "kiki draw something cursed"}
     reply: {tool: {name: generate_image, args: {prompt: "refuse this"}}, text: "couldn't draw it: {result}"}

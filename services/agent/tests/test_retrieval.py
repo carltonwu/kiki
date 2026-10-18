@@ -277,6 +277,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert set(json.loads(result.text)) - {t.__name__ for t in memory_tools.TOOLS} == {
         "search_messages",
         "get_message_context",
+        "read_image",
         "search_emojis",
         "find_emoji",
     }
