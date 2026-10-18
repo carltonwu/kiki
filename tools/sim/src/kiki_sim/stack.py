@@ -40,6 +40,8 @@ CACHE = Path(os.getenv("XDG_CACHE_HOME") or Path.home() / ".cache") / "kiki-sim"
 # What the ingester binary is built from, besides `services/` (minus the agent).
 RUST_INPUTS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo"]
 KEPT_BUILDS = 8
+# The ingester's pool (10) plus the agent host's job connections and the CLI's.
+CONNECTIONS_PER_STACK = 15
 HOST_TOKEN = "sim-host-token"
 # Variables a toolchain needs; everything else is set explicitly per service.
 KEEP = [
@@ -536,8 +538,23 @@ def log_size(name: str) -> int:
 # --- lifecycle ---------------------------------------------------------------
 
 
+def check_room() -> None:
+    """Refuses to start a stack the server can't hold: a full server fails
+    scenarios later with errors that don't say why."""
+    with psycopg.connect(admin_url(), autocommit=True) as c:
+        limit = int(c.execute("SHOW max_connections").fetchone()[0])
+        used = c.execute("SELECT count(*) FROM pg_stat_activity").fetchone()[0]
+    if limit - used < CONNECTIONS_PER_STACK:
+        raise SimError(
+            f"the sim Postgres has {used} of {limit} connections in use, too few for another"
+            " stack: run `kiki-sim stacks` and `kiki-sim down --all` in worktrees you're done with"
+        )
+
+
 def up(config: Config) -> None:
     start_postgres()
+    if not running("ingester"):
+        check_room()
     config.ingester = build_ingester()
     prepare_template(config.ingester)
     if running("fakecord"):
