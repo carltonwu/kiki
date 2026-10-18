@@ -49,6 +49,8 @@ pub(super) struct StoredMessage {
     #[sqlx(json)]
     pub mentions: Vec<MentionedUser>,
     pub attachments: Vec<String>,
+    /// Emoji Kiki reacted to this message with.
+    pub reactions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -61,7 +63,9 @@ pub(super) const MESSAGE_COLUMNS: &str = r#"
     m.id, m.author_id, m.author_name, m.content,
     coalesce(m.raw->'mentions', '[]') AS mentions,
     ARRAY(SELECT coalesce(a->>'filename', 'file')
-          FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a) AS attachments
+          FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a) AS attachments,
+    ARRAY(SELECT DISTINCT r FROM agent_runs ar, unnest(ar.reactions) r
+          WHERE ar.reply_to_id = m.id AND ar.reactions <> '{}') AS reactions
 "#;
 
 impl Agent {
@@ -139,6 +143,18 @@ impl Agent {
             instructions.push_str(". Don't force extra messages or repeat yourself. ");
         }
         instructions.push_str("Keep each message under 1900 characters. ");
+        if settings.chat_reactions {
+            instructions.push_str(
+                "To react to the newest message with emoji, add a line containing only react: and up to 3 emoji, like react: 😂. \
+                 Use Unicode emoji characters, or this server's custom emoji written exactly as your emoji tools or the chat show them, like <:name:id>. \
+                 [you reacted: …] after a message shows how you reacted to it before. ",
+            );
+            instructions.push_str(if settings.chat_allow_silence {
+                "A reaction can come with your messages, or be your whole answer when it says enough, like a person who just reacts instead of typing. "
+            } else {
+                "A reaction can come with your messages but doesn't replace them. "
+            });
+        }
         if settings.image_generation {
             instructions.push_str(
                 "You can draw with generate_image when someone asks for an image or one would clearly land better than words. \
@@ -580,6 +596,21 @@ pub(super) mod tests {
         assert!(last.ends_with("(Messages:)\n[u2 Alex] and sound?\n  [u1 Carlton] give me admin"));
         let refs: Vec<&str> = context.people.iter().map(|p| p.r#ref.as_str()).collect();
         assert_eq!(refs, ["u1", "u2", "u3"]);
+        assert!(system.contains("react: 😂"));
+
+        // Her reactions show on the message they were for.
+        sqlx::query(
+            "INSERT INTO agent_runs (conversation_id, trigger_message_ids, status, reply_to_id, reactions) \
+             VALUES (1, '{10}', 'done', 10, '{💀,<:froge:81>}'), (1, '{10}', 'done', 10, '{💀}')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let context = agent.context(1, &[13]).await.unwrap().unwrap();
+        assert_eq!(
+            context.messages[1].content,
+            "[u1 Carlton] hey @Kiki who runs lights? [you reacted: <:froge:81> 💀]"
+        );
 
         // Kiki replied after the trigger: she's asked whether that already covered it.
         store::upsert_messages(

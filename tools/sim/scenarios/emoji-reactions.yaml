@@ -1,0 +1,49 @@
+name: emoji reactions alone or with a reply, custom emoji, and the settings that limit them
+steps:
+  # React only: no message, the reaction lands on the trigger and is recorded.
+  - say: {as: alex, in: general, text: "@kiki i tripped on stage again", id: trip, reply: {text: "react: 💀"}}
+  - expect: {run: done, reply: false, prompt_contains: "react: 😂", reaction: {emoji: "💀", present: true}}
+  - expect: {of: trip, reaction: {emoji: "👀", present: false}}
+  - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "💀"}
+  # React and reply, with one of the server's custom emoji written the way models
+  # often do (trailing colon); the marker line never reaches Discord.
+  - say:
+      as: alex
+      in: general
+      text: "@kiki guess who got the lead"
+      reply: {text: "react: 🎉 <:huh:900000000000005001:>\nno WAY\n---\ncongrats queen"}
+  - expect:
+      run: done
+      reply: true
+      text_contains: [no way, congrats queen]
+      text_lacks: "react|huh"
+      prompt_contains: "i tripped on stage again [you reacted: 💀]"
+      reaction: {emoji: "🎉", present: true}
+  - expect: {reaction: {emoji: "huh:900000000000005001", present: true}}
+  - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "🎉 <:huh:900000000000005001>"}
+  # A :name: is looked up in the server's emoji catalog once it's synced;
+  # Unicode shortcodes aren't resolved but never show up as text.
+  - say: {as: alex, in: general, text: "@kiki the set fell over", reply: {text: "react: :tannah:\noh no"}}
+  - expect: {run: done, reply: true, text_lacks: "react|tannah", reaction: {emoji: "tannah:900000000000005003", present: false, added: false}}
+  - slash: {as: alex, in: general, command: emojis, options: {resync: true}}
+  - expect: {response_contains: "3 new"}
+  - say: {as: alex, in: general, text: "@kiki we won the regional", reply: {text: "react: :TANNAH: :skull:"}}
+  - expect: {run: done, reply: false, reaction: {emoji: "tannah:900000000000005003", present: true}}
+  - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "<a:tannah:900000000000005003>"}
+  # Discord rejects an emoji Kiki can't use; the reply still goes out.
+  - say: {as: alex, in: general, text: "@kiki rate my outfit", reply: {text: "react: <:nope:123>\nten"}}
+  - expect: {run: done, reply: true, text_contains: ten}
+  - expect: {sql: "SELECT cardinality(reactions) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 0}
+  # Reacting with the pending emoji keeps it instead of clearing it.
+  - say: {as: alex, in: general, text: "@kiki look behind you", reply: {text: "react: 👀"}}
+  - wait: 1
+  - expect: {run: done, reply: false, reaction: {emoji: "👀", present: true}}
+  # Reactions off: no instructions, and a stray marker is dropped, not posted.
+  - slash: {as: alex, in: general, command: config, options: {key: chat_reactions, value: "false"}}
+  - say: {as: alex, in: general, text: "@kiki say hey", reply: {text: "react: 😂\nhey"}}
+  - expect: {run: done, reply: true, text_contains: hey, text_lacks: "react", prompt_lacks: "react: 😂", reaction: {emoji: "😂", present: false, added: false}}
+  # A reaction alone is sitting out, which a server can disallow.
+  - slash: {as: alex, in: general, command: config, options: {key: chat_reactions, value: "true"}}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "false"}}
+  - say: {as: alex, in: general, text: "@kiki answer me", reply: {text: "react: 😂"}}
+  - expect: {run: failed, reply: false, prompt_contains: "doesn't replace them", reaction: {emoji: "😂", present: false, added: false}}

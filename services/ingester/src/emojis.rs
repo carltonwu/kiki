@@ -105,6 +105,33 @@ pub async fn list(db: &PgPool, guild_id: i64) -> sqlx::Result<Vec<Emoji>> {
     .await
 }
 
+/// The server's usable emoji named exactly (ignoring case) like `names`, as for
+/// a `:name:` reaction; `find_emoji`'s exact match. Keyed by lowercase name.
+pub async fn named(
+    db: &PgPool,
+    guild_id: i64,
+    names: &[String],
+) -> sqlx::Result<std::collections::HashMap<String, Emoji>> {
+    let lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    let found: Vec<Emoji> = sqlx::query_as(
+        r#"
+        SELECT DISTINCT ON (lower(name)) id, name, animated, available, description
+        FROM guild_emojis
+        WHERE guild_id = $1 AND removed_at IS NULL AND available AND lower(name) = ANY($2)
+        ORDER BY lower(name), name <> ALL($3), id
+        "#,
+    )
+    .bind(guild_id)
+    .bind(&lower)
+    .bind(names)
+    .fetch_all(db)
+    .await?;
+    Ok(found
+        .into_iter()
+        .map(|e| (e.name.to_lowercase(), e))
+        .collect())
+}
+
 /// The database clock in Unix milliseconds: describe calls compare it with
 /// their own `now()`, so one resync tries each emoji at most once.
 pub async fn now_ms(db: &PgPool) -> sqlx::Result<i64> {
@@ -117,7 +144,7 @@ pub async fn now_ms(db: &PgPool) -> sqlx::Result<i64> {
 mod tests {
     use serde_json::json;
 
-    use super::{Synced, list, sync};
+    use super::{Synced, list, named, sync};
 
     #[tokio::test]
     async fn sync_adds_renames_removes_and_keeps_descriptions() {
@@ -185,6 +212,11 @@ mod tests {
             .collect();
         assert_eq!(names, ["huh_what", "new"]);
         assert_eq!(list(&db, 2).await.unwrap().len(), 1);
+        // `:name:` reactions: exact names ignoring case, this server's, not removed.
+        let wanted = ["HUH_WHAT", "huh", "oop", "theirs"].map(String::from);
+        let found = named(&db, 1, &wanted).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found["huh_what"].mention(), "<:huh_what:11>");
 
         // A removed emoji that comes back counts as added, with its description.
         let third = sync(&db, 1, &[oop]).await.unwrap();

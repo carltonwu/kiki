@@ -70,6 +70,7 @@ settings! { r, a;
     chat_max_delay: u64 = 3000, Kind::Duration(1, 0, 10_000), "Maximum pause between messages (ms; total capped at 8s)";
     chat_allow_silence: bool = true, Kind::Bool, "Allow Kiki to sit out when a reply would add little";
     chat_reply_reference: bool = false, Kind::Bool, "Attach and ping a Discord reply on the first message";
+    chat_reactions: bool = true, Kind::Bool, "Let Kiki react to messages with emoji, alone or with a reply";
     status_reactions: bool = true, Kind::Bool, "Show routing and pending status reactions";
     reply_max_tokens: u32 = 2000, Kind::Integer(100, 4000), "Output tokens per model request";
     topic_every_messages: i64 = a.topic_every_messages, Kind::Integer(1, 50), "New messages before refreshing a topic";
@@ -433,7 +434,7 @@ pub mod tests {
             "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12,
             "lingo_nudge": 35, "chat_min_messages": 1, "chat_max_messages": 3,
             "chat_max_delay": 3000, "chat_allow_silence": true,
-            "chat_reply_reference": false, "status_reactions": true
+            "chat_reply_reference": false, "chat_reactions": true, "status_reactions": true
         }))
         .unwrap()
     }
