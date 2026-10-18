@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use super::{
     clean_reply,
-    discord::{MAX_MESSAGE_CHARS, split_message},
+    discord::{MAX_MESSAGE_CHARS, split_message, track_fence},
     emoji::{self, MAX_REACTIONS, Reaction},
     is_no_reply, strip_speaker,
 };
@@ -43,18 +43,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
     let mut fence = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        // A line like ```ls``` opens and closes inline; it isn't a fence.
-        let marker = ['`', '~'].into_iter().find(|&c| {
-            let run = String::from(c).repeat(3);
-            trimmed.starts_with(&run) && !trimmed[3..].contains(&run)
-        });
-        if let Some(marker) = marker {
-            if fence == Some(marker) {
-                fence = None;
-            } else if fence.is_none() {
-                fence = Some(marker);
-            }
-        }
+        track_fence(&mut fence, line);
         let reaction = fence
             .is_none()
             .then(|| emoji::parse_line(strip_speaker(trimmed).trim_start()))
