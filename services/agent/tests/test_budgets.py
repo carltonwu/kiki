@@ -9,8 +9,10 @@ from types import SimpleNamespace
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import db, memory_tools
-from kiki_agent_host.agent import PydanticExecutor
+from kiki_agent_host import db
+from kiki_agent_host.agent.deps import MemorySession
+from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.tools import memory as memory_tools
 from kiki_agent_host.contracts import JobRequest
 
 
@@ -91,7 +93,7 @@ async def test_memory_calls_queue_outside_the_deadline_and_a_timeout_drops_the_c
     monkeypatch.setattr(db, "connect", connect)
     monkeypatch.setattr(memory_tools, "TIMEOUT_SECONDS", 0.2)
     deps = SimpleNamespace(
-        memory=memory_tools.Session("unused"),
+        memory=MemorySession("unused"),
         spent=Counter(),
         job_id="reply:memory",
         scope=SimpleNamespace(channel_id=2, conversation_id=2),

@@ -1,85 +1,41 @@
-"""Memory tools for the chat agent (docs/subject-memory-hld.md), kept apart from
-the search tools in `agent`. They read `scope`, `roster` and `job_id` from the
-run's deps, and keep their own connection and budget in `deps.memory`."""
+"""Memory tools (docs/subject-memory-hld.md). They use their own connection
+(`deps.memory`) and their own budget, apart from the lookups."""
 
 import asyncio
-import contextlib
 import logging
-import time
-from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Literal
 
-from psycopg import AsyncConnection
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import RunContext
+from pydantic_ai.toolsets import FunctionToolset
 
-from . import db
-from .chat import memory
+from ...chat import memory
+from ..deps import Deps
+from ..guard import Budget, guarded
 
 logger = logging.getLogger(__name__)
 
-MAX_CALLS = 6  # separate from the search budget: filing a memory shouldn't cost a search
+
+# Separate from the lookups budget: filing a memory shouldn't cost a search.
+MEMORY = Budget("Memory", 6)
 TIMEOUT_SECONDS = 10
 
 
-@dataclass
-class Session:
-    """One run's memory state. Its own connection: memory transactions must not
-    interleave with background indexing on the run's shared one. The lock covers
-    parallel tool calls."""
+async def run(ctx: RunContext[Deps], name: str, operation) -> dict:
+    session = ctx.deps.memory
 
-    database_url: str
-    calls: int = 0
-    connection: AsyncConnection | None = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    async def work() -> dict:
+        try:
+            return await operation(await session.connect())
+        except asyncio.CancelledError:
+            # Timed out mid-query: the connection's state is unknown, so the
+            # next memory call opens a fresh one.
+            await session.close()
+            raise
 
-    async def connect(self) -> AsyncConnection:
-        if self.connection is None:
-            self.connection = await db.connect(self.database_url)
-        return self.connection
-
-    async def close(self) -> None:
-        if self.connection is not None:
-            connection, self.connection = self.connection, None
-            with contextlib.suppress(Exception):
-                await connection.close()
+    return await guarded(ctx, name, work, budget=MEMORY, timeout=TIMEOUT_SECONDS, lock=session.lock)
 
 
-async def run(ctx: RunContext[Any], name: str, operation) -> dict:
-    deps, session = ctx.deps, ctx.deps.memory
-    session.calls += 1
-    if session.calls > MAX_CALLS:
-        logger.debug("memory budget exhausted job_id=%s tool=%s", deps.job_id, name)
-        return {"error": "Memory budget used up. Answer with what you have."}
-    started = time.monotonic()
-    outcome = "ok"
-    try:
-        async with session.lock, asyncio.timeout(TIMEOUT_SECONDS):
-            try:
-                result = await operation(await session.connect())
-            except asyncio.CancelledError:
-                # Timed out mid-query: the connection's state is unknown, so the
-                # next memory call opens a fresh one.
-                await session.close()
-                raise
-    except TimeoutError:
-        outcome, result = "timeout", {"error": "Timed out."}
-    except ValueError as e:
-        outcome, result = "invalid_arguments", {"error": str(e)}
-    logger.info(
-        "tool completed job_id=%s tool=%s channel_id=%s conversation_id=%s "
-        "latency_ms=%d hits=%d outcome=%s",
-        deps.job_id,
-        name,
-        deps.scope.channel_id,
-        deps.scope.conversation_id,
-        (time.monotonic() - started) * 1000,
-        len(result.get("entries", [])),
-        "error" if outcome == "ok" and "error" in result else outcome,
-    )
-    return result
-
-
-async def recall(ctx: RunContext[Any], subject: str, doc: str | None = None) -> dict:
+async def recall(ctx: RunContext[Deps], subject: str, doc: str | None = None) -> dict:
     """Read what you remember about a person or thing: their base profile, or one of their docs.
 
     The result also lists all of the subject's docs (title, what belongs there, size), so
@@ -97,7 +53,7 @@ async def recall(ctx: RunContext[Any], subject: str, doc: str | None = None) -> 
     )
 
 
-async def search_memory(ctx: RunContext[Any], query: str, subject: str | None = None) -> dict:
+async def search_memory(ctx: RunContext[Deps], query: str, subject: str | None = None) -> dict:
     """Search your memory docs about everyone and everything in this server, by keywords.
 
     Args:
@@ -112,7 +68,7 @@ async def search_memory(ctx: RunContext[Any], query: str, subject: str | None = 
 
 
 async def remember(
-    ctx: RunContext[Any],
+    ctx: RunContext[Deps],
     subject: str,
     text: str,
     kind: Literal["fact", "opinion"],
@@ -159,7 +115,7 @@ async def remember(
     )
 
 
-async def forget(ctx: RunContext[Any], entry: str, sources: list[str] | None = None) -> dict:
+async def forget(ctx: RunContext[Deps], entry: str, sources: list[str] | None = None) -> dict:
     """Retire a saved entry that turned out wrong or outdated, or that someone asked you to forget.
 
     Needs the same evidence as changing it (see remember), unless the person it's about
@@ -177,7 +133,7 @@ async def forget(ctx: RunContext[Any], entry: str, sources: list[str] | None = N
 
 
 async def split_doc(
-    ctx: RunContext[Any],
+    ctx: RunContext[Deps],
     subject: str,
     new_doc: str,
     title: str,
@@ -215,9 +171,4 @@ async def split_doc(
     )
 
 
-TOOLS = [recall, search_memory, remember, forget, split_doc]
-
-
-def register(agent: Agent) -> None:
-    for tool in TOOLS:
-        agent.tool(tool)
+toolset = FunctionToolset([recall, search_memory, remember, forget, split_doc])

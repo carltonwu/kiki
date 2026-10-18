@@ -34,6 +34,7 @@ from pydantic_ai.usage import UsageLimits
 from ..chat.attachments import images_in
 from ..chat.scope import HEARD, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
+from ..prompt import history
 from .fetch import client, download, refresh, sniff
 from .vision import ImageRefused, Vision, billed_cost, look
 
@@ -425,7 +426,6 @@ async def failure_note(
     """Kiki's message about a drawing that failed, written by the chat model with the
     reply's own prompt (her voice, the conversation), and its cost. Empty if even
     that fails: Rust then posts its minimal notice."""
-    from ..agent import history  # agent.py imports this module
 
     cursor = await connection.execute(
         "SELECT request FROM agent_host_jobs WHERE id = %s", (reply_job,)

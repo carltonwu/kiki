@@ -10,9 +10,11 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 
-from kiki_agent_host import agent
-from kiki_agent_host.agent import PydanticExecutor, WebOpenRouterModel, web_use
+from kiki_agent_host.agent import web
+from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.web import web_use
 from kiki_agent_host.contracts import JobRequest, JobResult
+from kiki_agent_host.openrouter.chat import WebOpenRouterModel
 
 
 def completion(body: dict, server_tool_use: dict | None = None, annotations=()) -> dict:
@@ -70,14 +72,14 @@ def openrouter(requests: list[dict], **answer) -> OpenRouterProvider:
 async def test_reply_requests_offer_web_search_and_fetch_server_tools():
     requests: list[dict] = []
     model = WebOpenRouterModel("test/model", provider=openrouter(requests))
-    probe = Agent(model, capabilities=agent.WEB_TOOLS, tools=[lambda: "unused"])
-    await probe.run("hi", model_settings={"extra_body": {"max_tool_calls": agent.MAX_WEB_STEPS}})
+    probe = Agent(model, capabilities=web.WEB_TOOLS, tools=[lambda: "unused"])
+    await probe.run("hi", model_settings={"extra_body": {"max_tool_calls": web.MAX_WEB_STEPS}})
 
     [body] = requests
     server = {t["type"]: t.get("parameters") for t in body["tools"] if t["type"] != "function"}
     assert set(server) == {"openrouter:web_search", "openrouter:web_fetch"}
-    assert server["openrouter:web_fetch"] == {"max_content_tokens": agent.WEB_FETCH_MAX_TOKENS}
-    assert body["max_tool_calls"] == agent.MAX_WEB_STEPS
+    assert server["openrouter:web_fetch"] == {"max_content_tokens": web.WEB_FETCH_MAX_TOKENS}
+    assert body["max_tool_calls"] == web.MAX_WEB_STEPS
     assert any(t["type"] == "function" for t in body["tools"])
 
 
@@ -171,4 +173,4 @@ async def test_executor_reports_web_use(database_url):
         "openrouter:web_search",
         "openrouter:web_fetch",
     }
-    assert requests[0]["max_tool_calls"] == agent.MAX_WEB_STEPS
+    assert requests[0]["max_tool_calls"] == web.MAX_WEB_STEPS

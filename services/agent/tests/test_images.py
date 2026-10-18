@@ -20,7 +20,8 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import FunctionModel
 
-from kiki_agent_host.agent import MAX_IMAGES, PydanticExecutor
+from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.tools.drawing import MAX_IMAGES
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest, Subject
 from kiki_agent_host.media import drawing, fetch, generation
 from kiki_agent_host.media.vision import ImageRefused

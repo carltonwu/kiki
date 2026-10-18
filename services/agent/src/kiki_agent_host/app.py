@@ -145,7 +145,7 @@ def application() -> FastAPI:
     settings = Settings.from_env()
     executor = None
     if settings.openrouter_api_key:
-        from .agent import PydanticExecutor  # the SDK import dominates startup time
+        from .agent.executor import PydanticExecutor  # the SDK import dominates startup time
 
         executor = PydanticExecutor(
             settings.database_url,
