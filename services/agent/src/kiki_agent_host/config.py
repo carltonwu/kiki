@@ -3,6 +3,10 @@
 import os
 from dataclasses import dataclass
 
+# Draws what the image model's safety filter blocks (seen in prod: most failed
+# drawings were OpenAI blocks of campy, harmless requests). Empty turns it off.
+DEFAULT_IMAGE_FALLBACK_MODEL = "qwen/qwen-image-2.1-turbo"
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -12,6 +16,7 @@ class Settings:
     job_timeout_seconds: float = 120
     openrouter_api_key: str = ""
     openrouter_vision_model: str = ""
+    openrouter_image_fallback_model: str = DEFAULT_IMAGE_FALLBACK_MODEL
     # Refreshes expired Discord attachment links (reference images; `media.fetch.refresh`).
     discord_bot_token: str = ""
 
@@ -30,6 +35,9 @@ class Settings:
             job_timeout_seconds=float(os.getenv("AGENT_HOST_JOB_TIMEOUT_SECS", "120")),
             openrouter_api_key=os.getenv("OPENROUTER_CHAT_API_KEY", ""),
             openrouter_vision_model=os.getenv("OPENROUTER_VISION_MODEL", "").strip(),
+            openrouter_image_fallback_model=os.getenv(
+                "OPENROUTER_IMAGE_FALLBACK_MODEL", DEFAULT_IMAGE_FALLBACK_MODEL
+            ).strip(),
             discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         )
 

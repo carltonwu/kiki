@@ -49,7 +49,30 @@ Rust: reply job (+ image_model) ─▶ host: chat model calls generate_image(pro
   (her instructions and the conversation), her ack, and the reason. Rust posts it
   as the follow-up. Only if that call fails too, or the host can't be reached, does
   Rust post its minimal `(couldn't make that picture)`, so the request still gets
-  an answer.
+  an answer. A safety block (OpenRouter passes OpenAI's `400 "rejected by the
+  safety system… safety_violations=[…]"` through) is a `ContentFilterError`, and
+  the note's reason says asking again won't get it through. Before, the reason
+  was "HTTP 400": Kiki called it a glitch, invited a retry, and the retry was
+  blocked the same way. Other 4xx log their status and error code.
+- **A fallback model draws what the safety filter blocks.** When the server's
+  image model's filter blocks a picture, the host draws it again with
+  `OPENROUTER_IMAGE_FALLBACK_MODEL` on the agent service (default
+  `qwen/qwen-image-2.1-turbo`; empty turns it off), whose provider filters
+  differently. Only safety blocks fall back: other errors would fail the same
+  way. The fallback gets the references it takes (from OpenRouter's image
+  catalog: 4 for Qwen, 16 for GPT Image), each subject keeping its best ones in
+  turn, then the shared images, renumbered in its own prompt. A ratio it doesn't
+  take maps to the nearest (21:9 to 16:9). The saved image and the job result
+  name the model that drew it. If both block it, Kiki's note says so. The
+  fallback goes through the same OpenRouter key, so the workspace's guardrails
+  must allow its provider. Qwen's only provider, Alibaba Cloud, isn't
+  zero-data-retention.
+- **Pictures still drawing are in the prompt.** Each run's context lists the
+  channel's pictures that are queued but not yet posted: their request, its
+  author, and the caption. The tool says not to queue them again. Without this,
+  a run started during the 15–25 s a picture takes saw the request and Kiki's
+  "give me a sec" but no picture, and drew it again. In prod, one meme was drawn
+  five times in two minutes, triggered by "wtf" and "Wow I kinda look like Steve".
 
 ## Inputs
 
@@ -65,8 +88,11 @@ The chat model passes:
 - `subjects`: the people, pets and things whose look matters, each with a `name`,
   what she knows of them (`description`), a person's roster ref (`person`; a name
   only one member has gone by resolves too), `me` for herself, and `photos`:
-  message IDs she or the people asking already picked. A bare string is taken as a
-  name (models slip; two slips failed a prod reply through the tool's retry limit).
+  message IDs she or the people asking already picked, or a Discord message link
+  or attachment link they pasted. An attachment link's message is found by its
+  attachment ID in the link's channel; an attachment's snowflake comes just
+  before its message's. A bare string is taken as a name (models slip; two slips
+  failed a prod reply through the tool's retry limit).
 - `style` only when asked for or the joke needs it; `aspect_ratio` from what GPT
   Image 2.5 takes on OpenRouter (1:1, 3:2, 2:3, 4:3, 3:4, 16:9, 9:16, 21:9; anything
   else is dropped rather than failing the call); `caption`; and `edit` to change a
@@ -93,6 +119,21 @@ subject and 16 in all (OpenRouter's `input_references` range for GPT Image), bes
 4. **Kiki herself**: her earlier pictures saved with a `me` subject, so her look
    stays consistent once she has drawn herself.
 
+**Shared images** come after every subject's references. These are the images
+people shared with the request: attached to a trigger message, or in a message a
+trigger replies to or links (a message link or a pasted attachment link). Kiki's
+own pictures don't count. Rust works these out while building the context. The
+prompt shows what the newest messages reply to or link, with image markers, so
+Kiki can use them as `photos`. Rust adds the ones no subject uses as
+`Drawing.shared`, at most 4 messages. The host sends them unchecked (people
+picked them, and the check would turn down a meme template) and labels them
+"Reference image N is what they shared with the request (a photo, meme or
+template): use it as the request describes". In prod, "edit this meme" sent as a
+reply to the meme, a linked photo of a pet, and a photo attached to the request
+all failed to reach the image model, because the drawing used only the photos
+Kiki remembered to name. A given photo that the history search finds again isn't
+checked or sent twice.
+
 A subject with no usable reference is drawn from her description. Images are
 downloaded from Discord and sent as bytes (data URLs), never as Discord links:
 attachment links are signed and expire after about a day, so the host refreshes
@@ -116,7 +157,7 @@ Who and what is in it:
   tone and build the same; don't change Ethan's identity.
 - Nougie, shown in reference images 3-5: traumagotchi's dog. Keep Nougie's look (for an
   animal: breed, size, coat colors and markings) the same; don't change Nougie's identity.
-Use the reference images only for how these subjects look, not for their backgrounds,
+Use the subjects' reference images only for how they look, not for their backgrounds,
 lighting, clothing or framing: make the new picture described above.
 ```
 
@@ -159,7 +200,8 @@ reference and vision-call counts, outcome, cost and latency.
 - Results saved before this change may still list drawn `images`; Rust attaches
   them to the first message as before.
 - Deploy the host before (or with) the ingester: an older host has no
-  `/v1/images` and rejects the new tool arguments. Without `DISCORD_BOT_TOKEN` on
+  `/v1/images` and rejects the new tool arguments, and one without
+  `Drawing.shared` rejects drawings that carry it. Without `DISCORD_BOT_TOKEN` on
   the host, history photos older than about a day can't be downloaded, so drawings
   fall back to avatars and descriptions.
 
@@ -178,6 +220,9 @@ reference and vision-call counts, outcome, cost and latency.
 - **Chat-style image models** (`openai/gpt-5-image`) aren't supported; use their
   Images API equivalents.
 - **Moderation** is the provider's; Kiki relays its refusal in her note.
+- **Duplicates are prevented in the prompt only.** A run sees pictures already
+  queued, but two runs in different conversations of one channel that answer the
+  same request at the same moment can both queue it (seen once in prod).
 
 ## Tests
 

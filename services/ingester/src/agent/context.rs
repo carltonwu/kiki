@@ -36,7 +36,38 @@ pub(super) struct Context {
     pub reply_to: i64,
     pub messages: Vec<Message>,
     pub people: Vec<PersonRef>,
+    /// Messages with images people shared with this run's request: the triggers'
+    /// own and those they reply to or link, not Kiki's. A drawing the reply queues
+    /// gets the ones its subjects don't use (`Drawing.shared` on the host).
+    pub shared: Vec<i64>,
 }
+
+/// A message the newest messages reply to or link to.
+#[derive(FromRow)]
+pub(super) struct Pointed {
+    pub from_author: i64,
+    /// "replies to" or "links".
+    pub how: String,
+    #[sqlx(flatten)]
+    pub message: StoredMessage,
+}
+
+/// A picture a run queued that isn't posted yet.
+#[derive(FromRow)]
+pub(super) struct QueuedDrawing {
+    pub requester: Option<i64>,
+    pub request: Option<String>,
+    pub caption: String,
+    pub age_secs: i64,
+}
+
+/// What `generate_image` takes as photos: at most this many shared messages.
+const SHARED: usize = 4;
+/// An attachment's snowflake is made as it's uploaded, just before its message's:
+/// the message is within a minute of snowflake time after it.
+const ATTACHMENT_TO_MESSAGE: i64 = 60_000 << 22;
+/// Matches `drawing::MAX_AGE`: older pending pictures aren't drawn.
+const DRAWING_MAX_AGE_SECS: i64 = 15 * 60;
 
 #[derive(FromRow)]
 pub(super) struct StoredMessage {
@@ -133,6 +164,10 @@ impl Agent {
         let origin = self
             .thread_origin(&this, &mut history, &mut channel)
             .await?;
+        let (pointed, drawings) = tokio::try_join!(
+            self.pointed(this.guild_id, trigger_message_ids),
+            self.drawings(this.channel_id),
+        )?;
         let names = self
             .server_names(this.guild_id, &history, trigger_message_ids)
             .await?;
@@ -140,8 +175,21 @@ impl Agent {
         let more: Vec<i64> = others
             .iter()
             .flat_map(|c| c.participants.iter().map(|p| p.id))
+            .chain(drawings.iter().filter_map(|d| d.requester))
             .collect();
-        let shown: Vec<&StoredMessage> = history.iter().chain(&channel).chain(&origin).collect();
+        let shown: Vec<&StoredMessage> = history
+            .iter()
+            .chain(&channel)
+            .chain(&origin)
+            .chain(pointed.iter().map(|p| &p.message))
+            .collect();
+        let shared = shared(
+            history
+                .iter()
+                .filter(|m| trigger_message_ids.contains(&m.id))
+                .chain(pointed.iter().map(|p| &p.message)),
+            self.bot_user_id,
+        );
         let roster = self
             .roster(this.guild_id, conversation_id, &shown, &more)
             .await?;
@@ -220,6 +268,8 @@ impl Agent {
         }
 
         let mut run = self.run_context(&this, &others, &channel, origin.as_ref(), &roster, &now);
+        run.push_str(&pointed_context(&pointed, &roster));
+        run.push_str(&drawings_context(&drawings, &roster));
         run.push_str(&remembered);
         run.push_str(&names);
         if let Some((phrase, meaning)) =
@@ -259,7 +309,83 @@ impl Agent {
             reply_to,
             messages,
             people: roster.wire(),
+            shared,
         }))
+    }
+
+    /// What the trigger messages reply to, and the messages they link (message
+    /// links, or a pasted attachment link: its message is found by the attachment).
+    /// Shown whether or not they're in the history: which image "this" is matters.
+    pub(super) async fn pointed(
+        &self,
+        guild_id: i64,
+        trigger_message_ids: &[i64],
+    ) -> sqlx::Result<Vec<Pointed>> {
+        sqlx::query_as(&format!(
+            r#"
+            WITH t AS (
+                SELECT id, author_id, content, reply_to_id FROM messages
+                WHERE id = ANY($1) AND guild_id = $2 AND deleted_at IS NULL AND author_id <> $3
+            ), targets AS (
+                SELECT t.id AS from_id, t.author_id AS from_author, 'replies to' AS how,
+                       t.reply_to_id AS target
+                FROM t WHERE t.reply_to_id IS NOT NULL
+                UNION ALL
+                SELECT t.id, t.author_id, 'links', l.g[1]::bigint
+                FROM t CROSS JOIN LATERAL regexp_matches(
+                    t.content, 'discord(?:app)?\.com/channels/[0-9]+/[0-9]+/([0-9]+)', 'g') AS l(g)
+                UNION ALL
+                SELECT t.id, t.author_id, 'links', (
+                    SELECT m.id FROM messages m
+                    WHERE m.guild_id = $2 AND m.channel_id = a.g[1]::bigint
+                      AND m.id BETWEEN a.g[2]::bigint AND a.g[2]::bigint + $4
+                      AND m.raw->'attachments' @> jsonb_build_array(jsonb_build_object('id', a.g[2]))
+                    ORDER BY m.id LIMIT 1)
+                FROM t CROSS JOIN LATERAL regexp_matches(
+                    t.content,
+                    '(?:cdn|media)\.discord(?:app)?\.(?:com|net)/attachments/([0-9]+)/([0-9]+)/',
+                    'g') AS a(g)
+            )
+            SELECT * FROM (
+                SELECT DISTINCT ON (m.id) targets.from_author, targets.how, {MESSAGE_COLUMNS}
+                FROM targets JOIN messages m ON m.id = targets.target
+                WHERE m.guild_id = $2 AND m.deleted_at IS NULL AND m.id <> ALL($1)
+                  AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+                ORDER BY m.id, targets.from_id
+            ) pointed ORDER BY id LIMIT 6
+            "#
+        ))
+        .bind(trigger_message_ids)
+        .bind(guild_id)
+        .bind(self.bot_user_id)
+        .bind(ATTACHMENT_TO_MESSAGE)
+        .fetch_all(&self.db)
+        .await
+    }
+
+    /// Pictures queued in this channel that aren't posted yet. A run that sees a
+    /// request and Kiki's "give me a sec" but no picture would otherwise draw it
+    /// again (seen in prod: one meme drawn five times in two minutes).
+    pub(super) async fn drawings(&self, channel_id: i64) -> sqlx::Result<Vec<QueuedDrawing>> {
+        sqlx::query_as(
+            r#"
+            SELECT q.author_id AS requester, q.content AS request,
+                   coalesce(nullif(j.request->'drawing'->>'caption', ''),
+                            left(j.request->'drawing'->>'prompt', 150)) AS caption,
+                   extract(epoch FROM now() - j.created_at)::bigint AS age_secs
+            FROM agent_image_jobs j
+            JOIN agent_runs r ON r.id = j.run_id
+            JOIN conversations c ON c.id = r.conversation_id
+            LEFT JOIN messages q ON q.id = j.reply_to_id AND q.deleted_at IS NULL
+            WHERE c.channel_id = $1 AND j.status IN ('pending', 'drawing', 'delivering')
+              AND j.created_at > now() - make_interval(secs => $2)
+            ORDER BY j.id
+            "#,
+        )
+        .bind(channel_id)
+        .bind(DRAWING_MAX_AGE_SECS as f64)
+        .fetch_all(&self.db)
+        .await
     }
 
     pub(super) async fn conversation_messages(
@@ -544,6 +670,62 @@ fn place(this: &Conversation, guild_name: Option<String>) -> String {
         (None, Some(channel)) => format!(" on Discord, {channel}"),
         _ => " on Discord".into(),
     }
+}
+
+/// The messages with images among `messages` that aren't Kiki's, at most [`SHARED`].
+fn shared<'a>(messages: impl Iterator<Item = &'a StoredMessage>, bot_user_id: i64) -> Vec<i64> {
+    let mut ids: Vec<i64> = Vec::new();
+    for m in messages {
+        if m.author_id != bot_user_id && !m.images.is_empty() && !ids.contains(&m.id) {
+            ids.push(m.id);
+        }
+    }
+    ids.truncate(SHARED);
+    ids
+}
+
+fn pointed_context(pointed: &[Pointed], roster: &Roster) -> String {
+    let mut s = String::new();
+    if pointed.is_empty() {
+        return s;
+    }
+    s.push_str(
+        "What the newest messages reply to or link (when you draw for them, these images go to the image model with the request):\n",
+    );
+    for p in pointed {
+        let _ = writeln!(
+            s,
+            "- {} {}: {}",
+            roster.speaker(p.from_author),
+            p.how,
+            roster.line(&p.message)
+        );
+    }
+    s
+}
+
+fn drawings_context(drawings: &[QueuedDrawing], roster: &Roster) -> String {
+    let mut s = String::new();
+    if drawings.is_empty() {
+        return s;
+    }
+    s.push_str(
+        "Pictures you queued that are still being drawn. Each posts on its own in a moment, replying to its request, so don't queue them again unless someone asks for something different:\n",
+    );
+    for d in drawings {
+        let request = d.request.as_deref().unwrap_or("").replace('\n', " ");
+        let request: String = request.chars().take(100).collect();
+        let who = d.requester.map(|id| roster.speaker(id));
+        let _ = writeln!(
+            s,
+            "- for {}\"{}\" ({}s ago): {}",
+            who.map(|w| format!("{w}'s ")).unwrap_or_default(),
+            request.trim(),
+            d.age_secs,
+            d.caption.replace('\n', " "),
+        );
+    }
+    s
 }
 
 /// One of the server's phrases for `percent`% of replies, picked from the
@@ -888,6 +1070,93 @@ pub(super) mod tests {
 
     /// Issue #24: a thread on someone's photo shows that photo, by its real
     /// author, where Discord's starter message is an empty placeholder.
+    /// Seen in prod: "edit this meme" replying to the meme, a message link and a
+    /// pasted attachment link never reached the drawing; and a request with its
+    /// picture still drawing was drawn again by the next run.
+    #[tokio::test]
+    async fn requests_show_what_they_point_to_and_pictures_still_drawing() {
+        let Some(test) = crate::test_db::migrated("ingester_pointed_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let carlton = json!({"id": "101", "username": "luiskys", "global_name": "Carlton"});
+        let ethan = json!({"id": "102", "username": "wheatthin512", "global_name": "Ethan"});
+        let poot = json!({"id": "103", "username": "pootzootriot", "global_name": "traumagotchi"});
+        let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
+        let image = |id: i64, channel: i64, name: &str| {
+            json!([{"id": id.to_string(), "filename": name, "content_type": "image/png",
+                    "url": format!("https://cdn.discordapp.com/attachments/{channel}/{id}/{name}?ex=1")}])
+        };
+        let mut meme = message(30, ethan, json!({}), "", json!([]));
+        meme["attachments"] = image(29, CHANNEL, "meme.png");
+        let mut bed = message(31, poot.clone(), json!({}), "New bed", json!([]));
+        bed["channel_id"] = json!("7");
+        bed["attachments"] = image(28, 7, "bed.jpg");
+        let mut him = message(33, poot, json!({}), "this is him", json!([]));
+        him["attachments"] = image(32, CHANNEL, "him.png");
+        let mut drawn = message(34, kiki, json!({}), "da beach", json!([]));
+        drawn["attachments"] = image(27, CHANNEL, "kiki-5.png");
+        let mut edit = message(
+            35,
+            carlton.clone(),
+            json!({}),
+            "<@1> edit this meme, use https://discord.com/channels/9/7/31 and \
+             https://cdn.discordapp.com/attachments/2/32/him.png?ex=1&hm=2",
+            json!([{"id": "1", "username": "Kiki"}]),
+        );
+        edit["type"] = json!(19);
+        edit["message_reference"] = json!({"message_id": "30"});
+        edit["attachments"] = image(26, CHANNEL, "wig.png");
+        let kiss = message(36, carlton.clone(), json!({}), "make them kiss", json!([]));
+        let mut redo = message(37, carlton, json!({}), "redo it", json!([]));
+        redo["type"] = json!(19);
+        redo["message_reference"] = json!({"message_id": "34"});
+        store::upsert_messages(&db, GUILD, &[meme, bed, him, drawn, edit, kiss, redo])
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES
+                (35, 1, 'mention'), (36, 1, 'decide'), (37, 1, 'decide');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status) VALUES
+                (1, 1, '{36}', 'done'), (2, 1, '{36}', 'done');
+            INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status) VALUES
+                (1, 1, 36, '{"drawing": {"prompt": "two molecules kissing", "caption": "they share a bond"}}', 'drawing'),
+                (2, 1, 36, '{"drawing": {"prompt": "posted already", "caption": "old"}}', 'done');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let agent = agent(db.clone());
+
+        let context = agent.context(1, &[35, 37]).await.unwrap().unwrap();
+        let last = &context.messages.last().unwrap().content;
+        assert!(
+            last.contains(
+                "What the newest messages reply to or link (when you draw for them, these images go to the image model with the request):\n\
+                 - u1 Carlton replies to: [u2 Ethan] [image: meme.png; message 30]\n\
+                 - u1 Carlton links: [u3 traumagotchi] New bed [image: bed.jpg; message 31]\n\
+                 - u1 Carlton links: [u3 traumagotchi] this is him [image: him.png; message 33]\n\
+                 - u1 Carlton replies to: [Kiki] da beach [image: kiki-5.png; message 34]\n"
+            ),
+            "{last}"
+        );
+        assert!(
+            last.contains(
+                "so don't queue them again unless someone asks for something different:\n\
+                 - for u1 Carlton's \"make them kiss\" ("
+            ),
+            "{last}"
+        );
+        assert!(last.contains("s ago): they share a bond\n"), "{last}");
+        assert!(!last.contains(": old\n"), "{last}");
+        // The request's own image first, then what it points to; never Kiki's.
+        assert_eq!(context.shared, [35, 30, 31, 33]);
+        test.drop().await;
+    }
+
     #[tokio::test]
     async fn threads_show_what_they_were_started_from() {
         let Some(test) = crate::test_db::migrated("ingester_thread_test").await else {

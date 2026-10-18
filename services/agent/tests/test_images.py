@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior, UserError
@@ -25,7 +25,14 @@ from kiki_agent_host.agent.tools.drawing import MAX_IMAGES
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest, Subject
 from kiki_agent_host.media import drawing, fetch, generation
 from kiki_agent_host.media.vision import ImageRefused
-from kiki_agent_host.openrouter.images import MAX_REFERENCES, OPENAI_QUALITY, OpenRouterImageModel
+from kiki_agent_host.openrouter.images import (
+    MAX_REFERENCES,
+    OPENAI_QUALITY,
+    OpenRouterImageModel,
+    aspect_ratio_for,
+    reference_limit,
+    safety_violations,
+)
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
 JPEG = b"\xff\xd8\xff\xe0nougie"
@@ -108,6 +115,31 @@ async def test_openrouter_model_sends_quality_only_to_openai_and_raises_without_
     assert bodies == [{"model": "google/gemini-2.5-flash-image", "prompt": "x", "n": 1}]
 
 
+async def test_a_safety_block_is_a_content_filter_error_and_other_400s_stay_errors():
+    # OpenRouter passes OpenAI's 400 through; seen in prod for most failed drawings.
+    blocked = (
+        "Your request was rejected by the safety system. If you believe this is an error,"
+        " contact us at help.openai.com and include the request ID req_1."
+        " safety_violations=[sexu…"
+    )
+    for message, expected in [(blocked, "sexu"), ("Invalid aspect_ratio", None)]:
+
+        def handler(request, message=message):
+            return httpx.Response(400, json={"error": {"message": message, "code": 400}})
+
+        model = OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
+        if expected is None:
+            with pytest.raises(BadRequestError):
+                await generation.generate(model, "x")
+        else:
+            with pytest.raises(ImageRefused, match=r"safety filter blocked this picture \(sexu\)"):
+                await generation.generate(model, "x")
+    assert safety_violations("rejected by the safety system") == ""
+    assert safety_violations("safety_violations=[sexual, violence]") == "sexual, violence"
+    assert safety_violations("Alibaba blocked this request through content moderation.") == ""
+    assert safety_violations("bad request") is None
+
+
 class FakeImageModel(TestImageGenerationModel):
     """Records prompts and references; returns `image`, or raises `error`."""
 
@@ -142,7 +174,7 @@ async def test_generate_turns_failures_into_messages_for_the_model():
     data, mime, _ = await generation.generate(TestImageGenerationModel(), "x")
     assert mime == "image/png" and data.startswith(b"\x89PNG")
     cases = [
-        (FakeImageModel(error=ContentFilterError("blocked", body=None)), "refused"),
+        (FakeImageModel(error=ContentFilterError("sexual", body=None)), r"filter.*\(sexual\)"),
         (FakeImageModel(error=UnexpectedModelBehavior("empty", body=None)), "No image"),
         (FakeImageModel(image=b"<svg/>", media_type="image/svg+xml"), "unsupported image/svg"),
         (FakeImageModel(image=b"0" * (generation.MAX_IMAGE_BYTES + 1)), "too large"),
@@ -384,6 +416,44 @@ async def test_common_argument_slips_queue_rather_than_fail_the_reply(database_u
     assert queued.aspect_ratio is None
 
 
+async def test_pasted_message_and_attachment_links_are_photos(database_url):
+    # Seen in prod: a message link and a pasted CDN link for "use this photo" were
+    # dropped, since photos took only message IDs.
+    await seed(
+        database_url,
+        (1561505604110000237, 200, "this is him", [attachment(1561505603338109108, "him.png")]),
+    )
+    link = "https://discord.com/channels/1/2/1561505604110000237"
+    cdn = "https://cdn.discordapp.com/attachments/2/1561505603338109108/him.png?ex=1&hm=2"
+    args = {
+        "prompt": "x",
+        "subjects": [{"name": "Reece", "photos": [link]}, {"name": "Reece 2", "photos": [cdn]}],
+    }
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [s.photos for s in queued.subjects] == [["1561505604110000237"]] * 2
+
+    results = []
+
+    def respond(messages, info):
+        if len(messages) == 1:
+            call = {
+                "prompt": "x",
+                "subjects": [
+                    {
+                        "name": "X",
+                        "photos": [cdn.replace("1561505603338109108", "1561505603338109999")],
+                    }
+                ],
+            }
+            return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+        results.append(messages[-1].parts[0].content)
+        return ModelResponse(parts=[TextPart("hm")])
+
+    await executor(database_url, FakeImageModel(), respond).execute(request("test/image"))
+    assert "No message in this server has the attachment" in results[0]["error"]
+
+
 async def test_at_most_max_images_are_queued_per_reply(database_url):
     def respond(messages, info):
         if len(messages) == 1:
@@ -532,6 +602,114 @@ async def test_drawing_finds_checks_and_numbers_references(database_url):
     assert subjects[0]["name"] == "Nougie" and cost == pytest.approx(0.04)
 
 
+async def test_shared_images_come_last_and_given_photos_are_not_sent_twice(database_url):
+    # Seen in prod: the meme someone replied to never reached the image model, and a
+    # given photo found again in the history was sent twice.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (80, 300, "Nico", [attachment(81, "nico.jpg")]),
+        (82, 300, "", [attachment(83, "meme.png", "image/png")]),
+    )
+    files = {
+        "/attachments/2/81/nico.jpg": JPEG + b"nico",
+        "/attachments/2/83/meme.png": PNG + b"meme",
+    }
+
+    def chat(messages, info):
+        return ModelResponse(parts=[TextPart("Image 1: a man => yes")])
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord(files, [])
+    job = image_job([Subject(name="Nico", photos=["80"])], prompt="Nico in the meme")
+    job.drawing.shared = ["82", "80"]
+    result = await run.draw(job)
+    assert [(r.subject, r.message_id) for r in result.references] == [
+        ("Nico", "80"),
+        ("shared", "82"),
+    ]
+    assert [r.data for r in model.references[0]] == [JPEG + b"nico", PNG + b"meme"]
+    prompt = model.prompts[0][0]
+    assert "Nico, shown in reference image 1" in prompt
+    assert "Reference image 2 is what they shared with the request" in prompt
+
+
+def test_models_get_the_references_and_ratios_they_take():
+    assert reference_limit("openai/gpt-image-2.5-flare") == 16
+    assert reference_limit("qwen/qwen-image-2.1-turbo") == 4
+    assert reference_limit("google/gemini-2.5-flash-image") == MAX_REFERENCES
+    assert aspect_ratio_for("qwen/qwen-image-2.1-turbo", "21:9") == "16:9"
+    assert aspect_ratio_for("qwen/qwen-image-2.1-turbo", "4:3") == "4:3"
+    assert aspect_ratio_for("openai/gpt-image-2.5-flare", "21:9") == "21:9"
+    assert aspect_ratio_for("google/gemini-2.5-flash-image", "21:9") == "21:9"
+    assert aspect_ratio_for("qwen/qwen-image-2.1-turbo", None) is None
+
+
+def test_trimming_keeps_each_subjects_best_references_first():
+    groups = [["e1", "e2", "e3"], ["n1", "n2", "n3"], ["s1", "s2"]]
+    assert drawing.trim(groups, 4) == [["e1", "e2"], ["n1"], ["s1"]]
+    assert drawing.trim(groups, 16) == groups
+    assert drawing.trim([[], ["a"]], 0) == [[], []]
+
+
+async def test_a_safety_block_is_drawn_by_the_fallback_with_the_references_it_takes(database_url):
+    # Seen in prod: most failed drawings were OpenAI safety blocks of campy requests.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        *[(90 + i, 300, f"Nico pic {i}", [attachment(190 + i, f"n{i}.jpg")]) for i in range(5)],
+    )
+    files = {f"/attachments/2/{190 + i}/n{i}.jpg": JPEG + bytes([i]) for i in range(5)}
+    primary = FakeImageModel(error=ContentFilterError("sexual", body=None))
+    fallback = FakeImageModel(image=JPEG + b"qwen", media_type="image/jpeg")
+    models = {"openai/gpt-image-2.5-flare": primary, "qwen/qwen-image-2.1-turbo": fallback}
+
+    class Fallback(PydanticExecutor):
+        def image_model(self, name):
+            return models[name]
+
+    run = Fallback(database_url, "unused-key", image_fallback_model="qwen/qwen-image-2.1-turbo")
+    run.transport = discord(files, [])
+    job = image_job(
+        [Subject(name="Nico", photos=["90", "91", "92"]), Subject(name="Ethan", photos=["93"])],
+        prompt="Nico at the bar",
+    )
+    job.drawing.shared = ["94"]
+    job.drawing.aspect_ratio = "21:9"
+    result = await run.draw(job)
+    assert result.error is None and result.model == "qwen/qwen-image-2.1-turbo"
+    # The primary got every reference; the fallback its four, each subject's best first.
+    assert len(primary.references[0]) == 5
+    assert [(r.subject, r.message_id) for r in result.references] == [
+        ("Nico", "90"),
+        ("Nico", "91"),
+        ("Ethan", "93"),
+        ("shared", "94"),
+    ]
+    prompt, settings = fallback.prompts[0]
+    assert "Nico, shown in reference images 1-2" in prompt
+    assert "Ethan, shown in reference image 3" in prompt
+    assert "Reference image 4 is what they shared" in prompt
+    assert settings == {"aspect_ratio": "16:9"}
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        cursor = await db.execute(
+            "SELECT model FROM agent_host_images WHERE id = %s", (result.image.id,)
+        )
+        assert (await cursor.fetchone())[0] == "qwen/qwen-image-2.1-turbo"
+
+    # Blocked by both: the note says so, with the server's model's prompt recorded.
+    fallback.error = ContentFilterError("", body=None)
+
+    def chat(messages, info):
+        return ModelResponse(parts=[TextPart("both said no")])
+
+    run.model = lambda name: FunctionModel(chat)
+    result = await run.draw(job)
+    assert result.error == "refused" and result.failure_note == "both said no"
+    assert len(result.references) == 5 and "Nico at the bar" in result.prompt
+
+
 async def test_kiki_reuses_her_last_self_portrait(database_url):
     await reply_job(database_url)
     async with await AsyncConnection.connect(database_url, autocommit=True) as db:
@@ -565,7 +743,8 @@ async def test_a_failed_drawing_gets_a_note_in_kikis_words(database_url):
     assert "draw nougie" in json.dumps([str(m) for m in messages])
     assert messages[-2].parts[0].content == "drawing it now!!"
     last = messages[-1].parts[0]
-    assert isinstance(last, UserPromptPart) and "refused" in last.content
+    assert isinstance(last, UserPromptPart) and "safety filter" in last.content
+    assert "Asking again won't get it through" in last.content
 
 
 async def test_a_note_that_fails_too_leaves_rust_its_fallback(database_url):

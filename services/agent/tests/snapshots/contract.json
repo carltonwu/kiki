@@ -596,7 +596,7 @@
           "strict": null
         },
         {
-          "description": "Make a picture. It's drawn after your reply and posted as its own message.\n\nUse it when someone asks for a picture, drawing, meme or visual, or when one\nwould clearly land better than words. Your reply goes out first and lets them\nknow it's on the way; the picture follows in about half a minute, replying to\ntheir message, with your caption. If drawing fails, you get to tell them.\n\nName every person, pet or thing whose real look matters in `subjects`: the\ndrawing step finds photos of them in the server's history (and people's\navatars), checks them, and gives them to the image model as numbered\nreferences with what to keep the same, so their likeness carries over.",
+          "description": "Make a picture. It's drawn after your reply and posted as its own message.\n\nUse it when someone asks for a picture, drawing, meme or visual, or when one\nwould clearly land better than words. Your reply goes out first and lets them\nknow it's on the way; the picture follows in about half a minute, replying to\ntheir message, with your caption. If drawing fails, you get to tell them.\nA picture the context lists as still being drawn is on its way: don't queue\nit again unless someone asks for something different.\n\nName every person, pet or thing whose real look matters in `subjects`: the\ndrawing step finds photos of them in the server's history (and people's\navatars), checks them, and gives them to the image model as numbered\nreferences with what to keep the same, so their likeness carries over.",
           "kind": "function",
           "name": "generate_image",
           "parameters": {
@@ -631,7 +631,7 @@
                     "description": "Their ref, like u2, when it's someone in this server."
                   },
                   "photos": {
-                    "description": "IDs of messages whose images show them, when you or the people asking already picked some (like the message in [image: …; message 123]). Otherwise leave it empty: the drawing step finds their photos in the server's history.",
+                    "description": "IDs of messages whose images show them, when you or the people asking already picked some (like the message in [image: …; message 123]; a Discord message or attachment link they pasted works too). Otherwise leave it empty: the drawing step finds their photos in the server's history.",
                     "items": {
                       "type": "string"
                     },
@@ -1090,6 +1090,14 @@
               "minLength": 1,
               "title": "Prompt",
               "type": "string"
+            },
+            "shared": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Shared",
+              "type": "array"
             },
             "style": {
               "anyOf": [
@@ -1609,6 +1617,14 @@
               "minLength": 1,
               "title": "Prompt",
               "type": "string"
+            },
+            "shared": {
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 8,
+              "title": "Shared",
+              "type": "array"
             },
             "style": {
               "anyOf": [

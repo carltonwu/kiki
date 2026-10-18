@@ -109,6 +109,9 @@ class Drawing(Contract):
     caption: str = Field(default="", max_length=1500)
     # Changing a posted photo (the first subject's first photo) rather than a new picture.
     edit: bool = False
+    # Messages with images people shared with the request (attached, replied to or
+    # linked) that no subject uses; Rust adds them, and the drawing sees them too.
+    shared: list[str] = Field(default_factory=list, max_length=8)
 
 
 class JobResult(Contract):
