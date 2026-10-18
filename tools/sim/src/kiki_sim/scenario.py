@@ -13,6 +13,7 @@
       - slash: {as: alex, in: general, command: config,
                 options: {key: chat_model, value: sim/other}}
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
+      - expect: {attachments: 1, attachment_type: image/png}   # files on the replies
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
@@ -204,6 +205,16 @@ class Run:
         for pattern in as_list(args.get("text_lacks")):
             if re.search(pattern, replies, re.IGNORECASE | re.S):
                 self.fail(step, f"{label}: reply matches {pattern!r}: {replies[:300]!r}")
+        files = [a for r in o.replies for a in r.get("attachments") or []]
+        if "attachments" in args and len(files) != args["attachments"]:
+            self.fail(step, f"{label}: {len(files)} attachments, expected {args['attachments']}")
+        if "attachment_type" in args and not all(
+            a.get("content_type") == args["attachment_type"] for a in files
+        ):
+            types = [a.get("content_type") for a in files]
+            self.fail(
+                step, f"{label}: attachment types {types}, expected {args['attachment_type']}"
+            )
         if (
             "tool_called" in args
             or "tools_offered" in args

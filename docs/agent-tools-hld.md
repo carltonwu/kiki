@@ -231,7 +231,8 @@ queries are an argument error returned to the model.
      current retrieval is bounded by guild, with an optional channel filter.
    - Web tools: pick engines explicitly (e.g. Exa for search, `openrouter` for free
      fetch) once logs show cost and quality.
-   - Image results: need typed artifacts and Rust delivery.
+   - Image results: done for generated images ([image generation](image-generation.md));
+     search results still carry no images.
    - Embedding windows of adjacent messages, if short messages retrieve poorly.
    - `/kiki conversations` still lists the active pool across all channels to
      whoever runs it.

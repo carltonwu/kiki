@@ -36,6 +36,8 @@ class JobRequest(Contract):
     messages: list[Message] = Field(min_length=1, max_length=200)
     max_output_tokens: int = Field(gt=0, le=16000)
     people: list[Person] = Field(default_factory=list, max_length=500)
+    # OpenRouter image model for the generate_image tool; None leaves it out.
+    image_model: str | None = Field(default=None, min_length=1)
 
 
 class DescribeEmojisRequest(Contract):
@@ -69,12 +71,20 @@ class WebUse(Contract):
     sources: list[str] = Field(default_factory=list)
 
 
+class Image(Contract):
+    """A generated image, saved in `agent_host_images`; Rust attaches it to the reply."""
+
+    id: int = Field(gt=0)
+    mime_type: str
+
+
 class JobResult(Contract):
     text: str = Field(min_length=1, max_length=100000)
     model: str | None = None
     steps: int = Field(default=1, ge=0, le=2147483647)
     usage: Usage = Field(default_factory=Usage)
     web: WebUse | None = None
+    images: list[Image] = Field(default_factory=list, max_length=10)
 
 
 class JobResponse(Contract):

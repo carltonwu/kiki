@@ -46,6 +46,8 @@ macro_rules! settings {
 
 settings! { r, a;
     chat_model: String = a.chat_model.clone(), Kind::Model, "OpenRouter text model with tools";
+    image_generation: bool = true, Kind::Bool, "Let Kiki draw images and attach them to replies";
+    image_model: String = a.image_model.clone(), Kind::Model, "OpenRouter model that outputs images";
     keywords: Vec<String> = r.keywords.clone(), Kind::Keywords, "Comma-separated trigger words; empty disables";
     pool_debounce: u64 = r.pool_debounce.as_millis() as u64, Kind::Duration(1, 0, 30_000), "Quiet time before routing (ms)";
     pool_max_wait: u64 = r.pool_max_wait.as_millis() as u64, Kind::Duration(1, 0, 30_000), "Longest pool wait (ms)";
@@ -420,7 +422,8 @@ pub mod tests {
 
     pub fn defaults() -> GuildSettings {
         serde_json::from_value(json!({
-            "chat_model": "test/default", "keywords": ["kiki"],
+            "chat_model": "test/default", "image_generation": true, "image_model": "test/image",
+            "keywords": ["kiki"],
             "pool_debounce": 500, "pool_max_wait": 8000, "pool_max_messages": 10,
             "active_window": 3600, "max_active_conversations": 8,
             "decide_min_confidence": 0.5, "decide_keyword_min_confidence": 0.25,

@@ -28,7 +28,9 @@ async def run_job(database_url: str, request: JobRequest, executor: Executor) ->
             logger.debug("job already running job_id=%s", request.id)
             return JobResponse(id=request.id, status="running")
 
-        payload = request.model_dump(mode="json")
+        # Unset optional fields (image_model) are left out, as Rust omits them, so
+        # requests saved before a field existed still match on retry.
+        payload = request.model_dump(mode="json", exclude_none=True)
         cursor = await connection.execute(
             "SELECT request, status, result, error FROM agent_host_jobs WHERE id = %s",
             (request.id,),
