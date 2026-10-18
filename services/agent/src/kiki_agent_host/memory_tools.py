@@ -12,7 +12,8 @@ from typing import Any, Literal
 from psycopg import AsyncConnection
 from pydantic_ai import Agent, RunContext
 
-from . import db, memory
+from . import db
+from .chat import memory
 
 logger = logging.getLogger(__name__)
 

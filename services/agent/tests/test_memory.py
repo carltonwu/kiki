@@ -4,14 +4,15 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from psycopg import AsyncConnection
 
-from kiki_agent_host import memory, retrieval
+from kiki_agent_host.chat import memory
+from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.contracts import Person
 
 GUILD, OTHER_GUILD, CHANNEL, CONVERSATION = 1, 7, 2, 1
 ALEX, SAM, CHRIS_A, CHRIS_B = 100, 101, 102, 103
 NOW = datetime(2026, 10, 18, 12, tzinfo=UTC)
-SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
-ROSTER = retrieval.Roster.of(
+SCOPE = Scope(GUILD, CHANNEL, CONVERSATION)
+ROSTER = Roster.of(
     [
         Person(ref="u1", user_id=str(ALEX), label="Alex", names=["alex"]),
         Person(ref="u2", user_id=str(SAM), label="Sam", names=["sam"]),
@@ -228,7 +229,7 @@ async def test_forget_retires_entries_with_enough_evidence(db):
     assert "Bean" not in (await recall(db, "u1"))["doc"]
     again = await memory.forget(db, SCOPE, ROSTER, saved["saved"], now=NOW)
     assert "already forgotten" in again["error"]
-    other_guild = retrieval.Scope(OTHER_GUILD, CHANNEL, CONVERSATION)
+    other_guild = Scope(OTHER_GUILD, CHANNEL, CONVERSATION)
     result = await memory.forget(db, other_guild, ROSTER, saved["saved"], now=NOW)
     assert "isn't an entry" in result["error"]
 
@@ -327,7 +328,7 @@ async def test_search_memory_finds_entries_across_subjects_and_docs(db):
     assert found["entries"][0]["subject"] == "Nougie"
     found = await memory.search(db, SCOPE, ROSTER, "hospital", subject="u2")
     assert found["entries"] == []
-    other_guild = retrieval.Scope(OTHER_GUILD, CHANNEL, CONVERSATION)
+    other_guild = Scope(OTHER_GUILD, CHANNEL, CONVERSATION)
     assert (await memory.search(db, other_guild, ROSTER, "hospital"))["entries"] == []
 
 
