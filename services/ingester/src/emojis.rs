@@ -29,12 +29,7 @@ pub struct Emoji {
 impl Emoji {
     /// How the emoji is written in a message.
     pub fn mention(&self) -> String {
-        format!(
-            "<{}:{}:{}>",
-            if self.animated { "a" } else { "" },
-            self.name,
-            self.id
-        )
+        crate::agent::emoji::Reaction::from(self).to_string()
     }
 }
 

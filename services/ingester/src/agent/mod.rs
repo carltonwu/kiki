@@ -13,7 +13,7 @@
 mod context;
 mod delivery;
 mod discord;
-mod emoji;
+pub(crate) mod emoji;
 pub(crate) mod host;
 mod people;
 mod topic;
@@ -473,23 +473,15 @@ fn strip_speaker(text: &str) -> &str {
 fn fix_custom_emoji(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find(":>") {
-        let (before, after) = rest.split_at(i);
-        let digits = before.len() - before.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-        let emoji = digits > 0
-            && before[..before.len() - digits].ends_with(':')
-            && before[..before.len() - digits]
-                .rfind('<')
-                .is_some_and(|start| {
-                    let inner = &before[start + 1..before.len() - digits - 1];
-                    let name = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
-                    name.is_some_and(|n| {
-                        !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
-                    })
-                });
+    while let Some(i) = rest.find('<') {
+        let (before, at) = rest.split_at(i);
+        let (fixed, len) = match emoji::custom(at) {
+            Some((reaction, len)) if at[..len].ends_with(":>") => (reaction.to_string(), len),
+            _ => ("<".to_owned(), 1),
+        };
         out.push_str(before);
-        out.push_str(if emoji { ">" } else { ":>" });
-        rest = &after[2..];
+        out.push_str(&fixed);
+        rest = &at[len..];
     }
     out.push_str(rest);
     out
@@ -503,7 +495,7 @@ fn is_no_reply(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_reply, is_no_reply};
+    use super::{clean_reply, fix_custom_emoji, is_no_reply};
 
     #[test]
     fn recognizes_no_reply() {
@@ -526,5 +518,21 @@ mod tests {
             clean_reply("fine <:froge:81> :> 12:>"),
             "fine <:froge:81> :> 12:>"
         );
+    }
+
+    #[test]
+    fn fixes_custom_emoji() {
+        for (text, fixed) in [
+            (
+                "<a:ape_2:1444819174172922043:>!",
+                "<a:ape_2:1444819174172922043>!",
+            ),
+            ("a < b <:x:5:> c <:x:6> :>", "a < b <:x:5> c <:x:6> :>"),
+            ("<", "<"),
+            ("< :a:5:> <b:a:5:> <::5:>", "< :a:5:> <b:a:5:> <::5:>"),
+            ("é <:x:5:>", "é <:x:5>"),
+        ] {
+            assert_eq!(fix_custom_emoji(text), fixed, "{text}");
+        }
     }
 }
