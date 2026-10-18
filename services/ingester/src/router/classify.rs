@@ -413,6 +413,7 @@ impl Router {
             FROM messages m
             LEFT JOIN conversation_messages cm ON cm.message_id = m.id
             WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
             ORDER BY m.id DESC LIMIT $3
             "#,
         )

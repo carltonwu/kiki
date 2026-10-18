@@ -138,11 +138,14 @@ async def speakers(
     return found
 
 
-PENDING = """
+# Authors Kiki never reads (migration 0010), for messages aliased `m`.
+HEARD = "NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)"
+
+PENDING = f"""
 SELECT m.id, m.content, md5(m.content) AS hash FROM messages m
 WHERE (%(channel)s::bigint IS NULL OR m.channel_id = %(channel)s)
   AND (%(below)s::bigint IS NULL OR m.id < %(below)s)
-  AND m.deleted_at IS NULL AND NOT m.author_bot AND btrim(m.content) <> ''
+  AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD} AND btrim(m.content) <> ''
   AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
 ORDER BY m.id DESC LIMIT %(limit)s
 """
@@ -183,8 +186,8 @@ async def index_pending(
     return len(rows), (rows[-1][0] if len(rows) == limit else None)
 
 
-SCOPE = """
-m.channel_id = %(channel)s AND m.deleted_at IS NULL AND NOT m.author_bot
+SCOPE = f"""
+m.channel_id = %(channel)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
 AND (%(authors)s::bigint[] IS NULL OR m.author_id = ANY(%(authors)s))
 AND (%(after)s::timestamptz IS NULL OR m.created_at >= %(after)s)
 AND (%(before)s::timestamptz IS NULL OR m.created_at < %(before)s)
@@ -297,13 +300,14 @@ async def search(
 CONTEXT = f"""
 SELECT * FROM (
     (SELECT {COLUMNS} FROM messages m WHERE m.channel_id = %(channel)s AND m.deleted_at IS NULL
-       AND m.id < %(id)s ORDER BY m.id DESC LIMIT %(before)s)
+       AND {HEARD} AND m.id < %(id)s ORDER BY m.id DESC LIMIT %(before)s)
     UNION
     (SELECT {COLUMNS} FROM messages m WHERE m.channel_id = %(channel)s AND m.deleted_at IS NULL
-       AND m.id >= %(id)s ORDER BY m.id LIMIT %(after)s + 1)
+       AND {HEARD} AND m.id >= %(id)s ORDER BY m.id LIMIT %(after)s + 1)
     UNION
     SELECT {COLUMNS.replace("m.", "p.")} FROM messages m JOIN messages p ON p.id = m.reply_to_id
     WHERE m.id = %(id)s AND p.channel_id = %(channel)s AND p.deleted_at IS NULL
+      AND {HEARD.replace("m.", "p.")}
 ) around
 WHERE EXISTS (SELECT 1 FROM messages t WHERE t.id = %(id)s
               AND t.channel_id = %(channel)s AND t.deleted_at IS NULL)

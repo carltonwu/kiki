@@ -211,6 +211,18 @@ async def test_message_context_is_bounded_and_channel_scoped(db):
     assert "error" in await retrieval.message_context(db, SCOPE, 70)
 
 
+async def test_ignored_authors_are_never_read(db):
+    await add(db, 60, "release plan")
+    await add(
+        db, 61, "release plan from the noisy bot", author="noisy", author_id=1358234666267578368
+    )
+    await add(db, 62, "release plan again")
+    assert await retrieval.index_pending(db, embedder(), channel_id=CHANNEL) == (2, None)
+    assert sorted(await ids(db, "release plan")) == [60, 62]
+    result = await retrieval.message_context(db, SCOPE, 60)
+    assert [m["id"] for m in result["messages"]] == ["60", "62"]
+
+
 async def test_executor_runs_tools_and_reports_usage(database_url, db):
     await add(db, 80, "we shipped the release")
 
