@@ -13,6 +13,7 @@
 mod context;
 mod delivery;
 mod discord;
+mod emoji;
 pub(crate) mod host;
 mod people;
 mod topic;
@@ -62,6 +63,9 @@ struct Claim {
 #[derive(Default)]
 struct RunRecord {
     reply_message_ids: Vec<i64>,
+    /// Reactions Discord accepted, as written in message text.
+    reactions: Vec<String>,
+    reacted_to: Option<i64>,
     model: Option<String>,
     steps: i32,
     usage: Usage,
@@ -279,6 +283,7 @@ impl Agent {
                 conversation_id = claim.conversation_id,
                 channel_id = claim.channel_id,
                 reply_message_ids = ?record.reply_message_ids,
+                reactions = ?record.reactions,
                 model = record.model,
                 steps = record.steps,
                 prompt_tokens = record.usage.prompt_tokens,
@@ -292,6 +297,7 @@ impl Agent {
                 conversation_id = claim.conversation_id,
                 channel_id = claim.channel_id,
                 reply_message_ids = ?record.reply_message_ids,
+                reactions = ?record.reactions,
                 latency_ms,
                 error,
                 "agent run failed"
@@ -303,7 +309,12 @@ impl Agent {
         {
             warn!(run_id = claim.run_id, error = %e, "couldn't record agent run");
         }
-        self.clear_pending(claim.channel_id, &claim.trigger_message_ids);
+        // Keep the pending emoji where Kiki chose it as her reaction.
+        let mut pending = claim.trigger_message_ids.clone();
+        if record.reactions.contains(&self.pending_emoji) {
+            pending.retain(|&id| Some(id) != record.reacted_to);
+        }
+        self.clear_pending(claim.channel_id, &pending);
         if result.is_ok() {
             self.spawn_topic_refresh(claim.conversation_id);
         }
@@ -357,14 +368,15 @@ impl Agent {
         record.model = result.model;
         let images = self.load_images(&request.id, &result.images).await?;
         let mut plan = delivery::plan(&result.text, &context.settings)?;
-        if plan.is_empty() && !images.is_empty() {
+        emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
+        if plan.messages.is_empty() && !images.is_empty() {
             // Someone asked for the picture; don't drop it over a silence marker.
-            plan.push(delivery::Message {
+            plan.messages.push(delivery::Message {
                 text: String::new(),
                 delay: Duration::ZERO,
             });
         }
-        if plan.is_empty() {
+        if plan.messages.is_empty() && plan.reactions.is_empty() {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
@@ -375,11 +387,16 @@ impl Agent {
             .bind(context.reply_to)
             .execute(&self.db)
             .await?;
+        self.react(&context, &plan.reactions, record).await;
+        if plan.messages.is_empty() {
+            debug!(run_id = claim.run_id, "agent only reacted");
+            return Ok(());
+        }
         self.send(
             &context,
             claim.run_id,
             claim.conversation_id,
-            &plan,
+            &plan.messages,
             &images,
             record,
         )
@@ -397,7 +414,8 @@ impl Agent {
             r#"
             UPDATE agent_runs
             SET status = $2, error = $3, finished_at = now(), reply_message_ids = $4, model = $5,
-                steps = $6, prompt_tokens = $7, completion_tokens = $8, cost_usd = $9, latency_ms = $10
+                steps = $6, prompt_tokens = $7, completion_tokens = $8, cost_usd = $9, latency_ms = $10,
+                reactions = $11
             WHERE id = $1
             "#,
         )
@@ -411,6 +429,7 @@ impl Agent {
         .bind(record.usage.completion_tokens)
         .bind(record.usage.cost)
         .bind(latency_ms)
+        .bind(&record.reactions)
         .execute(&self.db)
         .await?;
         Ok(())
@@ -438,12 +457,15 @@ impl Workers {
 }
 
 fn clean_reply(text: &str) -> String {
-    let text = text.trim();
-    let text = ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
+    fix_custom_emoji(strip_speaker(text.trim()).trim())
+}
+
+/// Drops a leading `Kiki:`, as models sometimes label their own lines.
+fn strip_speaker(text: &str) -> &str {
+    ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
         .iter()
         .find_map(|prefix| text.strip_prefix(prefix))
-        .unwrap_or(text);
-    fix_custom_emoji(text.trim())
+        .unwrap_or(text)
 }
 
 /// Models often write a custom emoji as `<:name:id:>`, which Discord shows as

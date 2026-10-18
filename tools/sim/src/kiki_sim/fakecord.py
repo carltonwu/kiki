@@ -366,10 +366,14 @@ class Fakecord:
         ):
             from urllib.parse import unquote
 
+            emoji = unquote(m[4])
+            # Custom emoji are `name:id`; Discord rejects ones Kiki can't use.
+            if ":" in emoji and emoji.rsplit(":", 1)[1] not in w.emojis:
+                return json_response({"message": "Unknown Emoji", "code": 10014}, status=400)
             w.reactions.append(
                 {
                     "message_id": m[3],
-                    "emoji": unquote(m[4]),
+                    "emoji": emoji,
                     "action": "add" if m[1] == "PUT" else "remove",
                     "at": time.time(),
                 }

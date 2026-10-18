@@ -16,6 +16,7 @@ channels:
   staff: {id: 900000000000001003}
   general-thread: {id: 900000000000001004, type: 11, parent: general}
 # Custom emoji; `description` is what the stub vision model says about each.
+# Reactions with any other custom emoji are rejected.
 emojis:
   huh: {id: 900000000000005001, description: "a cartoon face squinting in confusion, for when something makes no sense"}
   monkeded: {id: 900000000000005002, description: "a monkey grinning sheepishly, for owning up to something a little embarrassing"}

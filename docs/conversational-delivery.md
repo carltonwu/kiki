@@ -22,6 +22,9 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
   this instruction fails the run rather than posting the silence marker.
 - `chat_reply_reference=false`: attach and ping a Discord reply on the first
   message when enabled; otherwise use ordinary channel messages.
+- `chat_reactions=true`: let Kiki react to the newest message with emoji, alone
+  or with her messages (see [Emoji reactions](#emoji-reactions)). Set `false` to
+  remove the instructions; stray markers are then dropped, not posted.
 - `status_reactions=true`: enable pending routing reactions. Disabling this
   reduces Discord-visible observability; logs and run records remain available.
   Global `ROUTE_PENDING_EMOJI=""` still disables them. Cleanup remains enabled for
@@ -60,6 +63,42 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 - Rust unit tests and `tools/sim/scenarios/conversational-delivery.yaml`: verify
   parsing, bounds, silence, references, reactions, and multi-message delivery.
   Existing follow-up scenarios exercise the new default of ordinary channel posts.
+
+## Emoji reactions
+
+Sometimes a reaction is the whole answer; sometimes it goes with a reply. The
+model writes a line containing only `react:` and emoji, anywhere outside code:
+
+    react: 😂 <:huh:814672652526420008>
+    no WAY
+    ---
+    congrats
+
+- `services/ingester/src/agent/emoji.rs` parses the line: Unicode emoji (split by
+  grapheme, so skin tones, ZWJ sequences, flags and keycaps stay whole) and custom
+  emoji as Discord writes them (`<:name:id>`, `<a:name:id>`, and the `<:name:id:>`
+  models often write). A line with anything else, like `react: idk`, stays text.
+  A shortcode like `:huh:` is looked up by exact name (ignoring case) among the
+  server's usable custom emoji in #7's catalog (`guild_emojis`, filled by
+  `/kiki emojis resync:true`); Unicode shortcodes like `:skull:` aren't resolved
+  but never leak. The prompt points Kiki at `search_emojis`/`find_emoji` for
+  custom emoji written as `<:name:id>`.
+- `delivery.rs` collects reactions from every line, deduplicated, at most three.
+  Reactions alone (or with `NO_REPLY`) are a reaction-only answer, which counts as
+  sitting out: with `chat_allow_silence=false` it fails the run like silence does.
+- `discord.rs` adds the reactions to the newest trigger message (the same message
+  as the reply target) before sending any message, like a person reacting before
+  typing. Adding a reaction is idempotent and a rejected emoji (Discord's Unknown
+  Emoji) is only logged, so the reply still goes out.
+- `agent_runs.reactions` (migration 0019) stores the emoji Discord accepted, with
+  `reply_to_id` as their target. Later prompts show them on that message as
+  `[you reacted: 💀]`, so Kiki knows a react-only turn already answered it.
+- If Kiki reacts with the pending emoji (👀), cleanup leaves it on that message.
+
+`tools/sim/scenarios/emoji-reactions.yaml` covers react-only, react with reply,
+custom emoji, a rejected emoji, the pending emoji, `chat_reactions=false` and
+react-only with silence disabled, and catalog shortcodes. Fakecord rejects
+custom emoji that aren't in the fixture's `emojis`.
 
 ## Review decisions
 
