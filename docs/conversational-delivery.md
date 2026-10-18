@@ -106,7 +106,8 @@ Opus 5.5 reviewed the initial proposal at medium effort. Its findings led to
 internal reply attribution, fixing config limits, bounded shutdown-aware pauses,
 and keeping the host contract unchanged. A typed host delivery API would add
 migration and retry compatibility work without being necessary for this version.
-Malformed plans preserve content where possible; mixed silence markers are errors.
+Malformed plans preserve content where possible; mixed silence markers are errors,
+including a `NO_REPLY` line (outside code) next to other text.
 
 Pauses increase turn latency. Crashes or send failures can leave a partial reply;
 interrupted delivery is failed rather than replayed and duplicated, as before.

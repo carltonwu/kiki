@@ -37,6 +37,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
     let mut reactions = Vec::<Reaction>::new();
     let mut shortcodes = Vec::<String>::new();
     let mut reacted = false;
+    let mut silenced = false;
     let mut body = String::new();
     let mut delay = Duration::ZERO;
     let mut fence = None;
@@ -83,6 +84,9 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
                 body.clear();
             }
             delay = next_delay;
+        } else if fence.is_none() && is_no_reply(strip_speaker(trimmed)) {
+            // A marker line is never text, even next to some.
+            silenced = true;
         } else {
             body.push_str(line);
             body.push('\n');
@@ -99,8 +103,9 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
         reactions.clear();
         shortcodes.clear();
     }
-    if parts.iter().any(|p| is_no_reply(&p.text)) {
-        if parts.len() == 1 && settings.chat_allow_silence {
+    parts.retain(|p| !p.text.is_empty());
+    if silenced {
+        if parts.is_empty() && settings.chat_allow_silence {
             return Ok(Plan {
                 messages: vec![],
                 reactions,
@@ -109,7 +114,6 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
         }
         bail!("invalid silence marker in reply plan");
     }
-    parts.retain(|p| !p.text.is_empty());
     if parts.is_empty() {
         ensure!(reacted, "agent returned no message content");
         ensure!(
@@ -253,6 +257,21 @@ mod tests {
         settings.chat_allow_silence = false;
         assert!(plan("NO_REPLY", &settings).is_err());
         assert!(plan(" ", &settings).is_err());
+    }
+
+    #[test]
+    fn marker_line_inside_text_never_reaches_discord() {
+        let settings = defaults();
+        for text in ["lol\nNO_REPLY", "hi\nNO_REPLY\nbye", "ok\nKiki: NO_REPLY"] {
+            assert!(plan(text, &settings).is_err(), "{text:?}");
+        }
+        let silent = plan("NO_REPLY\nKiki: NO_REPLY\nreact: 👀", &settings).unwrap();
+        assert!(silent.messages.is_empty());
+        assert_eq!(silent.reactions.len(), 1);
+        assert_eq!(
+            plan("```\nhi\nNO_REPLY\n```", &settings).unwrap().messages[0].text,
+            "```\nhi\nNO_REPLY\n```"
+        );
     }
 
     #[test]
