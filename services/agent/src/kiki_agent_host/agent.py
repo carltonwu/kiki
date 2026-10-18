@@ -13,7 +13,7 @@ from typing import Any, Literal
 from openai import APIError, APIStatusError
 from psycopg import AsyncConnection, OperationalError
 from pydantic_ai import Agent, RunContext, Tool
-from pydantic_ai.capabilities import NativeTool
+from pydantic_ai.capabilities import NativeTool, PrepareTools
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import (
@@ -285,6 +285,14 @@ async def only_with_image_model(
     return tool_def if ctx.deps.image_model else None
 
 
+async def answer_on_last_request(
+    ctx: RunContext[Deps], tool_defs: list[ToolDefinition]
+) -> list[ToolDefinition]:
+    """No function tools on the last request the limit allows, so the model answers
+    with what it has instead of the run failing with UsageLimitExceeded."""
+    return [] if ctx.run_step >= MAX_MODEL_REQUESTS else tool_defs
+
+
 async def search_emojis(ctx: RunContext[Deps], query: str, limit: int = 5) -> dict:
     """Find this server's custom emoji by mood, reaction or what they show.
 
@@ -393,6 +401,7 @@ chat = Agent(
         find_emoji,
         Tool(generate_image, prepare=only_with_image_model),
     ],
+    capabilities=[PrepareTools(answer_on_last_request)],
 )
 memory_tools.register(chat)
 plain = Agent()

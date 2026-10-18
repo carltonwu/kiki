@@ -185,29 +185,77 @@ fn extension(mime_type: &str) -> &'static str {
     }
 }
 
+/// Tracks the open code fence (its opening line) across lines of reply text.
+/// A line like ```ls``` opens and closes inline; it isn't a fence.
+pub(super) fn track_fence<'a>(fence: &mut Option<&'a str>, line: &'a str) {
+    let line = line.trim();
+    let marker = ['`', '~'].into_iter().find(|&c| {
+        let run = String::from(c).repeat(3);
+        line.starts_with(&run) && !line[3..].contains(&run)
+    });
+    match (marker, *fence) {
+        (Some(c), Some(open)) if open.starts_with(c) => *fence = None,
+        (Some(_), None) => *fence = Some(line),
+        _ => {}
+    }
+}
+
+/// Splits text into chunks of at most `max` chars. A code block cut between
+/// chunks is closed at the end of one and reopened in the next.
 pub(super) fn split_message(text: &str, max: usize) -> Vec<String> {
+    // Fence lines too long to repeat stay as they are.
+    let carried = |fence: Option<_>| fence.filter(|f: &&str| f.chars().count() < max / 4);
+    let closing = |f: &str| f[..f.find(|c| !f.starts_with(c)).unwrap_or(f.len())].to_owned();
     let mut chunks = Vec::new();
-    let mut rest = text.trim();
-    while rest.chars().count() > max {
-        let limit = rest.char_indices().nth(max).map_or(rest.len(), |(i, _)| i);
-        let window = &rest[..limit];
-        let cut = window
-            .rfind('\n')
-            .or_else(|| window.rfind(' '))
-            .filter(|&i| i > 0)
-            .unwrap_or(limit);
-        chunks.push(rest[..cut].trim_end().to_owned());
-        rest = rest[cut..].trim_start();
+    let (mut rest, mut open) = (text.trim(), None);
+    loop {
+        let reopen = carried(open).map_or(String::new(), |f| format!("{f}\n"));
+        let room = max - reopen.chars().count();
+        if rest.chars().count() <= room {
+            if !rest.is_empty() {
+                chunks.push(reopen + rest);
+            }
+            return chunks;
+        }
+        let mut reserve = 0;
+        let (cut, fence) = loop {
+            let limit = rest
+                .char_indices()
+                .nth(room - reserve)
+                .map_or(rest.len(), |(i, _)| i);
+            let window = &rest[..limit];
+            let cut = window
+                .rfind('\n')
+                .or_else(|| window.rfind(' '))
+                .filter(|&i| i > 0)
+                .unwrap_or(limit);
+            let mut fence = open;
+            rest[..cut]
+                .lines()
+                .for_each(|line| track_fence(&mut fence, line));
+            let close = carried(fence).map_or(0, |f| closing(f).len() + 1);
+            if close <= reserve {
+                break (cut, fence);
+            }
+            reserve = close;
+        };
+        let mut chunk = reopen + rest[..cut].trim_end();
+        if let Some(f) = carried(fence) {
+            chunk = chunk + "\n" + &closing(f);
+        }
+        chunks.push(chunk);
+        // Inside code, keep the next line's indentation.
+        rest = match fence {
+            Some(_) => rest[cut..].strip_prefix('\n').unwrap_or(&rest[cut..]),
+            None => rest[cut..].trim_start(),
+        };
+        open = fence;
     }
-    if !rest.is_empty() {
-        chunks.push(rest.to_owned());
-    }
-    chunks
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{extension, split_message};
+    use super::{MAX_MESSAGE_CHARS, extension, split_message};
 
     #[tokio::test]
     async fn loads_only_this_jobs_images() {
@@ -267,5 +315,68 @@ mod tests {
     #[test]
     fn hard_splits_long_words_on_char_boundaries() {
         assert_eq!(split_message("ééééé", 2), ["éé", "éé", "é"]);
+    }
+
+    #[test]
+    fn fence_free_text_splits_as_before() {
+        let text = "word ".repeat(500) + &"line\n".repeat(300);
+        let chunks = split_message(&text, MAX_MESSAGE_CHARS);
+        let lens: Vec<_> = chunks.iter().map(|c| c.chars().count()).collect();
+        assert_eq!(lens, [1899, 1899, 199]);
+        assert_eq!(
+            chunks.concat().replace([' ', '\n'], ""),
+            text.replace([' ', '\n'], "")
+        );
+    }
+
+    #[test]
+    fn pathological_fences_still_progress_within_the_limit() {
+        let long_tag = format!("```{}\ncode\n```", "x".repeat(3000));
+        let long_line = format!("```\n{}\n```", "y".repeat(5000));
+        for text in [long_tag, long_line, "```\n".repeat(2000)] {
+            for max in [8, 50, MAX_MESSAGE_CHARS] {
+                let chunks = split_message(&text, max);
+                assert!(chunks.iter().all(|c| c.chars().count() <= max), "{max}");
+            }
+        }
+        let chunks = split_message(&format!("```\n{}\n```", "y".repeat(5000)), 1900);
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.starts_with("```\n") && c.ends_with("\n```"))
+        );
+    }
+
+    #[test]
+    fn code_blocks_are_closed_and_reopened_across_chunks() {
+        for fence in ["```rust", "~~~py"] {
+            let code: Vec<String> = (0..120)
+                .map(|i| format!("    let x{i:03} = {i:017};"))
+                .collect();
+            let text = format!(
+                "intro\n{fence}\n{}\n{}\nafter",
+                code.join("\n"),
+                &fence[..3]
+            );
+            let chunks = split_message(&text, MAX_MESSAGE_CHARS);
+            assert!(chunks.len() > 1);
+            let mut lines = Vec::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                assert!(chunk.chars().count() <= MAX_MESSAGE_CHARS);
+                let fences = chunk.lines().filter(|l| l.starts_with(&fence[..3])).count();
+                assert_eq!(fences % 2, 0, "unbalanced chunk {i}: {chunk}");
+                if i > 0 {
+                    assert!(chunk.starts_with(fence), "chunk {i} reopens {fence}");
+                }
+                lines.extend(chunk.lines().filter(|l| l.starts_with("    let")));
+            }
+            assert_eq!(lines, code, "code and its indentation survive the cuts");
+            assert!(
+                chunks
+                    .last()
+                    .unwrap()
+                    .ends_with(&format!("\n{}\nafter", &fence[..3]))
+            );
+        }
     }
 }

@@ -285,3 +285,11 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert result.usage.cost == pytest.approx(0.003)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1
+
+
+async def test_out_of_range_ids_are_argument_errors(db):
+    # Above bigint: a Postgres cast would fail the whole reply, not just the tool.
+    too_big = "99999999999999999999"
+    for person, channel in [(f"<@{too_big}>", None), (too_big, None), (None, f"<#{too_big}>")]:
+        with pytest.raises(ValueError, match="not a Discord"):
+            await retrieval.search(db, embedder(), SCOPE, "hi", person=person, channel=channel)

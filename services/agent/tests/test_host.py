@@ -1,9 +1,13 @@
 import asyncio
+from types import SimpleNamespace
 
 import httpx
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 
+from kiki_agent_host.agent import MAX_MODEL_REQUESTS, PydanticExecutor
 from kiki_agent_host.app import Settings, create_app
 from kiki_agent_host.contracts import JobRequest, JobResult
 from kiki_agent_host.executor import TransientError
@@ -183,3 +187,32 @@ async def test_transient_failure_is_not_persisted_and_retry_runs_again(database_
         assert (await http.post("/v1/jobs", json=job(), headers=HEADERS)).status_code == 503
         response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
         assert response.json()["result"]["text"] == "recovered"
+
+
+async def test_last_allowed_request_offers_no_tools_so_the_reply_survives(database_url):
+    """A model that keeps calling tools still answers instead of hitting the request limit."""
+    offered = []
+
+    def respond(messages, info):
+        offered.append([tool.name for tool in info.function_tools])
+        if info.function_tools:
+            return ModelResponse(parts=[ToolCallPart("find_emoji", {"name": "huh"})])
+        return ModelResponse(parts=[TextPart("here's what I found")])
+
+    class TestExecutor(PydanticExecutor):
+        web_tools = ()  # FunctionModel can't run OpenRouter's server tools
+
+        def model(self, name):
+            return FunctionModel(respond)
+
+    async def no_embeddings(model, input):
+        raise RuntimeError("not needed")
+
+    run = TestExecutor(database_url, "unused-key")
+    run.embeddings = SimpleNamespace(embeddings=SimpleNamespace(create=no_embeddings))
+    result = await run.execute(JobRequest.model_validate(job()))
+    assert result.text == "here's what I found"
+    assert len(offered) == MAX_MODEL_REQUESTS
+    assert all("find_emoji" in tools for tools in offered[:-1])
+    assert "generate_image" not in offered[0]  # image gating still applies
+    assert offered[-1] == []

@@ -113,7 +113,9 @@ Limits:
   has, rather than aborting. Memory tools ([subject memory](subject-memory-hld.md))
   have their own budget of 6.
 - 10 model requests per run as the hard stop (`UsageLimits`); it was 6 before
-  memory tools, which can take a failed write, a split and a retry.
+  memory tools, which can take a failed write, a split and a retry. The last
+  allowed request offers no function tools (web search and fetch stay), so the
+  model answers with what it has instead of the run failing.
 - 10 seconds per tool call (45 for `read_image`); on timeout the tool returns
   an error to the model.
 - Topic jobs run with no tools.

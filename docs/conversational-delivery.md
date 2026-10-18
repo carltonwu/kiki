@@ -11,7 +11,8 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 
 - `chat_min_messages=1`, `chat_max_messages=3` (1–8, minimum ≤ maximum): preferred
   minimum and maximum planned messages. Extra beats are merged; Discord's 1900
-  character safety splits may exceed the maximum. The minimum is prompt guidance,
+  character safety splits may exceed the maximum (a code block cut by one is
+  closed and reopened with the same fence). The minimum is prompt guidance,
   so Kiki need not pad a short answer with filler.
 - `chat_max_delay=3000` (milliseconds, 0–10000): cap each pause. Total pauses are
   capped at eight seconds, the first message has no added delay, and shutdown
@@ -106,7 +107,8 @@ Opus 5.5 reviewed the initial proposal at medium effort. Its findings led to
 internal reply attribution, fixing config limits, bounded shutdown-aware pauses,
 and keeping the host contract unchanged. A typed host delivery API would add
 migration and retry compatibility work without being necessary for this version.
-Malformed plans preserve content where possible; mixed silence markers are errors.
+Malformed plans preserve content where possible; mixed silence markers are errors,
+including a `NO_REPLY` line (outside code) next to other text.
 
 Pauses increase turn latency. Crashes or send failures can leave a partial reply;
 interrupted delivery is failed rather than replayed and duplicated, as before.

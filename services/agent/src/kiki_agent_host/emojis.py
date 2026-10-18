@@ -21,7 +21,7 @@ from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent
 
 from . import vision
-from .retrieval import CANDIDATES, EMBED_BATCH, MIN_SIMILARITY, RRF_K, Embedder
+from .retrieval import CANDIDATES, EMBED_BATCH, MAX_ID, MIN_SIMILARITY, RRF_K, Embedder
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,6 @@ PROMPT = (
 # (name, animated, image) → (description, cost in USD or None)
 Describe = Callable[[str, bool, BinaryContent], Awaitable[tuple[str, float | None]]]
 EMOJI = re.compile(r"^<(a?):(\w+):([0-9]+)>$")
-MAX_ID = 2**63 - 1  # Postgres bigint
 
 
 def cdn_base() -> str:
