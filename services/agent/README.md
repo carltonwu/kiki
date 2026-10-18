@@ -27,6 +27,10 @@ across this order, and on a module named after a chat platform.
 - `agent/`: the Pydantic AI layer. `executor.py` runs jobs. `tools/` has one
   `FunctionToolset` per capability. `guard.py` gives every tool its deadline, its
   budget, and its log line.
+- `skills/`: Agent Skills packages (`<name>/SKILL.md`) for the reply agent, loaded
+  by pydantic-ai-harness `Skills`. The model sees each skill's name and description
+  and calls `load_capability` for the body when it wants it. To add one, add a
+  directory with a `SKILL.md` that has a `description` in its frontmatter.
 - `api/`: HTTP and durable jobs. Importing it does not load the agent SDK, so the
   host starts fast. `api/app.py` loads the executor only when a key is set.
 
