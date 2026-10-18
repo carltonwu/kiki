@@ -10,32 +10,41 @@ use super::{Agent, RunRecord, context::Context};
 use crate::store;
 
 /// Discord allows 2000 characters per message; leave room for safety.
-const MAX_MESSAGE_CHARS: usize = 1900;
+pub(super) const MAX_MESSAGE_CHARS: usize = 1900;
 
 impl Agent {
-    /// Sends `text` as a reply to the context's trigger message, split across
-    /// messages if it's too long. Each sent message is stored right away (the
-    /// Gateway copy may arrive later) and tagged into the conversation.
+    /// Delivers planned messages with bounded pauses and an optional first reply
+    /// reference. Each message is stored right away (the Gateway copy may arrive
+    /// later) and tagged into the conversation.
     ///
     /// Sends aren't retried: a retry after a timeout could post the reply twice.
     pub(super) async fn send(
         &self,
         context: &Context,
+        run_id: i64,
         conversation_id: i64,
-        text: &str,
+        plan: &[super::delivery::Message],
         record: &mut RunRecord,
     ) -> anyhow::Result<()> {
         let mentions = AllowedMentions {
-            replied_user: true,
+            replied_user: context.settings.chat_reply_reference,
             ..Default::default()
         };
-        for (i, chunk) in split_message(text, MAX_MESSAGE_CHARS).iter().enumerate() {
+        let mut draining = self.draining.subscribe();
+        for (i, message) in plan.iter().enumerate() {
+            if !*draining.borrow() && !message.delay.is_zero() {
+                tokio::select! {
+                    _ = tokio::time::sleep(message.delay) => {},
+                    _ = draining.wait_for(|drain| *drain) => {},
+                }
+            }
+            let chunk = &message.text;
             let mut request = self
                 .http
                 .create_message(Id::new(context.channel_id as u64))
                 .content(chunk)
                 .allowed_mentions(Some(&mentions));
-            if i == 0 {
+            if i == 0 && context.settings.chat_reply_reference {
                 request = request
                     .reply(Id::new(context.reply_to as u64))
                     .fail_if_not_exists(false);
@@ -60,6 +69,12 @@ impl Agent {
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+            // Attribute each message now: people can answer it during a pause.
+            sqlx::query("UPDATE agent_runs SET reply_message_ids = $2 WHERE id = $1")
+                .bind(run_id)
+                .bind(&record.reply_message_ids)
+                .execute(&mut *tx)
+                .await?;
             tx.commit().await?;
         }
         sqlx::query(
@@ -94,7 +109,7 @@ impl Agent {
     }
 }
 
-fn split_message(text: &str, max: usize) -> Vec<String> {
+pub(super) fn split_message(text: &str, max: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut rest = text.trim();
     while rest.chars().count() > max {

@@ -10,6 +10,7 @@
 //! the others are marked `superseded`: their messages are in the history anyway.
 
 mod context;
+mod delivery;
 mod discord;
 mod host;
 mod people;
@@ -44,6 +45,7 @@ pub struct Agent {
     settings: Arc<crate::guild_settings::Store>,
     bot_user_id: i64,
     pending_emoji: String,
+    draining: watch::Sender<bool>,
 }
 
 struct Claim {
@@ -86,6 +88,7 @@ impl Agent {
             settings,
             bot_user_id,
             pending_emoji,
+            draining: watch::channel(false).0,
         })
     }
 
@@ -153,6 +156,7 @@ impl Agent {
             }
         }
 
+        self.draining.send_replace(true);
         let busy = workers.tasks.len();
         if busy > 0 {
             info!(tasks = busy, "waiting for agent replies to finish");
@@ -346,24 +350,19 @@ impl Agent {
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
-        let text = clean_reply(&result.text);
-        if text.is_empty() {
-            bail!("agent host returned an empty reply");
-        }
-        if is_no_reply(&text) {
-            debug!(
-                run_id = claim.run_id,
-                "the previous reply already covered these messages"
-            );
+        let plan = delivery::plan(&result.text, &context.settings)?;
+        if plan.is_empty() {
+            debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
         // Commit before any Discord send: a crash from here may have posted a
         // reply, so startup fails this run instead of posting it again.
-        sqlx::query("UPDATE agent_runs SET status = 'delivering' WHERE id = $1")
+        sqlx::query("UPDATE agent_runs SET status = 'delivering', reply_to_id = $2 WHERE id = $1")
             .bind(claim.run_id)
+            .bind(context.reply_to)
             .execute(&self.db)
             .await?;
-        self.send(&context, claim.conversation_id, &text, record)
+        self.send(&context, claim.run_id, claim.conversation_id, &plan, record)
             .await
     }
 

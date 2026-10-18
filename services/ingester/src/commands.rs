@@ -1019,10 +1019,31 @@ fn config_embed(
     let mut embed = EmbedBuilder::new().color(COLOR).title("Server config")
         .description(truncate(global, 1000))
         .footer(EmbedFooterBuilder::new("Use key + value to edit, or key + reset:true. New pools and jobs use the new settings."));
-    for spec in guild_settings::SPECS
-        .iter()
-        .filter(|s| key.is_none_or(|key| key == s.key))
-    {
+    if key.is_none() {
+        let rows = guild_settings::SPECS
+            .iter()
+            .map(|s| {
+                let source = if settings.overrides.contains_key(s.key) {
+                    " *"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} = {}{}",
+                    s.key,
+                    truncate(&values[s.key].to_string(), 85),
+                    source
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.description(format!(
+            "{}\n* marks server overrides. Inspect a key for details.\n{}",
+            truncate(global, 800),
+            code_block(&rows)
+        ));
+    }
+    for spec in guild_settings::SPECS.iter().filter(|s| key == Some(s.key)) {
         let source = if settings.ignored.iter().any(|k| k == spec.key) {
             "default (invalid override ignored)"
         } else if settings.overrides.contains_key(spec.key) {
@@ -1111,8 +1132,11 @@ fn definition() -> CommandBuilder {
         .option(
             SubCommandBuilder::new("config", "View or change this server's settings")
                 .option(
-                    StringBuilder::new("key", "Setting to inspect, change or reset")
-                        .choices(guild_settings::SPECS.iter().map(|s| (s.key, s.key))),
+                    StringBuilder::new(
+                        "key",
+                        "Setting to inspect, change or reset; see /kiki config",
+                    )
+                    .max_length(100),
                 )
                 .option(
                     StringBuilder::new(
@@ -1340,9 +1364,7 @@ mod tests {
         assert!(
             key.choices
                 .as_ref()
-                .unwrap()
-                .iter()
-                .any(|choice| choice.name == "chat_model")
+                .is_none_or(|choices| choices.is_empty())
         );
     }
 
@@ -1430,6 +1452,12 @@ mod tests {
         for key in [None, Some("keywords"), Some("chat_model")] {
             let embed = config_embed(&settings, &values, key, &"x".repeat(1000));
             assert!(embed.fields.len() <= 25);
+            assert!(
+                embed
+                    .description
+                    .as_ref()
+                    .is_none_or(|d| d.chars().count() <= 4096)
+            );
             assert!(
                 embed
                     .fields

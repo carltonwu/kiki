@@ -16,6 +16,7 @@ use sqlx::{PgExecutor, PgPool};
 
 #[derive(Clone, Copy)]
 pub enum Kind {
+    Bool,
     Integer(u64, u64),
     Float(f64, f64),
     /// Native unit in milliseconds, lower and upper bounds in native units.
@@ -62,6 +63,12 @@ settings! { r, a;
     history_messages: i64 = a.history_messages, Kind::Integer(1, 190), "Conversation messages shown per reply";
     channel_context: i64 = 8, Kind::Integer(0, 30), "Background channel messages per reply";
     channel_context_age: u64 = 1800, Kind::Duration(1000, 0, 86_400), "Maximum background message age (seconds)";
+    chat_min_messages: usize = 1, Kind::Integer(1, 8), "Preferred minimum messages per turn";
+    chat_max_messages: usize = 3, Kind::Integer(1, 8), "Maximum planned messages per turn (Discord length splits may add more)";
+    chat_max_delay: u64 = 3000, Kind::Duration(1, 0, 10_000), "Maximum pause between messages (ms; total capped at 8s)";
+    chat_allow_silence: bool = true, Kind::Bool, "Allow Kiki to leave acknowledgments unanswered";
+    chat_reply_reference: bool = false, Kind::Bool, "Attach and ping a Discord reply on the first message";
+    status_reactions: bool = true, Kind::Bool, "Show routing and pending status reactions";
     reply_max_tokens: u32 = 2000, Kind::Integer(100, 4000), "Output tokens per model request";
     topic_every_messages: i64 = a.topic_every_messages, Kind::Integer(1, 50), "New messages before refreshing a topic";
     topic_sample_messages: i64 = 12, Kind::Integer(4, 50), "Messages shown to the topic summarizer";
@@ -94,6 +101,7 @@ pub fn spec(key: &str) -> anyhow::Result<&'static Spec> {
 impl Spec {
     pub fn bounds(&self) -> String {
         match self.kind {
+            Kind::Bool => "true/false".into(),
             Kind::Integer(min, max) => format!("{min}–{max}"),
             Kind::Float(min, max) => format!("{min}–{max}"),
             Kind::Duration(unit, min, max) => {
@@ -107,6 +115,11 @@ impl Spec {
     pub fn parse(&self, text: &str) -> anyhow::Result<Value> {
         let text = text.trim();
         let value = match self.kind {
+            Kind::Bool => json!(match text.to_ascii_lowercase().as_str() {
+                "true" | "on" | "yes" => true,
+                "false" | "off" | "no" => false,
+                _ => bail!("Use true/false, on/off or yes/no"),
+            }),
             Kind::Integer(..) => json!(text.parse::<u64>().context("Use a whole number")?),
             Kind::Float(..) => {
                 let n: f64 = text.parse().context("Use a number")?;
@@ -147,6 +160,7 @@ impl Spec {
 
     fn validate(&self, value: &Value) -> anyhow::Result<()> {
         let valid = match self.kind {
+            Kind::Bool => value.is_boolean(),
             Kind::Integer(min, max) | Kind::Duration(_, min, max) => {
                 value.as_u64().is_some_and(|n| (min..=max).contains(&n))
             }
@@ -256,6 +270,10 @@ impl Store {
             values.stale_min_confidence >= values.decide_min_confidence,
             "stale_min_confidence must be at least decide_min_confidence"
         );
+        ensure!(
+            values.chat_min_messages <= values.chat_max_messages,
+            "chat_min_messages must not exceed chat_max_messages"
+        );
         Ok(())
     }
 
@@ -285,6 +303,7 @@ impl Store {
             for group in [
                 ["pool_debounce", "pool_max_wait"],
                 ["decide_min_confidence", "stale_min_confidence"],
+                ["chat_min_messages", "chat_max_messages"],
             ] {
                 // Resolve each independent constraint group using defaults for the other.
                 let encoded = |key: &str| {
@@ -292,13 +311,21 @@ impl Store {
                         serde_json::to_value(&self.defaults.values).unwrap()[key].clone()
                     })
                 };
-                let invalid = if group[0] == "pool_debounce" {
-                    let debounce = encoded("pool_debounce").as_u64().unwrap();
-                    debounce.saturating_add(2000) > self.max_message_age_ms
-                        || encoded("pool_max_wait").as_u64().unwrap() < debounce
-                } else {
-                    encoded("stale_min_confidence").as_f64().unwrap()
-                        < encoded("decide_min_confidence").as_f64().unwrap()
+                let invalid = match group[0] {
+                    "pool_debounce" => {
+                        let debounce = encoded("pool_debounce").as_u64().unwrap();
+                        debounce.saturating_add(2000) > self.max_message_age_ms
+                            || encoded("pool_max_wait").as_u64().unwrap() < debounce
+                    }
+                    "chat_min_messages" => {
+                        encoded("chat_min_messages").as_u64().unwrap()
+                            > encoded("chat_max_messages").as_u64().unwrap()
+                    }
+                    "decide_min_confidence" => {
+                        encoded("stale_min_confidence").as_f64().unwrap()
+                            < encoded("decide_min_confidence").as_f64().unwrap()
+                    }
+                    _ => unreachable!("known constraint group"),
                 };
                 if invalid {
                     for key in group {
@@ -401,7 +428,9 @@ pub mod tests {
             "decide_recent_messages": 15, "decide_conversation_preview": 3,
             "history_messages": 30, "channel_context": 8, "channel_context_age": 1800,
             "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12,
-            "lingo_nudge": 35
+            "lingo_nudge": 35, "chat_min_messages": 1, "chat_max_messages": 3,
+            "chat_max_delay": 3000, "chat_allow_silence": true,
+            "chat_reply_reference": false, "status_reactions": true
         }))
         .unwrap()
     }
@@ -419,6 +448,8 @@ pub mod tests {
     fn parses_units_keywords_models_and_rejects_invalid_values() {
         for (key, text, expected) in [
             ("pool_debounce", "2s", json!(2000)),
+            ("status_reactions", "off", json!(false)),
+            ("chat_allow_silence", "yes", json!(true)),
             ("pool_debounce", "500", json!(500)),
             ("active_window", "30m", json!(1800)),
             ("channel_context_age", "1h", json!(3600)),
@@ -430,6 +461,8 @@ pub mod tests {
         }
         for (key, text) in [
             ("pool_max_messages", "0"),
+            ("status_reactions", "maybe"),
+            ("chat_max_messages", "9"),
             ("history_messages", "191"),
             ("decide_min_confidence", "NaN"),
             ("stale_min_confidence", "1.1"),
@@ -461,9 +494,11 @@ pub mod tests {
         assert_eq!(resolved.ignored.len(), 3);
         for overrides in [
             [("pool_max_wait".into(), json!(499))].into(),
+            [("chat_min_messages".into(), json!(4))].into(),
             [("decide_min_confidence".into(), json!(0.95))].into(),
         ] {
             assert!(store.merge(&overrides).is_err());
+            assert!(store.resolve(overrides).ignored.len() == 1);
         }
         let mut invalid = defaults();
         invalid.history_messages = 0;

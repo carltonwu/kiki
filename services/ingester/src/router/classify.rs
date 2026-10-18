@@ -206,7 +206,10 @@ impl Router {
     /// Reacts as soon as an explicit trigger (check 1: @Kiki or a reply to Kiki)
     /// is stored, instead of when its pool closes. Check 1 needs no Jev call, so
     /// the outcome is already certain; the pool keeps collecting for the agent.
-    pub(super) async fn react_if_explicit(&self, channel_id: i64, message_id: i64) {
+    pub(super) async fn react_if_explicit(&self, guild_id: i64, channel_id: i64, message_id: i64) {
+        if !self.settings.snapshot(guild_id).status_reactions {
+            return;
+        }
         match self.load_messages(&[message_id]).await {
             Ok(messages) => {
                 if messages.first().is_some_and(|m| self.is_explicit(m)) {
@@ -536,12 +539,12 @@ impl Router {
                   AND k.deleted_at IS NULL
                 ORDER BY k.id DESC LIMIT 1
             ), answered AS (
-                -- A long answer is several messages; only the first is a Discord reply.
-                SELECT r.author_id FROM messages a
-                JOIN conversation_messages cm ON cm.message_id = a.id
-                JOIN messages r ON r.id = a.reply_to_id
-                WHERE cm.conversation_id = (SELECT conversation_id FROM k) AND a.author_id = $2
-                ORDER BY a.id DESC LIMIT 1
+                -- Internal attribution also works for unreferenced channel posts.
+                SELECT r.author_id FROM agent_runs ar
+                JOIN messages r ON r.id = ar.reply_to_id
+                WHERE ar.conversation_id = (SELECT conversation_id FROM k)
+                  AND ar.reply_message_ids @> ARRAY[(SELECT id FROM k)]
+                ORDER BY ar.id DESC LIMIT 1
             )
             SELECT k.conversation_id FROM k, messages km
             WHERE km.id = k.id AND km.created_at > now() - make_interval(secs => $5)
@@ -605,7 +608,11 @@ impl Router {
                    r.author_id, r.author_name
             FROM messages m
             LEFT JOIN conversation_messages cm ON cm.message_id = m.id
-            LEFT JOIN messages r ON r.id = m.reply_to_id
+            LEFT JOIN messages r ON r.id = coalesce(m.reply_to_id, (
+                SELECT ar.reply_to_id FROM agent_runs ar
+                WHERE ar.conversation_id = cm.conversation_id AND ar.reply_message_ids @> ARRAY[m.id]
+                ORDER BY ar.id DESC LIMIT 1
+            ))
             WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
               AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
             ORDER BY m.id DESC LIMIT $3
@@ -653,7 +660,9 @@ impl Router {
         let answered: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT extract(epoch FROM now() - k.created_at)::bigint
-            FROM messages k JOIN messages r ON r.id = k.reply_to_id
+            FROM messages k
+            JOIN agent_runs ar ON ar.reply_message_ids @> ARRAY[k.id]
+            JOIN messages r ON r.id = ar.reply_to_id
             WHERE k.channel_id = $1 AND k.author_id = $2 AND r.author_id = $3 AND k.id < $4
             ORDER BY k.id DESC LIMIT 1
             "#,
@@ -789,7 +798,10 @@ impl Router {
         tx.commit().await?;
         // Shown until the agent replies (it removes the reaction then). Explicit
         // triggers (check 1) were already reacted to when they were stored.
-        if conversation_id.is_some() && !matches!(check, Check::Reply | Check::Mention) {
+        if pool.settings.status_reactions
+            && conversation_id.is_some()
+            && !matches!(check, Check::Reply | Check::Mention)
+        {
             self.react_pending(key.channel_id, pool_id);
         }
 

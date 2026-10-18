@@ -195,7 +195,11 @@ impl Router {
         }
 
         let router = self.clone();
-        tokio::spawn(async move { router.react_if_explicit(msg.channel_id, msg.id).await });
+        tokio::spawn(async move {
+            router
+                .react_if_explicit(msg.guild_id, msg.channel_id, msg.id)
+                .await
+        });
 
         let key = PoolKey {
             channel_id: msg.channel_id,

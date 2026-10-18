@@ -256,6 +256,13 @@ class Run:
 
     def expect_reaction(self, step: int, wanted: dict, message: dict, label: str) -> None:
         emoji, present = wanted.get("emoji", "👀"), wanted.get("present", False)
+        if "added" in wanted:
+            added = any(
+                r["message_id"] == message["id"] and r["emoji"] == emoji and r["action"] == "add"
+                for r in stack.control("state")["reactions"]
+            )
+            if added != wanted["added"]:
+                self.fail(step, f"{label}: {emoji} reaction added is {added}")
 
         def matches():
             on = None

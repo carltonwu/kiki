@@ -1,0 +1,23 @@
+name: conversational beats, silence, references and status reactions
+steps:
+  - slash: {as: alex, in: general, command: config, options: {key: chat_max_delay, value: "0"}}
+  - slash: {as: alex, in: general, command: config, options: {key: status_reactions, value: "false"}}
+  - say: {as: alex, in: general, text: "@kiki give me two thoughts", reply: {text: "first thought\n--- 2s\nsecond thought"}}
+  - expect: {run: done, reply: true, text_contains: [first thought, second thought], reaction: {present: false, added: false}}
+  - expect: {sql: "SELECT cardinality(reply_message_ids) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 2}
+  - expect: {sql: "SELECT count(*) FROM messages WHERE author_bot AND reply_to_id IS NOT NULL", equals: 0}
+  - say: {as: alex, in: general, text: "@kiki lmao", reply: {text: "NO_REPLY"}}
+  - expect: {run: done, reply: false}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "false"}}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_reply_reference, value: "true"}}
+  - say: {as: alex, in: general, text: "@kiki haha", reply: {text: "lol right"}}
+  - expect: {run: done, reply: true, prompt_contains: "Always give a brief natural answer", prompt_lacks: "NO_REPLY"}
+  - expect: {sql: "SELECT count(*) FROM messages WHERE author_bot AND reply_to_id IS NOT NULL", equals: 1}
+  - say: {as: alex, in: general, text: "@kiki do answer", reply: {text: "NO_REPLY"}}
+  - expect: {run: failed, reply: false}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_max_messages, value: "1"}}
+  - say: {as: alex, in: general, text: "@kiki one message", reply: {text: "one\n---\ntwo\n---\nthree"}}
+  - expect: {run: done, reply: true, text_contains: [one, two, three]}
+  - expect: {sql: "SELECT cardinality(reply_message_ids) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 1}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_min_messages, value: "2"}}
+  - expect: {response_contains: "chat_min_messages must not exceed chat_max_messages"}
