@@ -15,9 +15,15 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import OperationalError
 
 from . import STARTED
-from .contracts import DescribeEmojisRequest, DescribeEmojisResult, JobRequest, JobResponse
+from .contracts import (
+    DescribeEmojisRequest,
+    DescribeEmojisResult,
+    ImageJobRequest,
+    JobRequest,
+    JobResponse,
+)
 from .executor import Executor, TransientError
-from .jobs import RequestConflict, run_job
+from .jobs import RequestConflict, run_image_job, run_job
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +36,8 @@ class Settings:
     job_timeout_seconds: float = 120
     openrouter_api_key: str = ""
     openrouter_vision_model: str = ""
+    # Refreshes expired Discord attachment links (reference images; `vision.refresh`).
+    discord_bot_token: str = ""
 
     def __post_init__(self) -> None:
         if not self.database_url.strip() or not self.token.strip():
@@ -46,6 +54,7 @@ class Settings:
             job_timeout_seconds=float(os.getenv("AGENT_HOST_JOB_TIMEOUT_SECS", "120")),
             openrouter_api_key=os.getenv("OPENROUTER_CHAT_API_KEY", ""),
             openrouter_vision_model=os.getenv("OPENROUTER_VISION_MODEL", "").strip(),
+            discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         )
 
 
@@ -66,8 +75,8 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
     async def health() -> dict:
         return {"status": "ok", "executor_configured": executor is not None}
 
-    @app.post("/v1/jobs", response_model=JobResponse, dependencies=[Depends(authenticate)])
-    async def execute(request: JobRequest):
+    async def admit(request: JobRequest | ImageJobRequest, kind: str, run) -> JSONResponse:
+        """One durable job: a slot, the host deadline, and the retry contract."""
         if executor is None:
             raise HTTPException(
                 status_code=501, detail="agent framework executor is not configured"
@@ -79,12 +88,12 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
         started = time.monotonic()
         try:
             async with asyncio.timeout(settings.job_timeout_seconds):
-                result = await run_job(settings.database_url, request, executor)
+                result = await run(settings.database_url, request, executor)
             logger.debug(
                 "job response job_id=%s kind=%s channel_id=%s conversation_id=%s status=%s "
                 "latency_ms=%d rss_mb=%d",
                 request.id,
-                request.kind,
+                kind,
                 request.scope.channel_id,
                 request.scope.conversation_id,
                 result.status,
@@ -96,7 +105,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 content=result.model_dump(mode="json"),
             )
         except RequestConflict:
-            logger.warning("job input conflict job_id=%s kind=%s", request.id, request.kind)
+            logger.warning("job input conflict job_id=%s kind=%s", request.id, kind)
             raise HTTPException(
                 status_code=409, detail="job ID already has different input"
             ) from None
@@ -105,7 +114,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 "job interrupted job_id=%s kind=%s channel_id=%s conversation_id=%s "
                 "error_type=%s latency_ms=%d; retry the same ID",
                 request.id,
-                request.kind,
+                kind,
                 request.scope.channel_id,
                 request.scope.conversation_id,
                 type(error).__name__,
@@ -116,6 +125,15 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
             ) from None
         finally:
             slots.release()
+
+    @app.post("/v1/jobs", response_model=JobResponse, dependencies=[Depends(authenticate)])
+    async def execute(request: JobRequest):
+        return await admit(request, request.kind, run_job)
+
+    @app.post("/v1/images", response_model=JobResponse, dependencies=[Depends(authenticate)])
+    async def draw(request: ImageJobRequest):
+        """A drawing a reply queued (docs/image-generation.md); durable like jobs."""
+        return await admit(request, "image", run_image_job)
 
     @app.post(
         "/v1/emojis/describe",
@@ -164,15 +182,17 @@ def application() -> FastAPI:
             settings.database_url,
             settings.openrouter_api_key,
             settings.openrouter_vision_model,
+            settings.discord_bot_token,
         )
     logger.info(
         "agent host ready startup_ms=%d rss_mb=%d executor_configured=%s "
-        "max_concurrent_jobs=%d job_timeout_seconds=%s vision_model=%s",
+        "max_concurrent_jobs=%d job_timeout_seconds=%s vision_model=%s discord_links=%s",
         (time.monotonic() - STARTED) * 1000,
         max_rss_mb(),
         executor is not None,
         settings.max_concurrent_jobs,
         settings.job_timeout_seconds,
         settings.openrouter_vision_model or "chat model",
+        "refreshed" if settings.discord_bot_token else "as stored",
     )
     return create_app(settings, executor)

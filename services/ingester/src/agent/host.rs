@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use reqwest::{Response, StatusCode, Url, header};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use super::people::PersonRef;
@@ -16,15 +16,16 @@ use crate::{
 pub(crate) struct Host {
     http: reqwest::Client,
     endpoint: Url,
+    image_endpoint: Url,
     emoji_endpoint: Url,
     timeout: Duration,
 }
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct Scope {
-    guild_id: String,
-    channel_id: String,
-    conversation_id: String,
+    pub guild_id: String,
+    pub channel_id: String,
+    pub conversation_id: String,
 }
 
 impl Scope {
@@ -67,8 +68,42 @@ pub(super) struct JobResult {
     pub model: Option<String>,
     pub steps: i32,
     pub usage: Usage,
+    /// Drawn during the reply, by hosts from before drawings were queued.
     #[serde(default)]
     pub images: Vec<ImageRef>,
+    /// Pictures the reply queued (the host's `Drawing`, passed through as is):
+    /// each becomes an image job after the reply is posted.
+    #[serde(default)]
+    pub drawings: Vec<serde_json::Value>,
+}
+
+/// One queued drawing (`POST /v1/images`), ID `image:<run>:<n>`. Snapshotted in
+/// `agent_image_jobs` so retries send identical input.
+#[derive(Deserialize, Serialize)]
+pub(super) struct ImageJobRequest {
+    pub id: String,
+    pub scope: Scope,
+    pub image_model: String,
+    /// The reply job that queued it: the host writes a failure note from its prompt.
+    pub reply_job: String,
+    pub chat_model: String,
+    /// What Kiki posted when she queued it.
+    pub ack: String,
+    pub drawing: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ImageJobResult {
+    pub image: Option<ImageRef>,
+    #[serde(default)]
+    pub caption: String,
+    pub cost: Option<f64>,
+    /// `refused` or `failed` when there's no image.
+    pub error: Option<String>,
+    /// Kiki's message about the failure, written by the chat model; empty if
+    /// even that failed.
+    #[serde(default)]
+    pub failure_note: String,
 }
 
 /// Describes a server's emoji that lack a description (`emojis.rs`): one
@@ -102,10 +137,10 @@ enum JobStatus {
 }
 
 #[derive(Deserialize)]
-struct JobResponse {
+struct JobResponse<T> {
     id: String,
     status: JobStatus,
-    result: Option<JobResult>,
+    result: Option<T>,
     error: Option<String>,
 }
 
@@ -118,6 +153,7 @@ impl Host {
         let endpoint = Url::parse(&format!("{}/v1/jobs", base.trim_end_matches('/')))
             .context("invalid AGENT_HOST_URL")?;
         let emoji_endpoint = endpoint.join("emojis/describe")?;
+        let image_endpoint = endpoint.join("images")?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || !endpoint.username().is_empty()
             || endpoint.password().is_some()
@@ -144,15 +180,50 @@ impl Host {
         Ok(Self {
             http,
             endpoint,
+            image_endpoint,
             emoji_endpoint,
             timeout: config.host_timeout,
         })
     }
 
     pub(super) async fn execute(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
-        tokio::time::timeout(self.timeout, self.execute_with_retries(job))
-            .await
-            .context("agent host deadline exceeded (including wake-up retries)")?
+        let result: JobResult = tokio::time::timeout(
+            self.timeout,
+            self.run_with_retries(&self.endpoint, &job.id, &job.kind, job),
+        )
+        .await
+        .context("agent host deadline exceeded (including wake-up retries)")??;
+        if result.text.trim().is_empty()
+            || result.steps < 0
+            || result.usage.prompt_tokens < 0
+            || result.usage.completion_tokens < 0
+            || result
+                .usage
+                .cost
+                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            bail!("agent host returned an invalid result");
+        }
+        Ok(result)
+    }
+
+    /// Draws a queued picture: the same durable job contract as replies, with
+    /// its own ID, so a retry gets the saved image instead of drawing again.
+    pub(super) async fn draw(&self, job: &ImageJobRequest) -> anyhow::Result<ImageJobResult> {
+        let result: ImageJobResult = tokio::time::timeout(
+            self.timeout,
+            self.run_with_retries(&self.image_endpoint, &job.id, "image", job),
+        )
+        .await
+        .context("agent host deadline exceeded (including wake-up retries)")??;
+        if result.image.is_none() == result.error.is_none()
+            || result
+                .cost
+                .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
+        {
+            bail!("agent host returned an invalid image result");
+        }
+        Ok(result)
     }
 
     /// One describe batch, retried like jobs while the host wakes up or is busy.
@@ -205,39 +276,32 @@ impl Host {
         }
     }
 
-    async fn execute_with_retries(&self, job: &JobRequest) -> anyhow::Result<JobResult> {
+    async fn run_with_retries<T: DeserializeOwned>(
+        &self,
+        url: &Url,
+        id: &str,
+        kind: &str,
+        job: &impl Serialize,
+    ) -> anyhow::Result<T> {
         let mut delay = Duration::from_secs(1);
         let mut attempt = 0;
         let mut warned = false;
         loop {
             attempt += 1;
-            let (reason, status) = match self.attempt(&self.endpoint, job).await? {
+            let (reason, status) = match self.attempt(url, job).await? {
                 Err(retry) => retry,
                 Ok(response) => {
                     let status = response.status();
-                    let response: JobResponse = response
+                    let response: JobResponse<T> = response
                         .json()
                         .await
                         .context("parsing agent host response")?;
-                    if response.id != job.id {
+                    if response.id != id {
                         bail!("agent host returned a different job ID");
                     }
                     match response.status {
                         JobStatus::Completed => {
-                            let result =
-                                response.result.context("host completed without result")?;
-                            if result.text.trim().is_empty()
-                                || result.steps < 0
-                                || result.usage.prompt_tokens < 0
-                                || result.usage.completion_tokens < 0
-                                || result
-                                    .usage
-                                    .cost
-                                    .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
-                            {
-                                bail!("agent host returned an invalid result");
-                            }
-                            return Ok(result);
+                            return response.result.context("host completed without result");
                         }
                         JobStatus::Failed => bail!(
                             "agent host job failed: {}",
@@ -249,17 +313,13 @@ impl Host {
             };
             if reason != "running" && !warned {
                 warn!(
-                    job_id = job.id,
-                    kind = job.kind,
-                    attempt,
-                    reason,
-                    status,
-                    "agent host unavailable; retrying the same job"
+                    job_id = id,
+                    kind, attempt, reason, status, "agent host unavailable; retrying the same job"
                 );
                 warned = true;
             }
             debug!(
-                job_id = job.id,
+                job_id = id,
                 attempt,
                 reason,
                 status,
@@ -393,6 +453,80 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(result.images[0].id, 7);
+    }
+
+    #[tokio::test]
+    async fn drawings_are_durable_jobs_on_their_own_endpoint() {
+        type Requests = Arc<Mutex<Vec<Value>>>;
+        async fn handler(
+            State(requests): State<Requests>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let mut requests = requests.lock().unwrap();
+            requests.push(body);
+            match requests.len() {
+                1 => (
+                    StatusCode::ACCEPTED,
+                    Json(json!({"id": "image:42:1", "status": "running"})),
+                )
+                    .into_response(),
+                2 => Json(
+                    json!({"id": "image:42:1", "status": "completed", "result": {
+                        "image": {"id": 7, "mime_type": "image/png"}, "caption": "da beach",
+                        "prompt": "…", "references": [], "model": "test/image", "cost": 0.05,
+                        "latency_ms": 12000, "error": null, "failure_note": "",
+                    }}),
+                )
+                .into_response(),
+                // Neither an image nor a reason: rejected.
+                _ => Json(
+                    json!({"id": "image:42:1", "status": "completed", "result": {
+                        "image": null, "model": "test/image", "error": null,
+                    }}),
+                )
+                .into_response(),
+            }
+        }
+        let requests = Requests::default();
+        let (url, server) = server(
+            Router::new()
+                .route("/v1/images", post(handler))
+                .with_state(requests.clone()),
+        )
+        .await;
+        let host = host(url, Duration::from_secs(10));
+        let job = ImageJobRequest {
+            id: "image:42:1".into(),
+            scope: Scope::new(1, 2, 3),
+            image_model: "test/image".into(),
+            reply_job: "reply:42".into(),
+            chat_model: "test/model".into(),
+            ack: "brb".into(),
+            drawing: json!({"prompt": "Nougie on a beach"}),
+        };
+        let drawn = host.draw(&job).await.unwrap();
+        assert_eq!(drawn.image.unwrap().id, 7);
+        assert_eq!(drawn.caption, "da beach");
+        assert!(host.draw(&job).await.is_err());
+        server.abort();
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests[0], requests[1], "retries send identical input");
+        assert_eq!(requests[0]["drawing"]["prompt"], "Nougie on a beach");
+    }
+
+    #[test]
+    fn queued_drawings_pass_through_and_default_to_none() {
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "on it", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            "drawings": [{"prompt": "x", "subjects": [{"name": "Nougie"}], "caption": "hi"}],
+        }))
+        .unwrap();
+        assert_eq!(result.drawings[0]["subjects"][0]["name"], "Nougie");
+        let result: JobResult = serde_json::from_value(json!({
+            "text": "hi", "model": null, "steps": 1, "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        }))
+        .unwrap();
+        assert!(result.drawings.is_empty());
     }
 
     #[tokio::test]

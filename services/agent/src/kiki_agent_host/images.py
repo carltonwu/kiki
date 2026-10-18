@@ -1,5 +1,5 @@
 """Image generation: OpenRouter's Images API as a Pydantic AI image model, and storage
-for Rust to attach the result to the reply."""
+for Rust to post the result."""
 
 import base64
 import binascii
@@ -8,6 +8,7 @@ from collections.abc import Sequence
 import httpx
 from openai import AsyncOpenAI
 from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
 from pydantic_ai import ImageGenerator
 from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior, UserError
 from pydantic_ai.images import (
@@ -17,13 +18,16 @@ from pydantic_ai.images import (
     ImageGenerationResult,
     ImageGenerationSettings,
 )
-from pydantic_ai.messages import BinaryImage
+from pydantic_ai.messages import BinaryImage, ImageUrl
 
 from .vision import ImageRefused, sniff
 
 # Discord's smallest upload limit is 10 MiB; leave room for the rest of the request.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_PROMPT_CHARS = 4000
+# Kiki's prompt plus the subjects and reference legend the image job adds.
+MAX_PROMPT_CHARS = 8000
+# GPT Image's limit, and OpenRouter's `input_references` range for it.
+MAX_REFERENCES = 16
 # GPT Image bills by output tokens: "medium" keeps a 1024² image at a few cents
 # (OpenAI's "auto" may pick "high", about 4× the cost).
 OPENAI_QUALITY = "medium"
@@ -69,9 +73,14 @@ class OpenRouterImageModel(ImageGenerationModel):
         prompt, references, settings = self.prepare_generate(
             prompt, images=images, settings=settings
         )
-        if references:
-            raise UserError("OpenRouterImageModel doesn't edit reference images")
+        if len(references) > MAX_REFERENCES:
+            raise UserError(f"OpenRouter takes at most {MAX_REFERENCES} reference images")
         body: dict = {"model": self.model_name, "prompt": prompt, "n": 1}
+        if references:
+            # In order: prompts refer to them by position ("reference image 2").
+            body["input_references"] = [
+                {"type": "image_url", "image_url": {"url": reference_url(r)}} for r in references
+            ]
         if aspect_ratio := settings.get("aspect_ratio"):
             body["aspect_ratio"] = aspect_ratio
         if self.model_name.startswith("openai/"):
@@ -99,10 +108,23 @@ class OpenRouterImageModel(ImageGenerationModel):
         )
 
 
+def reference_url(image: ImageGenerationInput) -> str:
+    """A reference as OpenRouter takes it: bytes as a data URL (Discord's links expire)."""
+    if isinstance(image, BinaryImage):
+        return image.data_uri
+    if isinstance(image, ImageUrl):
+        return image.url
+    raise UserError("OpenRouter reference images must be bytes or URLs")
+
+
 async def generate(
-    model: ImageGenerationModel, prompt: str, aspect_ratio: str | None = None
+    model: ImageGenerationModel,
+    prompt: str,
+    aspect_ratio: str | None = None,
+    references: Sequence[BinaryImage] = (),
 ) -> tuple[bytes, str, float]:
-    """The image's bytes, MIME type and billed cost, or ImageRefused/ValueError."""
+    """The image's bytes, MIME type and billed cost, or ImageRefused/ValueError.
+    `references` go to the model in order, as the prompt numbers them."""
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("prompt must describe the image")
@@ -110,7 +132,9 @@ async def generate(
         raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
     settings: ImageGenerationSettings = {"aspect_ratio": aspect_ratio} if aspect_ratio else {}
     try:
-        result = await ImageGenerator(model).generate(prompt, settings=settings)
+        result = await ImageGenerator(model).generate(
+            prompt, images=list(references), settings=settings
+        )
     except ContentFilterError:
         raise ImageRefused("The image model refused that prompt.") from None
     except UnexpectedModelBehavior:
@@ -127,10 +151,36 @@ async def generate(
     return image.data, media_type, cost
 
 
-async def save(connection: AsyncConnection, job_id: str, mime_type: str, data: bytes) -> int:
+async def save(
+    connection: AsyncConnection,
+    job_id: str,
+    mime_type: str,
+    data: bytes,
+    *,
+    prompt: str | None = None,
+    model: str | None = None,
+    subjects: list | None = None,
+    references: list | None = None,
+    cost: float | None = None,
+    latency_ms: int | None = None,
+) -> int:
+    """Saves a drawing with what it was made from (`subjects` and `references` are
+    JSON-ready lists), so a later look at it can say why it came out as it did."""
     cursor = await connection.execute(
-        "INSERT INTO agent_host_images (job_id, mime_type, data) VALUES (%s, %s, %s) RETURNING id",
-        (job_id, mime_type, data),
+        "INSERT INTO agent_host_images (job_id, mime_type, data, prompt, model, subjects,"
+        " reference_images, cost_usd, latency_ms)"
+        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+        (
+            job_id,
+            mime_type,
+            data,
+            prompt,
+            model,
+            Jsonb(subjects or []),
+            Jsonb(references or []),
+            cost,
+            latency_ms,
+        ),
     )
     row = await cursor.fetchone()
     return row[0]

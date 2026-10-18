@@ -8,11 +8,12 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 
+import httpx
 from openai import APIError, APIStatusError
 from psycopg import AsyncConnection, OperationalError
-from pydantic import BeforeValidator
+from pydantic import BaseModel, BeforeValidator, Field
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
@@ -33,14 +34,19 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import emojis, images, memory_tools, reading, retrieval
+from . import drawing, emojis, images, memory_tools, reading, retrieval
 from .contracts import (
+    AspectRatio,
     DescribeEmojisRequest,
     DescribeEmojisResult,
+    Drawing,
     Image,
+    ImageJobRequest,
+    ImageJobResult,
     JobRequest,
     JobResult,
     Message,
+    Subject,
     Usage,
     WebUse,
 )
@@ -60,8 +66,10 @@ EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadli
 MAX_WEB_STEPS = 3
 WEB_FETCH_MAX_TOKENS = 6000  # truncates long pages, which every later request re-reads
 WEB_SOURCES = 10  # citation URLs kept in the result
-MAX_IMAGES = 2
-IMAGE_TIMEOUT_SECONDS = 60  # image models are slow; still well inside the job timeout
+MAX_IMAGES = 2  # pictures one reply may queue
+# Image models are slow, more so with references; with the reference check this
+# stays inside the host's job timeout (AGENT_HOST_JOB_TIMEOUT_SECS, 120 s).
+IMAGE_TIMEOUT_SECONDS = 75
 
 
 @dataclass
@@ -76,10 +84,9 @@ class Deps:
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
-    image_model: ImageGenerationModel | None = None
-    images: list[Image] = field(default_factory=list)
-    image_cost: float = 0.0
-    image_calls: int = 0
+    # The server's image model, when it has drawing on; drawings run after the reply.
+    image_model: str | None = None
+    drawings: list[Drawing] = field(default_factory=list)
     memory: memory_tools.Session | None = None
 
 
@@ -227,63 +234,120 @@ async def read_image(ctx: RunContext[Deps], message_id: str, question: str | Non
     return await guarded(ctx, "read_image", work, VISION_TIMEOUT_SECONDS)
 
 
+class Pictured(BaseModel):
+    """Someone or something in the picture."""
+
+    name: str = Field(description='What to call them in the picture, like "Ethan" or "Nougie".')
+    person: str | None = Field(
+        default=None, description="Their ref, like u2, when it's someone in this server."
+    )
+    me: bool = Field(default=False, description="True when it's you, Kiki.")
+    photos: list[str] = Field(
+        default_factory=list,
+        description="IDs of messages whose images show them, when you or the people asking "
+        "already picked some (like the message in [image: …; message 123]). Otherwise leave "
+        "it empty: the drawing step finds their photos in the server's history.",
+    )
+    description: str = Field(
+        default="",
+        description="Who or what they are and what they look like, as far as you know from "
+        'the chat or memory, like "traumagotchi\'s dog, a small fluffy white mutt".',
+    )
+
+
 async def generate_image(
     ctx: RunContext[Deps],
     prompt: str,
-    aspect_ratio: Literal["1:1", "3:2", "2:3"] | None = None,
+    subjects: list[Pictured] | None = None,
+    style: str | None = None,
+    aspect_ratio: AspectRatio | None = None,
+    caption: str = "",
 ) -> dict:
-    """Draw an image and attach it to your reply.
+    """Make a picture. It's drawn after your reply and posted as its own message.
 
-    Use it when someone asks for a picture, drawing, meme or edit-free visual, or
-    when one would clearly land better than words. The image is attached to your
-    first message automatically: don't paste links or markdown for it; just write
-    your message as if it's posted with the image.
+    Use it when someone asks for a picture, drawing, meme or visual, or when one
+    would clearly land better than words. Your reply goes out first and lets them
+    know it's on the way; the picture follows in about half a minute, replying to
+    their message, with your caption. If drawing fails, you get to tell them.
+
+    Name every person, pet or thing whose real look matters in `subjects`: the
+    drawing step finds photos of them in the server's history (and people's
+    avatars), checks them, and gives them to the image model as references, so
+    their likeness carries over.
 
     Args:
-        prompt: A complete, self-contained description of the image: subject,
-            style, composition and any text it should contain. The image model
-            can't see this conversation or people's faces, so describe what
-            matters instead of referring to it.
-        aspect_ratio: 3:2 for wide scenes, 2:3 for tall ones; square by default.
+        prompt: The scene, self-contained: who is doing what, where, the camera
+            angle and framing, lighting and mood, and any text in it in quotes.
+            Call subjects by their names. Get real-world details right (a lumbar
+            puncture goes in the lower back between the vertebrae).
+        subjects: The people, pets and things in it whose look matters, you
+            included (me: true) when you're in it.
+        style: Only when they asked for one or the joke needs it, like "90s anime"
+            or "oil painting". Leave it out for the default: a candid,
+            photorealistic phone-camera photo.
+        aspect_ratio: 3:4 or 4:3 for an everyday phone photo, 9:16 or 16:9 for
+            tall or wide scenes, 1:1 for icons; square when left out.
+        caption: Your words to post with the picture, written for it.
     """
 
     async def work():
         deps = ctx.deps
-        # Counted before the call: the model may request several images in parallel,
-        # and a failed attempt may still be billed.
-        if deps.image_calls >= MAX_IMAGES:
-            return {"error": f"At most {MAX_IMAGES} images per reply. Answer with what you have."}
-        deps.image_calls += 1
-        try:
-            data, mime_type, cost = await images.generate(deps.image_model, prompt, aspect_ratio)
-        except APIStatusError as e:
-            # Content-policy refusals are 4xx; tell the model rather than failing the reply.
-            logger.warning(
-                "image generation failed job_id=%s status=%d", deps.job_id, e.status_code
+        if len(deps.drawings) >= MAX_IMAGES:
+            return {"error": f"At most {MAX_IMAGES} pictures per reply."}
+        pictured = []
+        for s in subjects or []:
+            user_id = None
+            if s.person and s.person.strip():
+                ref = s.person.strip()
+                if ref not in deps.roster.ids:
+                    raise ValueError(f"{ref} isn't in this conversation's people list")
+                user_id = str(deps.roster.ids[ref])
+            photos = [p.strip() for p in s.photos if p.strip()]
+            if any(not p.isdigit() for p in photos):
+                raise ValueError("photos must be message IDs")
+            if photos and not await has_images(deps, photos):
+                raise ValueError(f"No message with images among {photos} in this server")
+            pictured.append(
+                Subject(
+                    name=s.name,
+                    description=s.description,
+                    user_id=user_id,
+                    kiki=s.me,
+                    photos=photos[:4],
+                )
             )
-            return {"error": f"The image model failed (HTTP {e.status_code}). Don't retry."}
-        except APIError as e:
-            logger.warning(
-                "image generation failed job_id=%s error_type=%s", deps.job_id, type(e).__name__
-            )
-            return {"error": "The image model is unreachable. Don't retry."}
-        deps.image_cost += cost
-        image = Image(
-            id=await images.save(deps.connection, deps.job_id, mime_type, data),
-            mime_type=mime_type,
+        drawing = Drawing(
+            prompt=prompt.strip(),
+            subjects=pictured,
+            style=(style or "").strip() or None,
+            aspect_ratio=aspect_ratio,
+            caption=caption.strip(),
         )
-        deps.images.append(image)
+        deps.drawings.append(drawing)
         logger.info(
-            "image generated job_id=%s image_id=%d mime_type=%s bytes=%d cost_usd=%s",
+            "drawing queued job_id=%s subjects=%d photos=%d styled=%s",
             deps.job_id,
-            image.id,
-            mime_type,
-            len(data),
-            cost,
+            len(pictured),
+            sum(len(s.photos) for s in pictured),
+            drawing.style is not None,
         )
-        return {"attached": True, "images_attached": len(deps.images)}
+        return {
+            "queued": True,
+            "note": "It's drawn after your reply and posted as its own message. Your reply "
+            "now is what they see while they wait: let them know a picture is coming, your "
+            "way. Don't describe it as if it's already posted.",
+        }
 
-    return await guarded(ctx, "generate_image", work, IMAGE_TIMEOUT_SECONDS, budgeted=False)
+    return await guarded(ctx, "generate_image", work, budgeted=False)
+
+
+async def has_images(deps: Deps, message_ids: list[str]) -> bool:
+    cursor = await deps.connection.execute(
+        "SELECT 1 FROM messages WHERE guild_id = %s AND id = ANY(%s) AND deleted_at IS NULL"
+        " AND jsonb_array_length(coalesce(raw->'attachments', '[]')) > 0 LIMIT 1",
+        (deps.scope.guild_id, [int(i) for i in message_ids]),
+    )
+    return await cursor.fetchone() is not None
 
 
 async def only_with_image_model(
@@ -435,11 +499,17 @@ def history(messages: list[Message]) -> list[ModelMessage]:
 
 class PydanticExecutor:
     web_tools = WEB_TOOLS
+    # Discord media and API requests (tests replace it).
+    transport: httpx.AsyncBaseTransport | None = None
 
-    def __init__(self, database_url: str, api_key: str, vision_model: str = ""):
+    def __init__(
+        self, database_url: str, api_key: str, vision_model: str = "", discord_token: str = ""
+    ):
         self.database_url = database_url
         # Without one, images go to the chat model, which may not read them.
         self.vision_model = vision_model
+        # Without it, images in messages older than a day can't be downloaded.
+        self.discord_token = discord_token
         if os.getenv("OPENROUTER_BASE_URL"):
             self.provider = OpenRouterProvider(openai_client=retrieval.openrouter_client(api_key))
         else:
@@ -477,8 +547,7 @@ class PydanticExecutor:
         if request.kind == "reply":
             options["model_settings"]["extra_body"] = {"max_tool_calls": MAX_WEB_STEPS}
         embed = retrieval.Embedder(self.embeddings)
-        vision_name = self.vision_model or request.model
-        vision = Vision(self.model(vision_name), vision_name, not self.vision_model)
+        vision = self.vision(request.model)
         deps = None
         try:
             if request.kind == "topic":
@@ -499,9 +568,7 @@ class PydanticExecutor:
                         retrieval.Roster.of(request.people),
                         vision,
                         job_id=request.id,
-                        image_model=self.image_model(request.image_model)
-                        if request.image_model
-                        else None,
+                        image_model=request.image_model,
                         memory=memory_tools.Session(self.database_url),
                     )
                     # Embedding is cheap: start while the model reads the prompt,
@@ -525,13 +592,13 @@ class PydanticExecutor:
         responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
         web = web_use(responses)
         cost = billed_cost(result)  # includes OpenRouter's web tool fees
-        extra = embed.cost + vision.cost + (deps.image_cost if deps else 0)
+        extra = embed.cost + vision.cost
         if extra:
             cost = (cost or 0) + extra
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
             "requests=%d tool_calls=%d vision_calls=%d web_searches=%d web_fetches=%d "
-            "web_sources=%d images=%d prompt_tokens=%d completion_tokens=%d cost_usd=%s "
+            "web_sources=%d drawings=%d prompt_tokens=%d completion_tokens=%d cost_usd=%s "
             "latency_ms=%d",
             request.id,
             request.kind,
@@ -544,7 +611,7 @@ class PydanticExecutor:
             web.searches,
             web.fetches,
             len(web.sources),
-            len(deps.images) if deps else 0,
+            len(deps.drawings) if deps else 0,
             usage.input_tokens,
             usage.output_tokens,
             cost,
@@ -558,7 +625,109 @@ class PydanticExecutor:
                 prompt_tokens=usage.input_tokens, completion_tokens=usage.output_tokens, cost=cost
             ),
             web=web if web.searches or web.fetches or web.sources else None,
-            images=deps.images if deps else [],
+            drawings=deps.drawings if deps else [],
+        )
+
+    def vision(self, chat_model: str) -> Vision:
+        name = self.vision_model or chat_model
+        return Vision(
+            self.model(name), name, not self.vision_model, discord_token=self.discord_token
+        )
+
+    async def draw(self, request: ImageJobRequest) -> ImageJobResult:
+        """A drawing a reply queued: references, the final prompt, the image, and
+        Kiki's note if it fails (docs/image-generation.md)."""
+        started = time.monotonic()
+        plan = request.drawing
+        vision = self.vision(request.chat_model)
+        scope = retrieval.Scope(
+            int(request.scope.guild_id),
+            int(request.scope.channel_id),
+            int(request.scope.conversation_id),
+        )
+        error = reason = None
+        image = None
+        image_cost = note_cost = 0.0
+        note = prompt = ""
+        references = []
+        try:
+            async with await AsyncConnection.connect(
+                self.database_url, autocommit=True, connect_timeout=10
+            ) as connection:
+                gather = drawing.Gatherer(
+                    connection, scope, vision, emojis.cdn_base(), self.transport
+                )
+                found = await asyncio.gather(*(gather.find(s) for s in plan.subjects))
+                prompt, references, pictures = drawing.compose(plan, found)
+                try:
+                    async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
+                        data, mime_type, image_cost = await images.generate(
+                            self.image_model(request.image_model),
+                            prompt,
+                            plan.aspect_ratio,
+                            pictures,
+                        )
+                except images.ImageRefused as e:
+                    error, reason = "refused", str(e)
+                except ValueError as e:
+                    error, reason = "failed", str(e)
+                except APIStatusError as e:
+                    # Content-policy blocks are 4xx: don't retry them.
+                    kind = "refused" if 400 <= e.status_code < 500 else "failed"
+                    error, reason = kind, f"the image model returned HTTP {e.status_code}"
+                except (APIError, TimeoutError) as e:
+                    error, reason = "failed", f"the image model failed ({type(e).__name__})"
+                latency_ms = int((time.monotonic() - started) * 1000)
+                if error is None:
+                    image = Image(
+                        id=await images.save(
+                            connection,
+                            request.id,
+                            mime_type,
+                            data,
+                            prompt=prompt,
+                            model=request.image_model,
+                            subjects=[s.model_dump(mode="json") for s in plan.subjects],
+                            references=[r.model_dump(mode="json") for r in references],
+                            cost=image_cost,
+                            latency_ms=latency_ms,
+                        ),
+                        mime_type=mime_type,
+                    )
+                else:
+                    note, note_cost = await drawing.failure_note(
+                        connection,
+                        self.model(request.chat_model),
+                        request.reply_job,
+                        request.ack,
+                        reason,
+                    )
+        except OperationalError as e:
+            raise TransientError(type(e).__name__) from e
+        cost = image_cost + vision.cost + note_cost
+        logger.info(
+            "drawing completed job_id=%s channel_id=%s model=%s subjects=%d references=%d "
+            "vision_calls=%d outcome=%s cost_usd=%s latency_ms=%d",
+            request.id,
+            request.scope.channel_id,
+            request.image_model,
+            len(plan.subjects),
+            len(references),
+            vision.calls,
+            error or "drawn",
+            cost,
+            (time.monotonic() - started) * 1000,
+        )
+        return ImageJobResult(
+            image=image,
+            caption=plan.caption,
+            prompt=prompt,
+            references=references,
+            model=request.image_model,
+            cost=cost,
+            latency_ms=int((time.monotonic() - started) * 1000),
+            error=error,
+            failure_note=note,
         )
 
     async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:

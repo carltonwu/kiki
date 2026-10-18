@@ -380,6 +380,7 @@ mod tests {
             attachments: Vec::new(),
             images: Vec::new(),
             reactions: Vec::new(),
+            starter_of: None,
         }
     }
 
