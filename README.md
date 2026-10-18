@@ -59,6 +59,10 @@ Python persists execution results in Postgres; Rust delivers them to Discord and
 replies into the conversation. Topic summaries also run through the Python host. Only
 the newest pending run per conversation is answered; older pending runs become `superseded`.
 
+Kiki's conversational clock uses US Eastern (`America/New_York`), including daylight
+saving changes. This only affects the time shown in reply context; stored timestamps,
+routing windows and search filters keep their existing behavior.
+
 The Python host runs Pydantic AI over OpenRouter once `OPENROUTER_CHAT_API_KEY` is set
 (without it, execution returns 501). Replies can search the destination channel's history:
 full text plus `qwen/qwen3-embedding-8b` vectors in pgvector, embedded lazily per searched

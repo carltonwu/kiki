@@ -67,8 +67,7 @@ export default defineRailway(() => {
       // service has OPENROUTER_CHAT_API_KEY; unset, nothing is dispatched.
       AGENT_HOST_URL: preserve(),
       AGENT_HOST_TOKEN: "${{shared.AGENT_HOST_TOKEN}}",
-      // Comma-separated guilds to ingest. Disabled for now: 348273727298863104.
-      DISCORD_GUILD_IDS: "1358240830887952575",
+      DISCORD_GUILD_IDS: "1358240830887952575,348273727298863104",
     },
   });
 

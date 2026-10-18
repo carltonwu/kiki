@@ -21,8 +21,11 @@ use crate::conversation;
 
 const INSTRUCTIONS: &str = "Kiki is an AI chat assistant in this Discord channel. Based on new_messages, \
 is their author talking to Kiki: continuing one of the listed conversations with her, starting a new \
-one, or not talking to her at all? Talking about Kiki is not talking to her. Kiki's own messages in \
-recent_channel_messages have from = \"Kiki\".";
+one, or not talking to her at all? Use recent_channel_messages to resolve short follow-ups: an answer \
+or correction to Kiki's recent reply continues that conversation even without mentioning her. \
+Use that reply's conversation_id to distinguish conversations with the same people. \
+Talking about Kiki or unrelated chatter is not talking to her; an active conversation alone is not \
+enough. Kiki's own messages in recent_channel_messages have from = \"Kiki\".";
 const RECENT_MESSAGES: i64 = 15;
 // Jev allows 10 choices: eight conversations plus "new" and "no".
 const CONVERSATION_CHOICES: usize = 8;
@@ -311,7 +314,7 @@ impl Router {
             criteria.insert(
                 format!("conversation_{}", c["id"]),
                 json!(format!(
-                    "Continuing the conversation with Kiki that {} are in (see conversations[id={}])",
+                    "Replying to Kiki in the conversation that {} are in (see conversations[id={}]), including a short answer or correction to her recent reply without naming her",
                     participants.unwrap_or_default(),
                     c["id"]
                 )),
@@ -404,11 +407,13 @@ impl Router {
         active: &[Value],
     ) -> anyhow::Result<Value> {
         let first = pool.message_ids.iter().min().copied().unwrap_or_default();
-        let recent: Vec<(i64, Option<String>, String)> = sqlx::query_as(
+        let recent: Vec<(i64, Option<String>, String, Option<i64>)> = sqlx::query_as(
             r#"
-            SELECT author_id, author_name, content FROM messages
-            WHERE channel_id = $1 AND id < $2 AND deleted_at IS NULL
-            ORDER BY id DESC LIMIT $3
+            SELECT m.author_id, m.author_name, m.content, cm.conversation_id
+            FROM messages m
+            LEFT JOIN conversation_messages cm ON cm.message_id = m.id
+            WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
+            ORDER BY m.id DESC LIMIT $3
             "#,
         )
         .bind(key.channel_id)
@@ -426,7 +431,13 @@ impl Router {
         let recent: Vec<Value> = recent
             .into_iter()
             .rev()
-            .map(|(id, name, content)| json!({ "from": self.display_name(id, name), "text": content }))
+            .map(|(id, name, content, conversation_id)| {
+                json!({
+                    "from": self.display_name(id, name),
+                    "text": content,
+                    "conversation_id": conversation_id,
+                })
+            })
             .collect();
         Ok(json!({
             "recent_channel_messages": recent,
