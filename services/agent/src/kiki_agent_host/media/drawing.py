@@ -12,6 +12,10 @@ the subject looks like, best first:
 3. a person's Discord avatar, if the same check says it's a photo of them;
 4. for Kiki herself, her earlier self-portraits.
 
+Images people shared with the request (`Drawing.shared`: attached to it, or in a
+message it replies to or links) go in too, after the subjects', as what the
+request is about: the scene, meme or template to work from.
+
 Then it writes the final prompt around Kiki's, numbering the references ("reference
 images 1-2 show Ethan"), draws with them, and saves the image with what it was made
 from. A failed drawing gets a note in Kiki's voice, written by the chat model from
@@ -21,6 +25,7 @@ the reply's own prompt, so the request never ends in silence.
 import asyncio
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import httpx
@@ -41,6 +46,7 @@ from .vision import ImageRefused, Vision, billed_cost, look
 logger = logging.getLogger(__name__)
 
 PER_SUBJECT = 3  # references per subject: enough for a likeness, room for several subjects
+SHARED_IMAGES = 4  # images shared with the request, after the subjects'
 CANDIDATE_MESSAGES = 10
 CANDIDATES = 8  # images shown to the vision check per subject
 VERIFY_TIMEOUT_SECONDS = 30
@@ -63,10 +69,14 @@ PHOTO_STYLE = (
 PERSON_LOOK = "face, facial features, hair, skin tone and build"
 THING_LOOK = "look (for an animal: breed, size, coat colors and markings)"
 REFERENCES_ONLY = (
-    "Use the reference images only for how these subjects look, not for their "
+    "Use the subjects' reference images only for how they look, not for their "
     "backgrounds, lighting, clothing or framing: make the new picture described above. "
     "Only the subjects named here look like their references; anyone else in the "
     "picture looks clearly different from them."
+)
+SHARED = (
+    "{span} {verb} what they shared with the request (a photo, meme or template): "
+    "use {pronoun} as the request describes, like the scene, layout or people to recreate."
 )
 EDIT = (
     "Reference image 1 is the photo to edit: change only what's described above and "
@@ -110,7 +120,7 @@ FAILURE_NOTE = """\
 (Not from the chat:) The picture you just said you'd make couldn't be made: \
 {reason}. Write the one short message you'd send now to tell them, in your own \
 words and in the mood of the conversation. Don't promise to try again by \
-yourself; they can ask again. Return only the message."""
+yourself. Return only the message."""
 
 note_writer = Agent()
 
@@ -250,6 +260,24 @@ class Gatherer:
             logger.warning("references failed error_type=%s", type(error).__name__)
             return Found(subject, [])
 
+    async def shared(self, message_ids: list[str]) -> list[tuple[Reference, BinaryImage]]:
+        """The images shared with the request, used as given (people chose them).
+        Empty if they can't be read: the picture is still drawn."""
+        ids = [int(i) for i in message_ids if i.isdigit()]
+        if not ids:
+            return []
+        try:
+            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4)
+            fetched = await self.fetch(given[:SHARED_IMAGES])
+        except OperationalError:
+            raise
+        except Exception as error:  # noqa: BLE001 - shared images must not sink the drawing
+            logger.warning("shared images failed error_type=%s", type(error).__name__)
+            return []
+        for c, _ in fetched:
+            c.reference.subject = "shared"
+        return [(c.reference, image) for c, image in fetched]
+
     async def subject(self, subject: Subject) -> Found:
         """References for one subject, at most PER_SUBJECT."""
         name = subject.name
@@ -266,7 +294,11 @@ class Gatherer:
                 if image := binary(bytes(row["data"])):
                     chosen.append((Reference(subject=name, drawing_id=row["id"]), image))
         if len(chosen) < PER_SUBJECT and not subject.kiki:
-            candidates = await self.candidates(subject)
+            # A given photo found again in the history isn't checked or sent twice.
+            given_keys = {key(r) for r, _ in chosen}
+            candidates = [
+                c for c in await self.candidates(subject) if key(c.reference) not in given_keys
+            ]
             approved = await self.verify(subject, candidates)
             chosen += [(c.reference, image) for c, image in approved][: PER_SUBJECT - len(chosen)]
         for reference, _ in chosen:
@@ -364,6 +396,29 @@ class Gatherer:
         return [pair for n, pair in enumerate(usable, 1) if n in approved]
 
 
+def key(reference: Reference) -> tuple:
+    """What makes two references the same image."""
+    return (
+        reference.message_id,
+        reference.attachment_id,
+        reference.avatar_of,
+        reference.drawing_id,
+    )
+
+
+def trim(groups: list[list], limit: int) -> list[list]:
+    """`groups` with at most `limit` items in all, taking each group's first, then
+    each one's second, and so on, so every subject keeps its best reference."""
+    kept = [0] * len(groups)
+    total = 0
+    for depth in range(max((len(g) for g in groups), default=0)):
+        for i, group in enumerate(groups):
+            if depth < len(group) and total < limit:
+                kept[i] += 1
+                total += 1
+    return [group[:n] for group, n in zip(groups, kept, strict=True)]
+
+
 def verdicts(answer: str) -> set[int]:
     """The image numbers the vision check approved ("Image 3: a selfie => yes")."""
     return {int(m[1]) for m in re.finditer(r"(?im)^\W*image\s+(\d+)\b[^\n]*?=>\W*yes\b", answer)}
@@ -376,10 +431,24 @@ def binary(data: bytes) -> BinaryImage | None:
     return BinaryImage(data, media_type=media_type)
 
 
-def compose(drawing: Drawing, found: list[Found]) -> tuple[str, list[Reference], list[BinaryImage]]:
+def compose(
+    drawing: Drawing,
+    found: list[Found],
+    shared: Sequence[tuple[Reference, BinaryImage]] = (),
+    max_references: int | None = None,
+) -> tuple[str, list[Reference], list[BinaryImage]]:
     """The final prompt: Kiki's, then the style, then who's who, each reference
     labeled by its number (in the order the image model gets them) and its role,
-    with what must stay the same, as OpenAI's image prompting guide advises."""
+    with what must stay the same, as OpenAI's image prompting guide advises.
+    `shared` images come last, labeled as what the request shared. With
+    `max_references`, each subject and the shared images keep their best ones in
+    turn until it's reached (an edit's photo, the first, always stays)."""
+    used = {key(r) for f in found for r, _ in f.images}
+    shared = [(r, image) for r, image in shared if key(r) not in used]
+    if max_references is not None:
+        groups = trim([f.images for f in found] + [shared], max_references)
+        found = [Found(f.subject, g) for f, g in zip(found, groups, strict=False)]
+        shared = groups[-1]
     references: list[Reference] = []
     images: list[BinaryImage] = []
     lines = []
@@ -413,6 +482,17 @@ def compose(drawing: Drawing, found: list[Found]) -> tuple[str, list[Reference],
         elif images:
             subjects += f"\n{REFERENCES_ONLY}"
         parts.append(subjects)
+    if shared:
+        first = len(images) + 1
+        for reference, image in shared:
+            references.append(reference)
+            images.append(image)
+        last = len(images)
+        span = f"Reference image {first}" if first == last else f"Reference images {first}-{last}"
+        one = first == last
+        parts.append(
+            SHARED.format(span=span, verb="is" if one else "are", pronoun="it" if one else "them")
+        )
     return "\n\n".join(parts), references, images
 
 

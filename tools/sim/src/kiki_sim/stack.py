@@ -407,6 +407,7 @@ class Config:
                 "OPENROUTER_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/openrouter",
                 "OPENROUTER_CHAT_API_KEY": "sim-key",
                 "OPENROUTER_VISION_MODEL": "sim/vision",
+                "OPENROUTER_IMAGE_FALLBACK_MODEL": "sim/image-fallback",
             }
         return service_env(values)
 

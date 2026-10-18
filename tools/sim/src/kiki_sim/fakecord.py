@@ -846,8 +846,10 @@ class Fakecord:
     def image(self, body: dict) -> web.Response:
         """OpenRouter's Images API: a 1×1 PNG labeled with the prompt (so the stub
         vision model can tell what was drawn), or a 400 for prompts containing
-        "refuse", as a moderation block would. Reference images must be inline
-        bytes (Discord links expire); their labels are recorded, in order."""
+        "refuse", as a moderation block would; prompts containing "prude" are
+        blocked only by `sim/image`, so the fallback model draws them. Reference
+        images must be inline bytes (Discord links expire); their labels are
+        recorded, in order."""
         w = self.world
         prompt = body["prompt"]
         references = []
@@ -857,7 +859,9 @@ class Fakecord:
                 error = {"code": 400, "message": "input_references must be image data URLs"}
                 return web.json_response({"error": error}, status=400)
             references.append(png_label(base64.b64decode(url.partition(",")[2])) or "an image")
-        drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE)
+        drew = not re.search(r"\brefuse\b", prompt, re.IGNORECASE) and not (
+            body["model"] == "sim/image" and re.search(r"\bprude\b", prompt, re.IGNORECASE)
+        )
         w.llm.append(
             {
                 "kind": "image",
@@ -868,7 +872,11 @@ class Fakecord:
             }
         )
         if not drew:
-            error = {"code": 400, "message": "Request blocked by the provider's safety system"}
+            error = {
+                "code": 400,
+                "message": "Your request was rejected by the safety system."
+                " safety_violations=[sexual].",
+            }
             return web.json_response({"error": error}, status=400)
         drawing = png(f"a drawing of {prompt[:80]}")
         image = {"b64_json": base64.b64encode(drawing).decode(), "media_type": "image/png"}

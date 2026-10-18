@@ -18,6 +18,10 @@ MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_PROMPT_CHARS = 8000
 
 
+class SafetyRefused(ImageRefused):
+    """The image model's safety filter blocked the picture: another model may draw it."""
+
+
 async def generate(
     model: ImageGenerationModel,
     prompt: str,
@@ -36,8 +40,14 @@ async def generate(
         result = await ImageGenerator(model).generate(
             prompt, images=list(references), settings=settings
         )
-    except ContentFilterError:
-        raise ImageRefused("The image model refused that prompt.") from None
+    except ContentFilterError as e:
+        # Seen in prod: told "the image model choked, ask again", people did, and the
+        # same picture was blocked again. Only a tamer picture gets through.
+        about = f" ({e.message})" if e.message.strip() else ""
+        raise SafetyRefused(
+            f"The image model's safety filter blocked this picture{about}. Asking again "
+            "won't get it through; only a tamer version of the idea could be drawn."
+        ) from None
     except UnexpectedModelBehavior:
         raise ImageRefused("No image was generated.") from None
     image = result.image
