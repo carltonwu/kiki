@@ -4,9 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 from psycopg import AsyncConnection
+from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import memory_tools, retrieval
+from kiki_agent_host import agent, memory_tools, retrieval
 from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.contracts import JobRequest
 
@@ -285,3 +286,14 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert result.usage.cost == pytest.approx(0.003)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1
+
+
+def test_blank_search_times_mean_no_bound():
+    # Models that fill every optional argument send "" for an unused bound.
+    times = TypeAdapter(agent.OptionalTime)
+    assert times.validate_python("") is None
+    assert times.validate_python("  ") is None
+    assert times.validate_python(None) is None
+    assert times.validate_python("2026-10-18") == datetime(2026, 10, 18)
+    with pytest.raises(ValidationError):
+        times.validate_python("yesterday")

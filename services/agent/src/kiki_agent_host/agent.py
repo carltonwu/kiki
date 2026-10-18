@@ -8,10 +8,11 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from openai import APIError, APIStatusError
 from psycopg import AsyncConnection, OperationalError
+from pydantic import BeforeValidator
 from pydantic_ai import Agent, RunContext, Tool
 from pydantic_ai.capabilities import NativeTool
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
@@ -125,13 +126,20 @@ async def guarded(
     return result
 
 
+# Some models fill every optional argument, sending "" for a time they mean to leave
+# out. Rejecting it costs a tool retry, and a second slip fails the whole reply.
+OptionalTime = Annotated[
+    datetime | None, BeforeValidator(lambda v: None if isinstance(v, str) and not v.strip() else v)
+]
+
+
 async def search_messages(
     ctx: RunContext[Deps],
     query: str,
     person: str | None = None,
     channel: str | None = None,
-    before: datetime | None = None,
-    after: datetime | None = None,
+    before: OptionalTime = None,
+    after: OptionalTime = None,
     limit: int = 10,
 ) -> dict:
     """Search the message history of every channel in this server (by meaning and by keywords).
