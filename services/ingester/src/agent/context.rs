@@ -146,7 +146,8 @@ impl Agent {
         if settings.chat_reactions {
             instructions.push_str(
                 "To react to the newest message with emoji, add a line containing only react: and up to 3 emoji, like react: 😂. \
-                 Use Unicode emoji, or this server's custom emoji written exactly as they appear, like <:name:id>. ",
+                 Use Unicode emoji (not :shortcodes:), or this server's custom emoji written exactly as they appear, like <:name:id>. \
+                 [you reacted: …] after a message shows how you reacted to it before. ",
             );
             instructions.push_str(if settings.chat_allow_silence {
                 "A reaction can come with your messages, or be your whole answer when it says enough, like a person who just reacts instead of typing. "

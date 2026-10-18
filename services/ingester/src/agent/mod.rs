@@ -296,6 +296,7 @@ impl Agent {
                 conversation_id = claim.conversation_id,
                 channel_id = claim.channel_id,
                 reply_message_ids = ?record.reply_message_ids,
+                reactions = ?record.reactions,
                 latency_ms,
                 error,
                 "agent run failed"
@@ -441,12 +442,15 @@ impl Workers {
 }
 
 fn clean_reply(text: &str) -> String {
-    let text = text.trim();
-    let text = ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
+    fix_custom_emoji(strip_speaker(text.trim()).trim())
+}
+
+/// Drops a leading `Kiki:`, as models sometimes label their own lines.
+fn strip_speaker(text: &str) -> &str {
+    ["Kiki:", "**Kiki**:", "[Kiki]:", "[Kiki]"]
         .iter()
         .find_map(|prefix| text.strip_prefix(prefix))
-        .unwrap_or(text);
-    fix_custom_emoji(text.trim())
+        .unwrap_or(text)
 }
 
 /// Models often write a custom emoji as `<:name:id:>`, which Discord shows as

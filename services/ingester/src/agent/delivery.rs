@@ -8,7 +8,7 @@ use super::{
     clean_reply,
     discord::{MAX_MESSAGE_CHARS, split_message},
     emoji::{self, MAX_REACTIONS, Reaction},
-    is_no_reply,
+    is_no_reply, strip_speaker,
 };
 use crate::guild_settings::GuildSettings;
 use anyhow::{bail, ensure};
@@ -55,7 +55,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
         }
         let reaction = fence
             .is_none()
-            .then(|| emoji::parse_line(trimmed))
+            .then(|| emoji::parse_line(strip_speaker(trimmed).trim_start()))
             .flatten();
         let pause = fence
             .is_none()
@@ -281,6 +281,12 @@ mod tests {
         );
         let many = plan("react: 😂 💀 👍 🔥\nok", &settings).unwrap();
         assert_eq!(emoji(&many), ["😂", "💀", "👍"]);
+        // A speaker label doesn't hide the marker.
+        let labeled = plan("Kiki: react: 😂\nok", &settings).unwrap();
+        assert_eq!(
+            (texts(&labeled), emoji(&labeled)),
+            (vec!["ok".to_owned()], vec!["😂".to_owned()])
+        );
 
         // Silence with a reaction is a reaction; unresolved ones are still hidden.
         assert_eq!(
