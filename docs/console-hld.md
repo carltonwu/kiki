@@ -176,7 +176,7 @@ user/assistant alternation; stored replies are cut to the ingester's 8 000-chara
 | `/g/{id}/audit` | admin | this server's change log |
 | `/audit` | operator | every change |
 
-## Data model (migration 0021)
+## Data model (migration 0022)
 
 ```sql
 guild_facts (id, guild_id, title, body, enabled, updated_by, updated_at)
@@ -191,7 +191,7 @@ trigger guild_settings → NOTIFY guild_settings_changed
 
 ## Deploying (not applied)
 
-1. Merge; Railway deploys the ingester (migration 0021 runs in pre-deploy).
+1. Merge; Railway deploys the ingester (migration 0022 runs in pre-deploy).
 2. In the Discord developer portal, add the redirect `https://<console domain>/auth/callback`
    to Kiki's application and copy the client secret.
 3. Add the `console` service to `.railway/railway.ts` (sketch below), then
