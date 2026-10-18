@@ -7,8 +7,9 @@ from psycopg import AsyncConnection
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import agent, memory_tools
-from kiki_agent_host.agent import PydanticExecutor
+from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.tools import memory as memory_tools
+from kiki_agent_host.agent.tools.messages import OptionalTime
 from kiki_agent_host.chat.indexing import SAVE, index_pending
 from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.chat.search import message_context, search
@@ -277,7 +278,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # with their results.
     assert result.steps == 2
     # Memory tools are covered in test_memory; placeholder arguments only get errors.
-    assert set(json.loads(result.text)) - {t.__name__ for t in memory_tools.TOOLS} == {
+    assert set(json.loads(result.text)) - set(memory_tools.toolset.tools) == {
         "search_messages",
         "get_message_context",
         "read_image",
@@ -292,7 +293,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
 
 def test_blank_search_times_mean_no_bound():
     # Models that fill every optional argument send "" for an unused bound.
-    times = TypeAdapter(agent.OptionalTime)
+    times = TypeAdapter(OptionalTime)
     assert times.validate_python("") is None
     assert times.validate_python("  ") is None
     assert times.validate_python(None) is None

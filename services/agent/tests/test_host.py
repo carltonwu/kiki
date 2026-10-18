@@ -4,7 +4,7 @@ import httpx
 from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
-from kiki_agent_host.app import create_app
+from kiki_agent_host.app import application, create_app
 from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult
 from kiki_agent_host.executor import TransientError
@@ -213,3 +213,14 @@ async def test_transient_failure_is_not_persisted_and_retry_runs_again(database_
         assert (await http.post("/v1/jobs", json=job(), headers=HEADERS)).status_code == 503
         response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
         assert response.json()["result"]["text"] == "recovered"
+
+
+async def test_the_factory_configures_an_executor_only_with_an_openrouter_key(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://unreachable.invalid/kiki")
+    monkeypatch.setenv("AGENT_HOST_TOKEN", TOKEN)
+    monkeypatch.delenv("OPENROUTER_CHAT_API_KEY", raising=False)
+    async with client(application()) as http:
+        assert (await http.get("/health")).json()["executor_configured"] is False
+    monkeypatch.setenv("OPENROUTER_CHAT_API_KEY", "test-key")
+    async with client(application()) as http:
+        assert (await http.get("/health")).json()["executor_configured"] is True

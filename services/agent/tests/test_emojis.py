@@ -10,7 +10,7 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host.agent import PydanticExecutor
+from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.app import create_app
 from kiki_agent_host.chat import emojis
 from kiki_agent_host.config import Settings
