@@ -115,50 +115,16 @@ pub async fn now_ms(db: &PgPool) -> sqlx::Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use serde_json::json;
-    use sqlx::{Executor, PgPool, postgres::PgConnectOptions};
 
     use super::{Synced, list, sync};
 
     #[tokio::test]
     async fn sync_adds_renames_removes_and_keeps_descriptions() {
-        let Ok(url) = std::env::var("TEST_DATABASE_URL") else {
+        let Some(test) = crate::test_db::migrated("emojis_test").await else {
             return;
         };
-        let schema = format!(
-            "emojis_test_{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let admin = PgPool::connect(&url).await.unwrap();
-        admin
-            .execute(format!("CREATE SCHEMA {schema}").as_str())
-            .await
-            .unwrap();
-        let options: PgConnectOptions = url.parse().unwrap();
-        let db =
-            PgPool::connect_with(options.options([("search_path", format!("{schema},public"))]))
-                .await
-                .unwrap();
-        // In public, like the migrations; retried once in case a concurrent test
-        // is creating it too.
-        for attempt in 0..2 {
-            let created = admin
-                .execute("CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public")
-                .await;
-            if created.is_ok() || attempt == 1 {
-                created.unwrap();
-                break;
-            }
-        }
-        sqlx::raw_sql(include_str!("../migrations/0017_guild_emojis.sql"))
-            .execute(&db)
-            .await
-            .unwrap();
+        let db = test.db.clone();
 
         let huh = json!({"id": "11", "name": "huh"});
         let oop = json!({"id": "12", "name": "oop", "animated": true});
@@ -228,10 +194,6 @@ mod tests {
         };
         assert_eq!(oop.mention(), "<a:oop:12>");
 
-        db.close().await;
-        admin
-            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+        test.drop().await;
     }
 }

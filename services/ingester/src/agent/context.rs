@@ -423,10 +423,7 @@ mod tests {
     };
 
     use serde_json::{Value, json};
-    use sqlx::{
-        Executor, PgPool,
-        postgres::{PgConnectOptions, PgPoolOptions},
-    };
+    use sqlx::PgPool;
 
     use crate::{
         agent::{Agent, host::Host},
@@ -437,27 +434,6 @@ mod tests {
     const KIKI: i64 = 1;
     const GUILD: i64 = 9;
     const CHANNEL: i64 = 2;
-
-    /// A pool on a fresh schema with every migration applied, or `None` without
-    /// `TEST_DATABASE_URL` (as in the Python tests).
-    async fn database() -> Option<(PgPool, PgPool, String)> {
-        let url = std::env::var("TEST_DATABASE_URL").ok()?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let schema = format!("ingester_test_{nanos}");
-        let admin = PgPool::connect(&url).await.unwrap();
-        admin
-            .execute(format!("CREATE SCHEMA {schema}").as_str())
-            .await
-            .unwrap();
-        let options: PgConnectOptions = url.parse().unwrap();
-        let options = options.options([("search_path", format!("{schema},public"))]);
-        let db = PgPoolOptions::new().connect_with(options).await.unwrap();
-        crate::MIGRATOR.run(&db).await.unwrap();
-        Some((admin, db, schema))
-    }
 
     fn agent(db: PgPool) -> Agent {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -513,9 +489,10 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_is_cacheable_and_keyed_by_people() {
-        let Some((admin, db, schema)) = database().await else {
+        let Some(test) = crate::test_db::migrated("ingester_test").await else {
             return;
         };
+        let db = test.db.clone();
         let carlton = json!({"id": "101", "username": "carltonwu", "global_name": "Carlton"});
         let alex = json!({"id": "102", "username": "alex_99", "global_name": "A"});
         let bob = json!({"id": "103", "username": "bob", "global_name": null});
@@ -637,10 +614,6 @@ mod tests {
                 .contains("unrelated")
         );
 
-        db.close().await;
-        admin
-            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+        test.drop().await;
     }
 }
