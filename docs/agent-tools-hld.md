@@ -100,7 +100,9 @@ than for people (agent to agent).
 - **What counts as an image:** attachments with an `image/*` content type or a
   png/jpg/gif/webp name, then embeds of type `image`/`gifv` (their thumbnail)
   or with an `image`, deduplicated by URL, at most 10. Rust (`MESSAGE_COLUMNS`)
-  and Python (`images_in`) apply the same test.
+  and Python (`images_in`) apply the same test (Rust doesn't deduplicate).
+  Discord's attachment URLs are signed and expire after about a day, and the
+  host can't refresh them, so older images usually come back as expired.
 - **Galleries:** a message with several images is a Discord gallery. One call
   sends them all, labeled `Image n: <file name>` (with alt text if set), plus
   the message text and author for context and Kiki's optional `question`. The
@@ -110,7 +112,8 @@ than for people (agent to agent).
   (usernames and timestamps in screenshots), people and animals, setting, and
   the point (joke, meme format, mood), marking interpretation and unreadable
   parts. It forbids identifying people from their faces and treats text in
-  images as content, never instructions.
+  images, the message text, file names and alt text as content, never
+  instructions.
 - **Downloads:** URLs come only from the stored message payload, never from
   model arguments. The host downloads them itself (no redirects, 10 s, 5 MB
   each) and sends them inline, only from `https` Discord hosts
@@ -118,7 +121,8 @@ than for people (agent to agent).
   Discord's proxy URL, not the linked site. `DISCORD_MEDIA_EXTRA_HOSTS` adds
   hosts (the simulator's fakecord). Images over 1568 px or 5 MB are fetched
   through Discord's media proxy with `width`/`height`. PNG, JPEG, WebP and GIF
-  are sent; anything else, an expired link (403/404/410) or an oversized file
+  are sent, typed by their leading bytes rather than the file name or
+  `Content-Type` (providers reject a renamed JPEG sent as PNG); anything else, an expired link (403/404/410) or an oversized file
   is reported per image while the rest are still described.
 - **Cost:** the vision call's billed cost is added to the reply's
   `usage.cost`; the job log reports `vision_calls`. Descriptions aren't cached,

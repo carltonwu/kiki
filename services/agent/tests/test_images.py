@@ -14,6 +14,8 @@ GUILD, CHANNEL, CONVERSATION = 1, 2, 1
 SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
 CDN = "https://cdn.discordapp.com/attachments/2/3"
 PNG = b"\x89PNG\r\n\x1a\nsim"
+JPEG = b"\xff\xd8\xff\xe0sim"
+WEBP = b"RIFF\x04\x00\x00\x00WEBPsim"
 
 
 def attachment(name, content_type="image/png", **extra):
@@ -92,7 +94,8 @@ async def test_download_checks_status_size_and_format(monkeypatch):
     transport = serve(
         {
             "/ok.png": (200, PNG[:9], "image/png"),
-            "/untyped.jpg": (200, b"jpeg", "application/octet-stream"),
+            "/untyped": (200, JPEG[:9], "application/octet-stream"),
+            "/renamed.png": (200, JPEG[:9], "image/png"),
             "/big.png": (200, b"x" * 11, "image/png"),
             "/page.png": (200, b"<html>", "text/html"),
             "/svg": (200, b"<svg/>", "image/svg+xml"),
@@ -108,10 +111,12 @@ async def test_download_checks_status_size_and_format(monkeypatch):
 
         ok = await get("/ok.png")
         assert isinstance(ok, BinaryContent) and ok.media_type == "image/png"
-        assert (await get("/untyped.jpg")).media_type == "image/jpeg"
+        # The bytes decide the type, not the header or the file name.
+        assert (await get("/untyped")).media_type == "image/jpeg"
+        assert (await get("/renamed.png", "image/png")).media_type == "image/jpeg"
         assert await get("/gone.png") == "no longer available (deleted, or an expired Discord link)"
         assert await get("/big.png") == "too large"
-        assert (await get("/page.png")).media_type == "image/png"  # from the file name
+        assert await get("/page.png", "image/png") == "unsupported format (text/html)"
         assert await get("/svg", "image/svg+xml") == "unsupported format (image/svg+xml)"
         assert await get("/down.png") == "download failed (HTTP 503)"
         assert await images.download(client, Image("x", "https://example.com/a.png")) == (
@@ -144,8 +149,8 @@ async def add(db, id, content, raw_extra, *, guild=GUILD, author_id=100):
 ROSTER = retrieval.Roster({"u1": 100}, {100: "u1 Alex"})
 CDN_FILES = {
     "/attachments/2/3/a.png": (200, PNG, "image/png"),
-    "/attachments/2/3/b.JPG": (200, b"jpeg", "image/jpeg"),
-    "/attachments/2/3/c.webp": (200, b"webp", "image/webp"),
+    "/attachments/2/3/b.JPG": (200, JPEG, "image/jpeg"),
+    "/attachments/2/3/c.webp": (200, WEBP, "image/webp"),
     "/x.png": (200, PNG, "image/png"),
 }
 
@@ -218,6 +223,17 @@ async def test_explains_messages_it_cannot_read(db):
     assert (await read(db, model, 73))["error"] == "none of the images could be downloaded"
     assert await read(db, model, 74) == {"error": "no such message in this server"}
     assert await read(db, model, 999) == {"error": "no such message in this server"}
+    assert seen == []
+
+
+async def test_reads_only_messages_kiki_may_see(db):
+    await add(db, 78, "deleted", {"attachments": [attachment("a.png")]})
+    await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 78")
+    await add(db, 79, "ignored", {"attachments": [attachment("a.png")]}, author_id=200)
+    await db.execute("INSERT INTO ignored_authors (user_id) VALUES (200)")
+    model, seen = vision()
+    assert await read(db, model, 78) == {"error": "no such message in this server"}
+    assert await read(db, model, 79) == {"error": "no such message in this server"}
     assert seen == []
 
 

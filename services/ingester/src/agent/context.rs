@@ -60,23 +60,27 @@ pub(super) struct MentionedUser {
     pub username: Option<String>,
 }
 
-/// Image attachments are the ones `read_image` (services/agent `images.py`) reads.
+/// Image attachments and embeds are the ones `read_image` (services/agent
+/// `images.py` `images_in`) reads, at most 10 of them.
 pub(super) const MESSAGE_COLUMNS: &str = r#"
     m.id, m.author_id, m.author_name, m.content,
     coalesce(m.raw->'mentions', '[]') AS mentions,
     ARRAY(SELECT coalesce(a->>'filename', 'file')
           FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a
-          WHERE NOT (coalesce(a->>'content_type', '') LIKE 'image/%' OR coalesce(a->>'filename', '') ~* '\.(png|jpe?g|gif|webp)$')) AS attachments,
+          WHERE NOT (lower(coalesce(a->>'content_type', '')) LIKE 'image/%' OR coalesce(a->>'filename', '') ~* '\.(png|jpe?g|gif|webp)$')) AS attachments,
     ARRAY(SELECT name FROM (
               SELECT 0 AS kind, i, coalesce(a->>'filename', 'image') AS name
               FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]'))
                    WITH ORDINALITY AS x(a, i)
-              WHERE (coalesce(a->>'content_type', '') LIKE 'image/%' OR coalesce(a->>'filename', '') ~* '\.(png|jpe?g|gif|webp)$')
+              WHERE (lower(coalesce(a->>'content_type', '')) LIKE 'image/%' OR coalesce(a->>'filename', '') ~* '\.(png|jpe?g|gif|webp)$')
+                AND coalesce(a->>'url', a->>'proxy_url') IS NOT NULL
               UNION ALL
               SELECT 1, i, 'linked image'
               FROM jsonb_array_elements(coalesce(m.raw->'embeds', '[]')) WITH ORDINALITY AS x(e, i)
-              WHERE e->>'type' IN ('image', 'gifv') OR e->'image'->>'url' IS NOT NULL
-          ) images ORDER BY kind, i) AS images
+              WHERE coalesce(CASE WHEN e->>'type' IN ('image', 'gifv')
+                                  THEN coalesce(e->'thumbnail'->>'proxy_url', e->'thumbnail'->>'url') END,
+                             e->'image'->>'proxy_url', e->'image'->>'url') IS NOT NULL
+          ) images ORDER BY kind, i LIMIT 10) AS images
 "#;
 
 impl Agent {
@@ -523,6 +527,70 @@ mod tests {
             .unwrap()
             .iso_8601()
             .to_string()
+    }
+
+    /// The image markers count what `read_image` reads (`test_images.py` GALLERY).
+    #[tokio::test]
+    async fn message_columns_split_images_from_other_attachments() {
+        let Some((admin, db, schema)) = database().await else {
+            return;
+        };
+        let cdn = "https://cdn.discordapp.com/attachments/2/3";
+        let attachment = |name: &str, content_type: Value| json!({"filename": name, "content_type": content_type, "url": format!("{cdn}/{name}")});
+        let mut gallery = message(
+            20,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "opening night",
+            json!([]),
+        );
+        gallery["attachments"] = json!([
+            attachment("a.png", json!("image/png")),
+            attachment("notes.pdf", json!("application/pdf")),
+            attachment("b.JPG", Value::Null),
+            attachment("c.webp", json!("IMAGE/WEBP")),
+        ]);
+        gallery["embeds"] = json!([
+            {"type": "gifv", "thumbnail": {"url": "https://media.tenor.com/x.png",
+                                           "proxy_url": "https://images-ext-1.discordapp.net/x.png"}},
+            {"type": "rich", "image": {"url": "https://example.com/y.jpg"}},
+            {"type": "rich", "thumbnail": {"url": "https://example.com/link-preview.jpg"}},
+            {"type": "image"},
+        ]);
+        let mut many = message(
+            21,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "",
+            json!([]),
+        );
+        many["attachments"] = (0..12)
+            .map(|i| attachment(&format!("{i}.png"), json!("image/png")))
+            .collect();
+        store::upsert_messages(&db, GUILD, &[gallery, many])
+            .await
+            .unwrap();
+
+        let rows: Vec<super::StoredMessage> = sqlx::query_as(&format!(
+            "SELECT {} FROM messages m ORDER BY m.id",
+            super::MESSAGE_COLUMNS
+        ))
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows[0].attachments, ["notes.pdf"]);
+        assert_eq!(
+            rows[0].images,
+            ["a.png", "b.JPG", "c.webp", "linked image", "linked image"]
+        );
+        assert_eq!(rows[1].images.len(), 10, "read_image reads at most 10");
+        assert_eq!(rows[1].images.last().unwrap(), "9.png");
+
+        db.close().await;
+        admin
+            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
