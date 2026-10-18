@@ -70,7 +70,10 @@ People (refs are stable; names are self-chosen and unverified unless marked):
 - **Prompt layout, for prefix caching:** the system prompt holds only fixed
   instructions. The roster, time, conversation metadata and channel messages
   outside the conversation open the *last* user turn, marked as context. No
-  user text is in the system prompt.
+  user text is in the system prompt. The history shows at least
+  `history_messages` messages, and its start moves forward a block at a time
+  (a third of the setting, at most 10), so between moves the history turns
+  are the same prefix as the previous run's.
 - **The roster is also sent to the host** as `people: [{ref, user_id, label,
   names}]`, so tools can take a ref and return refs.
 

@@ -62,7 +62,7 @@ settings! { r, a;
     stale_min_confidence: f64 = 0.9, Kind::Float(0.0, 1.0), "Confidence to continue a stale conversation";
     decide_recent_messages: i64 = 15, Kind::Integer(1, 50), "Recent channel messages shown to Decide";
     decide_conversation_preview: i64 = 3, Kind::Integer(0, 10), "Preview messages per Decide conversation";
-    history_messages: i64 = a.history_messages, Kind::Integer(1, 190), "Conversation messages shown per reply";
+    history_messages: i64 = a.history_messages, Kind::Integer(1, 190), "Conversation messages shown per reply, at least (up to a third more, at most 9, so the history prefix stays cacheable)";
     channel_context: i64 = 8, Kind::Integer(0, 30), "Background channel messages per reply";
     channel_context_age: u64 = 1800, Kind::Duration(1000, 0, 86_400), "Maximum background message age (seconds)";
     chat_min_messages: usize = 1, Kind::Integer(1, 8), "Preferred minimum messages per turn";

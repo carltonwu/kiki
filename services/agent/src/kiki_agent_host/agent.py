@@ -532,8 +532,8 @@ class PydanticExecutor:
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
             "requests=%d tool_calls=%d vision_calls=%d web_searches=%d web_fetches=%d "
-            "web_sources=%d images=%d prompt_tokens=%d completion_tokens=%d cost_usd=%s "
-            "latency_ms=%d",
+            "web_sources=%d images=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
+            "cost_usd=%s latency_ms=%d",
             request.id,
             request.kind,
             request.scope.channel_id,
@@ -547,6 +547,7 @@ class PydanticExecutor:
             len(web.sources),
             len(deps.images) if deps else 0,
             usage.input_tokens,
+            usage.cache_read_tokens,
             usage.output_tokens,
             cost,
             (time.monotonic() - started) * 1000,

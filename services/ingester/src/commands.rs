@@ -358,7 +358,7 @@ impl Commands {
                     c.message_count.to_string(),
                     c.participants.len().to_string(),
                     ago(c.last_active_at_ms),
-                    usd(c.cost_usd),
+                    usd(c.cost_usd.unwrap_or_default()),
                 ]
             })
             .collect();

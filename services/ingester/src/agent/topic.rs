@@ -55,7 +55,7 @@ impl Agent {
         }
 
         let messages = self
-            .conversation_messages(conversation_id, settings.topic_sample_messages)
+            .conversation_messages(conversation_id, settings.topic_sample_messages, 1)
             .await?;
         let Some(through) = messages.last().map(|m| m.id) else {
             return Ok(());
