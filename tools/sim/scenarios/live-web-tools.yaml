@@ -1,0 +1,14 @@
+name: real models search and fetch the web, when asked and when the answer needs it
+# Needs `kiki-sim up --live`. Read the transcript for cited sources. Tool use is
+# read from the agent host's saved result (OpenRouter's server tool usage).
+live: only
+steps:
+  # Explicit search.
+  - say: {as: alex, in: general, text: "@kiki search the web: what's the latest version of pydantic-ai on PyPI?"}
+  - expect: {run: done, reply: true, tool_called: web_search}
+  # Explicit fetch.
+  - say: {as: sam, in: lore, text: "@kiki what does the page at https://example.com say?"}
+  - expect: {run: done, reply: true, tool_called: web_fetch, text_contains: "example"}
+  # Implicit: recent news the model can't know without looking it up.
+  - say: {as: ethan, in: general-thread, text: "@kiki who won the most recent Formula 1 Grand Prix?"}
+  - expect: {run: done, reply: true, tool_called: web_search}

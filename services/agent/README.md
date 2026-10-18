@@ -24,6 +24,12 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
 
+Reply jobs also always offer OpenRouter's server tools `openrouter:web_search` and
+`openrouter:web_fetch`, which OpenRouter runs itself (at most 3 server-tool steps per
+model request; fetched pages are cut to about 6,000 tokens). Their fees are in the
+reply's cost, and the result adds `web: {searches, fetches, sources}` when they were
+used ([design](../../docs/agent-tools-hld.md#web-search-and-fetch-issue-1)).
+
 Results exclude deleted messages, bot messages, and the current conversation
 (already in the prompt). A run gets 4 tool calls and 6 model requests. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are

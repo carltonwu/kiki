@@ -248,6 +248,8 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     await add(db, 80, "we shipped the release")
 
     class TestExecutor(PydanticExecutor):
+        web_tools = ()  # TestModel can't run OpenRouter's server tools (see test_web.py)
+
         def model(self, name):
             return TestModel()
 

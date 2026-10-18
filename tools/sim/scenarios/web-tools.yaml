@@ -1,0 +1,33 @@
+name: web search and fetch are offered on every reply and their use is recorded
+# Stub mode stands in for OpenRouter's server tools; live-web-tools.yaml checks
+# that real models choose them.
+steps:
+  # Explicit: asked to search the web.
+  - say: {as: alex, in: general, text: "kiki search the web for the latest pydantic ai release"}
+    reply:
+      web: [{search: "pydantic ai latest release", source: "https://pypi.org/project/pydantic-ai/"}]
+      text: "2.57.0, per <{result}>"
+  - expect:
+      reply: true
+      tool_called: web_search
+      tools_offered: [openrouter:web_search, openrouter:web_fetch]
+      text_contains: "https://pypi.org/project/pydantic-ai/"
+  # Explicit: asked to read a shared link.
+  - say: {as: sam, in: lore, text: "kiki read https://example.com/menu and tell me what's vegan"}
+    reply: {web: [{fetch: "https://example.com/menu"}], text: "the falafel wrap is vegan"}
+  - expect: {reply: true, tool_called: web_fetch, text_contains: "falafel"}
+  # Implicit: a question that needs current information, without asking for a search.
+  - say: {as: ethan, in: general-thread, text: "kiki who won the f1 race last weekend?"}
+    reply:
+      web: [{search: "f1 race winner last weekend", source: "https://www.formula1.com/en/results"}]
+      text: "Norris took it, see <{result}>"
+  - expect: {reply: true, tool_called: web_search, text_contains: "formula1.com"}
+  # Banter needs no web, but the tools are still offered.
+  - say: {as: chris, in: general, text: "kiki rate my outfit"}
+  - expect:
+      reply: true
+      tools_offered: [openrouter:web_search, openrouter:web_fetch]
+  # Only the three web replies recorded web use.
+  - expect:
+      sql: "SELECT count(*) FROM agent_host_jobs WHERE jsonb_typeof(result->'web') = 'object'"
+      equals: 3

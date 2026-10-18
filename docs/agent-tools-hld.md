@@ -33,7 +33,7 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 | File | Contents |
 |---|---|
 | `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
-| `agent.py` | `PydanticExecutor`: agents, trusted deps, two tools, message/usage mapping, transient-error mapping. |
+| `agent.py` | `PydanticExecutor`: agents, trusted deps, two tools plus OpenRouter's web search/fetch server tools, message/usage mapping, transient-error mapping. |
 | `app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
 
@@ -63,6 +63,40 @@ model arguments, and arguments can only narrow them.
 
 Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
+
+### Web search and fetch (issue #1)
+
+Every reply job also offers OpenRouter's **server tools** `openrouter:web_search`
+and `openrouter:web_fetch`. OpenRouter runs them inside a model request and the
+model decides when to use them; the system prompt tells Kiki to look things up
+unprompted when an answer depends on current or uncertain facts, and to cite the
+pages it used. Topic jobs still have no tools.
+
+- **Why server tools:** they use the existing OpenRouter key and billing, need no
+  search-provider account, and the fetch runs on OpenRouter's side, so the agent
+  host never requests arbitrary URLs from Railway's private network (no SSRF
+  surface).
+- **Wiring:** Pydantic AI's `WebSearchTool` maps to `openrouter:web_search`.
+  2.57.0 doesn't map `WebFetchTool` for OpenRouter, so `WebOpenRouterModel`
+  appends `openrouter:web_fetch` in `_get_tool_choice` (a private hook; recheck
+  it on SDK upgrades). Engines are OpenRouter's `auto` defaults.
+- **Limits:** `max_tool_calls` = 3 server-tool steps per model request (OpenRouter's
+  default is 30), so at most 18 over the 6-request cap. Fetched pages are cut to
+  about 6,000 tokens (`max_content_tokens`; the native engine ignores it). Kiki's
+  4-call budget covers only its own tools.
+- **Cost:** OpenRouter adds the search fee to the response's `usage.cost` (Exa: about
+  $0.007 per search; native search passes through the provider's price, about
+  $0.016 for one probe on 2026-10-18), which already flows into the run's cost. Search
+  results enter the prompt, so a searched reply reads tens of thousands of input
+  tokens.
+- **Recorded use:** OpenRouter reports `usage.server_tool_use_details`
+  (`web_search_requests`, `tool_calls_executed`) and search sources as
+  `url_citation` annotations. The host sums these into
+  `result.web = {searches, fetches, sources}` (fetches = executed − searches, since
+  only those two are offered), logs the counts, and saves them with the job. Rust
+  ignores the field. The sim's `tool_called: web_search|web_fetch` reads it.
+- **Replays** repeat web calls and their fees, like inference.
+- **Privacy:** queries and URLs reach OpenRouter's search and fetch engines.
 
 Limits:
 - 4 tool calls per run. After that, tools tell the model to answer with what it
@@ -163,10 +197,8 @@ queries are an argument error returned to the model.
 3. **Later:**
    - Member-specific channel permission filtering and optional allowlists;
      current retrieval is bounded by guild, with an optional channel filter.
-   - OpenRouter server tools: Pydantic's `WebSearchTool` maps to
-     `openrouter:web_search` and the engine isn't selectable. Cap
-     `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
-     replay, and note that queries reach outside engines.
+   - Web tools: pick engines explicitly (e.g. Exa for search, `openrouter` for free
+     fetch) once logs show cost and quality.
    - Image results: need typed artifacts and Rust delivery.
    - Embedding windows of adjacent messages, if short messages retrieve poorly.
    - `/kiki conversations` still lists the active pool across all channels to

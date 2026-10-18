@@ -468,6 +468,7 @@ class Fakecord:
         w = self.world
         n = next(w.ids)
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
+        usage = {}
         if record["kind"] == "topic":
             message = {"role": "assistant", "content": "stub topic"}
         else:
@@ -505,6 +506,9 @@ class Fakecord:
                         ],
                     }
                     record["tool_call"] = tool
+                elif entry and entry.get("web"):
+                    message, usage = self.server_tools(body, entry, trigger)
+                    record["web"] = usage["server_tool_use_details"]
                 elif entry:
                     message = {
                         "role": "assistant",
@@ -533,8 +537,43 @@ class Fakecord:
                 "completion_tokens": 5,
                 "total_tokens": 15,
                 "cost": 0.0001,
+                **usage,
             },
         }
+
+    def server_tools(self, body: dict, entry: dict, trigger: str) -> tuple[dict, dict]:
+        """OpenRouter's server tools: it searches and fetches itself, then reports
+        counts in usage and search sources as `url_citation` annotations. A scripted
+        `web: [{search: q, source: url} | {fetch: url}]` only runs if it was offered."""
+        offered = {t.get("type") for t in body.get("tools", [])}
+        searches = fetches = 0
+        sources = []
+        for call in entry["web"]:
+            if "search" in call and "openrouter:web_search" in offered:
+                searches += 1
+                sources.append(call.get("source") or "https://example.com/search")
+            elif "fetch" in call and "openrouter:web_fetch" in offered:
+                fetches += 1
+        annotations = [
+            {
+                "type": "url_citation",
+                "url_citation": {"url": url, "title": url, "start_index": 0, "end_index": 0},
+            }
+            for url in sources
+        ]
+        text = entry.get("text", "stub web: {trigger}")
+        message = {
+            "role": "assistant",
+            "content": text.format(trigger=trigger, ids="", result=" ".join(sources)),
+            "annotations": annotations,
+        }
+        used = searches + fetches
+        details = {
+            "web_search_requests": searches,
+            "tool_calls_requested": used,
+            "tool_calls_executed": used,
+        }
+        return message, {"server_tool_use_details": details}
 
     # --- control API -------------------------------------------------------
 

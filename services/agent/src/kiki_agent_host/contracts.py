@@ -44,11 +44,20 @@ class Usage(Contract):
     cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
+class WebUse(Contract):
+    """OpenRouter web tools used by the run (informational; Rust ignores it)."""
+
+    searches: int = Field(default=0, ge=0)
+    fetches: int = Field(default=0, ge=0)
+    sources: list[str] = Field(default_factory=list)
+
+
 class JobResult(Contract):
     text: str = Field(min_length=1, max_length=100000)
     model: str | None = None
     steps: int = Field(default=1, ge=0, le=2147483647)
     usage: Usage = Field(default_factory=Usage)
+    web: WebUse | None = None
 
 
 class JobResponse(Contract):
