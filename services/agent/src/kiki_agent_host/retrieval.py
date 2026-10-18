@@ -170,8 +170,10 @@ async def speakers(
     return found
 
 
-# Authors Kiki never reads (migration 0010), for messages aliased `m`.
-HEARD = "NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)"
+# Authors Kiki never reads (migration 0010), for messages aliased `m`. Not an
+# anti-join: the one-row table is never auto-analyzed, and the planner's guess
+# of 1,200 rows turned the guild-wide pending scan into an 84 s nested loop.
+HEARD = "m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors))"
 
 PENDING = f"""
 SELECT m.id, m.content, md5(m.content) AS hash FROM messages m
