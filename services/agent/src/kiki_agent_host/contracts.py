@@ -63,6 +63,14 @@ class Usage(Contract):
     cost: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
+class WebUse(Contract):
+    """OpenRouter web tools used by the run (informational; Rust ignores it)."""
+
+    searches: int = Field(default=0, ge=0)
+    fetches: int = Field(default=0, ge=0)
+    sources: list[str] = Field(default_factory=list)
+
+
 class Image(Contract):
     """A generated image, saved in `agent_host_images`; Rust attaches it to the reply."""
 
@@ -75,6 +83,7 @@ class JobResult(Contract):
     model: str | None = None
     steps: int = Field(default=1, ge=0, le=2147483647)
     usage: Usage = Field(default_factory=Usage)
+    web: WebUse | None = None
     images: list[Image] = Field(default_factory=list, max_length=10)
 
 
