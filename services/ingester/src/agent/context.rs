@@ -107,11 +107,10 @@ impl Agent {
             async {
                 // Only this channel's: the prompt must not reveal other channels to
                 // the people reading the reply.
-                Ok(conversation::active(&self.db, self.bot_user_id)
-                    .await?
-                    .into_iter()
-                    .filter(|c| c.id != conversation_id && c.channel_id == this.channel_id)
-                    .collect::<Vec<_>>())
+                let mut others =
+                    conversation::in_channel(&self.db, self.bot_user_id, this.channel_id).await?;
+                others.retain(|c| c.id != conversation_id);
+                Ok(others)
             },
             self.channel_messages(this.channel_id, conversation_id, &settings),
             sqlx::query_as::<_, (Option<String>, String)>(
@@ -825,6 +824,11 @@ pub(super) mod tests {
             INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
             INSERT INTO conversation_messages (message_id, conversation_id, via)
             VALUES (10, 1, 'mention'), (11, 1, 'agent'), (12, 1, 'agent'), (13, 1, 'decide');
+            -- Other conversations: only this channel's open ones are shown.
+            INSERT INTO conversations (id, guild_id, channel_id, started_by, topic, closed_at) VALUES
+                (2, 9, 2, 103, 'Props for act two', NULL), (3, 9, 3, 101, 'Elsewhere', NULL),
+                (4, 9, 2, 101, 'Closed', now());
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (14, 2, 'mention');
             -- Memory on Alex and a dog; Bob's only entry was forgotten; 104 isn't here.
             INSERT INTO memory_subjects (id, guild_id, kind, user_id) VALUES
                 (1, 9, 'person', 102), (2, 9, 'person', 103), (3, 9, 'person', 104);
@@ -871,6 +875,10 @@ pub(super) mod tests {
             "People here:\n- u1 Carlton (@carltonwu)\n- u2 Alex (@alex_99)\n- u3 @bob\n"
         ));
         assert!(last.contains("[u3 bob] unrelated @Carlton (u1)\n"));
+        assert!(last.contains(
+            "Your other active conversations in this channel:\n- With u3 bob, last active under a minute ago: Props for act two\n"
+        ));
+        assert!(!last.contains("Elsewhere") && !last.contains("Closed"));
         assert!(last.contains(
             "You have memory on: u2 Alex.\nOther subjects you have memory on: Nougie.\n"
         ));

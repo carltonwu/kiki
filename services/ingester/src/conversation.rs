@@ -21,8 +21,9 @@ pub struct Conversation {
     pub message_count: i32,
     pub created_at_ms: i64,
     pub last_active_at_ms: i64,
-    /// USD across chat runs, Decide and topic summaries.
-    pub cost_usd: f64,
+    pub last_reply_seconds_ago: Option<i64>,
+    /// USD across chat runs, Decide and topic summaries. Only [`active`] sums it.
+    pub cost_usd: Option<f64>,
     /// Everyone but Kiki, most messages first.
     #[sqlx(json)]
     pub participants: Vec<Participant>,
@@ -35,17 +36,16 @@ pub struct Participant {
     pub messages: i64,
 }
 
-const SELECT: &str = r#"
+/// `cost` is the `cost_usd` column: [`COST`], or NULL where nobody reads it.
+fn select(cost: &str) -> String {
+    format!(
+        r#"
     SELECT c.id, c.guild_id, c.channel_id, ch.name AS channel_name, c.started_by, c.topic,
            c.topic_through_message_id, c.message_count,
            (extract(epoch FROM c.created_at) * 1000)::bigint AS created_at_ms,
            (extract(epoch FROM c.last_active_at) * 1000)::bigint AS last_active_at_ms,
-           c.topic_cost_usd
-               + coalesce((SELECT sum(r.cost_usd) FROM agent_runs r WHERE r.conversation_id = c.id), 0)
-               -- Decide cost is stored on every message of a pool; count it once.
-               + coalesce((SELECT sum(cl.jev_cost_usd) FROM classifications cl
-                           WHERE cl.conversation_id = c.id AND cl.message_id = cl.pool_id), 0)
-                   AS cost_usd,
+           extract(epoch FROM now() - c.last_reply_at)::bigint AS last_reply_seconds_ago,
+           {cost} AS cost_usd,
            coalesce((
                SELECT jsonb_agg(jsonb_build_object('id', p.author_id, 'name', p.name, 'messages', p.n)
                                 ORDER BY p.n DESC, p.author_id)
@@ -57,13 +57,39 @@ const SELECT: &str = r#"
            ), '[]') AS participants
     FROM conversations c
     LEFT JOIN channels ch ON ch.id = c.channel_id
-"#;
+"#
+    )
+}
 
+const COST: &str = r#"c.topic_cost_usd
+    + coalesce((SELECT sum(r.cost_usd) FROM agent_runs r WHERE r.conversation_id = c.id), 0)
+    -- Decide cost is stored on every message of a pool; count it once.
+    + coalesce((SELECT sum(cl.jev_cost_usd) FROM classifications cl
+                WHERE cl.conversation_id = c.id AND cl.message_id = cl.pool_id), 0)"#;
+
+/// Every open conversation, most recently active first, with its cost.
 pub async fn active(db: impl PgExecutor<'_>, bot_user_id: i64) -> sqlx::Result<Vec<Conversation>> {
     sqlx::query_as(&format!(
-        "{SELECT} WHERE c.closed_at IS NULL ORDER BY c.last_active_at DESC"
+        "{} WHERE c.closed_at IS NULL ORDER BY c.last_active_at DESC",
+        select(COST)
     ))
     .bind(bot_user_id)
+    .fetch_all(db)
+    .await
+}
+
+/// The channel's open conversations, most recently active first.
+pub async fn in_channel(
+    db: impl PgExecutor<'_>,
+    bot_user_id: i64,
+    channel_id: i64,
+) -> sqlx::Result<Vec<Conversation>> {
+    sqlx::query_as(&format!(
+        "{} WHERE c.closed_at IS NULL AND c.channel_id = $2 ORDER BY c.last_active_at DESC",
+        select("NULL::float8")
+    ))
+    .bind(bot_user_id)
+    .bind(channel_id)
     .fetch_all(db)
     .await
 }
@@ -73,7 +99,7 @@ pub async fn get(
     bot_user_id: i64,
     id: i64,
 ) -> sqlx::Result<Option<Conversation>> {
-    sqlx::query_as(&format!("{SELECT} WHERE c.id = $2"))
+    sqlx::query_as(&format!("{} WHERE c.id = $2", select("NULL::float8")))
         .bind(bot_user_id)
         .bind(id)
         .fetch_optional(db)
