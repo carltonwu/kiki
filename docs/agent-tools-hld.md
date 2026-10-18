@@ -109,9 +109,11 @@ pages it used. Topic jobs still have no tools.
 - **Privacy:** queries and URLs reach OpenRouter's search and fetch engines.
 
 Limits:
-- 4 tool calls per run. After that, tools tell the model to answer with what it
-  has, rather than aborting.
-- 6 model requests per run as the hard stop (`UsageLimits`).
+- 4 search tool calls per run. After that, tools tell the model to answer with what it
+  has, rather than aborting. Memory tools ([subject memory](subject-memory-hld.md))
+  have their own budget of 6.
+- 10 model requests per run as the hard stop (`UsageLimits`); it was 6 before
+  memory tools, which can take a failed write, a split and a retry.
 - 10 seconds per tool call (45 for `read_image`); on timeout the tool returns
   an error to the model.
 - Topic jobs run with no tools.

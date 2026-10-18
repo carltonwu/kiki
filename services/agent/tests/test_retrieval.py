@@ -6,7 +6,7 @@ import pytest
 from psycopg import AsyncConnection
 from pydantic_ai.models.test import TestModel
 
-from kiki_agent_host import retrieval
+from kiki_agent_host import memory_tools, retrieval
 from kiki_agent_host.agent import PydanticExecutor
 from kiki_agent_host.contracts import JobRequest
 
@@ -273,7 +273,8 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # TestModel calls each tool once (with placeholder arguments), then answers
     # with their results.
     assert result.steps == 2
-    assert set(json.loads(result.text)) == {
+    # Memory tools are covered in test_memory; placeholder arguments only get errors.
+    assert set(json.loads(result.text)) - {t.__name__ for t in memory_tools.TOOLS} == {
         "search_messages",
         "get_message_context",
         "read_image",

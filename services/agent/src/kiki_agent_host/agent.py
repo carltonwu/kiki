@@ -32,7 +32,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import emojis, images, reading, retrieval
+from . import emojis, images, memory_tools, reading, retrieval
 from .contracts import (
     DescribeEmojisRequest,
     DescribeEmojisResult,
@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
 MAX_TOOL_CALLS = 4
-MAX_MODEL_REQUESTS = 6
+MAX_MODEL_REQUESTS = 10  # room for memory tools: a failed write, a split and a retry
 TOOL_TIMEOUT_SECONDS = 10
 VISION_TIMEOUT_SECONDS = 45  # downloads plus a vision model call
 EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
@@ -79,6 +79,7 @@ class Deps:
     images: list[Image] = field(default_factory=list)
     image_cost: float = 0.0
     image_calls: int = 0
+    memory: memory_tools.Session | None = None
 
 
 async def guarded(
@@ -393,6 +394,7 @@ chat = Agent(
         Tool(generate_image, prepare=only_with_image_model),
     ],
 )
+memory_tools.register(chat)
 plain = Agent()
 
 
@@ -492,6 +494,7 @@ class PydanticExecutor:
                         image_model=self.image_model(request.image_model)
                         if request.image_model
                         else None,
+                        memory=memory_tools.Session(self.database_url),
                     )
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.
@@ -502,6 +505,7 @@ class PydanticExecutor:
                         )
                     finally:
                         await finish(deps.indexing)
+                        await deps.memory.close()
         except ModelHTTPError as e:
             if e.status_code == 429 or e.status_code >= 500:
                 raise TransientError(f"provider returned {e.status_code}") from e

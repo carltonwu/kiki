@@ -10,7 +10,7 @@ is set.
 
 ## Tools and search
 
-Reply jobs get five tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get search, emoji, image and memory tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -54,9 +54,14 @@ model request; fetched pages are cut to about 6,000 tokens). Their fees are in t
 reply's cost, and the result adds `web: {searches, fetches, sources}` when they were
 used ([design](../../docs/agent-tools-hld.md#web-search-and-fetch-issue-1)).
 
+Memory tools ([design](../../docs/subject-memory-hld.md)), `recall`, `search_memory`,
+`remember`, `forget` and `split_doc`, read and write documents about people and
+things in the guild (a base profile each, plus sub docs of at most 1024 words).
+Changes to saved entries need cited evidence in proportion to how settled they are.
+
 Results exclude deleted messages, bot messages, and the current conversation
 (already in the prompt). A run gets 4 lookup tool calls (`read_image` is one of them;
-drawings are capped separately) and 6 model requests; vision and image calls add their
+drawings and memory are capped separately) and 10 model requests; vision and image calls add their
 cost to the reply's. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
@@ -152,6 +157,8 @@ Legacy runs already in progress when the migration runs are also failed.
 If the Python process dies before saving a result, inference may repeat on retry.
 Search tools only read. `generate_image` costs money and saves a row, so a replay can
 bill again and leave an unreferenced image row; Rust only attaches the IDs in the saved result.
+Memory writes tolerate replay: they record the job ID, and saving text that is already
+live confirms it, which is a no-op for the same job.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
 

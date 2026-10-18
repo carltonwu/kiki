@@ -23,9 +23,11 @@
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
 that channel), `age_s`, `attachments` (`[{filename, label?, content_type?}]`;
 the stub vision model describes an image as its label), and the sugar
-`jev: {choice, confidence}` and `reply: {text | tool | web}` to script the stub's
-answer to exactly this message. In tool arguments, `{image_message}` is the
+`jev: {choice, confidence}` and `reply: {text | tool | tools | web}` to script the
+stub's answer to exactly this message. In tool arguments, `{image_message}` is the
 message ID from the trigger's image marker, else the newest one in the conversation.
+`tools` is a sequence of calls; an argument `"{entry_id}"` (or `"{entry_ids:N}"`)
+takes memory entry IDs from the previous call's result.
 `web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
 tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
 it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the

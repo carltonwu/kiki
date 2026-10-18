@@ -669,43 +669,41 @@ class Fakecord:
             record["trigger"] = trigger
             tool_results = [content_text(m.get("content")) for m in messages if m["role"] == "tool"]
             if messages[-1]["role"] == "tool":
-                # Second turn of a scripted tool call: answer from its result.
-                entry = next((e for e in w.scripts["reply"] if e.pop("pending", False)), {})
-                ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
-                text = entry.get("text", "stub: found {ids}").format(
-                    trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
-                )
+                entry = next((e for e in w.scripts["reply"] if e.get("pending")), {})
+                queue = entry.get("queue") or []
                 record["tool_results"] = tool_results
-                message = {"role": "assistant", "content": text}
+                if queue:
+                    # A scripted sequence: the next call may use IDs from this result.
+                    tool = fill_args(queue.pop(0), tool_results[-1])
+                    message = tool_call_message(n, tool)
+                    record["tool_call"] = tool
+                else:
+                    # Last turn of a scripted tool call: answer from its result.
+                    entry.pop("pending", None)
+                    ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
+                    text = entry.get("text", "stub: found {ids}").format(
+                        trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
+                    )
+                    message = {"role": "assistant", "content": text}
             else:
                 entry = self.take("reply", trigger)
-                if entry and entry.get("tool"):
+                tools = (entry or {}).get("tools") or (
+                    [entry["tool"]] if entry and entry.get("tool") else []
+                )
+                if tools:
                     entry["pending"] = True
-                    tool = entry["tool"]
                     # `{image_message}`: the message ID of the trigger's image marker,
                     # else of the newest marker in the conversation (like Kiki's drawing).
                     everything = "\n".join(content_text(m.get("content")) for m in messages)
                     markers = re.findall(r"; message (\d+)\]", trigger) or re.findall(
                         r"; message (\d+)\]", everything
                     )
-                    marker = [None, markers[-1]] if markers else None
-                    args = json.dumps(tool.get("args", {})).replace(
-                        "{image_message}", marker[1] if marker else ""
+                    args = json.dumps(tools[0].get("args", {})).replace(
+                        "{image_message}", markers[-1] if markers else ""
                     )
-                    message = {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": f"call_{n}",
-                                "type": "function",
-                                "function": {
-                                    "name": tool["name"],
-                                    "arguments": args,
-                                },
-                            }
-                        ],
-                    }
+                    tool = {**tools[0], "args": json.loads(args)}
+                    entry["queue"] = list(tools[1:])
+                    message = tool_call_message(n, tool)
                     record["tool_call"] = tool
                 elif entry and entry.get("web"):
                     message, usage = self.server_tools(body, entry, trigger)
@@ -922,6 +920,35 @@ class Fakecord:
         app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
+
+
+def tool_call_message(n: int, tool: dict) -> dict:
+    return {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": f"call_{n}",
+                "type": "function",
+                "function": {"name": tool["name"], "arguments": json.dumps(tool.get("args", {}))},
+            }
+        ],
+    }
+
+
+def fill_args(tool: dict, previous: str) -> dict:
+    """`{entry_id}` is the first memory entry ID (e12) in the previous tool result;
+    `{entry_ids:N}` the first N, as a list."""
+    entries = list(dict.fromkeys(re.findall(r"\be[0-9]+\b", previous)))
+
+    def fill(value):
+        if value == "{entry_id}":
+            return entries[0] if entries else value
+        if isinstance(value, str) and (m := re.fullmatch(r"\{entry_ids:(\d+)\}", value)):
+            return entries[: int(m[1])]
+        return value
+
+    return {**tool, "args": {k: fill(v) for k, v in (tool.get("args") or {}).items()}}
 
 
 def content_text(content) -> str:
