@@ -1,0 +1,18 @@
+{
+ "agent/tools/memory.py": {
+  "doc": "Memory tools for the chat agent (docs/subject-memory-hld.md), kept apart from\nthe search tools in `agent`. They read `scope`, `roster` and `job_id` from the\nrun's deps, and keep their own connection and budget in `deps.memory`.",
+  "symbols": [
+   "MAX_CALLS",
+   "TIMEOUT_SECONDS",
+   "Session",
+   "run",
+   "recall",
+   "search_memory",
+   "remember",
+   "forget",
+   "split_doc",
+   "TOOLS",
+   "register"
+  ]
+ }
+}
