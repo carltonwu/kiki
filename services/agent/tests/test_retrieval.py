@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -248,6 +249,16 @@ async def test_ignored_authors_are_never_read(db):
     assert [m["id"] for m in result["messages"]] == ["60", "62"]
 
 
+class ToolsOnlyModel(TestModel):
+    """Calls every tool but `load_capability`: skill loading is covered in test_skills,
+    and a placeholder skill id only errors."""
+
+    async def request(self, messages, model_settings, parameters):
+        tools = [t for t in parameters.function_tools if t.name != "load_capability"]
+        parameters = replace(parameters, function_tools=tools)
+        return await super().request(messages, model_settings, parameters)
+
+
 async def test_executor_runs_tools_and_reports_usage(database_url, db):
     await add(db, 80, "we shipped the release")
 
@@ -255,7 +266,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
         web_tools = ()  # TestModel can't run OpenRouter's server tools (see test_web.py)
 
         def model(self, name):
-            return TestModel()
+            return ToolsOnlyModel()
 
     executor = TestExecutor(database_url, "unused-key")
     executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())

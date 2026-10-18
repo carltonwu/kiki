@@ -1,0 +1,22 @@
+name: Kiki reads Discord's preview of a shared Spotify link, never Spotify itself
+steps:
+  - say:
+      as: alex
+      in: general
+      text: "@kiki rate this https://open.spotify.com/track/2ZWlPOoWh0626oTaHrnl2a?si=abc"
+      embeds:
+        - type: link
+          url: https://open.spotify.com/track/2ZWlPOoWh0626oTaHrnl2a
+          title: Padam Padam
+          description: "Kylie Minogue · Tension · Song · 2023"
+          provider: {name: Spotify, url: "https://open.spotify.com"}
+        - type: link
+          url: https://example.com/blog
+          title: Unrelated blog
+          provider: {name: Example}
+  - expect:
+      reply: true
+      prompt_contains: "?si=abc [Spotify: Padam Padam — Kylie Minogue · Tension · Song · 2023]"
+      prompt_lacks: "Unrelated blog"
+  - say: {as: sam, in: general, text: "@kiki and https://open.spotify.com/track/abc with no preview"}
+  - expect: {reply: true, prompt_contains: "with no preview", prompt_lacks: "with no preview [Spotify"}

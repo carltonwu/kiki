@@ -29,7 +29,8 @@
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
-that channel), `age_s`, `attachments` (`[{filename, label?, content_type?, expired?}]`;
+that channel), `age_s`, `embeds` (link previews, delivered like Discord's unfurler as a
+follow-up MESSAGE_UPDATE), `attachments` (`[{filename, label?, content_type?, expired?}]`;
 the stub vision model describes an image as its label, the drawing step's
 reference check turns down labels saying meme or screenshot, and an `expired`
 link only downloads after Discord's refresh), and the sugar
@@ -92,6 +93,8 @@ class Run:
         body = {"as": args["as"], "in": args["in"], "text": str(args["text"])}
         if "age_s" in args:
             body["age_s"] = args["age_s"]
+        if "embeds" in args:
+            body["embeds"] = args["embeds"]
         if "attachments" in args:
             body["attachments"] = args["attachments"]
         if reply_to := args.get("reply_to"):

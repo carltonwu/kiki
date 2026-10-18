@@ -13,6 +13,27 @@
       "text": "ok",
       "tools": [
         {
+          "description": "Load a listed capability whenever it is plausibly relevant to the task. Loading makes the capability instructions and any tools it provides available.",
+          "kind": "function",
+          "name": "load_capability",
+          "parameters": {
+            "description": "Typed arguments for a `load_capability` tool call.",
+            "properties": {
+              "id": {
+                "description": "The id of the capability to load.",
+                "title": "Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "title": "LoadCapabilityArgs",
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
           "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
           "kind": "function",
           "name": "search_messages",
@@ -418,6 +439,27 @@
       },
       "text": "ok",
       "tools": [
+        {
+          "description": "Load a listed capability whenever it is plausibly relevant to the task. Loading makes the capability instructions and any tools it provides available.",
+          "kind": "function",
+          "name": "load_capability",
+          "parameters": {
+            "description": "Typed arguments for a `load_capability` tool call.",
+            "properties": {
+              "id": {
+                "description": "The id of the capability to load.",
+                "title": "Id",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "title": "LoadCapabilityArgs",
+            "type": "object"
+          },
+          "strict": null
+        },
         {
           "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
           "kind": "function",

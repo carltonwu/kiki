@@ -8,6 +8,7 @@ dependencies = [
     "fastapi>=0.143.3",
     "httpx>=0.28.1",
     "psycopg[binary]>=3.2",
+    "pydantic-ai-harness[skills]==0.57.0",
     "pydantic-ai-slim[openrouter]==2.57.0",
     "uvicorn>=0.30",
 ]
