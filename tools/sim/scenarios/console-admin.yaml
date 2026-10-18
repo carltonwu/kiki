@@ -1,0 +1,40 @@
+name: the console's admin API edits settings, prompts and facts and chats outside Discord
+steps:
+  - admin: {path: "/guilds/1/settings", status: 404}
+  - admin: {path: "/guilds/{guild}/settings"}
+  - expect: {response_contains: "pool_max_messages"}
+  # Settings: same registry and catalog check as /kiki config.
+  - admin: {method: PUT, path: "/guilds/{guild}/settings/chat_model",
+            body: {value: sim/missing, actor: "1"}, status: 422}
+  - expect: {response_contains: "isn't in OpenRouter's catalog"}
+  - admin: {method: PUT, path: "/guilds/{guild}/settings/chat_model",
+            body: {value: sim/other, actor: "1"}}
+  - expect: {response_contains: "sim/other"}
+  # Facts and a persona override (written by the console directly) reach the next reply.
+  - exec: >-
+      INSERT INTO guild_facts (guild_id, title, body, updated_by)
+      SELECT guild_id, 'Spring show', 'Opens November 3 at the Grand', 1 FROM channels LIMIT 1;
+      INSERT INTO guild_facts (guild_id, title, body, enabled, updated_by)
+      SELECT guild_id, 'Old show', 'Disabled fact text', false, 1 FROM channels LIMIT 1;
+      INSERT INTO guild_prompts (guild_id, part, body, updated_by)
+      SELECT guild_id, 'persona', 'Where you are: a community theatre crew.', 1
+      FROM channels LIMIT 1
+  - say: {as: alex, in: general, text: "@kiki when does the show open?", id: q}
+  - expect: {of: q, reply: true,
+             prompt_contains: ["Opens November 3 at the Grand", "a community theatre crew"],
+             prompt_lacks: ["Disabled fact text", "Most people here are gay"]}
+  - expect: {sql: "SELECT model FROM agent_runs ORDER BY id DESC LIMIT 1", equals: sim/other}
+  # Chat: Kiki's real prompt for this server, nothing posted to Discord.
+  - admin: {method: POST, path: "/guilds/{guild}/chat",
+            body: {job_id: console-1, actor: "1", actor_name: Alex,
+                   messages: [{role: user, content: "what's the show?"}]}}
+  - expect: {response_contains: "stub: what's the show?"}
+  - expect: {sql: "SELECT count(*) FROM messages WHERE content LIKE 'stub: what''s the show%'",
+             equals: 0}
+  - expect: {sql: "SELECT request->'messages'->0->>'content' LIKE '%Kiki console%Opens November 3%'
+                   FROM agent_host_jobs WHERE id = 'console-1'", equals: "False"}
+  - expect: {sql: "SELECT request->'messages'->0->>'content' LIKE '%Opens November 3%Kiki console%'
+                   FROM agent_host_jobs WHERE id = 'console-1'", equals: "True"}
+  - admin: {method: POST, path: "/guilds/{guild}/chat",
+            body: {job_id: console-2, actor: "1", actor_name: Alex,
+                   messages: [{role: assistant, content: "hi"}]}, status: 422}

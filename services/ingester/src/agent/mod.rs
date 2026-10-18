@@ -9,11 +9,13 @@
 //! (people kept talking while Kiki was replying), only the newest is answered and
 //! the others are marked `superseded`: their messages are in the history anyway.
 
+pub mod console;
 mod context;
 mod delivery;
 mod discord;
 mod host;
 mod people;
+pub mod prompt;
 mod topic;
 
 use std::{

@@ -1,5 +1,7 @@
-//! Server overrides and immutable work snapshots. The leader is the sole writer;
-//! Discord writes publish to this cache after committing, with no routing I/O.
+//! Server overrides and immutable work snapshots. Writes in this process
+//! (`/kiki config`, the console's admin API) publish to the cache after
+//! committing, with no routing I/O. Other writers (another instance, manual SQL)
+//! reach it through the `guild_settings_changed` trigger and [`Store::listen`].
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, RwLock},
@@ -12,7 +14,12 @@ use crate::{
 use anyhow::{Context, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{PgExecutor, PgPool};
+use sqlx::{PgExecutor, PgPool, postgres::PgListener};
+use tokio::sync::watch;
+
+const NOTIFY_CHANNEL: &str = "guild_settings_changed";
+/// Every cached guild is also reread this often, in case a notification was lost.
+const RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Clone, Copy)]
 pub enum Kind {
@@ -238,6 +245,85 @@ impl Store {
                 .insert(guild_id, Arc::new(resolved));
         }
         Ok(())
+    }
+
+    /// Rereads one cached guild. Holds the writer mutex, so a slower in-process
+    /// publication can't overwrite the newer committed state.
+    pub async fn reload(&self, guild_id: i64) -> sqlx::Result<()> {
+        if !self.is_cached(guild_id) {
+            return Ok(());
+        }
+        let _writer = self.writer.lock().await;
+        let resolved = self.read(&self.db, guild_id).await?;
+        self.cache
+            .write()
+            .expect("settings cache poisoned")
+            .insert(guild_id, Arc::new(resolved));
+        Ok(())
+    }
+
+    fn is_cached(&self, guild_id: i64) -> bool {
+        self.cache
+            .read()
+            .expect("settings cache poisoned")
+            .contains_key(&guild_id)
+    }
+
+    /// The guilds loaded at startup: the only ones this process serves.
+    pub fn guild_ids(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .cache
+            .read()
+            .expect("settings cache poisoned")
+            .keys()
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    async fn reload_all(&self) {
+        for guild_id in self.guild_ids() {
+            if let Err(e) = self.reload(guild_id).await {
+                tracing::warn!(guild_id, error = %e, "couldn't reload server settings");
+            }
+        }
+    }
+
+    /// Applies other writers' commits until shutdown. After a listener reconnect
+    /// (notifications may be lost) and periodically, rereads every guild.
+    pub async fn listen(
+        self: Arc<Self>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let mut listener = PgListener::connect_with(&self.db).await?;
+        listener.listen(NOTIFY_CHANNEL).await?;
+        let mut poll = tokio::time::interval(RELOAD_INTERVAL);
+        poll.tick().await;
+        loop {
+            tokio::select! {
+                // The guard `wait_for` returns isn't Send; don't hold it.
+                _ = async { let _ = shutdown.wait_for(|stop| *stop).await; } => return Ok(()),
+                notification = listener.try_recv() => match notification {
+                    Ok(Some(n)) => match n.payload().parse::<i64>() {
+                        Ok(guild_id) => {
+                            if let Err(e) = self.reload(guild_id).await {
+                                tracing::warn!(guild_id, error = %e, "couldn't reload server settings");
+                            } else {
+                                tracing::debug!(guild_id, "server settings reloaded");
+                            }
+                        }
+                        Err(_) => tracing::warn!(payload = n.payload(), "unparseable settings notification"),
+                    },
+                    Ok(None) => self.reload_all().await,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "settings lost their Postgres listener; reconnecting");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                },
+                _ = poll.tick() => self.reload_all().await,
+            }
+        }
     }
 
     pub fn snapshot(&self, guild_id: i64) -> Arc<Resolved> {
@@ -505,7 +591,7 @@ pub mod tests {
         assert!(Store::new(store.db.clone(), invalid, 5000).is_err());
     }
 
-    async fn database() -> Option<(PgPool, PgPool, String)> {
+    pub async fn database() -> Option<(PgPool, PgPool, String)> {
         let url = std::env::var("TEST_DATABASE_URL").ok()?;
         let schema = format!(
             "guild_settings_test_{}",
@@ -535,10 +621,14 @@ pub mod tests {
             .await
             .unwrap();
         sqlx::raw_sql("CREATE TABLE conversations (id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ, closed_reason TEXT)").execute(&db).await.unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0017_console.sql"))
+            .execute(&db)
+            .await
+            .unwrap();
         Some((admin, db, schema))
     }
 
-    async fn cleanup(admin: PgPool, db: PgPool, schema: String) {
+    pub async fn cleanup(admin: PgPool, db: PgPool, schema: String) {
         db.close().await;
         admin
             .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
@@ -652,6 +742,53 @@ pub mod tests {
         waiting_tag.commit().await.unwrap();
         let counts: Vec<(i64, i64)> = sqlx::query_as("SELECT guild_id, count(*) FROM conversations WHERE closed_at IS NULL GROUP BY guild_id ORDER BY guild_id").fetch_all(&db).await.unwrap();
         assert_eq!(counts, [(1, 1), (2, 3)]);
+        cleanup(admin, db, schema).await;
+    }
+
+    #[tokio::test]
+    async fn other_writers_reach_the_cache_through_notify() {
+        let Some((admin, db, schema)) = database().await else {
+            return;
+        };
+        let writer = Store::new(db.clone(), defaults(), 5000).unwrap();
+        let reader = Arc::new(Store::new(db.clone(), defaults(), 5000).unwrap());
+        writer.load(&[1]).await.unwrap();
+        reader.load(&[1]).await.unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let listening = tokio::spawn(reader.clone().listen(shutdown));
+        // LISTEN must be registered before the first change.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let eventually = |expected: usize| {
+            let reader = reader.clone();
+            async move {
+                for _ in 0..50 {
+                    if reader.snapshot(1).pool_max_messages == expected {
+                        return true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                false
+            }
+        };
+        writer
+            .change(1, "pool_max_messages", Some(json!(3)), 7)
+            .await
+            .unwrap();
+        assert!(eventually(3).await, "another instance's change");
+        sqlx::query("DELETE FROM guild_settings WHERE guild_id = 1")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(eventually(10).await, "a manual SQL reset");
+        // Guilds this process doesn't serve stay out of the cache.
+        sqlx::query("INSERT INTO guild_settings VALUES (2, 'pool_max_messages', '4', 7)")
+            .execute(&db)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(reader.guild_ids(), [1]);
+        stop.send(true).unwrap();
+        listening.await.unwrap().unwrap();
         cleanup(admin, db, schema).await;
     }
 }

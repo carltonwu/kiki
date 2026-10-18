@@ -5,6 +5,7 @@
 //!   ingester           run the service
 //!   ingester migrate   apply database migrations and exit (Railway pre-deploy step)
 
+mod admin;
 mod agent;
 mod catch_up;
 mod chat;
@@ -73,9 +74,55 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
+    // Before leadership: the console's admin API serves on every instance.
+    let guild_settings = Arc::new(guild_settings::Store::new(
+        pool.clone(),
+        guild_settings::GuildSettings::defaults(&router_config, &agent_config),
+        router_config.max_message_age.as_millis() as u64,
+    )?);
+    guild_settings
+        .load(
+            &discord
+                .guild_ids
+                .iter()
+                .map(|id| id.get() as i64)
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+    tokio::spawn({
+        let store = guild_settings.clone();
+        let shutdown = shutdown_rx.clone();
+        async move {
+            if let Err(e) = store.listen(shutdown).await {
+                warn!(error = %e, "settings listener stopped; other writers' changes apply after a restart");
+            }
+        }
+    });
+    let admin = match &config.admin_token {
+        Some(token) => {
+            let chat = match agent_config.host_url {
+                Some(_) => Some(agent::console::ConsoleChat::new(
+                    pool.clone(),
+                    &agent_config,
+                    guild_settings.clone(),
+                )?),
+                None => None,
+            };
+            info!(chat = chat.is_some(), "admin API enabled");
+            Some(admin::router(Arc::new(admin::Admin {
+                token: token.clone(),
+                settings: guild_settings.clone(),
+                global: Settings::new(&router_config, &agent_config, guild_settings.clone()),
+                chat,
+            })))
+        }
+        None => None,
+    };
+
     let mut health = tokio::spawn(health::serve(
         config.port,
         pool.clone(),
+        admin,
         shutdown_rx.clone(),
     ));
 
@@ -87,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut ingest = tokio::spawn(ingest(
         pool,
+        guild_settings,
         discord,
         router_config,
         agent_config,
@@ -111,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn ingest(
     pool: sqlx::PgPool,
+    guild_settings: Arc<guild_settings::Store>,
     discord: DiscordConfig,
     router_config: RouterConfig,
     agent_config: AgentConfig,
@@ -126,20 +175,6 @@ async fn ingest(
 
     // The router starts before the Gateway so it sees every live message.
     let pending_emoji = router_config.pending_emoji.clone();
-    let guild_settings = Arc::new(guild_settings::Store::new(
-        pool.clone(),
-        guild_settings::GuildSettings::defaults(&router_config, &agent_config),
-        router_config.max_message_age.as_millis() as u64,
-    )?);
-    guild_settings
-        .load(
-            &discord
-                .guild_ids
-                .iter()
-                .map(|id| id.get() as i64)
-                .collect::<Vec<_>>(),
-        )
-        .await?;
     let settings = Settings::new(&router_config, &agent_config, guild_settings.clone());
     let router = Arc::new(
         Router::new(

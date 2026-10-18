@@ -15,6 +15,9 @@
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
+      - admin: {method: PUT, path: "/guilds/{guild}/settings/chat_model",
+                body: {value: sim/other, actor: "1"}, status: 200}
+                                            # the ingester's console admin API
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
@@ -141,6 +144,15 @@ class Run:
         if "id" in args:
             self.slashes[args["id"]] = result
         return result
+
+    def admin(self, step: int, args: dict) -> None:
+        """Its response is checked like a slash command's (`response_contains`)."""
+        status, body = stack.admin(
+            self.config, args.get("method", "GET"), args["path"], args.get("body")
+        )
+        if status != args.get("status", 200):
+            self.fail(step, f"admin {args['path']} returned {status}: {json.dumps(body)[:300]}")
+        self.last_slash = {"id": None, "response": body}
 
     def expect(self, step: int, args: dict) -> None:
         if "sql" in args:
@@ -307,6 +319,8 @@ class Run:
             elif kind == "exec":
                 with stack.connect() as db:
                     db.execute(args)
+            elif kind == "admin":
+                self.admin(i, args)
             elif kind == "drop_gateway":
                 self.drop_gateway()
             elif kind == "wait":

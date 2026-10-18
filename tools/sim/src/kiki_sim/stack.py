@@ -34,6 +34,8 @@ INGESTER_PORT = 8092
 DATABASE = "kiki_sim"
 TEMPLATE = "kiki_sim_template"
 HOST_TOKEN = "sim-host-token"
+# The ingester's console admin API (docs/console-hld.md); 32+ characters.
+ADMIN_TOKEN = "sim-admin-token-0123456789abcdef0123"
 # Variables a toolchain needs; everything else is set explicitly per service.
 KEEP = [
     "PATH",
@@ -207,6 +209,7 @@ class Config:
             "DISCORD_GATEWAY_URL": f"ws://127.0.0.1:{FAKECORD_PORT}/gateway",
             "AGENT_HOST_URL": f"http://127.0.0.1:{HOST_PORT}",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
+            "ADMIN_API_TOKEN": ADMIN_TOKEN,
         }
         if self.live:
             values["OPENROUTER_DECISION_API_KEY"] = live_keys()["OPENROUTER_DECISION_API_KEY"]
@@ -429,3 +432,19 @@ def down(purge: bool = False) -> None:
     (STATE / "config.json").unlink(missing_ok=True)
     if purge and not os.getenv("KIKI_SIM_POSTGRES"):
         run(["docker", "compose", "-f", str(SIM / "compose.yml"), "down", "-v"])
+
+
+def admin(config: "Config", method: str, path: str, body=None) -> tuple[int, dict]:
+    """Calls the ingester's admin API; `{guild}` in the path is the fixture guild."""
+    url = f"http://127.0.0.1:{INGESTER_PORT}/admin/v1{path.replace('{guild}', config.guild_id())}"
+    request = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={"Authorization": f"Bearer {ADMIN_TOKEN}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read() or b"{}")

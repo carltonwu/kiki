@@ -96,6 +96,7 @@ pub struct Commands {
     settings: Settings,
 }
 
+#[derive(Clone)]
 pub struct Settings {
     chat_model: Option<String>,
     topic_model: Option<String>,
@@ -136,6 +137,31 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// Global (env) settings, read-only everywhere: for the console.
+    pub fn global(&self) -> Vec<(String, String)> {
+        let on = |model: &Option<String>| model.clone().unwrap_or_else(|| "off".into());
+        let mut rows = vec![
+            ("Chat model default".to_owned(), on(&self.chat_model)),
+            ("Topic model".to_owned(), on(&self.topic_model)),
+            (
+                "Decide model".to_owned(),
+                if self.decide_enabled {
+                    self.decide_model.clone()
+                } else {
+                    "off".into()
+                },
+            ),
+        ];
+        rows.extend(
+            self.global
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone())),
+        );
+        rows
+    }
+}
+
 struct Invocation<'a> {
     guild_id: i64,
     member: &'a Value,
@@ -158,7 +184,7 @@ impl<'a> Invocation<'a> {
 
 /// A failure the person running the command can fix, shown as-is.
 #[derive(Debug)]
-struct UserError(String);
+pub(crate) struct UserError(pub String);
 
 impl std::fmt::Display for UserError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1024,7 +1050,7 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
     Ok(Some((actor, key, value)))
 }
 
-async fn check_catalog_model(model: &str) -> anyhow::Result<()> {
+pub(crate) async fn check_catalog_model(model: &str) -> anyhow::Result<()> {
     let catalog: Value = reqwest::Client::new()
                     .get(format!("{}/v1/models", crate::config::openrouter_base()))
                     .timeout(Duration::from_secs(10))

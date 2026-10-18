@@ -2,6 +2,9 @@
 //! instance is ready. It reports process + database health only, never leadership:
 //! the new instance must turn healthy *before* the old one is stopped and releases
 //! the leader lock.
+//!
+//! With `ADMIN_API_TOKEN` set, the console's admin API ([`crate::admin`]) is served
+//! here too, on every instance: its writes don't need leadership.
 
 use std::net::{Ipv6Addr, SocketAddr};
 
@@ -13,9 +16,13 @@ use tracing::{info, warn};
 pub async fn serve(
     port: u16,
     pool: PgPool,
+    admin: Option<Router>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let app = Router::new().route("/health", get(health)).with_state(pool);
+    let mut app = Router::new().route("/health", get(health)).with_state(pool);
+    if let Some(admin) = admin {
+        app = app.merge(admin);
+    }
     // `::` accepts IPv4 and IPv6; Railway's private network is IPv6.
     let addr = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
