@@ -57,6 +57,7 @@ class Deps:
     image_client: AsyncOpenAI | None = None
     images: list[Image] = field(default_factory=list)
     image_cost: float = 0.0
+    image_calls: int = 0
 
 
 async def guarded(
@@ -182,8 +183,11 @@ async def generate_image(ctx: RunContext[Deps], prompt: str) -> dict:
 
     async def work():
         deps = ctx.deps
-        if len(deps.images) >= MAX_IMAGES:
+        # Counted before the call: the model may request several images in parallel,
+        # and a failed attempt may still be billed.
+        if deps.image_calls >= MAX_IMAGES:
             return {"error": f"At most {MAX_IMAGES} images per reply. Answer with what you have."}
+        deps.image_calls += 1
         try:
             data, mime_type, cost = await images.generate(
                 deps.image_client, deps.image_model, prompt

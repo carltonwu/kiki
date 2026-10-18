@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from types import SimpleNamespace
@@ -6,7 +7,7 @@ import pytest
 from pydantic_ai.models.test import TestModel
 
 from kiki_agent_host import images
-from kiki_agent_host.agent import PydanticExecutor
+from kiki_agent_host.agent import MAX_IMAGES, PydanticExecutor
 from kiki_agent_host.contracts import JobRequest
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
@@ -32,6 +33,7 @@ class FakeImages:
 
     async def create(self, **request):
         self.requests.append(request)
+        await asyncio.sleep(0.01)  # like a real call, let parallel tool calls interleave
         return self.response
 
 
@@ -134,3 +136,27 @@ async def test_refusals_reach_the_model_instead_of_failing_the_reply(database_ur
         "error": "No image was generated. The image model said: nope"
     }
     assert result.images == []
+
+
+async def test_parallel_calls_still_draw_at_most_max_images(database_url):
+    from psycopg import AsyncConnection
+    from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+    from pydantic_ai.models.function import FunctionModel
+
+    def model(messages, info):
+        if len(messages) == 1:
+            # One response asking for three images at once: the tools run concurrently.
+            return ModelResponse(
+                parts=[
+                    ToolCallPart("generate_image", {"prompt": f"frog {i}"}, tool_call_id=str(i))
+                    for i in range(3)
+                ]
+            )
+        return ModelResponse(parts=[TextPart("here")])
+
+    run = executor(database_url, completion([data_url()]))
+    run.model = lambda name: FunctionModel(model)
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await job_row(db)
+    result = await run.execute(request("test/image"))
+    assert len(result.images) == MAX_IMAGES == len(run.images.chat.completions.requests)

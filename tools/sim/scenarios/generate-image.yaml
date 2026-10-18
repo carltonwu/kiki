@@ -15,6 +15,11 @@ steps:
   - say: {as: alex, in: general, text: "kiki draw something cursed"}
     reply: {tool: {name: generate_image, args: {prompt: "refuse this"}}, text: "couldn't draw it: {result}"}
   - expect: {run: done, text_contains: "No image was generated", attachments: 0}
+  # A drawing followed by NO_REPLY still goes out, as a message with only the file.
+  - say: {as: alex, in: general, text: "kiki just the picture please"}
+    reply: {tool: {name: generate_image, args: {prompt: "a frog, no text"}}, text: "NO_REPLY"}
+  - expect: {run: done, reply: true, attachments: 1}
+  - expect: {sql: "SELECT m.content FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[1] ORDER BY r.id DESC LIMIT 1", equals: ""}
   # Servers can turn it off, and image_model must be an image model.
   - slash: {as: alex, in: general, command: config, options: {key: image_model, value: sim/chat}}
   - expect: {response_contains: "outputs images"}

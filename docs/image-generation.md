@@ -21,18 +21,25 @@ Rust: reply job (+ image_model) ─▶ Python host: chat model calls generate_im
 - **Host** (`images.py`, `agent.py`). OpenRouter chat completions with
   `modalities: ["image", "text"]`, the same key as chat. The first inline
   PNG/JPEG/WebP/GIF up to 8 MiB is saved; its billed cost is added to the run's
-  `usage.cost`. Limits: 2 images per run, 60 s per call (the job timeout is 120 s),
-  no client retries since attempts may be billed, and the call counts toward the 4
-  tool calls. A refusal, a missing image or a provider error becomes a tool error,
-  so Kiki can say she couldn't draw it rather than failing the reply.
+  `usage.cost`. Limits: 2 image calls per run (reserved before each call, so parallel
+  calls can't exceed it), 60 s per call (Rust's host deadline,
+  `AGENT_HOST_TIMEOUT_MS`, defaults to 180 s), no client retries since attempts may
+  be billed, and the call counts toward the 4 tool calls. A refusal, a missing
+  image or a provider error becomes a tool error, so Kiki can say she couldn't draw
+  it rather than failing the reply.
+- **Wire compatibility.** Rust omits `image_model` when off and the host saves
+  requests without unset optional fields, so jobs saved before this change still
+  match on retry. Deploy the host before (or with) the ingester: an older host
+  rejects requests that carry `image_model`.
 - **Storage** (`0017_agent_host_images.sql`). Bytes stay out of the job result
   JSON. Rows reference `agent_host_jobs` with `ON DELETE CASCADE`, so a future
   retention policy for jobs also removes images. There is no retention yet.
 - **Delivery** (`agent/discord.rs`). Rust loads only rows whose `job_id` matches the
   run's job and that the saved result lists, then attaches them (`kiki-<id>.png`)
   to the first planned message. If the model generated an image but returned
-  `NO_REPLY`, the image is still posted alone. Later prompts show it as
-  `[attachment: kiki-<id>.png]` in Kiki's history, like other attachments.
+  `NO_REPLY` (with `chat_allow_silence` on), the image is still posted alone.
+  Later prompts show it as `[attachment: kiki-<id>.png]` in Kiki's history, like
+  other attachments.
 
 ## Trade-offs
 
