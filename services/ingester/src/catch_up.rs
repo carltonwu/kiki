@@ -30,7 +30,7 @@ const MESSAGE_CHANNEL_TYPES: &[i16] = &[0, 2, 5, 13, 10, 11, 12];
 const THREAD_PARENT_TYPES: &[i64] = &[0, 5, 15, 16];
 const PAGE_SIZE: u16 = 100;
 /// Channels fetched in parallel. Each channel has its own rate limit bucket.
-const CHANNEL_CONCURRENCY: usize = 4;
+const CHANNEL_CONCURRENCY: usize = 8;
 
 pub struct CatchUp {
     http: Arc<Client>,
