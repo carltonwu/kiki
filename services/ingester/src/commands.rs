@@ -58,6 +58,33 @@ const RUN_STATUSES: [&str; 6] = [
     "superseded",
 ];
 
+/// `(option value, column header)` of the time windows, oldest cutoff last.
+/// The SQL numbers them 0, 1, 2 in this order.
+const WINDOWS: [(&str, &str); 3] = [("24h", "24 h"), ("7d", "7 d"), ("all", "All")];
+const WINDOW_COLUMNS: [(&str, Align); 4] = [
+    ("", Align::Left),
+    (WINDOWS[0].1, Align::Right),
+    (WINDOWS[1].1, Align::Right),
+    (WINDOWS[2].1, Align::Right),
+];
+const MAX_USER_ROWS: usize = 20;
+/// How per-person cost is attributed.
+const COST_NOTE: &str = "Cost: replies split across the messages that triggered them, plus Decide; topic summaries excluded";
+
+/// One person's activity in one time window.
+#[derive(FromRow)]
+struct UserStats {
+    #[sqlx(rename = "win")]
+    window: i32,
+    user_id: i64,
+    name: Option<String>,
+    messages: i64,
+    /// Messages tagged into a conversation with Kiki.
+    kiki_messages: i64,
+    conversations: i64,
+    cost: f64,
+}
+
 pub struct Commands {
     db: PgPool,
     http: Arc<Client>,
@@ -281,6 +308,7 @@ impl Commands {
             "stats" => self.stats(invocation.guild_id).await?,
             "runs" => self.runs(invocation).await?,
             "config" => self.config().await?,
+            "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
             other => error_embed(&format!("Unknown subcommand `{other}`.")),
         };
@@ -395,7 +423,9 @@ impl Commands {
             runs AS (SELECT r.status, r.latency_ms, r.cost_usd,
                             coalesce(r.finished_at, r.created_at) AS at
                      FROM agent_runs r JOIN conv ON conv.id = r.conversation_id),
-            cls AS (SELECT c.check_hit, c.outcome, c.jev_cost_usd, c.classified_at AS at
+            -- Decide cost is stored on every message of a pool; `newest` counts it once.
+            cls AS (SELECT c.check_hit, c.outcome, c.jev_cost_usd, c.classified_at AS at,
+                           c.message_id = c.pool_id AS newest
                     FROM classifications c JOIN messages m ON m.id = c.message_id
                     WHERE m.guild_id = $1),
             tagged AS (SELECT cm.tagged_at AS at
@@ -417,7 +447,8 @@ impl Commands {
                 (SELECT count(*) FROM cls WHERE check_hit = 'none' AND at > w.since) AS via_none,
                 (SELECT count(*) FROM cls WHERE outcome <> 'no' AND at > w.since) AS routed,
                 (SELECT coalesce(sum(cost_usd), 0) FROM runs WHERE at > w.since) AS chat_cost,
-                (SELECT coalesce(sum(jev_cost_usd), 0) FROM cls WHERE at > w.since) AS decide_cost
+                (SELECT coalesce(sum(jev_cost_usd), 0) FROM cls WHERE newest AND at > w.since)
+                    AS decide_cost
             FROM w ORDER BY w.n
             "#,
         )
@@ -439,12 +470,6 @@ impl Commands {
         .fetch_one(&self.db)
         .await?;
 
-        let columns = [
-            ("", Align::Left),
-            ("24 h", Align::Right),
-            ("7 d", Align::Right),
-            ("All", Align::Right),
-        ];
         let row = |label: &str, cell: &dyn Fn(&Window) -> String| -> Vec<String> {
             std::iter::once(label.to_owned())
                 .chain(windows.iter().map(cell))
@@ -495,9 +520,9 @@ impl Commands {
         let description = format!(
             "**Activity**\n{}**Routing** · messages by the first check they matched\n{}**Cost** · USD\n{}\
              Topic summaries have no timestamp, so their cost counts toward All only.",
-            table(&columns, &activity),
-            table(&columns, &routing),
-            table(&columns, &cost),
+            table(&WINDOW_COLUMNS, &activity),
+            table(&WINDOW_COLUMNS, &routing),
+            table(&WINDOW_COLUMNS, &cost),
         );
         Ok(EmbedBuilder::new()
             .color(COLOR)
@@ -696,12 +721,9 @@ impl Commands {
             last_seen_ms: i64,
         }
         #[derive(FromRow)]
-        struct Activity {
-            messages: i64,
+        struct Span {
             first_message_s: Option<i64>,
             last_message_s: Option<i64>,
-            conversations: i64,
-            conversation_messages: i64,
         }
         let user_id = invocation
             .option("user")
@@ -742,22 +764,30 @@ impl Commands {
         .bind(user_id)
         .fetch_all(&self.db)
         .await?;
-        let activity: Activity = sqlx::query_as(
+        let span: Span = sqlx::query_as(
             r#"
-            SELECT count(*) AS messages,
-                   extract(epoch FROM min(m.created_at))::bigint AS first_message_s,
-                   extract(epoch FROM max(m.created_at))::bigint AS last_message_s,
-                   count(DISTINCT cm.conversation_id) AS conversations,
-                   count(cm.message_id) AS conversation_messages
-            FROM messages m
-            LEFT JOIN conversation_messages cm ON cm.message_id = m.id
-            WHERE m.guild_id = $1 AND m.author_id = $2 AND m.deleted_at IS NULL
+            SELECT extract(epoch FROM min(created_at))::bigint AS first_message_s,
+                   extract(epoch FROM max(created_at))::bigint AS last_message_s
+            FROM messages WHERE guild_id = $1 AND author_id = $2 AND deleted_at IS NULL
             "#,
         )
         .bind(guild_id)
         .bind(user_id)
         .fetch_one(&self.db)
         .await?;
+        let stats = self.user_stats(guild_id, Some(user_id), &[0, 1, 2]).await?;
+        let window = |i: i32| stats.iter().find(|s| s.window == i);
+        let row = |label: &str, cell: &dyn Fn(&UserStats) -> String| -> Vec<String> {
+            std::iter::once(label.to_owned())
+                .chain((0..3).map(|i| window(i).map_or("0".to_owned(), cell)))
+                .collect()
+        };
+        let activity = [
+            row("Messages", &|s| s.messages.to_string()),
+            row("With Kiki", &|s| s.kiki_messages.to_string()),
+            row("Conversations", &|s| s.conversations.to_string()),
+            row("Cost", &|s| usd(s.cost)),
+        ];
 
         let title = person
             .nick
@@ -791,24 +821,13 @@ impl Commands {
             .color(COLOR)
             .title(title)
             .description(description)
-            .field(EmbedFieldBuilder::new("Messages", activity.messages.to_string()).inline())
-            .field(
-                EmbedFieldBuilder::new(
-                    "With Kiki",
-                    format!(
-                        "{} in {} conversations",
-                        activity.conversation_messages, activity.conversations
-                    ),
-                )
-                .inline(),
-            )
+            .field(EmbedFieldBuilder::new(
+                "Activity",
+                table(&WINDOW_COLUMNS, &activity),
+            ))
             .field(EmbedFieldBuilder::new("Joined", at(person.joined_at_s, 'D')).inline())
-            .field(
-                EmbedFieldBuilder::new("First message", at(activity.first_message_s, 'R')).inline(),
-            )
-            .field(
-                EmbedFieldBuilder::new("Last message", at(activity.last_message_s, 'R')).inline(),
-            )
+            .field(EmbedFieldBuilder::new("First message", at(span.first_message_s, 'R')).inline())
+            .field(EmbedFieldBuilder::new("Last message", at(span.last_message_s, 'R')).inline())
             .field(EmbedFieldBuilder::new(
                 "Names seen",
                 truncate(
@@ -823,13 +842,154 @@ impl Commands {
                     ),
                     MAX_FIELD_CHARS,
                 ),
-            ));
+            ))
+            .footer(EmbedFooterBuilder::new(COST_NOTE));
         if let Some(url) = avatar_url(invocation.resolved, user_id)
             && let Ok(source) = ImageSource::url(url)
         {
             embed = embed.thumbnail(source);
         }
         Ok(embed.build())
+    }
+
+    /// `/kiki users [period] [sort]`: everyone active in the period, ranked.
+    async fn users(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        let period = invocation
+            .option("period")
+            .and_then(Value::as_str)
+            .unwrap_or("7d");
+        let window = WINDOWS
+            .iter()
+            .position(|(key, _)| *key == period)
+            .ok_or_else(|| UserError(format!("Unknown period `{period}`.")))?;
+        let sort = invocation
+            .option("sort")
+            .and_then(Value::as_str)
+            .unwrap_or("cost");
+        let mut stats = self
+            .user_stats(invocation.guild_id, None, &[window as i32])
+            .await?;
+        // Ties fall back to messages, then to user id so the order is stable.
+        stats.sort_by(|a, b| {
+            let primary = match sort {
+                "messages" => b.messages.cmp(&a.messages),
+                "conversations" => b.conversations.cmp(&a.conversations),
+                _ => b.cost.total_cmp(&a.cost),
+            };
+            primary
+                .then(b.messages.cmp(&a.messages))
+                .then(a.user_id.cmp(&b.user_id))
+        });
+
+        let label = WINDOWS[window].1;
+        let embed = EmbedBuilder::new()
+            .color(COLOR)
+            .title(format!(
+                "People · {}",
+                if window == 2 { "all time" } else { label }
+            ))
+            .timestamp(now());
+        if stats.is_empty() {
+            return Ok(embed.description("Nobody posted in this period.").build());
+        }
+        let rows: Vec<Vec<String>> = stats
+            .iter()
+            .take(MAX_USER_ROWS)
+            .enumerate()
+            .map(|(i, s)| {
+                vec![
+                    (i + 1).to_string(),
+                    truncate(s.name.as_deref().unwrap_or(&s.user_id.to_string()), 16),
+                    s.messages.to_string(),
+                    s.kiki_messages.to_string(),
+                    s.conversations.to_string(),
+                    usd(s.cost),
+                ]
+            })
+            .collect();
+        let mut description = table(
+            &[
+                ("#", Align::Right),
+                ("Person", Align::Left),
+                ("Msgs", Align::Right),
+                ("Kiki", Align::Right),
+                ("Convos", Align::Right),
+                ("Cost", Align::Right),
+            ],
+            &rows,
+        );
+        if stats.len() > MAX_USER_ROWS {
+            let _ = writeln!(description, "…and {} more.", stats.len() - MAX_USER_ROWS);
+        }
+        description.push_str(
+            "**Msgs:** all messages · **Kiki:** messages in a conversation with Kiki · \
+             **Convos:** conversations with Kiki",
+        );
+        Ok(embed
+            .description(truncate(&description, MAX_DESCRIPTION_CHARS))
+            .footer(EmbedFooterBuilder::new(format!(
+                "{} people · sorted by {sort} · {COST_NOTE}",
+                stats.len()
+            )))
+            .build())
+    }
+
+    /// Per-person messages, conversations and cost for each of `windows`
+    /// (indexes into [`WINDOWS`]), for one person or everyone but Kiki.
+    async fn user_stats(
+        &self,
+        guild_id: i64,
+        user_id: Option<i64>,
+        windows: &[i32],
+    ) -> sqlx::Result<Vec<UserStats>> {
+        sqlx::query_as(
+            r#"
+            WITH w(n, since) AS (VALUES (0, now() - interval '24 hours'),
+                                        (1, now() - interval '7 days'),
+                                        (2, '-infinity'::timestamptz)),
+            mine AS (SELECT id, author_id, created_at FROM messages
+                     WHERE guild_id = $1 AND author_id <> $2 AND deleted_at IS NULL
+                       AND ($3::bigint IS NULL OR author_id = $3)),
+            events AS (
+                SELECT author_id AS user_id, created_at AS at, 1 AS messages, 0 AS kiki_messages,
+                       NULL::bigint AS conversation_id, 0::float8 AS cost
+                FROM mine
+                UNION ALL
+                SELECT m.author_id, m.created_at, 0, 1, cm.conversation_id, 0
+                FROM mine m JOIN conversation_messages cm ON cm.message_id = m.id
+                UNION ALL
+                -- A reply's cost, split evenly across the messages that triggered it.
+                SELECT m.author_id, coalesce(r.finished_at, r.created_at), 0, 0, NULL,
+                       r.cost_usd / cardinality(r.trigger_message_ids)
+                FROM agent_runs r
+                CROSS JOIN unnest(r.trigger_message_ids) t(id)
+                JOIN mine m ON m.id = t.id
+                WHERE r.cost_usd IS NOT NULL
+                UNION ALL
+                -- Decide cost is stored on every message of a pool (one person's);
+                -- count it once, on the newest.
+                SELECT m.author_id, c.classified_at, 0, 0, NULL, c.jev_cost_usd
+                FROM classifications c JOIN mine m ON m.id = c.message_id
+                WHERE c.message_id = c.pool_id AND c.jev_cost_usd IS NOT NULL
+            )
+            SELECT s.*, coalesce(p.nick, p.global_name, p.username) AS name
+            FROM (SELECT w.n AS win, e.user_id,
+                         sum(e.messages)::bigint AS messages,
+                         sum(e.kiki_messages)::bigint AS kiki_messages,
+                         count(DISTINCT e.conversation_id) AS conversations,
+                         sum(e.cost)::float8 AS cost
+                  FROM w JOIN events e ON e.at > w.since
+                  WHERE w.n = ANY($4)
+                  GROUP BY w.n, e.user_id) s
+            LEFT JOIN people p ON p.guild_id = $1 AND p.user_id = s.user_id
+            "#,
+        )
+        .bind(guild_id)
+        .bind(self.bot_user_id)
+        .bind(user_id)
+        .bind(windows)
+        .fetch_all(&self.db)
+        .await
     }
 }
 
@@ -861,7 +1021,21 @@ fn definition() -> CommandBuilder {
             "Models and routing and agent settings in effect",
         ))
         .option(
-            SubCommandBuilder::new("whois", "Every name Kiki has seen for someone")
+            SubCommandBuilder::new("users", "Messages, conversations and LLM cost per person")
+                .option(
+                    StringBuilder::new("period", "Time period (default 7 days)")
+                        .choices(WINDOWS.map(|(key, label)| (label, key))),
+                )
+                .option(
+                    StringBuilder::new("sort", "Rank by (default cost)").choices([
+                        ("Cost", "cost"),
+                        ("Messages", "messages"),
+                        ("Conversations", "conversations"),
+                    ]),
+                ),
+        )
+        .option(
+            SubCommandBuilder::new("whois", "Someone's names, messages, conversations and cost")
                 .option(UserBuilder::new("user", "Who to look up").required(true)),
         )
 }

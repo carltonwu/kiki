@@ -41,8 +41,10 @@ const SELECT: &str = r#"
            (extract(epoch FROM c.last_active_at) * 1000)::bigint AS last_active_at_ms,
            c.topic_cost_usd
                + coalesce((SELECT sum(r.cost_usd) FROM agent_runs r WHERE r.conversation_id = c.id), 0)
+               -- Decide cost is stored on every message of a pool; count it once.
                + coalesce((SELECT sum(cl.jev_cost_usd) FROM classifications cl
-                           WHERE cl.conversation_id = c.id), 0) AS cost_usd,
+                           WHERE cl.conversation_id = c.id AND cl.message_id = cl.pool_id), 0)
+                   AS cost_usd,
            coalesce((
                SELECT jsonb_agg(jsonb_build_object('id', p.author_id, 'name', p.name, 'messages', p.n)
                                 ORDER BY p.n DESC, p.author_id)
