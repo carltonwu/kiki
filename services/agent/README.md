@@ -10,7 +10,7 @@ is set.
 
 ## Tools and search
 
-Reply jobs get two tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get four tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -23,6 +23,13 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
+  (full text over name and description, plus vectors of `:name: description`).
+- `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a
+  message (`<:huh:123>`) or its ID, which also explains emoji since removed.
+
+Emoji results carry the `<:name:id>` form to write in a reply. Descriptions come
+from `POST /v1/emojis/describe` (below).
 
 Reply jobs also always offer OpenRouter's server tools `openrouter:web_search` and
 `openrouter:web_fetch`, which OpenRouter runs itself (at most 3 server-tool steps per
@@ -124,6 +131,25 @@ If the Python process dies before saving a result, inference may repeat on retry
 Current tools only read; future tools with side effects or costs must tolerate replay.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
+
+### Emoji descriptions
+
+`POST /v1/emojis/describe` (same bearer token) describes one batch of a server's
+custom emoji that `/kiki emojis resync:true` copied into `guild_emojis`:
+
+```json
+{"guild_id": "1", "model": "google/gemini-2.5-flash-lite",
+ "attempted_before_ms": 1792000000000, "redescribe": false}
+```
+
+It claims up to 8 emoji not tried since `attempted_before_ms` (the database clock
+when the resync started), downloads each as a 128 px PNG from Discord's CDN
+(`DISCORD_CDN_URL` overrides it for the simulator), asks the model for a short
+description, then embeds the described ones. The response is
+`{"described", "failed", "remaining", "cost"}`; Rust repeats the call until
+`remaining` is 0 or nothing progresses. A failed emoji (download or model) waits
+for the next resync. It's not a durable job: writes are idempotent, so a retry
+after 503 simply continues. It shares the job concurrency slots and timeout.
 
 ## Railway and idle resources
 
