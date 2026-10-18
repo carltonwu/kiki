@@ -2,8 +2,6 @@
 //! still works.
 use std::time::Duration;
 
-use tracing::debug;
-
 use super::{
     clean_reply,
     discord::{MAX_MESSAGE_CHARS, split_message},
@@ -26,6 +24,8 @@ pub(super) struct Plan {
     pub messages: Vec<Message>,
     /// For the newest trigger message, added before any message is sent.
     pub reactions: Vec<Reaction>,
+    /// `:name:` reactions, for the server's emoji catalog to resolve.
+    pub shortcodes: Vec<String>,
 }
 
 pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan> {
@@ -35,6 +35,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
     );
     let mut parts = Vec::<Message>::new();
     let mut reactions = Vec::<Reaction>::new();
+    let mut shortcodes = Vec::<String>::new();
     let mut reacted = false;
     let mut body = String::new();
     let mut delay = Duration::ZERO;
@@ -63,8 +64,10 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
             .flatten();
         if let Some(line) = reaction {
             reacted = true;
-            if !line.unresolved.is_empty() {
-                debug!(shortcodes = ?line.unresolved, "skipped unresolved emoji shortcodes");
+            for name in line.unresolved {
+                if !shortcodes.contains(&name) {
+                    shortcodes.push(name);
+                }
             }
             for reaction in line.reactions {
                 if !reactions.contains(&reaction) {
@@ -94,12 +97,14 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
     reactions.truncate(MAX_REACTIONS);
     if !settings.chat_reactions {
         reactions.clear();
+        shortcodes.clear();
     }
     if parts.iter().any(|p| is_no_reply(&p.text)) {
         if parts.len() == 1 && settings.chat_allow_silence {
             return Ok(Plan {
                 messages: vec![],
                 reactions,
+                shortcodes,
             });
         }
         bail!("invalid silence marker in reply plan");
@@ -114,6 +119,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
         return Ok(Plan {
             messages: vec![],
             reactions,
+            shortcodes,
         });
     }
     // Preserve all content when the model exceeds the requested message count.
@@ -144,6 +150,7 @@ pub(super) fn plan(text: &str, settings: &GuildSettings) -> anyhow::Result<Plan>
     Ok(Plan {
         messages,
         reactions,
+        shortcodes,
     })
 }
 
@@ -288,13 +295,20 @@ mod tests {
             (vec!["ok".to_owned()], vec!["😂".to_owned()])
         );
 
-        // Silence with a reaction is a reaction; unresolved ones are still hidden.
+        // Silence with a reaction is a reaction; shortcodes are left to the catalog.
         assert_eq!(
             emoji(&plan("NO_REPLY\nreact: 👀", &settings).unwrap()),
             ["👀"]
         );
-        let hidden = plan("react: :skull:", &settings).unwrap();
-        assert!(hidden.messages.is_empty() && hidden.reactions.is_empty());
+        let named = plan("react: :huh: :skull: :huh:\nreact: 💀", &settings).unwrap();
+        assert!(named.messages.is_empty());
+        assert_eq!(
+            (named.shortcodes.clone(), emoji(&named)),
+            (
+                vec!["huh".to_owned(), "skull".to_owned()],
+                vec!["💀".to_owned()]
+            )
+        );
         // Not markers: kept as text, and code is left alone.
         assert_eq!(
             texts(&plan("react: idk", &settings).unwrap()),

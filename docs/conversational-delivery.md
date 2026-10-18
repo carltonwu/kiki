@@ -69,7 +69,7 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 Sometimes a reaction is the whole answer; sometimes it goes with a reply. The
 model writes a line containing only `react:` and emoji, anywhere outside code:
 
-    react: 😂 <:froge:814672652526420008>
+    react: 😂 <:huh:814672652526420008>
     no WAY
     ---
     congrats
@@ -78,9 +78,11 @@ model writes a line containing only `react:` and emoji, anywhere outside code:
   grapheme, so skin tones, ZWJ sequences, flags and keycaps stay whole) and custom
   emoji as Discord writes them (`<:name:id>`, `<a:name:id>`, and the `<:name:id:>`
   models often write). A line with anything else, like `react: idk`, stays text.
-  Shortcodes like `:skull:` are recognized so they never leak, but can't be
-  resolved without a catalog of the server's emoji; issue #7's emoji knowledge can
-  plug in at `Line::unresolved` (and the prompt can then list usable emoji).
+  A shortcode like `:huh:` is looked up by exact name (ignoring case) among the
+  server's usable custom emoji in #7's catalog (`guild_emojis`, filled by
+  `/kiki emojis resync:true`); Unicode shortcodes like `:skull:` aren't resolved
+  but never leak. The prompt points Kiki at `search_emojis`/`find_emoji` for
+  custom emoji written as `<:name:id>`.
 - `delivery.rs` collects reactions from every line, deduplicated, at most three.
   Reactions alone (or with `NO_REPLY`) are a reaction-only answer, which counts as
   sitting out: with `chat_allow_silence=false` it fails the run like silence does.
@@ -88,15 +90,15 @@ model writes a line containing only `react:` and emoji, anywhere outside code:
   as the reply target) before sending any message, like a person reacting before
   typing. Adding a reaction is idempotent and a rejected emoji (Discord's Unknown
   Emoji) is only logged, so the reply still goes out.
-- `agent_runs.reactions` (migration 0017) stores the emoji Discord accepted, with
+- `agent_runs.reactions` (migration 0019) stores the emoji Discord accepted, with
   `reply_to_id` as their target. Later prompts show them on that message as
   `[you reacted: 💀]`, so Kiki knows a react-only turn already answered it.
 - If Kiki reacts with the pending emoji (👀), cleanup leaves it on that message.
 
 `tools/sim/scenarios/emoji-reactions.yaml` covers react-only, react with reply,
 custom emoji, a rejected emoji, the pending emoji, `chat_reactions=false` and
-react-only with silence disabled. Fakecord rejects custom emoji that aren't in
-the fixture's `emojis`.
+react-only with silence disabled, and catalog shortcodes. Fakecord rejects
+custom emoji that aren't in the fixture's `emojis`.
 
 ## Review decisions
 

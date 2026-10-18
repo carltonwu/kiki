@@ -13,7 +13,7 @@ mod context;
 mod delivery;
 mod discord;
 mod emoji;
-mod host;
+pub(crate) mod host;
 mod people;
 mod topic;
 
@@ -361,7 +361,8 @@ impl Agent {
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
-        let plan = delivery::plan(&result.text, &context.settings)?;
+        let mut plan = delivery::plan(&result.text, &context.settings)?;
+        emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
         if plan.messages.is_empty() && plan.reactions.is_empty() {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());

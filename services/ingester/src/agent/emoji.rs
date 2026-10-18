@@ -1,15 +1,19 @@
 //! Emoji reactions, written in a reply plan as a line like `react: 😂 <:froge:123>`.
 //!
 //! Kiki reacts with Unicode emoji or with custom emoji written the way Discord
-//! renders them (`<:name:id>`, `<a:name:id>`). Shortcodes such as `:skull:` are
-//! recognized so the marker never leaks into a message, but without a catalog of
-//! the server's emoji they can't be resolved: a lookup by name can plug in where
-//! [`Line::unresolved`] is consumed.
+//! renders them (`<:name:id>`, `<a:name:id>`). A shortcode such as `:huh:` is
+//! looked up in the server's emoji catalog ([`crate::emojis`]); Unicode
+//! shortcodes like `:skull:` aren't resolved, but never leak into a message.
 use std::fmt;
 
+use sqlx::PgPool;
+use tracing::debug;
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::id::Id;
 use unicode_segmentation::UnicodeSegmentation;
+
+use super::delivery::Plan;
+use crate::emojis::Emoji;
 
 /// Reactions per turn; more reads as spam.
 pub(super) const MAX_REACTIONS: usize = 3;
@@ -36,6 +40,38 @@ impl Reaction {
     }
 }
 
+impl From<&Emoji> for Reaction {
+    fn from(emoji: &Emoji) -> Self {
+        Self::Custom {
+            name: emoji.name.clone(),
+            id: emoji.id as u64,
+            animated: emoji.animated,
+        }
+    }
+}
+
+/// Adds the plan's `:name:` reactions that name one of the server's usable
+/// custom emoji, after the ones written out, up to [`MAX_REACTIONS`].
+pub(super) async fn resolve(db: &PgPool, guild_id: i64, plan: &mut Plan) -> sqlx::Result<()> {
+    if plan.shortcodes.is_empty() {
+        return Ok(());
+    }
+    let found = crate::emojis::named(db, guild_id, &plan.shortcodes).await?;
+    for name in &plan.shortcodes {
+        match found.get(&name.to_lowercase()) {
+            Some(emoji) => {
+                let reaction = Reaction::from(emoji);
+                if !plan.reactions.contains(&reaction) {
+                    plan.reactions.push(reaction);
+                }
+            }
+            None => debug!(name, "no server emoji for a reaction shortcode"),
+        }
+    }
+    plan.reactions.truncate(MAX_REACTIONS);
+    Ok(())
+}
+
 /// As written in Discord message text, which is also how it's stored and shown
 /// to the model.
 impl fmt::Display for Reaction {
@@ -52,7 +88,7 @@ impl fmt::Display for Reaction {
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Line {
     pub reactions: Vec<Reaction>,
-    /// Shortcode names (`skull` for `:skull:`) without a known emoji.
+    /// Shortcode names (`huh` for `:huh:`), for the catalog to resolve.
     pub unresolved: Vec<String>,
 }
 
