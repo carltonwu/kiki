@@ -32,5 +32,8 @@ railway-plan*.json
 .DS_Store
 Thumbs.db
 
+# Claude Code workflow worktrees
+/.claude/worktrees/
+
 # kiki-sim state and logs
 /.sim/

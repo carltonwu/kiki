@@ -565,7 +565,7 @@ class PydanticExecutor:
                 name=name, animated=" (animated; this is its first frame)" if animated else ""
             )
             spent = vision.cost
-            text = await look(vision, [prompt, image], max_tokens=200)
+            text = await look(vision, [prompt, image], max_tokens=emojis.DESCRIBE_MAX_TOKENS)
             return text, vision.cost - spent
 
         embed = retrieval.Embedder(self.embeddings)

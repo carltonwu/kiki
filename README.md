@@ -164,7 +164,7 @@ There is no automatic phrase learning or Discord command to edit the phrase list
 
 Every custom emoji of a server is also in `guild_emojis` (migration 0017), with a
 one- or two-sentence description written by a vision model (`OPENROUTER_EMOJI_MODEL`,
-default `google/gemini-2.5-flash-lite`, about $0.0001 per emoji). Replies can look
+default `deepseek/deepseek-v4.1-flash-1017`). Replies can look
 them up with the `search_emojis` (by mood or meaning) and `find_emoji` (by name, or
 to explain `<:name:id>` in a message) tools. The list only changes on
 `/kiki emojis resync:true`: run it after adding, renaming or deleting emoji. Each

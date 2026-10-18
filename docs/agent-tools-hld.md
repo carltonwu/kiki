@@ -251,7 +251,7 @@ queries are an argument error returned to the model.
   until none are left (at most 10 minutes; the interaction token lasts 15). The host
   downloads each emoji as a 128 px PNG (the first frame if animated) and asks
   `OPENROUTER_EMOJI_MODEL` (Rust's env, sent per request like the chat model;
-  default `google/gemini-2.5-flash-lite`) for one or two sentences on what it shows
+  default `deepseek/deepseek-v4.1-flash-1017`) for one or two sentences on what it shows
   and when people use it. Download and model call are `read_image`'s
   (`vision.py`): Discord hosts only, the type checked from the bytes, and a
   provider error fails just that emoji. Each emoji is tried at most once per resync

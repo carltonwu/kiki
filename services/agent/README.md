@@ -168,7 +168,7 @@ retention policy.
 custom emoji that `/kiki emojis resync:true` copied into `guild_emojis`:
 
 ```json
-{"guild_id": "1", "model": "google/gemini-2.5-flash-lite",
+{"guild_id": "1", "model": "deepseek/deepseek-v4.1-flash-1017",
  "attempted_before_ms": 1792000000000, "redescribe": false}
 ```
 

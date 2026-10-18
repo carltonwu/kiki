@@ -178,7 +178,7 @@ impl AgentConfig {
                 .map(|m| m.trim().to_owned())
                 .ok()
                 .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| "google/gemini-2.5-flash-lite".into()),
+                .unwrap_or_else(|| "deepseek/deepseek-v4.1-flash-1017".into()),
             chat_model,
             image_model: std::env::var("OPENROUTER_IMAGE_MODEL")
                 .unwrap_or_else(|_| "openai/gpt-image-2.5-flare".into()),
