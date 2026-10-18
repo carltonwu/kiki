@@ -1,0 +1,12 @@
+name: Kiki knows the server's lingo and is sometimes nudged to use it
+steps:
+  - exec: >-
+      INSERT INTO guild_lingo (guild_id, phrase, meaning)
+      VALUES (900000000000000001, 'r8 da eats', 'rate a food pic')
+  - slash: {as: alex, in: general, command: config, options: {key: lingo_nudge, value: "100"}}
+  - expect: {response_contains: "lingo_nudge"}
+  - say: {as: ethan, in: general, text: "@kiki hiii"}
+  - expect: {reply: true, prompt_contains: ["r8 da eats: rate a food pic", "work in the server's \\\"r8 da eats\\\""]}
+  - slash: {as: alex, in: general, command: config, options: {key: lingo_nudge, value: "0"}}
+  - say: {as: ethan, in: general, text: "@kiki again"}
+  - expect: {reply: true, prompt_contains: "r8 da eats: rate a food pic", prompt_lacks: "work in the server's"}

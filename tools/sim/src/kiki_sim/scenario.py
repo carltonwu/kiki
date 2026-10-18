@@ -13,6 +13,7 @@
       - slash: {as: alex, in: general, command: model, options: {model: sim/other}}
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
       - drop_gateway: {}
+      - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
@@ -269,6 +270,9 @@ class Run:
                 self.slash(args)
             elif kind == "expect":
                 self.expect(i, args)
+            elif kind == "exec":
+                with stack.connect() as db:
+                    db.execute(args)
             elif kind == "drop_gateway":
                 self.drop_gateway()
             elif kind == "wait":

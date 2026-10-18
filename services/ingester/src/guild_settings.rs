@@ -65,6 +65,7 @@ settings! { r, a;
     reply_max_tokens: u32 = 2000, Kind::Integer(100, 4000), "Output tokens per model request";
     topic_every_messages: i64 = a.topic_every_messages, Kind::Integer(1, 50), "New messages before refreshing a topic";
     topic_sample_messages: i64 = 12, Kind::Integer(4, 50), "Messages shown to the topic summarizer";
+    lingo_nudge: i64 = 35, Kind::Integer(0, 100), "Chance (%) a reply is nudged to use one of the server's phrases";
 }
 
 type Overrides = BTreeMap<String, Value>;
@@ -399,7 +400,8 @@ pub mod tests {
             "follow_up_window": 300, "follow_up_max_no_confidence": 0.55, "stale_after": 1800, "stale_min_confidence": 0.9,
             "decide_recent_messages": 15, "decide_conversation_preview": 3,
             "history_messages": 30, "channel_context": 8, "channel_context_age": 1800,
-            "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12
+            "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12,
+            "lingo_nudge": 35
         }))
         .unwrap()
     }

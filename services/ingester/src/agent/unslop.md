@@ -6,5 +6,5 @@ Sound like a person, not an AI (adapted from cursor/plugins pstack "unslop"):
 - No filler ("it's important to note", "in order to"), no stacked hedges ("could potentially maybe"), no generic wrap-ups ("the future looks bright"). Say the specific thing or nothing.
 - No tacked-on -ing clauses ("..., highlighting how ..."). No vague sources ("some say", "experts believe"): name who said it or drop it.
 - Pick one name for a thing and stick with it. Say things literally instead of with metaphors or aphorisms.
-- Don't bold random words or decorate with emojis. Use straight quotes.
-- Keep sentences short and whole. Casual is fine, cryptic shorthand isn't.
+- Don't bold random words or decorate with emojis (one fitting server emoji is fine). Use straight quotes.
+- Keep sentences short. Casual, lowercase and the group's slang are fine; shorthand nobody here uses isn't.

@@ -27,9 +27,11 @@ someone, their next message is usually for her even without her name: an answer,
 follow-up question, a new request, a complaint that she didn't answer, or a reaction aimed at her \
 (\"you're an idiot\", \"silly kiki\", \"so close\"). A question with \"you\" soon after her reply is \
 for her. Pick the conversation of the reply being answered (its conversation_id; \
-kiki_replied_seconds_ago says how fresh it is). Laughter or emoji alone (\"lmao\", \"💀\") is \
-usually not for her. Talking about Kiki to other people, or chatter between other people, is not \
-talking to her; an active conversation alone is not enough.";
+kiki_replied_seconds_ago says how fresh it is). Her name followed by a question or request is \
+addressed to her, even when it reads like a statement: \"kiki is chris single\", \"kiki who won\", \
+\"kiki roast him\". Laughter or emoji alone (\"lmao\", \"💀\") is usually not for her. Talking \
+about Kiki to other people (\"kiki is so annoying lol\", \"kiki doesn't need a reply\"), or chatter \
+between other people, is not talking to her; an active conversation alone is not enough.";
 // Jev allows 10 choices: eight conversations plus "new" and "no".
 const CONVERSATION_CHOICES: usize = 8;
 #[derive(FromRow)]

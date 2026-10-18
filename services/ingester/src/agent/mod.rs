@@ -424,7 +424,34 @@ fn clean_reply(text: &str) -> String {
         .iter()
         .find_map(|prefix| text.strip_prefix(prefix))
         .unwrap_or(text);
-    text.trim().to_owned()
+    fix_custom_emoji(text.trim())
+}
+
+/// Models often write a custom emoji as `<:name:id:>`, which Discord shows as
+/// text. Drops the colon after the ID.
+fn fix_custom_emoji(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(":>") {
+        let (before, after) = rest.split_at(i);
+        let digits = before.len() - before.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let emoji = digits > 0
+            && before[..before.len() - digits].ends_with(':')
+            && before[..before.len() - digits]
+                .rfind('<')
+                .is_some_and(|start| {
+                    let inner = &before[start + 1..before.len() - digits - 1];
+                    let name = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':'));
+                    name.is_some_and(|n| {
+                        !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
+                    })
+                });
+        out.push_str(before);
+        out.push_str(if emoji { ">" } else { ":>" });
+        rest = &after[2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Kiki's answer when her previous reply already covered the messages (see
@@ -450,5 +477,13 @@ mod tests {
         assert_eq!(clean_reply("[Kiki] hey"), "hey");
         assert_eq!(clean_reply("hey Kiki: there"), "hey Kiki: there");
         assert_eq!(clean_reply("   "), "");
+        assert_eq!(
+            clean_reply("ok <:froge:814672652526420008:> and <a:ape:1444819174172922043:>"),
+            "ok <:froge:814672652526420008> and <a:ape:1444819174172922043>"
+        );
+        assert_eq!(
+            clean_reply("fine <:froge:81> :> 12:>"),
+            "fine <:froge:81> :> 12:>"
+        );
     }
 }
