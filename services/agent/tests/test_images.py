@@ -1,0 +1,247 @@
+import json
+
+import httpx
+import pytest
+from psycopg import AsyncConnection
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from kiki_agent_host import images, retrieval
+from kiki_agent_host.images import Image, Vision, allowed, images_in, sized
+
+GUILD, CHANNEL, CONVERSATION = 1, 2, 1
+SCOPE = retrieval.Scope(GUILD, CHANNEL, CONVERSATION)
+CDN = "https://cdn.discordapp.com/attachments/2/3"
+PNG = b"\x89PNG\r\n\x1a\nsim"
+
+
+def attachment(name, content_type="image/png", **extra):
+    url = f"{CDN}/{name}?ex=1&hm=2"
+    return {"filename": name, "content_type": content_type, "url": url, **extra}
+
+
+GALLERY = {
+    "attachments": [
+        attachment("a.png", width=800, height=600),
+        attachment("notes.pdf", "application/pdf"),
+        attachment("b.JPG", None),
+        attachment("c.webp", "image/webp", description="a cat on a piano"),
+    ],
+    "embeds": [
+        {
+            "type": "gifv",
+            "thumbnail": {
+                "url": "https://media.tenor.com/x.png",
+                "proxy_url": "https://images-ext-1.discordapp.net/x.png",
+            },
+        },
+        {"type": "rich", "image": {"url": "https://example.com/y.jpg"}},
+        {"type": "rich", "thumbnail": {"url": "https://example.com/link-preview.jpg"}},
+        {"type": "image", "thumbnail": {"url": f"{CDN}/a.png?ex=1&hm=2"}},  # duplicate
+    ],
+}
+
+
+def test_finds_image_attachments_then_image_embeds():
+    found = images_in(GALLERY)
+    assert [i.name for i in found] == ["a.png", "b.JPG", "c.webp", "linked image", "linked image"]
+    assert found[2].alt == "a cat on a piano"
+    assert found[3].url == "https://images-ext-1.discordapp.net/x.png"  # Discord's proxy
+    assert images_in({"attachments": [attachment(f"{i}.png") for i in range(14)]})[-1].name == (
+        "9.png"
+    )
+    assert images_in({}) == []
+
+
+def test_large_images_use_the_resizing_proxy():
+    small = {"url": "u", "proxy_url": "p", "width": 100, "height": 50}
+    assert sized(small) == "u"
+    big = {
+        "url": "u",
+        "proxy_url": "https://media.discordapp.net/a.png?ex=1&width=9",
+        "width": 4000,
+        "height": 2000,
+    }
+    assert sized(big) == "https://media.discordapp.net/a.png?ex=1&width=1568&height=784"
+    heavy = {"url": "u", "proxy_url": "https://media.discordapp.net/a.png", "size": 9 << 20}
+    assert sized(heavy) == "https://media.discordapp.net/a.png?width=1568"
+
+
+def test_downloads_only_from_discord(monkeypatch):
+    assert allowed(f"{CDN}/a.png")
+    assert allowed("https://media.discordapp.net/a.png?width=10")
+    assert not allowed("http://cdn.discordapp.com/a.png")
+    assert not allowed("https://cdn.discordapp.com.evil.example/a.png")
+    assert not allowed("https://cdn.discordapp.com:8443/a.png")
+    assert not allowed("http://127.0.0.1:8090/cdn/a.png")
+    monkeypatch.setenv("DISCORD_MEDIA_EXTRA_HOSTS", "127.0.0.1:8090")
+    assert allowed("http://127.0.0.1:8090/cdn/a.png")
+
+
+def serve(routes: dict[str, tuple[int, bytes, str]]):
+    def handler(request: httpx.Request) -> httpx.Response:
+        status, body, content_type = routes.get(request.url.path, (404, b"", "text/plain"))
+        return httpx.Response(status, content=body, headers={"content-type": content_type})
+
+    return httpx.MockTransport(handler)
+
+
+async def test_download_checks_status_size_and_format(monkeypatch):
+    monkeypatch.setattr(images, "MAX_BYTES", 10)
+    transport = serve(
+        {
+            "/ok.png": (200, PNG[:9], "image/png"),
+            "/untyped.jpg": (200, b"jpeg", "application/octet-stream"),
+            "/big.png": (200, b"x" * 11, "image/png"),
+            "/page.png": (200, b"<html>", "text/html"),
+            "/svg": (200, b"<svg/>", "image/svg+xml"),
+            "/down.png": (503, b"", "text/plain"),
+        }
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+
+        async def get(path, media_type=None):
+            return await images.download(
+                client, Image("x", f"https://cdn.discordapp.com{path}", media_type)
+            )
+
+        ok = await get("/ok.png")
+        assert isinstance(ok, BinaryContent) and ok.media_type == "image/png"
+        assert (await get("/untyped.jpg")).media_type == "image/jpeg"
+        assert await get("/gone.png") == "no longer available (deleted, or an expired Discord link)"
+        assert await get("/big.png") == "too large"
+        assert (await get("/page.png")).media_type == "image/png"  # from the file name
+        assert await get("/svg", "image/svg+xml") == "unsupported format (image/svg+xml)"
+        assert await get("/down.png") == "download failed (HTTP 503)"
+        assert await images.download(client, Image("x", "https://example.com/a.png")) == (
+            "not hosted by Discord"
+        )
+
+
+# --- with Postgres -------------------------------------------------------------
+
+
+@pytest.fixture
+async def db(database_url):
+    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+        await connection.execute(
+            "INSERT INTO channels (id, guild_id, name, type) VALUES (%s, %s, 'general', 0)",
+            (CHANNEL, GUILD),
+        )
+        yield connection
+
+
+async def add(db, id, content, raw_extra, *, guild=GUILD, author_id=100):
+    raw = {"author": {"id": str(author_id), "username": "alex"}, "mentions": [], **raw_extra}
+    await db.execute(
+        "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
+        " created_at, raw) VALUES (%s, %s, %s, %s, 'alex', %s, now(), %s)",
+        (id, guild, CHANNEL, author_id, content, json.dumps(raw)),
+    )
+
+
+ROSTER = retrieval.Roster({"u1": 100}, {100: "u1 Alex"})
+CDN_FILES = {
+    "/attachments/2/3/a.png": (200, PNG, "image/png"),
+    "/attachments/2/3/b.JPG": (200, b"jpeg", "image/jpeg"),
+    "/attachments/2/3/c.webp": (200, b"webp", "image/webp"),
+    "/x.png": (200, PNG, "image/png"),
+}
+
+
+def vision(answer="Image 1: a stage.", error: Exception | None = None, fallback=False):
+    seen = []
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        seen.append((messages, info))
+        if error:
+            raise error
+        return ModelResponse(parts=[TextPart(answer)], provider_details={"cost": 0.002})
+
+    return Vision(FunctionModel(respond), "test/vision", fallback), seen
+
+
+async def read(db, vision_model, message_id=70, question=None, files=CDN_FILES):
+    return await images.read_image(
+        db, SCOPE, ROSTER, vision_model, message_id, question, transport=serve(files)
+    )
+
+
+async def test_reads_a_gallery_image_by_image_and_as_a_whole(db):
+    await add(db, 70, "opening night!!", GALLERY)
+    model, seen = vision("Image 1: ...\nGallery: the whole show.")
+    result = await read(db, model, question="who is on stage?")
+    assert result["description"] == "Image 1: ...\nGallery: the whole show."
+    assert result["message"]["author"] == "u1 Alex"
+    assert result["message"]["url"] == "https://discord.com/channels/1/2/70"
+    assert [i.get("error") for i in result["images"]] == [None] * 4 + ["not hosted by Discord"]
+    assert model.cost == pytest.approx(0.002) and model.calls == 1
+
+    [(messages, info)] = seen
+    assert "Gallery:" in messages[0].instructions
+    parts = messages[0].parts[0].content
+    assert 'Message text: "opening night!!"' in parts[0]
+    assert "who is on stage?" in parts[0]
+    labels = [p for p in parts[1:] if isinstance(p, str)]
+    assert labels[:4] == [
+        "Image 1: a.png",
+        "Image 2: b.JPG",
+        'Image 3: c.webp (alt text: "a cat on a piano")',
+        "Image 4: linked image",
+    ]
+    assert "Image(s) 5 couldn't be loaded" in labels[-1]
+    assert [p.media_type for p in parts if isinstance(p, BinaryContent)] == [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/png",
+    ]
+    assert info.model_settings["max_tokens"] == 2200
+
+
+async def test_reads_a_single_image(db):
+    await add(db, 71, "", {"attachments": [attachment("a.png")]})
+    model, seen = vision()
+    result = await read(db, model, 71)
+    assert result["description"] == "Image 1: a stage."
+    assert result["images"] == [{"image": 1, "name": "a.png"}]
+    assert "No message text." in seen[0][0][0].parts[0].content[0]
+
+
+async def test_explains_messages_it_cannot_read(db):
+    await add(db, 72, "no pictures", {"attachments": [attachment("notes.pdf", "text/plain")]})
+    await add(db, 73, "expired", {"attachments": [attachment("gone.png")]})
+    await add(db, 74, "elsewhere", {"attachments": [attachment("a.png")]}, guild=7)
+    model, seen = vision()
+    assert await read(db, model, 72) == {"error": "that message has no images"}
+    assert (await read(db, model, 73))["error"] == "none of the images could be downloaded"
+    assert await read(db, model, 74) == {"error": "no such message in this server"}
+    assert await read(db, model, 999) == {"error": "no such message in this server"}
+    assert seen == []
+
+
+@pytest.mark.parametrize(
+    ("status", "fallback", "expected"),
+    [
+        (404, True, "No vision model is configured (OPENROUTER_VISION_MODEL)"),
+        (400, False, "The image model test/vision rejected these images."),
+        (503, True, "The image model is unavailable right now"),
+        (429, False, "The image model is unavailable right now"),
+    ],
+)
+async def test_vision_failures_become_errors_for_kiki(db, status, fallback, expected):
+    await add(db, 75, "", {"attachments": [attachment("a.png")]})
+    error = ModelHTTPError(status, "test/vision", body={"message": "No endpoints support images"})
+    model, _ = vision(error=error, fallback=fallback)
+    result = await read(db, model, 75)
+    assert expected in result["error"]
+    assert result["images"] == [{"image": 1, "name": "a.png"}]
+    assert model.cost == 0
+
+
+async def test_search_results_say_which_messages_have_images(db):
+    await add(db, 76, "plain", {})
+    await add(db, 77, "pics", GALLERY)
+    result = await retrieval.message_context(db, SCOPE, 76)
+    assert [m.get("images") for m in result["messages"]] == [None, 5]

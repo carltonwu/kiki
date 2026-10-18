@@ -33,6 +33,8 @@ export default defineRailway(() => {
       AGENT_HOST_JOB_TIMEOUT_SECS: "120",
       // Chat and embeddings via OpenRouter; without it the host returns 501.
       OPENROUTER_CHAT_API_KEY: preserve(),
+      // read_image's model, e.g. anthropic/claude-haiku-5.5; unset falls back to the chat model.
+      OPENROUTER_VISION_MODEL: preserve(),
     },
   });
 

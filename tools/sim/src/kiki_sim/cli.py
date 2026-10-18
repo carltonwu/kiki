@@ -38,6 +38,13 @@ def main() -> None:
         p.add_argument("--in", dest="channel", default="general")
         p.add_argument("--reply-to", help="message id, or `kiki` for her latest message")
         p.add_argument("--age", type=float, default=0, help="seconds in the past")
+        p.add_argument(
+            "--image",
+            action="append",
+            default=[],
+            metavar="FILE[=LABEL]",
+            help="attach an image; the stub vision model describes it as LABEL (repeat: gallery)",
+        )
         p.add_argument("text")
 
     p = sub.add_parser("slash", help="run /kiki SUBCOMMAND [name=value ...]")
@@ -93,6 +100,11 @@ def cmd_say(args, wait: bool = True) -> None:
     body = {"as": args.author, "in": args.channel, "text": args.text, "age_s": args.age}
     if args.reply_to:
         body["reply_to"] = resolve_reply(args.reply_to, args.channel)
+    if args.image:
+        body["attachments"] = [
+            {"filename": f, "label": label or f}
+            for f, _, label in (i.partition("=") for i in args.image)
+        ]
     message = stack.control("messages", body)
     message["_age_s"] = args.age
     state = stack.control("state")

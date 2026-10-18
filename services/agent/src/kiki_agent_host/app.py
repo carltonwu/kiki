@@ -29,6 +29,7 @@ class Settings:
     max_concurrent_jobs: int = 2
     job_timeout_seconds: float = 120
     openrouter_api_key: str = ""
+    openrouter_vision_model: str = ""
 
     def __post_init__(self) -> None:
         if not self.database_url.strip() or not self.token.strip():
@@ -44,6 +45,7 @@ class Settings:
             max_concurrent_jobs=int(os.getenv("AGENT_HOST_MAX_CONCURRENT_JOBS", "2")),
             job_timeout_seconds=float(os.getenv("AGENT_HOST_JOB_TIMEOUT_SECS", "120")),
             openrouter_api_key=os.getenv("OPENROUTER_CHAT_API_KEY", ""),
+            openrouter_vision_model=os.getenv("OPENROUTER_VISION_MODEL", "").strip(),
         )
 
 
@@ -129,14 +131,19 @@ def application() -> FastAPI:
     if settings.openrouter_api_key:
         from .agent import PydanticExecutor  # the SDK import dominates startup time
 
-        executor = PydanticExecutor(settings.database_url, settings.openrouter_api_key)
+        executor = PydanticExecutor(
+            settings.database_url,
+            settings.openrouter_api_key,
+            settings.openrouter_vision_model,
+        )
     logger.info(
         "agent host ready startup_ms=%d rss_mb=%d executor_configured=%s "
-        "max_concurrent_jobs=%d job_timeout_seconds=%s",
+        "max_concurrent_jobs=%d job_timeout_seconds=%s vision_model=%s",
         (time.monotonic() - STARTED) * 1000,
         max_rss_mb(),
         executor is not None,
         settings.max_concurrent_jobs,
         settings.job_timeout_seconds,
+        settings.openrouter_vision_model or "chat model",
     )
     return create_app(settings, executor)

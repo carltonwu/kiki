@@ -53,6 +53,8 @@ KEEP = [
     "SSL_CERT_DIR",
 ]
 LIVE_KEYS = ["OPENROUTER_CHAT_API_KEY", "OPENROUTER_DECISION_API_KEY"]
+# Optional in live mode; without it, images go to the chat model.
+LIVE_OPTIONAL = ["OPENROUTER_VISION_MODEL"]
 
 
 class SimError(Exception):
@@ -157,12 +159,13 @@ def service_env(values: dict[str, str]) -> dict[str, str]:
 
 def live_keys() -> dict[str, str]:
     """Only the OpenRouter keys, from the environment or the repo's dotenv file."""
-    found = {k: os.environ[k] for k in LIVE_KEYS if os.getenv(k)}
+    wanted = LIVE_KEYS + LIVE_OPTIONAL
+    found = {k: os.environ[k] for k in wanted if os.getenv(k)}
     path = ROOT / ".env"
     if path.exists():
         for line in path.read_text().splitlines():
             key, _, value = line.partition("=")
-            if key.strip() in LIVE_KEYS and value.strip() and key.strip() not in found:
+            if key.strip() in wanted and value.strip() and key.strip() not in found:
                 found[key.strip()] = value.strip().strip("'\"")
     missing = [k for k in LIVE_KEYS if k not in found]
     if missing:
@@ -224,13 +227,19 @@ class Config:
             "PORT": str(HOST_PORT),
             "LOG_FORMAT": "json",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
+            # Attachments are served by fakecord, not Discord's CDN.
+            "DISCORD_MEDIA_EXTRA_HOSTS": f"127.0.0.1:{FAKECORD_PORT}",
         }
         if self.live:
-            values["OPENROUTER_CHAT_API_KEY"] = live_keys()["OPENROUTER_CHAT_API_KEY"]
+            keys = live_keys()
+            values["OPENROUTER_CHAT_API_KEY"] = keys["OPENROUTER_CHAT_API_KEY"]
+            if "OPENROUTER_VISION_MODEL" in keys:
+                values["OPENROUTER_VISION_MODEL"] = keys["OPENROUTER_VISION_MODEL"]
         else:
             values |= {
                 "OPENROUTER_BASE_URL": f"http://127.0.0.1:{FAKECORD_PORT}/openrouter",
                 "OPENROUTER_CHAT_API_KEY": "sim-key",
+                "OPENROUTER_VISION_MODEL": "sim/vision",
             }
         return service_env(values)
 

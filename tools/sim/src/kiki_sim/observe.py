@@ -166,6 +166,8 @@ def render(message: dict, state: dict) -> str:
         reply = f" ↩ {name_of(state, message['referenced_message']['author'])}"
     emoji = reactions(state, message["id"])
     flags = (" [deleted]" if message.get("deleted") else "") + (f" {emoji}" if emoji else "")
+    for a in message.get("attachments") or []:
+        text += f" [{a['filename']}]"
     channel = channels.get(message["channel_id"], message["channel_id"])
     return f"[{channel}] {name_of(state, message['author'])}{reply}: {text}{flags}"
 

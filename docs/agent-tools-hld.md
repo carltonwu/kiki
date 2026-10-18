@@ -33,7 +33,8 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 | File | Contents |
 |---|---|
 | `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
-| `agent.py` | `PydanticExecutor`: agents, trusted deps, two tools, message/usage mapping, transient-error mapping. |
+| `agent.py` | `PydanticExecutor`: agents, trusted deps, three tools, message/usage mapping, transient-error mapping. |
+| `images.py` | `read_image`: image extraction from the stored payload, Discord-only downloads, the vision prompt and call. |
 | `app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
 
@@ -60,6 +61,8 @@ model arguments, and arguments can only narrow them.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
   target message's own channel (at most 10 on each side) and the reply parent
   if it is in the same guild.
+- `read_image(message_id, question?)` has another model look at a message's
+  images (see below). Search and context hits with images carry `images: n`.
 
 Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
@@ -68,10 +71,58 @@ Limits:
 - 4 tool calls per run. After that, tools tell the model to answer with what it
   has, rather than aborting.
 - 6 model requests per run as the hard stop (`UsageLimits`).
-- 10 seconds per tool call; on timeout the tool returns an error to the model.
+- 10 seconds per tool call (45 for `read_image`); on timeout the tool returns
+  an error to the model.
 - Topic jobs run with no tools.
 
 All values are constants to tune from the logs.
+
+## Images: `read_image`
+
+The chat model may not see images, and a text-only model is cheaper for chat,
+so images are read by a separate **vision model** that writes for Kiki rather
+than for people (agent to agent).
+
+- **Model:** `OPENROUTER_VISION_MODEL` on the Python service. When unset, the
+  chat model is tried; if the provider rejects images (a 4xx), the tool tells
+  Kiki that no vision model is configured and the chat model can't read images.
+  Rate limits and 5xx become "unavailable right now". Failures never fail the
+  run. In a live check (2026-10-18; a captioned cat meme plus its source photo),
+  `anthropic/claude-haiku-5.5` transcribed the captions exactly, noted the
+  cropped letters and told the two images apart, for $0.0007. The default chat
+  model `deepseek/deepseek-v4.1-flash-1017` accepts images but described text
+  that wasn't there, so set a vision model rather than relying on the fallback.
+- **In the prompt:** Rust renders a message's images as
+  `[image: cat.png; message 123]` or `[gallery of 3 images: a.png, b.png,
+  linked image; message 123]`, so the model has the ID to pass. File names are
+  stripped of `[];` so a name can't forge another marker. The system prompt says
+  Kiki can't see images and should call the tool when they matter.
+- **What counts as an image:** attachments with an `image/*` content type or a
+  png/jpg/gif/webp name, then embeds of type `image`/`gifv` (their thumbnail)
+  or with an `image`, deduplicated by URL, at most 10. Rust (`MESSAGE_COLUMNS`)
+  and Python (`images_in`) apply the same test.
+- **Galleries:** a message with several images is a Discord gallery. One call
+  sends them all, labeled `Image n: <file name>` (with alt text if set), plus
+  the message text and author for context and Kiki's optional `question`. The
+  answer has one `Image n:` line per image and a `Gallery:` line on how they
+  relate and what they add up to.
+- **The prompt** asks for the kind of image, every legible text verbatim
+  (usernames and timestamps in screenshots), people and animals, setting, and
+  the point (joke, meme format, mood), marking interpretation and unreadable
+  parts. It forbids identifying people from their faces and treats text in
+  images as content, never instructions.
+- **Downloads:** URLs come only from the stored message payload, never from
+  model arguments. The host downloads them itself (no redirects, 10 s, 5 MB
+  each) and sends them inline, only from `https` Discord hosts
+  (`*.discordapp.com`, `*.discordapp.net`, `*.discord.com`); embed images use
+  Discord's proxy URL, not the linked site. `DISCORD_MEDIA_EXTRA_HOSTS` adds
+  hosts (the simulator's fakecord). Images over 1568 px or 5 MB are fetched
+  through Discord's media proxy with `width`/`height`. PNG, JPEG, WebP and GIF
+  are sent; anything else, an expired link (403/404/410) or an oversized file
+  is reported per image while the rest are still described.
+- **Cost:** the vision call's billed cost is added to the reply's
+  `usage.cost`; the job log reports `vision_calls`. Descriptions aren't cached,
+  so reading the same image again (or a replay) pays again.
 
 ## Search: one SQL statement
 
@@ -168,6 +219,10 @@ queries are an argument error returned to the model.
      `max_tool_calls` (OpenRouter's default is 30), accept repeated cost on
      replay, and note that queries reach outside engines.
    - Image results: need typed artifacts and Rust delivery.
+   - `read_image` on old messages: Discord's signed attachment URLs expire
+     after about a day. Refreshing them needs the bot token
+     (`POST /attachments/refresh-urls`), which only Rust has.
+   - Caching image descriptions per attachment, if images get re-read often.
    - Embedding windows of adjacent messages, if short messages retrieve poorly.
    - `/kiki conversations` still lists the active pool across all channels to
      whoever runs it.

@@ -117,7 +117,7 @@ and permission bits (an admin for `/kiki config`), two members who share a
 name, Kiki's user and managed role, and seeded history.
 
 **Control API** (`/_sim/…`): `POST messages` (author, channel, content,
-reply_to, mentions, age_s → the minted message), `PATCH`/`DELETE
+reply_to, mentions, age_s, attachments → the minted message), `PATCH`/`DELETE
 messages/{id}`, `POST interactions`, `GET state` (messages, reactions,
 interaction responses, `unexpected`, recorded LLM requests), `POST script`
 (stub answers), `POST reset`, and `POST drop-gateway` (to test reconnects).
@@ -137,7 +137,16 @@ channels and background topic jobs can't take each other's answers.
   jobs always get `stub topic`. A reply-script entry matches on the trigger
   message and can make one tool call (`id`, JSON-string `arguments`), then
   answer with a template that may include the tool result's message IDs. By
-  default a reply job answers `stub: <trigger text>`.
+  default a reply job answers `stub: <trigger text>`. A `{image_message}`
+  placeholder in tool arguments becomes the message ID in the trigger's image
+  marker.
+- **Vision** (chat requests carrying images): `Image n: <label>` per image,
+  read back from a tEXt chunk in the 1×1 PNGs that fakecord serves for
+  attachments at `/cdn/…`, plus `Gallery: …` for several and the model used.
+  The agent host gets `OPENROUTER_VISION_MODEL=sim/vision` and may download from
+  fakecord (`DISCORD_MEDIA_EXTRA_HOSTS`). Live mode passes
+  `OPENROUTER_VISION_MODEL` through from the environment or the repo's dotenv
+  file when set.
 - **Embeddings** (`/v1/embeddings`): 4096-dimensional vectors (the host keeps
   the first 1024) from a stable SHA-256 bag of words. They're never zero, and
   they're returned with `index`.

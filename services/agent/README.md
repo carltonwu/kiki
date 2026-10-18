@@ -10,7 +10,7 @@ is set.
 
 ## Tools and search
 
-Reply jobs get two tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get three tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -23,9 +23,16 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- `read_image(message_id, question?)`: a vision model describes the message's images
+  for Kiki, each one and a gallery as a whole. The model is `OPENROUTER_VISION_MODEL`,
+  or the chat model when unset (the tool reports an error if it can't read images).
+  Images come from the stored message and are downloaded only from Discord's CDN and
+  media proxy (`DISCORD_MEDIA_EXTRA_HOSTS` adds hosts, for the simulator). Search and
+  context hits with images carry `images: n`.
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 tool calls and 6 model requests. Topic jobs have
+(already in the prompt). A run gets 4 tool calls and 6 model requests (a
+`read_image` vision call is separate and adds its cost to the reply's). Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all

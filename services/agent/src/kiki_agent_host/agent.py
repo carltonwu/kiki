@@ -24,7 +24,7 @@ from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
 
-from . import retrieval
+from . import images, retrieval
 from .contracts import JobRequest, JobResult, Message, Usage
 from .executor import TransientError
 
@@ -34,6 +34,7 @@ os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 MAX_TOOL_CALLS = 4
 MAX_MODEL_REQUESTS = 6
 TOOL_TIMEOUT_SECONDS = 10
+VISION_TIMEOUT_SECONDS = 45  # downloads plus a vision model call
 EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
 
 
@@ -45,20 +46,23 @@ class Deps:
     scope: retrieval.Scope
     embed: retrieval.Embedder
     roster: retrieval.Roster
+    vision: images.Vision
     tool_calls: int = 0
     indexing: asyncio.Task[retrieval.Semantic] | None = None
     job_id: str = ""
 
 
-async def guarded(ctx: RunContext[Deps], name: str, work) -> dict:
+async def guarded(
+    ctx: RunContext[Deps], name: str, work, timeout: float = TOOL_TIMEOUT_SECONDS
+) -> dict:
     ctx.deps.tool_calls += 1
     if ctx.deps.tool_calls > MAX_TOOL_CALLS:
         logger.debug("tool budget exhausted job_id=%s tool=%s", ctx.deps.job_id, name)
-        return {"error": "Search budget used up. Answer with what you have."}
+        return {"error": "Tool budget used up. Answer with what you have."}
     started = time.monotonic()
     outcome = "ok"
     try:
-        async with asyncio.timeout(TOOL_TIMEOUT_SECONDS):
+        async with asyncio.timeout(timeout):
             result = await work()
     except TimeoutError:
         outcome = "timeout"
@@ -74,7 +78,7 @@ async def guarded(ctx: RunContext[Deps], name: str, work) -> dict:
         ctx.deps.scope.channel_id,
         ctx.deps.scope.conversation_id,
         (time.monotonic() - started) * 1000,
-        len(result.get("messages", [])),
+        len(result.get("messages", result.get("images", []))),
         result.get("semantic", "-"),
         "error" if outcome == "ok" and "error" in result else outcome,
     )
@@ -151,6 +155,30 @@ async def get_message_context(
     return await guarded(ctx, "get_message_context", work)
 
 
+async def read_image(ctx: RunContext[Deps], message_id: str, question: str | None = None) -> dict:
+    """Look at the images in one message: a single image or a whole gallery.
+
+    Another model looks at them and describes each image in detail (with any
+    text in it), and a gallery as a whole.
+
+    Args:
+        message_id: The message ID shown with its images, like "[image: cat.png;
+            message 123]", or a message `id` from search results.
+        question: Optional: what you want to know about them, so the
+            description covers it.
+    """
+
+    async def work():
+        if not message_id.strip().isdigit():
+            raise ValueError("message_id must be the ID of a message with images")
+        deps = ctx.deps
+        return await images.read_image(
+            deps.connection, deps.scope, deps.roster, deps.vision, int(message_id), question
+        )
+
+    return await guarded(ctx, "read_image", work, VISION_TIMEOUT_SECONDS)
+
+
 async def index_guild(deps: Deps) -> retrieval.Semantic:
     try:
         found, more = await retrieval.index_pending(
@@ -185,7 +213,7 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-chat = Agent(deps_type=Deps, tools=[search_messages, get_message_context])
+chat = Agent(deps_type=Deps, tools=[search_messages, get_message_context, read_image])
 plain = Agent()
 
 
@@ -200,8 +228,10 @@ def history(messages: list[Message]) -> list[ModelMessage]:
 
 
 class PydanticExecutor:
-    def __init__(self, database_url: str, api_key: str):
+    def __init__(self, database_url: str, api_key: str, vision_model: str = ""):
         self.database_url = database_url
+        # Without one, images go to the chat model, which may not read them.
+        self.vision_model = vision_model
         if os.getenv("OPENROUTER_BASE_URL"):
             self.provider = OpenRouterProvider(openai_client=retrieval.openrouter_client(api_key))
         else:
@@ -230,6 +260,8 @@ class PydanticExecutor:
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
         }
         embed = retrieval.Embedder(self.embeddings)
+        vision_name = self.vision_model or request.model
+        vision = images.Vision(self.model(vision_name), vision_name, not self.vision_model)
         try:
             if request.kind == "topic":
                 result = await plain.run(prompt, **options)
@@ -247,6 +279,7 @@ class PydanticExecutor:
                         scope,
                         embed,
                         retrieval.Roster.of(request.people),
+                        vision,
                         job_id=request.id,
                     )
                     # Embedding is cheap: start while the model reads the prompt,
@@ -271,11 +304,11 @@ class PydanticExecutor:
             if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
         ]
         cost = sum(billed) if billed else (float(usage.cost) if usage.cost is not None else None)
-        if embed.cost:
-            cost = (cost or 0) + embed.cost
+        if embed.cost or vision.cost:
+            cost = (cost or 0) + embed.cost + vision.cost
         logger.info(
             "execution completed job_id=%s kind=%s channel_id=%s conversation_id=%s model=%s "
-            "requests=%d tool_calls=%d prompt_tokens=%d completion_tokens=%d "
+            "requests=%d tool_calls=%d vision_calls=%d prompt_tokens=%d completion_tokens=%d "
             "cost_usd=%s latency_ms=%d",
             request.id,
             request.kind,
@@ -284,6 +317,7 @@ class PydanticExecutor:
             request.model,
             usage.requests,
             usage.tool_calls,
+            vision.calls,
             usage.input_tokens,
             usage.output_tokens,
             cost,
