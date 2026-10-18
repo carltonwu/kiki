@@ -1,5 +1,5 @@
 """`read_image`: a Discord message's images, described by a vision model for Kiki
-(the common image code is `vision.py`).
+(the shared image code is `fetch.py` and `vision.py`).
 
 Kiki's chat model may not see images, so another model looks at them and writes
 a detailed description for her (agent to agent). A message with several images
@@ -7,7 +7,7 @@ is a Discord gallery: it's read in one call, image by image and as a whole.
 
 Images come only from the stored message's own payload (attachments and image
 embeds), never from model arguments, and are downloaded only from Discord's
-media hosts (`vision.download`), so a message can't make the host fetch an
+media hosts (`fetch.download`), so a message can't make the host fetch an
 arbitrary URL.
 """
 
@@ -19,9 +19,10 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent, UserContent
 
-from .chat.attachments import Image, images_in
-from .chat.scope import HEARD, MENTION, Roster, Scope, channel_names, speakers
-from .vision import ImageRefused, Vision, client, download, look, refresh, sniff
+from ..chat.attachments import Image, images_in
+from ..chat.scope import HEARD, MENTION, Roster, Scope, channel_names, speakers
+from .fetch import client, download, refresh, sniff
+from .vision import ImageRefused, Vision, look
 
 MAX_OUTPUT_TOKENS = 3000
 
@@ -89,7 +90,7 @@ async def read_image(
     if not images:
         return {"error": "that message has no images"}
 
-    # Kiki's own drawings come from the host's store (`images.py`), not Discord's
+    # Kiki's own drawings come from the host's store (`generation.save`), not Discord's
     # CDN, whose links expire.
     drawn = await drawings(connection, scope, images) if m["author_bot"] else {}
     async with client(transport) as http:

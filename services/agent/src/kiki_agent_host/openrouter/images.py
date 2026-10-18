@@ -1,5 +1,4 @@
-"""Image generation: OpenRouter's Images API as a Pydantic AI image model, and storage
-for Rust to post the result."""
+"""OpenRouter's Images API as a Pydantic AI image model."""
 
 import base64
 import binascii
@@ -7,10 +6,7 @@ from collections.abc import Sequence
 
 import httpx
 from openai import AsyncOpenAI
-from psycopg import AsyncConnection
-from psycopg.types.json import Jsonb
-from pydantic_ai import ImageGenerator
-from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior, UserError
+from pydantic_ai.exceptions import UnexpectedModelBehavior, UserError
 from pydantic_ai.images import (
     GeneratedImage,
     ImageGenerationInput,
@@ -20,12 +16,6 @@ from pydantic_ai.images import (
 )
 from pydantic_ai.messages import BinaryImage, ImageUrl
 
-from .vision import ImageRefused, sniff
-
-# Discord's smallest upload limit is 10 MiB; leave room for the rest of the request.
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-# Kiki's prompt plus the subjects and reference legend the image job adds.
-MAX_PROMPT_CHARS = 8000
 # GPT Image's limit, and OpenRouter's `input_references` range for it.
 MAX_REFERENCES = 16
 # GPT Image bills by output tokens: "medium" keeps a 1024² image at a few cents
@@ -115,72 +105,3 @@ def reference_url(image: ImageGenerationInput) -> str:
     if isinstance(image, ImageUrl):
         return image.url
     raise UserError("OpenRouter reference images must be bytes or URLs")
-
-
-async def generate(
-    model: ImageGenerationModel,
-    prompt: str,
-    aspect_ratio: str | None = None,
-    references: Sequence[BinaryImage] = (),
-) -> tuple[bytes, str, float]:
-    """The image's bytes, MIME type and billed cost, or ImageRefused/ValueError.
-    `references` go to the model in order, as the prompt numbers them."""
-    prompt = prompt.strip()
-    if not prompt:
-        raise ValueError("prompt must describe the image")
-    if len(prompt) > MAX_PROMPT_CHARS:
-        raise ValueError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
-    settings: ImageGenerationSettings = {"aspect_ratio": aspect_ratio} if aspect_ratio else {}
-    try:
-        result = await ImageGenerator(model).generate(
-            prompt, images=list(references), settings=settings
-        )
-    except ContentFilterError:
-        raise ImageRefused("The image model refused that prompt.") from None
-    except UnexpectedModelBehavior:
-        raise ImageRefused("No image was generated.") from None
-    image = result.image
-    cost = float((result.provider_details or {}).get("cost") or 0)
-    # The bytes decide the type (`vision.sniff`), as for images Kiki reads: a
-    # provider's declared type can be wrong, and Discord shows these inline.
-    if len(image.data) > MAX_IMAGE_BYTES:
-        raise ImageRefused("The generated image was too large to send.")
-    media_type = sniff(image.data[:12])
-    if media_type is None:
-        raise ImageRefused(f"The image model returned an unsupported {image.media_type} file.")
-    return image.data, media_type, cost
-
-
-async def save(
-    connection: AsyncConnection,
-    job_id: str,
-    mime_type: str,
-    data: bytes,
-    *,
-    prompt: str | None = None,
-    model: str | None = None,
-    subjects: list | None = None,
-    references: list | None = None,
-    cost: float | None = None,
-    latency_ms: int | None = None,
-) -> int:
-    """Saves a drawing with what it was made from (`subjects` and `references` are
-    JSON-ready lists), so a later look at it can say why it came out as it did."""
-    cursor = await connection.execute(
-        "INSERT INTO agent_host_images (job_id, mime_type, data, prompt, model, subjects,"
-        " reference_images, cost_usd, latency_ms)"
-        " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-        (
-            job_id,
-            mime_type,
-            data,
-            prompt,
-            model,
-            Jsonb(subjects or []),
-            Jsonb(references or []),
-            cost,
-            latency_ms,
-        ),
-    )
-    row = await cursor.fetchone()
-    return row[0]

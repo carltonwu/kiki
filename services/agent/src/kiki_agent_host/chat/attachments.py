@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
-from ..vision import MAX_BYTES
+from ..media.fetch import MAX_BYTES
 
 MAX_IMAGES = 10  # Discord's attachment limit per message
 MAX_SIDE = 1568  # larger images are downscaled by Discord's media proxy

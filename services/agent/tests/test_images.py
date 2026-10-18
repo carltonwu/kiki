@@ -20,9 +20,11 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models.function import FunctionModel
 
-from kiki_agent_host import drawing, images, vision
 from kiki_agent_host.agent import MAX_IMAGES, PydanticExecutor
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest, Subject
+from kiki_agent_host.media import drawing, fetch, generation
+from kiki_agent_host.media.vision import ImageRefused
+from kiki_agent_host.openrouter.images import MAX_REFERENCES, OPENAI_QUALITY, OpenRouterImageModel
 
 PNG = b"\x89PNG\r\n\x1a\nfake"
 JPEG = b"\xff\xd8\xff\xe0nougie"
@@ -52,8 +54,8 @@ async def test_openrouter_model_calls_the_images_api_and_reports_cost():
         ]
         return httpx.Response(200, json={"created": 1, "data": data, "usage": {"cost": 0.03}})
 
-    model = images.OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
-    data, mime, cost = await images.generate(model, "  a frog in a hat ", "3:4")
+    model = OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
+    data, mime, cost = await generation.generate(model, "  a frog in a hat ", "3:4")
     assert (data, mime, cost) == (PNG, "image/png", 0.03)
     [(path, authorization, body)] = sent
     assert path == "/api/v1/images"
@@ -63,7 +65,7 @@ async def test_openrouter_model_calls_the_images_api_and_reports_cost():
         "prompt": "a frog in a hat",
         "n": 1,
         "aspect_ratio": "3:4",
-        "quality": images.OPENAI_QUALITY,
+        "quality": OPENAI_QUALITY,
     }
 
 
@@ -75,12 +77,12 @@ async def test_openrouter_model_sends_references_in_order_as_data_urls():
         image = {"b64_json": base64.b64encode(PNG).decode()}
         return httpx.Response(200, json={"data": [image], "usage": {"cost": 0.05}})
 
-    model = images.OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
+    model = OpenRouterImageModel("openai/gpt-image-2.5-flare", openrouter(handler))
     references = [
         BinaryImage(JPEG, media_type="image/jpeg"),
         BinaryImage(PNG, media_type="image/png"),
     ]
-    await images.generate(model, "Nougie on a beach", references=references)
+    await generation.generate(model, "Nougie on a beach", references=references)
     sent = bodies[0]["input_references"]
     assert [r["type"] for r in sent] == ["image_url", "image_url"]
     # Bytes, not Discord links (they expire), in the order the prompt numbers them.
@@ -89,7 +91,7 @@ async def test_openrouter_model_sends_references_in_order_as_data_urls():
     )
     assert sent[1]["image_url"]["url"].startswith("data:image/png;base64,")
     with pytest.raises(UserError, match="at most 16"):
-        await model.generate("x", images=[references[0]] * (images.MAX_REFERENCES + 1))
+        await model.generate("x", images=[references[0]] * (MAX_REFERENCES + 1))
 
 
 async def test_openrouter_model_sends_quality_only_to_openai_and_raises_without_images():
@@ -99,7 +101,7 @@ async def test_openrouter_model_sends_quality_only_to_openai_and_raises_without_
         bodies.append(json.loads(request.content))
         return httpx.Response(200, json={"data": [], "usage": {"cost": 0}})
 
-    model = images.OpenRouterImageModel("google/gemini-2.5-flash-image", openrouter(handler))
+    model = OpenRouterImageModel("google/gemini-2.5-flash-image", openrouter(handler))
     with pytest.raises(UnexpectedModelBehavior):
         await model.generate("x")
     assert bodies == [{"model": "google/gemini-2.5-flash-image", "prompt": "x", "n": 1}]
@@ -131,25 +133,25 @@ class FakeImageModel(TestImageGenerationModel):
 
 async def test_generate_turns_failures_into_messages_for_the_model():
     model = FakeImageModel()
-    assert await images.generate(model, " a frog ", "2:3") == (PNG, "image/png", 0.04)
+    assert await generation.generate(model, " a frog ", "2:3") == (PNG, "image/png", 0.04)
     assert model.prompts == [("a frog", {"aspect_ratio": "2:3"})]
-    # The bytes decide the type (vision.sniff), not the provider's label.
+    # The bytes decide the type (fetch.sniff), not the provider's label.
     mislabeled = FakeImageModel(media_type="image/jpeg")
-    assert (await images.generate(mislabeled, "x"))[1] == "image/png"
-    data, mime, _ = await images.generate(TestImageGenerationModel(), "x")
+    assert (await generation.generate(mislabeled, "x"))[1] == "image/png"
+    data, mime, _ = await generation.generate(TestImageGenerationModel(), "x")
     assert mime == "image/png" and data.startswith(b"\x89PNG")
     cases = [
         (FakeImageModel(error=ContentFilterError("blocked", body=None)), "refused"),
         (FakeImageModel(error=UnexpectedModelBehavior("empty", body=None)), "No image"),
         (FakeImageModel(image=b"<svg/>", media_type="image/svg+xml"), "unsupported image/svg"),
-        (FakeImageModel(image=b"0" * (images.MAX_IMAGE_BYTES + 1)), "too large"),
+        (FakeImageModel(image=b"0" * (generation.MAX_IMAGE_BYTES + 1)), "too large"),
     ]
     for model, message in cases:
-        with pytest.raises(images.ImageRefused, match=message):
-            await images.generate(model, "x")
-    for prompt in ["   ", "x" * (images.MAX_PROMPT_CHARS + 1)]:
+        with pytest.raises(ImageRefused, match=message):
+            await generation.generate(model, "x")
+    for prompt in ["   ", "x" * (generation.MAX_PROMPT_CHARS + 1)]:
         with pytest.raises(ValueError, match="prompt"):
-            await images.generate(FakeImageModel(), prompt)
+            await generation.generate(FakeImageModel(), prompt)
 
 
 def test_compose_numbers_references_and_defaults_to_a_phone_photo():
@@ -201,11 +203,11 @@ def test_verdicts_read_the_vision_check():
 
 
 def test_links_expire_and_refresh_only_for_discord():
-    assert vision.expired("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&is=2&hm=3")
-    assert not vision.expired(
+    assert fetch.expired("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&is=2&hm=3")
+    assert not fetch.expired(
         "https://cdn.discordapp.com/attachments/1/2/a.png?ex=ffffffff&is=2&hm=3"
     )
-    assert not vision.expired("https://cdn.discordapp.com/avatars/1/abc.png")
+    assert not fetch.expired("https://cdn.discordapp.com/avatars/1/abc.png")
 
 
 async def test_refresh_asks_discord_for_expired_links_only(monkeypatch):
@@ -228,8 +230,8 @@ async def test_refresh_asks_discord_for_expired_links_only(monkeypatch):
     old = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=1&hm=3"
     fresh = "https://cdn.discordapp.com/attachments/1/2/b.png?ex=ffffffff&hm=3"
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        assert await vision.refresh(http, "", [old]) == {}  # no token: nothing to ask
-        found = await vision.refresh(
+        assert await fetch.refresh(http, "", [old]) == {}  # no token: nothing to ask
+        found = await fetch.refresh(
             http, "bot-token", [old, fresh, "https://example.com/x.png?ex=1"]
         )
     assert found == {old: old.replace("ex=1", "ex=ffffffff")}

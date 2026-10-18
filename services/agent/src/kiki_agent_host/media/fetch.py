@@ -1,53 +1,23 @@
-"""The common image backing: reading (`reading.py`, `read_image`), drawing
-(`images.py`, `generate_image`) and custom emoji descriptions (`emojis.py`).
-
-- One set of image types, decided by the bytes (`sniff`), for downloads and for
-  generated images alike.
-- Downloads only from Discord's media hosts, refreshing expired attachment links.
-- One vision model call that maps provider failures to `ImageRefused`, the one
-  image error whose message is safe to show the chat model, and adds billed cost.
-"""
+"""Image downloads from the chat platform's media hosts only, with expired
+attachment links refreshed first. One set of image types, decided by the bytes
+(`sniff`), for downloads and generated images alike."""
 
 import logging
 import time
-from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import BinaryContent, ModelResponse, UserContent
-from pydantic_ai.models import Model
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.messages import BinaryContent
 
-from .config import discord_api, extra_media_hosts
+from ..config import discord_api, extra_media_hosts
 
 logger = logging.getLogger(__name__)
+
 
 MAX_BYTES = 5 * 1024 * 1024  # the strictest common provider limit per image
 DOWNLOAD_TIMEOUT_SECONDS = 10
 # Discord's refresh endpoint takes at most 50 links per call.
 REFRESH_BATCH = 50
-
-viewer = Agent()
-
-
-@dataclass
-class Vision:
-    """The model that reads images; `fallback` means it's the chat model."""
-
-    model: Model
-    name: str
-    fallback: bool = False
-    cost: float = 0.0
-    calls: int = 0
-    # The bot token, to refresh expired attachment links (`refresh`); none skips it.
-    discord_token: str = ""
-
-
-class ImageRefused(ValueError):
-    """No usable image (read, described or drawn); the message is safe to show the
-    chat model. A ValueError, so tools report it rather than failing the reply."""
 
 
 def client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
@@ -145,68 +115,3 @@ def sniff(head: bytes) -> str | None:
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp"
     return None
-
-
-async def look(
-    vision: Vision,
-    prompt: list[UserContent],
-    *,
-    max_tokens: int,
-    instructions: str | None = None,
-    think: bool = True,
-) -> str:
-    """One vision model request; its billed cost is added to `vision.cost`.
-    `think=False` turns off a reasoning model's thinking, for quick yes/no checks:
-    over several photos it can take longer than the answer is worth."""
-    vision.calls += 1
-    settings: dict = {"max_tokens": max_tokens, "openrouter_usage": {"include": True}}
-    if not think:
-        settings["openrouter_reasoning"] = {"enabled": False}
-        settings["temperature"] = 0  # the same photos get the same verdicts
-    try:
-        run = await viewer.run(
-            prompt,
-            model=vision.model,
-            instructions=instructions,
-            model_settings=settings,
-            usage_limits=UsageLimits(request_limit=1),
-        )
-    except ModelHTTPError as error:
-        logger.warning(
-            "vision call failed model=%s fallback=%s status=%d",
-            vision.name,
-            vision.fallback,
-            error.status_code,
-        )
-        if error.status_code == 429 or error.status_code >= 500:
-            raise ImageRefused(
-                "The image model is unavailable right now; try again later."
-            ) from None
-        if vision.fallback:
-            raise ImageRefused(
-                "No vision model is configured (OPENROUTER_VISION_MODEL), and the "
-                f"chat model {vision.name} can't read images. Tell them you can't see "
-                "images right now."
-            ) from None
-        raise ImageRefused(f"The image model {vision.name} rejected these images.") from None
-    except (ModelAPIError, UnexpectedModelBehavior) as error:
-        logger.warning(
-            "vision call failed model=%s error_type=%s", vision.name, type(error).__name__
-        )
-        raise ImageRefused("The image model is unavailable right now; try again later.") from None
-    vision.cost += billed_cost(run) or 0.0
-    if not run.output.strip():
-        raise ImageRefused("The image model returned no description.")
-    return run.output.strip()
-
-
-def billed_cost(result) -> float | None:
-    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
-    billed = [
-        m.provider_details["cost"]
-        for m in result.new_messages()
-        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
-    ]
-    if billed:
-        return sum(billed)
-    return float(result.usage.cost) if result.usage.cost is not None else None

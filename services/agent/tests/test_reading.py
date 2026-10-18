@@ -7,12 +7,13 @@ from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from kiki_agent_host import vision
 from kiki_agent_host.chat.attachments import images_in, sized
 from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.chat.search import message_context
-from kiki_agent_host.reading import read_image
-from kiki_agent_host.vision import Vision, allowed
+from kiki_agent_host.media import fetch
+from kiki_agent_host.media.fetch import allowed
+from kiki_agent_host.media.reading import read_image
+from kiki_agent_host.media.vision import Vision
 
 GUILD, CHANNEL, CONVERSATION = 1, 2, 1
 SCOPE = Scope(GUILD, CHANNEL, CONVERSATION)
@@ -94,7 +95,7 @@ def serve(routes: dict[str, tuple[int, bytes, str]]):
 
 
 async def test_download_checks_status_size_and_format(monkeypatch):
-    monkeypatch.setattr(vision, "MAX_BYTES", 10)
+    monkeypatch.setattr(fetch, "MAX_BYTES", 10)
     transport = serve(
         {
             "/ok.png": (200, PNG[:9], "image/png"),
@@ -109,7 +110,7 @@ async def test_download_checks_status_size_and_format(monkeypatch):
     async with httpx.AsyncClient(transport=transport) as client:
 
         async def get(path, media_type=None):
-            return await vision.download(client, f"https://cdn.discordapp.com{path}", media_type)
+            return await fetch.download(client, f"https://cdn.discordapp.com{path}", media_type)
 
         ok = await get("/ok.png")
         assert isinstance(ok, BinaryContent) and ok.media_type == "image/png"
@@ -121,7 +122,7 @@ async def test_download_checks_status_size_and_format(monkeypatch):
         assert await get("/page.png", "image/png") == "unsupported format (text/html)"
         assert await get("/svg", "image/svg+xml") == "unsupported format (image/svg+xml)"
         assert await get("/down.png") == "download failed (HTTP 503)"
-        assert await vision.download(client, "https://example.com/a.png") == (
+        assert await fetch.download(client, "https://example.com/a.png") == (
             "not hosted by Discord"
         )
 

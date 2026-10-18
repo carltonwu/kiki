@@ -35,7 +35,7 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import db, drawing, images, memory_tools, reading
+from . import db, memory_tools
 from .chat import emojis
 from .chat.indexing import index_pending
 from .chat.scope import Roster, Scope, resolve_person
@@ -57,9 +57,11 @@ from .contracts import (
     WebUse,
 )
 from .executor import TransientError
+from .media import drawing, generation, reading
+from .media.vision import ImageRefused, Vision, billed_cost, look
 from .openrouter.client import openrouter_client
 from .openrouter.embeddings import Embedder
-from .vision import Vision, billed_cost, look
+from .openrouter.images import OpenRouterImageModel
 
 logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
@@ -120,7 +122,7 @@ async def guarded(
     except TimeoutError:
         outcome = "timeout"
         result = {"error": "Timed out."}
-    except images.ImageRefused as e:
+    except ImageRefused as e:
         outcome = "refused"
         result = {"error": str(e)}
     except ValueError as e:
@@ -573,7 +575,7 @@ class PydanticExecutor:
         return WebOpenRouterModel(name, provider=self.provider)
 
     def image_model(self, name: str) -> ImageGenerationModel:
-        return images.OpenRouterImageModel(name, self.images)
+        return OpenRouterImageModel(name, self.images)
 
     async def execute(self, request: JobRequest) -> JobResult:
         started = time.monotonic()
@@ -700,13 +702,13 @@ class PydanticExecutor:
                 prompt, references, pictures = drawing.compose(plan, found)
                 try:
                     async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
-                        data, mime_type, image_cost = await images.generate(
+                        data, mime_type, image_cost = await generation.generate(
                             self.image_model(request.image_model),
                             prompt,
                             plan.aspect_ratio,
                             pictures,
                         )
-                except images.ImageRefused as e:
+                except ImageRefused as e:
                     error, reason = "refused", str(e)
                 except ValueError as e:
                     error, reason = "failed", str(e)
@@ -719,7 +721,7 @@ class PydanticExecutor:
                 latency_ms = int((time.monotonic() - started) * 1000)
                 if error is None:
                     image = Image(
-                        id=await images.save(
+                        id=await generation.save(
                             connection,
                             request.id,
                             mime_type,

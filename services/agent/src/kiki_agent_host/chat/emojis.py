@@ -5,7 +5,7 @@ resync:true`) and then calls `POST /v1/emojis/describe`, which lands in
 `describe_pending`. Descriptions are embedded like messages, so `search` fuses
 full text and vectors the way message search does, without the recency vote.
 The model call is passed in; images are fetched like `read_image`'s
-(`vision.download`: Discord hosts only, typed by their bytes).
+(`media.fetch.download`: Discord hosts only, typed by their bytes).
 """
 
 import asyncio
@@ -19,8 +19,8 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent
 
-from .. import vision
 from ..config import cdn_base
+from ..media import fetch
 from ..openrouter.embeddings import EMBED_BATCH, Embedder
 from .search import CANDIDATES, MIN_SIMILARITY, RRF_K
 
@@ -58,7 +58,7 @@ class ImageUnavailable(Exception):
 async def fetch_image(client: httpx.AsyncClient, emoji_id: int) -> BinaryContent:
     """The emoji as a PNG (the first frame, if animated): every vision model takes PNG."""
     url = f"{cdn_base()}/emojis/{emoji_id}.png?size=128"
-    image = await vision.download(client, url, "image/png")
+    image = await fetch.download(client, url, "image/png")
     if isinstance(image, str):
         raise ImageUnavailable(image)
     return image
@@ -141,7 +141,7 @@ async def describe_pending(
         )
         return True
 
-    async with client or vision.client() as http:
+    async with client or fetch.client() as http:
         results = await asyncio.gather(*(one(http, *row) for row in claimed))
     described = sum(results)
     try:

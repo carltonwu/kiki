@@ -12,7 +12,7 @@ class Settings:
     job_timeout_seconds: float = 120
     openrouter_api_key: str = ""
     openrouter_vision_model: str = ""
-    # Refreshes expired Discord attachment links (reference images; `vision.refresh`).
+    # Refreshes expired Discord attachment links (reference images; `media.fetch.refresh`).
     discord_bot_token: str = ""
 
     def __post_init__(self) -> None:
