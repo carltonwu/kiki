@@ -94,6 +94,9 @@ settings whose upper bound the operator can lower with an env var (see Bounds).
 | `pool_max_messages` | env `POOL_MAX_MESSAGES` | 10 | 1–50 | server |
 | `max_active_conversations` | env `MAX_ACTIVE_CONVERSATIONS` | 8 | 1–8 | server (after pool isolation) |
 | `decide_min_confidence` | env `JEV_MIN_CONFIDENCE` | 0.5 | 0–1 | server |
+| `decide_keyword_min_confidence` | default | 0.25 | 0–1: the bar when a keyword named Kiki | server |
+| `follow_up_window` | default | 5 min | 0–1 h: after Kiki replies, a participant's unsure Decide answer (below the bar, or "no" below the next setting) continues that conversation | server |
+| `follow_up_max_no_confidence` | default | 0.55 | 0–1 | server |
 | `stale_after` | const `STALE_AFTER_SECS` | 30 min | 1 min–24 h | server |
 | `stale_min_confidence` | const `STALE_MIN_CONFIDENCE` | 0.9 | ≥ decide_min_confidence, ≤ 1 | server |
 | `decide_recent_messages` | const `RECENT_MESSAGES` | 15 | 1–50 | server, ceiling |

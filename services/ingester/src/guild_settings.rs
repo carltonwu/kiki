@@ -52,6 +52,9 @@ settings! { r, a;
     active_window: u64 = r.active_window.as_secs(), Kind::Duration(1000, 0, 86_400), "Decide on active-channel messages (seconds)";
     max_active_conversations: i64 = r.max_active_conversations, Kind::Integer(1, 8), "Open conversations in this server";
     decide_min_confidence: f64 = r.jev_min_confidence, Kind::Float(0.0, 1.0), "Minimum Decide confidence";
+    decide_keyword_min_confidence: f64 = 0.25, Kind::Float(0.0, 1.0), "Minimum Decide confidence when Kiki is named";
+    follow_up_window: u64 = 300, Kind::Duration(1000, 0, 3600), "After Kiki replies, a participant's unsure Decide answer continues (seconds)";
+    follow_up_max_no_confidence: f64 = 0.55, Kind::Float(0.0, 1.0), "Decide must be this sure to ignore such a follow-up";
     stale_after: u64 = 1800, Kind::Duration(1000, 60, 86_400), "Idle time before a conversation is stale (seconds)";
     stale_min_confidence: f64 = 0.9, Kind::Float(0.0, 1.0), "Confidence to continue a stale conversation";
     decide_recent_messages: i64 = 15, Kind::Integer(1, 50), "Recent channel messages shown to Decide";
@@ -392,7 +395,8 @@ pub mod tests {
             "chat_model": "test/default", "keywords": ["kiki"],
             "pool_debounce": 500, "pool_max_wait": 8000, "pool_max_messages": 10,
             "active_window": 3600, "max_active_conversations": 8,
-            "decide_min_confidence": 0.5, "stale_after": 1800, "stale_min_confidence": 0.9,
+            "decide_min_confidence": 0.5, "decide_keyword_min_confidence": 0.25,
+            "follow_up_window": 300, "follow_up_max_no_confidence": 0.55, "stale_after": 1800, "stale_min_confidence": 0.9,
             "decide_recent_messages": 15, "decide_conversation_preview": 3,
             "history_messages": 30, "channel_context": 8, "channel_context_age": 1800,
             "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12

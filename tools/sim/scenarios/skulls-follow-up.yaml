@@ -1,0 +1,12 @@
+name: a question to Kiki right after her reply is answered
+# 2026-10-18: Ethan's "Do I not have to reply to you to get a response" got Jev
+# "no" at 0.25 after Kiki had just answered his 💀💀💀.
+steps:
+  - say: {as: ethan, in: general, text: "@kiki rate my lunch", id: start}
+  - expect: {reply: true}
+  - say: {as: ethan, in: general, text: "💀💀💀"}
+    jev: {choice: "no", confidence: 0.9}
+  - expect: {outcome: "no", reply: false}
+  - say: {as: ethan, in: general, text: "Do I not have to reply to you to get a response"}
+    jev: {choice: "no", confidence: 0.25}
+  - expect: {outcome: continue, conversation: {same_as: start}, reply: true}

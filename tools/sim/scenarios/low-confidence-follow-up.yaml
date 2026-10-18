@@ -1,0 +1,11 @@
+name: a participant's unsure follow-up right after Kiki's reply continues
+# 2026-10-18: "bro its 11pm" (0.19) and "explain reece's life in a haiku" (0.39).
+steps:
+  - say: {as: alex, in: general, text: "@kiki whats up", id: start}
+  - expect: {reply: true}
+  - say: {as: alex, in: general, text: "bro its 11pm"}
+    jev: {choice: conversation_latest, confidence: 0.3}
+  - expect: {check: active_conversation, outcome: continue, conversation: {same_as: start}}
+  - say: {as: sam, in: general, text: "same tbh"}
+    jev: {choice: conversation_latest, confidence: 0.3}
+  - expect: {outcome: "no", reply: false}

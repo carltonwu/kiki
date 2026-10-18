@@ -19,13 +19,17 @@ use tracing::{debug, info, warn};
 use super::{Pool, PoolKey, Router, unix_millis};
 use crate::conversation;
 
-const INSTRUCTIONS: &str = "Kiki is an AI chat assistant in this Discord channel. Based on new_messages, \
-is their author talking to Kiki: continuing one of the listed conversations with her, starting a new \
-one, or not talking to her at all? Use recent_channel_messages to resolve short follow-ups: an answer \
-or correction to Kiki's recent reply continues that conversation even without mentioning her. \
-Use that reply's conversation_id to distinguish conversations with the same people. \
-Talking about Kiki or unrelated chatter is not talking to her; an active conversation alone is not \
-enough. Kiki's own messages in recent_channel_messages have from = \"Kiki\".";
+const INSTRUCTIONS: &str = "Kiki is an AI member of this Discord server, a close friend group where \
+banter, teasing and roasting are normal. Based on new_messages, is their author talking to Kiki: \
+continuing one of the listed conversations with her, starting a new one, or not talking to her at all? \
+Kiki's own messages in recent_channel_messages have from = \"Kiki\". Right after Kiki replies to \
+someone, their next message is usually for her even without her name: an answer, a correction, a \
+follow-up question, a new request, a complaint that she didn't answer, or a reaction aimed at her \
+(\"you're an idiot\", \"silly kiki\", \"so close\"). A question with \"you\" soon after her reply is \
+for her. Pick the conversation of the reply being answered (its conversation_id; \
+kiki_replied_seconds_ago says how fresh it is). Laughter or emoji alone (\"lmao\", \"💀\") is \
+usually not for her. Talking about Kiki to other people, or chatter between other people, is not \
+talking to her; an active conversation alone is not enough.";
 // Jev allows 10 choices: eight conversations plus "new" and "no".
 const CONVERSATION_CHOICES: usize = 8;
 #[derive(FromRow)]
@@ -139,7 +143,10 @@ impl Router {
             };
             let outcome = match check {
                 Check::None => Outcome::No,
-                _ => self.decide(key, pool, &messages, &active, &mut jev).await,
+                _ => {
+                    self.decide(key, pool, check, &messages, &active, &mut jev)
+                        .await
+                }
             };
             (check, outcome)
         };
@@ -255,10 +262,17 @@ impl Router {
                 .iter()
                 .map(|p| p.name.clone().unwrap_or_else(|| p.id.to_string()))
                 .collect();
+            let replied: Option<i64> = sqlx::query_scalar(
+                "SELECT extract(epoch FROM now() - last_reply_at)::bigint FROM conversations WHERE id = $1",
+            )
+            .bind(c.id)
+            .fetch_one(&self.db)
+            .await?;
             let mut conversation = json!({
                 "id": c.id,
                 "participants": participants,
                 "last_active_seconds_ago": (unix_millis() - c.last_active_at_ms) / 1000,
+                "kiki_replied_seconds_ago": replied,
                 "latest_messages": latest,
             });
             if let Some(topic) = &c.topic {
@@ -269,12 +283,15 @@ impl Router {
         Ok(conversations)
     }
 
-    /// Asks Jev whether the pool is talking to Kiki. Errors, timeouts and low
-    /// confidence all count as "no".
+    /// Asks Jev whether the pool is talking to Kiki. Errors and timeouts count as
+    /// "no". So does low confidence, except when Kiki was named (a lower bar) or
+    /// the author is answering Kiki's fresh reply (see [`Self::follow_up`]).
+    #[allow(clippy::too_many_arguments)]
     async fn decide(
         &self,
         key: PoolKey,
         pool: &Pool,
+        check: Check,
         messages: &[PooledMessage],
         active: &[Value],
         jev_result: &mut JevResult,
@@ -344,12 +361,42 @@ impl Router {
         jev_result.cost_usd = answer.cost;
         jev_result.choice = Some(answer.choice.clone());
         jev_result.confidence = Some(answer.confidence);
-        if answer.confidence < pool.settings.decide_min_confidence {
+        let settings = &pool.settings;
+        let min_confidence = match check {
+            Check::Keyword => settings.decide_keyword_min_confidence,
+            _ => settings.decide_min_confidence,
+        };
+        let unsure = answer.confidence < min_confidence;
+        // Jev is least sure about short follow-ups ("bro its 11pm", "do I have to
+        // reply to you?"): from someone Kiki just answered, take those as continuing.
+        let doubtful_no =
+            answer.choice == "no" && answer.confidence < settings.follow_up_max_no_confidence;
+        if unsure || doubtful_no {
+            match self.follow_up(key, settings.follow_up_window).await {
+                Ok(Some(conversation_id)) => {
+                    info!(
+                        channel_id = key.channel_id,
+                        pool_id = pool.message_ids.last(),
+                        conversation_id,
+                        choice = answer.choice,
+                        confidence = answer.confidence,
+                        "unsure Decide on a fresh follow-up; continuing"
+                    );
+                    return Outcome::Continue {
+                        conversation_id,
+                        via: "decide",
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => warn!(error = %e, "couldn't check for a follow-up"),
+            }
+        }
+        if unsure {
             debug!(
                 channel_id = key.channel_id,
                 pool_id = pool.message_ids.last(),
                 confidence = answer.confidence,
-                min_confidence = pool.settings.decide_min_confidence,
+                min_confidence,
                 "Jev confidence too low; treating as no"
             );
             return Outcome::No;
@@ -391,6 +438,27 @@ impl Router {
                 }
             },
         }
+    }
+
+    /// The author's open conversation in this channel that Kiki replied to within
+    /// `window_secs`, if any.
+    async fn follow_up(&self, key: PoolKey, window_secs: u64) -> sqlx::Result<Option<i64>> {
+        sqlx::query_scalar(
+            r#"
+            SELECT c.id FROM conversations c
+            WHERE c.channel_id = $1 AND c.closed_at IS NULL
+              AND c.last_reply_at > now() - make_interval(secs => $3)
+              AND EXISTS (SELECT 1 FROM conversation_messages cm
+                          JOIN messages m ON m.id = cm.message_id
+                          WHERE cm.conversation_id = c.id AND m.author_id = $2)
+            ORDER BY c.last_reply_at DESC LIMIT 1
+            "#,
+        )
+        .bind(key.channel_id)
+        .bind(key.user_id)
+        .bind(window_secs as f64)
+        .fetch_optional(&self.db)
+        .await
     }
 
     async fn decide_state(
