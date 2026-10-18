@@ -212,10 +212,10 @@ mod tests {
     #[tokio::test]
     async fn loads_only_this_jobs_images() {
         use crate::agent::{context::tests, host::ImageRef};
-        use sqlx::Executor;
-        let Some((admin, db, schema)) = tests::database().await else {
+        let Some(test) = crate::test_db::migrated("ingester_images_test").await else {
             return;
         };
+        let db = test.db.clone();
         let ids: Vec<i64> = sqlx::query_scalar(
             "WITH jobs AS (INSERT INTO agent_host_jobs (id, request, status) \
                  VALUES ('reply:1', '{}', 'running'), ('reply:2', '{}', 'running')) \
@@ -239,11 +239,7 @@ mod tests {
             .load_images("reply:1", &[ImageRef { id: ids[1] }])
             .await;
         assert!(theirs.is_err());
-        db.close().await;
-        admin
-            .execute(format!("DROP SCHEMA {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+        test.drop().await;
     }
 
     #[test]

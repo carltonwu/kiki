@@ -137,6 +137,8 @@ class FakeEmbeddings:
 
 def executor(database_url, image_model):
     class TestExecutor(PydanticExecutor):
+        web_tools = ()  # TestModel can't run OpenRouter's server tools (see test_web.py)
+
         def model(self, name):
             return TestModel()
 
