@@ -72,7 +72,7 @@ The chat model passes:
   else is dropped rather than failing the call); `caption`; and `edit` to change a
   posted photo rather than make a new picture.
 
-The image job (`drawing.py`) then finds references for each subject, at most 3 per
+The image job (`media/drawing.py`) then finds references for each subject, at most 3 per
 subject and 16 in all (OpenRouter's `input_references` range for GPT Image), best first:
 
 1. **Given photos** (`photos`): used as they are.
@@ -139,7 +139,7 @@ and the live API. GPT Image models get `quality: medium`.
   host's job timeout (`AGENT_HOST_JOB_TIMEOUT_SECS`, 120 s in prod) and Rust's host
   deadline (`AGENT_HOST_TIMEOUT_MS`, 180 s). The reference check has 30 s; past it,
   that subject is drawn without references.
-- PNG/JPEG/WebP/GIF results up to 8 MiB, typed by their bytes (`vision.sniff`).
+- PNG/JPEG/WebP/GIF results up to 8 MiB, typed by their bytes (`media/fetch.py` `sniff`).
 
 ## Observability
 

@@ -12,16 +12,16 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import OperationalError
 
-from . import STARTED
-from .config import Settings
-from .contracts import (
+from .. import STARTED
+from ..config import Settings
+from ..contracts import (
     DescribeEmojisRequest,
     DescribeEmojisResult,
     ImageJobRequest,
     JobRequest,
     JobResponse,
 )
-from .executor import Executor, TransientError
+from ..executor import Executor, TransientError
 from .jobs import RequestConflict, run_image_job, run_job
 
 logger = logging.getLogger(__name__)
@@ -145,7 +145,7 @@ def application() -> FastAPI:
     settings = Settings.from_env()
     executor = None
     if settings.openrouter_api_key:
-        from .agent.executor import PydanticExecutor  # the SDK import dominates startup time
+        from ..agent.executor import PydanticExecutor  # the SDK import dominates startup time
 
         executor = PydanticExecutor(
             settings.database_url,

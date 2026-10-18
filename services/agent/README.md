@@ -1,12 +1,40 @@
 # Kiki agent host
 
 Python 3.13 service managed with Astral `uv`. FastAPI is the HTTP transport and
-[Pydantic AI](https://ai.pydantic.dev/) (`agent.py`) runs the model loop over
+[Pydantic AI](https://ai.pydantic.dev/) (`agent/`) runs the model loop over
 OpenRouter behind `executor.Executor`. It generates both replies and topic summaries.
 
 Without `OPENROUTER_CHAT_API_KEY`, the host serves `/health`, but authenticated
 execution requests return **501**. Keep Rust's `AGENT_HOST_URL` unset until the key
 is set.
+
+## Layout
+
+`src/kiki_agent_host/` has one package per layer. A layer imports only the layers
+listed before it. The one exception is `chat/`, which downloads emoji through
+`media/fetch.py`. `tests/test_structure.py` fails the build on any other import
+across this order, and on a module named after a chat platform.
+
+- `config.py`, `db.py`, `logs.py`, `contracts.py`, `executor.py`, `prompt.py`: env
+  settings, connections, log format, the wire contract, the `Executor` protocol, and
+  the job's messages as model messages.
+- `openrouter/`: the provider. Clients, embeddings, the chat model with web fetch,
+  and the image model.
+- `chat/`: the community's history in Postgres. Scope and people, message search and
+  indexing, attachments, custom emoji, and subject memory. No agent code.
+- `media/`: images in and out. Downloads, the vision call, `read_image`, drawing
+  jobs, and generation.
+- `agent/`: the Pydantic AI layer. `executor.py` runs jobs. `tools/` has one
+  `FunctionToolset` per capability. `guard.py` gives every tool its deadline, its
+  budget, and its log line.
+- `api/`: HTTP and durable jobs. Importing it does not load the agent SDK, so the
+  host starts fast. `api/app.py` loads the executor only when a key is set.
+
+To give the agent a new capability, add a module to `agent/tools/` that exports a
+`toolset`. Run each tool through `guard.guarded`, with a `Budget` of its own if its
+calls must not use up the lookups. Then add the toolset to `TOOLSETS` in
+`agent/tools/__init__.py`. Then run `UPDATE_SNAPSHOT=1 uv run pytest
+tests/test_contract_snapshot.py` and review the diff in `tests/snapshots/contract.json`.
 
 ## Tools and search
 
@@ -34,17 +62,18 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   `drawings` (at most 2) go back to Rust, which posts Kiki's reply first and then
   runs each as an image job (below). Bad subject refs or photo IDs are tool errors
   the model can fix ([design](../../docs/image-generation.md)).
-- Image jobs (`drawing.py`): reference photos per subject from the guild's history
+- Image jobs (`media/drawing.py`): reference photos per subject from the guild's history
   and avatars, checked by the vision model, a final prompt numbering them, and a
-  Pydantic AI `ImageGenerator` over `images.OpenRouterImageModel` (OpenRouter's
+  Pydantic AI `ImageGenerator` over `openrouter/images.py`'s `OpenRouterImageModel` (OpenRouter's
   Images API, `POST /api/v1/images` with `input_references`, same key). The image
   (PNG/JPEG/WebP/GIF ≤ 8 MiB) is saved in `agent_host_images` with its prompt,
   references, model, cost and latency. 75 s for the image call, no client retries;
   a refusal or provider error gets a note in Kiki's voice instead.
-- Shared image code is `vision.py` (Discord-only downloads, refreshing expired
+- Shared image code is `media/fetch.py` (Discord-only downloads, refreshing expired
   attachment links with `DISCORD_BOT_TOKEN`, types from the bytes for downloads and
-  drawings alike, the vision call, `ImageRefused`, billed cost); reading is
-  `reading.py`, drawing `drawing.py` and `images.py`. `read_image` reads Kiki's own
+  drawings alike) and `media/vision.py` (the vision call, `ImageRefused`, billed
+  cost); reading is `media/reading.py`, drawing `media/drawing.py` and
+  `media/generation.py`. `read_image` reads Kiki's own
   drawings (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
@@ -80,7 +109,7 @@ latency, RSS and capacity; executions report job, channel and conversation IDs,
 model requests, tool calls, tokens, cost and latency. Tool calls report outcomes,
 latency, hits and semantic coverage. Set `LOG_LEVEL=DEBUG` for saved-result reuse,
 HTTP job status, indexing and top vector similarity (to calibrate
-`retrieval.MIN_SIMILARITY`). Routine HTTP client logs are suppressed at INFO.
+`chat/search.py` `MIN_SIMILARITY`). Routine HTTP client logs are suppressed at INFO.
 The container writes JSON logs to stdout so Railway records their actual severity;
 local logs use plain text unless `LOG_FORMAT=json` is set.
 
