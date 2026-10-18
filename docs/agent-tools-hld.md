@@ -65,9 +65,11 @@ Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
 and the current conversation's messages, which Rust already put in the prompt.
 
 Limits:
-- 4 tool calls per run. After that, tools tell the model to answer with what it
-  has, rather than aborting.
-- 6 model requests per run as the hard stop (`UsageLimits`).
+- 4 search tool calls per run. After that, tools tell the model to answer with what it
+  has, rather than aborting. Memory tools ([subject memory](subject-memory-hld.md))
+  have their own budget of 6.
+- 10 model requests per run as the hard stop (`UsageLimits`); it was 6 before
+  memory tools, which can take a failed write, a split and a retry.
 - 10 seconds per tool call; on timeout the tool returns an error to the model.
 - Topic jobs run with no tools.
 

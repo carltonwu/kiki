@@ -271,7 +271,18 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # TestModel calls each tool once (with placeholder arguments), then answers
     # with their results.
     assert result.steps == 2
-    assert set(json.loads(result.text)) == {"search_messages", "get_message_context"}
+    tools = json.loads(result.text)
+    assert set(tools) == {
+        "search_messages",
+        "get_message_context",
+        "recall",
+        "search_memory",
+        "remember",
+        "forget",
+        "split_doc",
+    }
+    # Placeholder arguments make memory tools return errors to the model, not crash the run.
+    assert "error" in tools["remember"] and "error" in tools["forget"]
     assert result.usage.cost == pytest.approx(0.002)  # indexing + query embedding
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1

@@ -10,7 +10,7 @@ is set.
 
 ## Tools and search
 
-Reply jobs get two tools, scoped to the job's guild (every channel Kiki can read) by
+Reply jobs get search tools and memory tools, scoped to the job's guild (every channel Kiki can read) by
 trusted run context, never by model arguments ([design](../../docs/agent-tools-hld.md)):
 
 - `search_messages(query, person?, channel?, before?, after?, limit)`: `channel` (a
@@ -23,9 +23,13 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   that halves every 30 days. Date filters turn the bonus off.
 - `get_message_context(message_id, before, after)`: neighbors in the message's own
   channel and the reply parent.
+- Memory ([design](../../docs/subject-memory-hld.md)): `recall`, `search_memory`,
+  `remember`, `forget` and `split_doc` read and write documents about people and
+  things in the guild (a base profile each, plus sub docs of at most 1024 words).
+  Changes to saved entries need cited evidence in proportion to how settled they are.
 
 Results exclude deleted messages, bot messages, and the current conversation
-(already in the prompt). A run gets 4 tool calls and 6 model requests. Topic jobs have
+(already in the prompt). A run gets 4 search tool calls, 6 memory tool calls and 10 model requests. Topic jobs have
 no tools. When a reply job starts, the guild's 256 newest pending messages are
 embedded in the background, so the first search rarely waits. Results report `semantic: full | partial | off`. A database trigger drops
 vectors when messages are edited or deleted. `kiki-agent-host index` embeds all
@@ -115,7 +119,8 @@ omit a reply if a crash happens before the send; it avoids blind duplicate posts
 Legacy runs already in progress when the migration runs are also failed.
 
 If the Python process dies before saving a result, inference may repeat on retry.
-Current tools only read; future tools with side effects or costs must tolerate replay.
+Memory writes tolerate replay: they record the job ID, and saving text that is already
+live confirms it, which is a no-op for the same job. Other tools only read.
 Job tables contain private prompts and replies and currently have no automatic
 retention policy.
 

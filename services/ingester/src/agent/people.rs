@@ -271,6 +271,10 @@ impl Roster {
         s
     }
 
+    pub fn user_ids(&self) -> Vec<i64> {
+        self.people.iter().map(|p| p.user_id).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.people.is_empty()
     }
