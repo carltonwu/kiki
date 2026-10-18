@@ -35,7 +35,11 @@ from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.usage import UsageLimits
 
-from . import db, drawing, emojis, images, memory_tools, reading, retrieval
+from . import db, drawing, images, memory_tools, reading
+from .chat import emojis
+from .chat.indexing import index_pending
+from .chat.scope import Roster, Scope, resolve_person
+from .chat.search import Semantic, message_context, search
 from .config import cdn_base
 from .contracts import (
     AspectRatio,
@@ -53,6 +57,8 @@ from .contracts import (
     WebUse,
 )
 from .executor import TransientError
+from .openrouter.client import openrouter_client
+from .openrouter.embeddings import Embedder
 from .vision import Vision, billed_cost, look
 
 logger = logging.getLogger(__name__)
@@ -79,12 +85,12 @@ class Deps:
     """Trusted per-run context: tool arguments can only narrow it."""
 
     connection: AsyncConnection
-    scope: retrieval.Scope
-    embed: retrieval.Embedder
-    roster: retrieval.Roster
+    scope: Scope
+    embed: Embedder
+    roster: Roster
     vision: Vision
     tool_calls: int = 0
-    indexing: asyncio.Task[retrieval.Semantic] | None = None
+    indexing: asyncio.Task[Semantic] | None = None
     job_id: str = ""
     # The server's image model, when it has drawing on; drawings run after the reply.
     image_model: str | None = None
@@ -174,7 +180,7 @@ async def search_messages(
             deps.indexing = asyncio.create_task(index_guild(deps))
         # Shielded: a search timing out must not cancel indexing for the next one.
         semantic = await asyncio.shield(deps.indexing)
-        return await retrieval.search(
+        return await search(
             deps.connection,
             deps.embed,
             deps.scope,
@@ -205,7 +211,7 @@ async def get_message_context(
     async def work():
         if not message_id.isdigit():
             raise ValueError("message_id must be a message ID from search results")
-        return await retrieval.message_context(
+        return await message_context(
             ctx.deps.connection, ctx.deps.scope, int(message_id), before, after, ctx.deps.roster
         )
 
@@ -335,9 +341,7 @@ async def generate_image(
                 # person here has gone by is them, so their own photos are used.
                 tries = [f"@{label['username']}"] if label and label["username"] else []
                 for who in [*tries, name]:
-                    ids = await retrieval.resolve_person(
-                        deps.connection, deps.scope, deps.roster, who
-                    )
+                    ids = await resolve_person(deps.connection, deps.scope, deps.roster, who)
                     if len(ids) == 1:
                         user_id = str(ids[0])
                         break
@@ -434,11 +438,9 @@ async def find_emoji(ctx: RunContext[Deps], name: str) -> dict:
     return await guarded(ctx, "find_emoji", work)
 
 
-async def index_guild(deps: Deps) -> retrieval.Semantic:
+async def index_guild(deps: Deps) -> Semantic:
     try:
-        found, more = await retrieval.index_pending(
-            deps.connection, deps.embed, guild_id=deps.scope.guild_id
-        )
+        found, more = await index_pending(deps.connection, deps.embed, guild_id=deps.scope.guild_id)
     except OperationalError:
         raise
     except Exception as error:  # noqa: BLE001 - preserve search without logging provider payloads
@@ -556,18 +558,16 @@ class PydanticExecutor:
         # Without it, images in messages older than a day can't be downloaded.
         self.discord_token = discord_token
         if os.getenv("OPENROUTER_BASE_URL"):
-            self.provider = OpenRouterProvider(openai_client=retrieval.openrouter_client(api_key))
+            self.provider = OpenRouterProvider(openai_client=openrouter_client(api_key))
         else:
             self.provider = OpenRouterProvider(api_key=api_key)
         # Fail fast inside a tool's deadline: a slow embedding degrades to "partial"
         # indexing and lexical search instead of losing the whole call.
-        self.embeddings = retrieval.openrouter_client(
+        self.embeddings = openrouter_client(
             api_key, timeout=EMBEDDING_TIMEOUT_SECONDS, max_retries=0
         )
         # No retries: each attempt may be billed, and the tool has its own deadline.
-        self.images = retrieval.openrouter_client(
-            api_key, timeout=IMAGE_TIMEOUT_SECONDS, max_retries=0
-        )
+        self.images = openrouter_client(api_key, timeout=IMAGE_TIMEOUT_SECONDS, max_retries=0)
 
     def model(self, name: str) -> Model:
         return WebOpenRouterModel(name, provider=self.provider)
@@ -591,7 +591,7 @@ class PydanticExecutor:
         }
         if request.kind == "reply":
             options["model_settings"]["extra_body"] = {"max_tool_calls": MAX_WEB_STEPS}
-        embed = retrieval.Embedder(self.embeddings)
+        embed = Embedder(self.embeddings)
         vision = self.vision(request.model)
         deps = None
         try:
@@ -599,7 +599,7 @@ class PydanticExecutor:
                 result = await plain.run(prompt, **options)
             else:
                 async with await db.connect(self.database_url) as connection:
-                    scope = retrieval.Scope(
+                    scope = Scope(
                         int(request.scope.guild_id),
                         int(request.scope.channel_id),
                         int(request.scope.conversation_id),
@@ -608,7 +608,7 @@ class PydanticExecutor:
                         connection,
                         scope,
                         embed,
-                        retrieval.Roster.of(request.people),
+                        Roster.of(request.people),
                         vision,
                         job_id=request.id,
                         image_model=request.image_model,
@@ -683,7 +683,7 @@ class PydanticExecutor:
         started = time.monotonic()
         plan = request.drawing
         vision = self.vision(request.chat_model)
-        scope = retrieval.Scope(
+        scope = Scope(
             int(request.scope.guild_id),
             int(request.scope.channel_id),
             int(request.scope.conversation_id),
@@ -784,7 +784,7 @@ class PydanticExecutor:
             text = await look(vision, [prompt, image], max_tokens=emojis.DESCRIBE_MAX_TOKENS)
             return text, vision.cost - spent
 
-        embed = retrieval.Embedder(self.embeddings)
+        embed = Embedder(self.embeddings)
         try:
             async with await db.connect(self.database_url) as connection:
                 counts = await emojis.describe_pending(

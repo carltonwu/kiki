@@ -19,9 +19,10 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent
 
-from . import vision
-from .config import cdn_base
-from .retrieval import CANDIDATES, EMBED_BATCH, MIN_SIMILARITY, RRF_K, Embedder
+from .. import vision
+from ..config import cdn_base
+from ..openrouter.embeddings import EMBED_BATCH, Embedder
+from .search import CANDIDATES, MIN_SIMILARITY, RRF_K
 
 logger = logging.getLogger(__name__)
 

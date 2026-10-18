@@ -17,7 +17,7 @@ def main() -> None:
         pass
     configure_logging()
     if sys.argv[1:] == ["index"]:
-        from .retrieval import index_all
+        from .chat.indexing import index_all
 
         asyncio.run(index_all(os.environ["DATABASE_URL"], os.environ["OPENROUTER_CHAT_API_KEY"]))
         return
