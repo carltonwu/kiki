@@ -327,7 +327,12 @@ impl Agent {
                         context.channel_id,
                         claim.conversation_id,
                     ),
-                    model: self.config.chat_model.clone(),
+                    model: crate::guild_models::effective(
+                        &self.db,
+                        context.guild_id,
+                        &self.config.chat_model,
+                    )
+                    .await?,
                     messages: context.messages.clone(),
                     max_output_tokens: MAX_REPLY_TOKENS,
                     people: context.people.clone(),

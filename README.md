@@ -86,9 +86,16 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config` | Configured models next to the version that last answered, and the routing and agent settings in effect, by environment variable. |
+| `/kiki model [model]` | View this server's chat model. Set `model` to an OpenRouter ID to change it, or `default` to restore `OPENROUTER_CHAT_MODEL`. Changes require Manage Server. |
 | `/kiki whois <user>` | Every name Kiki has seen for someone (nickname, display name, username) with first and last seen, plus their message and conversation counts. |
 
 The bot must be invited with the `applications.commands` scope for registration to succeed.
+
+Chat model changes persist per server and apply to new reply jobs without a restart.
+For example: `/kiki model model:deepseek/deepseek-v4.1-flash-1017`.
+The model must be listed by OpenRouter and support text output and tools. `/kiki config`
+shows the effective chat model for this server. In-flight jobs keep their original model;
+topic summaries and Decide keep their global models.
 
 Only one ingester instance holds the Discord Gateway connection at a time: instances take a
 Postgres advisory lock first, so during a deploy the new instance waits until the old one has

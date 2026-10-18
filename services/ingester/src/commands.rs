@@ -1,4 +1,4 @@
-//! The `/kiki` slash command: conversations, stats, runs, config and whois.
+//! The `/kiki` slash command: inspection and server chat-model selection.
 //!
 //! Registered as a guild command at startup (guild commands update instantly,
 //! global ones don't) and answered from `INTERACTION_CREATE` Gateway events.
@@ -37,7 +37,7 @@ use twilight_util::builder::{
 use crate::{
     catch_up::snowflake,
     config::{AgentConfig, RouterConfig},
-    conversation,
+    conversation, guild_models,
     rest::get_json,
     router::unix_millis,
 };
@@ -152,6 +152,7 @@ impl Settings {
 
 struct Invocation<'a> {
     guild_id: i64,
+    member: &'a Value,
     subcommand: &'a str,
     /// The subcommand's options: `[{name, type, value}]`.
     options: &'a Value,
@@ -159,8 +160,8 @@ struct Invocation<'a> {
     resolved: &'a Value,
 }
 
-impl Invocation<'_> {
-    fn option(&self, name: &str) -> Option<&Value> {
+impl<'a> Invocation<'a> {
+    fn option(&self, name: &str) -> Option<&'a Value> {
         self.options
             .as_array()?
             .iter()
@@ -268,6 +269,7 @@ impl Commands {
             Some(guild_id) => {
                 let invocation = Invocation {
                     guild_id,
+                    member: &interaction["member"],
                     subcommand: subcommand["name"].as_str().unwrap_or_default(),
                     options: &subcommand["options"],
                     resolved: &interaction["data"]["resolved"],
@@ -307,7 +309,8 @@ impl Commands {
             "conversations" => self.conversations(invocation.guild_id).await?,
             "stats" => self.stats(invocation.guild_id).await?,
             "runs" => self.runs(invocation).await?,
-            "config" => self.config().await?,
+            "config" => self.config(invocation.guild_id).await?,
+            "model" => self.model(invocation).await?,
             "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
             other => error_embed(&format!("Unknown subcommand `{other}`.")),
@@ -621,24 +624,73 @@ impl Commands {
         Ok(embed.build())
     }
 
-    async fn config(&self) -> anyhow::Result<Embed> {
+    async fn model(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        // Check permissions before catalog or database work, even if an admin
+        // granted the overall /kiki command to a role without Manage Server.
+        let change = model_change(invocation)?;
+        let default = self
+            .settings
+            .chat_model
+            .as_deref()
+            .ok_or_else(|| UserError("The agent is off: AGENT_HOST_URL is not set.".into()))?;
+        if let Some((actor, model)) = change {
+            if let Some(model) = model {
+                let catalog: Value = reqwest::Client::new()
+                    .get("https://openrouter.ai/api/v1/models")
+                    .timeout(Duration::from_secs(10))
+                    .send().await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|_| UserError("Couldn't check OpenRouter's model catalog. Try again; your setting has not changed.".into()))?
+                    .json().await
+                    .map_err(|_| UserError("Couldn't read OpenRouter's model catalog. Try again; your setting has not changed.".into()))?;
+                validate_catalog_model(&catalog, model)?;
+            }
+            guild_models::set(&self.db, invocation.guild_id, model, actor).await?;
+            info!(
+                guild_id = invocation.guild_id,
+                actor, model, "server chat model changed"
+            );
+        }
+        let effective = guild_models::effective(&self.db, invocation.guild_id, default).await?;
+        let detail = if change.is_some() {
+            "Applies to new replies. Jobs already in progress keep their original model."
+        } else {
+            "Use `/kiki model model:<provider/model>` to change it, or `model:default` to reset."
+        };
+        Ok(EmbedBuilder::new()
+            .color(COLOR)
+            .title("Server chat model")
+            .description(format!(
+                "Chat model: `{effective}`\nDefault: `{default}`\n\n{detail}"
+            ))
+            .build())
+    }
+
+    async fn config(&self, guild_id: i64) -> anyhow::Result<Embed> {
         let (last_chat, last_decide): (Option<String>, Option<String>) = sqlx::query_as(
             r#"
             SELECT
-                (SELECT model FROM agent_runs WHERE model IS NOT NULL ORDER BY id DESC LIMIT 1),
-                (SELECT jev_model FROM classifications WHERE jev_model IS NOT NULL
-                 ORDER BY classified_at DESC LIMIT 1)
+                (SELECT r.model FROM agent_runs r JOIN conversations c ON c.id = r.conversation_id
+                 WHERE c.guild_id = $1 AND r.model IS NOT NULL ORDER BY r.id DESC LIMIT 1),
+                (SELECT c.jev_model FROM classifications c JOIN messages m ON m.id = c.message_id
+                 WHERE m.guild_id = $1 AND c.jev_model IS NOT NULL
+                 ORDER BY c.classified_at DESC LIMIT 1)
             "#,
         )
+        .bind(guild_id)
         .fetch_one(&self.db)
         .await?;
 
         let s = &self.settings;
+        let chat_model = match &s.chat_model {
+            Some(default) => Some(guild_models::effective(&self.db, guild_id, default).await?),
+            None => None,
+        };
         let off = || "off".to_owned();
         let models = [
             vec![
                 "Chat".to_owned(),
-                s.chat_model.clone().unwrap_or_else(off),
+                chat_model.unwrap_or_else(off),
                 last_chat.unwrap_or_else(|| "–".into()),
             ],
             vec![
@@ -993,6 +1045,67 @@ impl Commands {
     }
 }
 
+/// Read access can be delegated, but model changes always require Manage Server.
+fn model_change<'a>(
+    invocation: &Invocation<'a>,
+) -> Result<Option<(i64, Option<&'a str>)>, UserError> {
+    let Some(value) = invocation.option("model") else {
+        return Ok(None);
+    };
+    let permissions = snowflake(&invocation.member["permissions"])
+        .map(|bits| Permissions::from_bits_truncate(bits as u64))
+        .unwrap_or_else(Permissions::empty);
+    if !permissions.intersects(Permissions::MANAGE_GUILD | Permissions::ADMINISTRATOR) {
+        return Err(UserError(
+            "You need Manage Server permission to change the chat model.".into(),
+        ));
+    }
+    let actor = snowflake(&invocation.member["user"]["id"])
+        .ok_or_else(|| UserError("Couldn't identify who is changing the model.".into()))?;
+    let model = value.as_str().unwrap_or_default().trim();
+    if model == "default" {
+        return Ok(Some((actor, None)));
+    }
+    if model.len() > 200
+        || !model
+            .split_once('/')
+            .is_some_and(|(provider, name)| !provider.is_empty() && !name.is_empty())
+        || !model
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"/-_.:~".contains(&c))
+    {
+        return Err(UserError("Use an OpenRouter model ID like `deepseek/deepseek-v4.1-flash-1017`, or `default` to reset.".into()));
+    }
+    Ok(Some((actor, Some(model))))
+}
+
+fn validate_catalog_model(catalog: &Value, model: &str) -> Result<(), UserError> {
+    let models = catalog["data"].as_array().ok_or_else(|| {
+        UserError("Couldn't read OpenRouter's model catalog. Your setting has not changed.".into())
+    })?;
+    let entry = models
+        .iter()
+        .find(|entry| entry["id"].as_str() == Some(model))
+        .ok_or_else(|| {
+            UserError(
+                "That model ID isn't in OpenRouter's catalog. Check the ID and try again.".into(),
+            )
+        })?;
+    let text_output = entry["architecture"]["output_modalities"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|v| v == "text"));
+    let tools = entry["supported_parameters"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|v| v == "tools"));
+    if !text_output || !tools {
+        return Err(UserError(
+            "Choose a text model that supports tools; Kiki needs tools to search channel history."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn definition() -> CommandBuilder {
     CommandBuilder::new("kiki", "Inspect Kiki", CommandType::ChatInput)
         .default_member_permissions(Permissions::MANAGE_GUILD)
@@ -1020,6 +1133,20 @@ fn definition() -> CommandBuilder {
             "config",
             "Models and routing and agent settings in effect",
         ))
+        .option(
+            SubCommandBuilder::new(
+                "model",
+                "View or change this server's chat model (Manage Server to change)",
+            )
+            .option(
+                StringBuilder::new(
+                    "model",
+                    "OpenRouter model ID, or default to reset; omit to view",
+                )
+                .min_length(3)
+                .max_length(200),
+            ),
+        )
         .option(
             SubCommandBuilder::new("users", "Messages, conversations and LLM cost per person")
                 .option(
@@ -1218,5 +1345,71 @@ mod tests {
     #[test]
     fn command_is_valid() {
         let _ = definition().validate().unwrap().build();
+    }
+
+    #[test]
+    fn model_edits_require_permissions_even_when_read_access_is_delegated() {
+        use super::{Invocation, Permissions, model_change};
+        use serde_json::{Value, json};
+        let options = json!([{"name": "model", "value": "test/model"}]);
+        let mut member = json!({"user": {"id": "42"}, "permissions": "0"});
+        fn invoke<'a>(member: &'a Value, options: &'a Value) -> Invocation<'a> {
+            Invocation {
+                guild_id: 1,
+                member,
+                subcommand: "model",
+                options,
+                resolved: &Value::Null,
+            }
+        }
+        assert!(model_change(&invoke(&member, &options)).is_err());
+        assert!(
+            model_change(&invoke(&member, &Value::Null))
+                .unwrap()
+                .is_none()
+        );
+        for bits in [
+            Permissions::MANAGE_GUILD.bits(),
+            Permissions::ADMINISTRATOR.bits(),
+        ] {
+            member["permissions"] = json!(bits.to_string());
+            assert_eq!(
+                model_change(&invoke(&member, &options)).unwrap(),
+                Some((42, Some("test/model")))
+            );
+        }
+        for value in [
+            "bad",
+            "test/",
+            "/model",
+            "test/model with spaces",
+            "test/`model",
+            "",
+        ] {
+            let options = json!([{"name": "model", "value": value}]);
+            assert!(model_change(&invoke(&member, &options)).is_err());
+        }
+        let options = json!([{"name": "model", "value": "default"}]);
+        assert_eq!(
+            model_change(&invoke(&member, &options)).unwrap(),
+            Some((42, None))
+        );
+        assert!(model_change(&invoke(&Value::Null, &options)).is_err());
+    }
+
+    #[test]
+    fn model_catalog_rejects_unknown_and_incompatible_models() {
+        use super::validate_catalog_model;
+        use serde_json::json;
+        let catalog = json!({"data": [
+            {"id": "test/chat", "architecture": {"output_modalities": ["text"]}, "supported_parameters": ["tools"]},
+            {"id": "test/no-tools", "architecture": {"output_modalities": ["text"]}, "supported_parameters": []},
+            {"id": "test/image", "architecture": {"output_modalities": ["image"]}, "supported_parameters": ["tools"]}
+        ]});
+        assert!(validate_catalog_model(&catalog, "test/chat").is_ok());
+        for model in ["test/unknown", "test/no-tools", "test/image"] {
+            assert!(validate_catalog_model(&catalog, model).is_err());
+        }
+        assert!(validate_catalog_model(&json!({}), "test/chat").is_err());
     }
 }

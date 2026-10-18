@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod conversation;
 mod gateway;
+mod guild_models;
 mod health;
 mod jev;
 mod leader;
