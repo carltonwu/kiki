@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! agent_runs INSERT ─NOTIFY→ dispatch (one task per conversation) → claim newest run
-//!     → context → Python host (HTTP) → reply in Discord → tag → refresh topic
+//!     → context → Python host (HTTP) → reply (+ generated images) in Discord
+//!     → tag → refresh topic
 //! ```
 //!
 //! Runs of one conversation are answered one at a time. When several are pending
@@ -348,6 +349,10 @@ impl Agent {
                     messages: context.messages.clone(),
                     max_output_tokens: context.settings.reply_max_tokens,
                     people: context.people.clone(),
+                    image_model: context
+                        .settings
+                        .image_generation
+                        .then(|| context.settings.image_model.clone()),
                 };
                 sqlx::query("UPDATE agent_runs SET host_request = $2 WHERE id = $1")
                     .bind(claim.run_id)
@@ -361,8 +366,16 @@ impl Agent {
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
+        let images = self.load_images(&request.id, &result.images).await?;
         let mut plan = delivery::plan(&result.text, &context.settings)?;
         emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
+        if plan.messages.is_empty() && !images.is_empty() {
+            // Someone asked for the picture; don't drop it over a silence marker.
+            plan.messages.push(delivery::Message {
+                text: String::new(),
+                delay: Duration::ZERO,
+            });
+        }
         if plan.messages.is_empty() && plan.reactions.is_empty() {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
@@ -384,6 +397,7 @@ impl Agent {
             claim.run_id,
             claim.conversation_id,
             &plan.messages,
+            &images,
             record,
         )
         .await
