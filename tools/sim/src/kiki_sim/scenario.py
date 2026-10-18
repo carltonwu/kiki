@@ -14,6 +14,11 @@
                 options: {key: chat_model, value: sim/other}}
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
       - expect: {attachments: 1, attachment_type: image/png}   # files on the replies
+      - expect: {followup: {status: done, attachments: 1, text_contains: "…"},
+                 image_references: [photo of nougie], image_prompt_contains: "…"}
+                 # a run's queued pictures, each posted later as a reply to the
+                 # request, and what the newest image model call got
+      - thread: {from: photo, name: Thread, as: alex}   # a thread on a message
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
@@ -21,8 +26,10 @@
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
-that channel), `age_s`, `attachments` (`[{filename, label?, content_type?}]`;
-the stub vision model describes an image as its label), and the sugar
+that channel), `age_s`, `attachments` (`[{filename, label?, content_type?, expired?}]`;
+the stub vision model describes an image as its label, the drawing step's
+reference check turns down labels saying meme or screenshot, and an `expired`
+link only downloads after Discord's refresh), and the sugar
 `jev: {choice, confidence}` and `reply: {text | tool | tools | web}` to script the
 stub's answer to exactly this message. In tool arguments, `{image_message}` is the
 message ID from the trigger's image marker, else the newest one in the conversation.
@@ -229,10 +236,60 @@ class Run:
             or any(k in args for k in ("prompt_contains", "prompt_lacks"))
         ):
             self.expect_llm(step, args, o, label)
+        if "followup" in args:
+            self.expect_followup(step, args["followup"], o, message, label)
+        if any(k in args for k in ("image_references", "image_prompt_contains")):
+            self.expect_image_request(step, args, label)
         if "reaction" in args:
             self.expect_reaction(step, args["reaction"], message, label)
         if "decide_contains" in args or "decide_lacks" in args:
             self.expect_decide(step, args, message, label)
+
+    def expect_followup(
+        self, step: int, wanted: dict, o: Observation, message: dict, label: str
+    ) -> None:
+        """The pictures the run queued, each posted as its own message replying to
+        the request: `{count, status, attachments, text_contains, text_lacks}`."""
+        if len(o.drawings) != wanted.get("count", 1):
+            self.fail(
+                step, f"{label}: {len(o.drawings)} drawings, expected {wanted.get('count', 1)}"
+            )
+        for d in o.drawings:
+            posted = d["message"]
+            if "status" in wanted and d["status"] != wanted["status"]:
+                self.fail(step, f"{label}: drawing {d['status']} ({d['error']})")
+            if posted is None:
+                self.fail(step, f"{label}: drawing {d['status']} posted nothing ({d['error']})")
+                continue
+            reference = (posted.get("message_reference") or {}).get("message_id")
+            if reference != message["id"]:
+                self.fail(step, f"{label}: the follow-up replies to {reference}, not the request")
+            files = posted.get("attachments") or []
+            if "attachments" in wanted and len(files) != wanted["attachments"]:
+                self.fail(step, f"{label}: follow-up has {len(files)} attachments")
+            for needle in as_list(wanted.get("text_contains")):
+                if str(needle).lower() not in posted["content"].lower():
+                    self.fail(step, f"{label}: follow-up lacks {needle!r}: {posted['content']!r}")
+            for pattern in as_list(wanted.get("text_lacks")):
+                if re.search(pattern, posted["content"], re.IGNORECASE):
+                    self.fail(step, f"{label}: follow-up matches {pattern!r}")
+
+    def expect_image_request(self, step: int, args: dict, label: str) -> None:
+        """What the newest call to the image model got: reference images (by their
+        sim labels, in order) and the prompt."""
+        calls = [r for r in stack.control("state")["llm"] if r["kind"] == "image"]
+        if not calls:
+            self.fail(step, f"{label}: the image model wasn't called")
+            return
+        references, prompt = calls[-1]["references"], calls[-1]["prompt"]
+        wanted = as_list(args.get("image_references"))
+        if len(references) != len(wanted) or not all(
+            str(w).lower() in r.lower() for w, r in zip(wanted, references, strict=False)
+        ):
+            self.fail(step, f"{label}: image references {references}, expected {wanted}")
+        for needle in as_list(args.get("image_prompt_contains")):
+            if str(needle).lower() not in prompt.lower():
+                self.fail(step, f"{label}: image prompt lacks {needle!r}: {prompt[:400]!r}")
 
     def expect_decide(self, step: int, args: dict, message: dict, label: str) -> None:
         """What the router sent Jev for this message (JSON, compact)."""
@@ -351,6 +408,14 @@ class Run:
                 stack.control(f"messages/{self.named[args['of']]['id']}", None, "DELETE")
             elif kind == "slash":
                 self.slash(args)
+            elif kind == "thread":
+                body = {
+                    "from": self.named[args["from"]]["id"],
+                    "name": args["name"],
+                    "as": args["as"],
+                }
+                stack.control("threads", body)
+                time.sleep(0.5)  # let the ingester store the thread before anyone talks in it
             elif kind == "expect":
                 self.expect(i, args)
             elif kind == "exec":

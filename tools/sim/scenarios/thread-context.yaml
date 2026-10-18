@@ -1,0 +1,23 @@
+name: a thread started on a photo shows that photo by its real author, and read_image reads it from inside the thread
+steps:
+  - send:
+      as: sam
+      in: boba
+      text: ""
+      age_s: 3600
+      id: photo
+      attachments: [{filename: FullSizeRender.jpg, content_type: image/jpeg, label: "a bernese mountain dog in a green dinosaur robe"}]
+  # Discord posts "Thread" (type 18) in #boba and an empty starter (type 21) in the thread.
+  - thread: {from: photo, name: Thread, as: alex}
+  - say: {as: alex, in: Thread, text: "kiki describe boba"}
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "{result}"}
+  - expect:
+      reply: true
+      tool_called: read_image
+      prompt_contains:
+        - 'thread \"Thread\" in #boba'
+        - "This thread was started from this message in #boba"
+        - "[u2 Sam] [image: FullSizeRender.jpg; message"
+        - "#boba (a channel here)"
+      prompt_lacks: ["[no text]", "] Thread"]
+      tool_result_contains: "a bernese mountain dog in a green dinosaur robe"

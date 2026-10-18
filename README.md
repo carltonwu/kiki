@@ -151,8 +151,10 @@ In-flight jobs retain their saved model input. Topic summaries and Decide keep t
 models. See [server settings](docs/server-settings-hld.md) for the inventory and reviewed scope.
 
 Kiki can draw: with `image_generation` on (the default), reply jobs get a
-`generate_image` tool backed by the server's `image_model`, and the picture is
-attached to her first message. See [image generation](docs/image-generation.md).
+`generate_image` tool backed by the server's `image_model`. Her reply goes out
+first; the picture follows as its own message, drawn from reference photos of its
+subjects found in the server. The agent host needs `DISCORD_BOT_TOKEN` to refresh
+expired attachment links. See [image generation](docs/image-generation.md).
 
 Server phrases and custom emoji come from the manually curated `guild_lingo`
 table (migration 0014 seeds one server). Reply prompts include only that server's

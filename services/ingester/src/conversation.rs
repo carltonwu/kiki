@@ -14,6 +14,8 @@ pub struct Conversation {
     pub guild_id: i64,
     pub channel_id: i64,
     pub channel_name: Option<String>,
+    /// For a thread, the channel it's in.
+    pub parent_channel_name: Option<String>,
     pub started_by: i64,
     pub topic: Option<String>,
     pub topic_through_message_id: Option<i64>,
@@ -36,12 +38,15 @@ pub struct Participant {
 }
 
 const SELECT: &str = r#"
-    SELECT c.id, c.guild_id, c.channel_id, ch.name AS channel_name, c.started_by, c.topic,
+    SELECT c.id, c.guild_id, c.channel_id, ch.name AS channel_name,
+           pa.name AS parent_channel_name, c.started_by, c.topic,
            c.topic_through_message_id, c.message_count,
            (extract(epoch FROM c.created_at) * 1000)::bigint AS created_at_ms,
            (extract(epoch FROM c.last_active_at) * 1000)::bigint AS last_active_at_ms,
            c.topic_cost_usd
                + coalesce((SELECT sum(r.cost_usd) FROM agent_runs r WHERE r.conversation_id = c.id), 0)
+               + coalesce((SELECT sum(j.cost_usd) FROM agent_image_jobs j
+                           JOIN agent_runs r ON r.id = j.run_id WHERE r.conversation_id = c.id), 0)
                -- Decide cost is stored on every message of a pool; count it once.
                + coalesce((SELECT sum(cl.jev_cost_usd) FROM classifications cl
                            WHERE cl.conversation_id = c.id AND cl.message_id = cl.pool_id), 0)
@@ -57,6 +62,8 @@ const SELECT: &str = r#"
            ), '[]') AS participants
     FROM conversations c
     LEFT JOIN channels ch ON ch.id = c.channel_id
+    -- A thread's parent channel (other channels' parent is their category).
+    LEFT JOIN channels pa ON pa.id = ch.parent_id AND ch.type IN (10, 11, 12)
 "#;
 
 pub async fn active(db: impl PgExecutor<'_>, bot_user_id: i64) -> sqlx::Result<Vec<Conversation>> {

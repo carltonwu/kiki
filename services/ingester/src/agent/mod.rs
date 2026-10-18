@@ -2,17 +2,19 @@
 //!
 //! ```text
 //! agent_runs INSERT ─NOTIFY→ dispatch (one task per conversation) → claim newest run
-//!     → context → Python host (HTTP) → reply (+ generated images) in Discord
-//!     → tag → refresh topic
+//!     → context → Python host (HTTP) → reply in Discord → tag → refresh topic
+//!                                        └→ queued drawings, posted as follow-ups
 //! ```
 //!
 //! Runs of one conversation are answered one at a time. When several are pending
 //! (people kept talking while Kiki was replying), only the newest is answered and
 //! the others are marked `superseded`: their messages are in the history anyway.
+//! Drawings run on their own tasks ([`drawing`]), so the conversation carries on.
 
 mod context;
 mod delivery;
 mod discord;
+mod drawing;
 pub(crate) mod emoji;
 pub(crate) mod host;
 mod people;
@@ -69,6 +71,8 @@ struct RunRecord {
     model: Option<String>,
     steps: i32,
     usage: Usage,
+    /// Pictures the reply queued.
+    drawings: usize,
 }
 
 impl Agent {
@@ -122,6 +126,7 @@ impl Agent {
         if recovered > 0 {
             info!(runs = recovered, "requeued interrupted agent runs");
         }
+        self.recover_drawings().await?;
 
         let mut listener = PgListener::connect_with(&self.db).await?;
         listener.listen(NOTIFY_CHANNEL).await?;
@@ -141,8 +146,12 @@ impl Agent {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 },
-                // Also picks up runs queued before startup (first tick is immediate).
-                _ = poll.tick() => self.dispatch(&mut workers).await,
+                // Also picks up runs queued before startup (first tick is immediate),
+                // and drawings left pending by a restart.
+                _ = poll.tick() => {
+                    self.dispatch(&mut workers).await;
+                    self.spawn_drawings(None).await;
+                }
                 Some(done) = workers.tasks.join_next_with_id() => {
                     let id = match &done {
                         Ok((id, _)) => *id,
@@ -314,7 +323,16 @@ impl Agent {
         if record.reactions.contains(&self.pending_emoji) {
             pending.retain(|&id| Some(id) != record.reacted_to);
         }
+        // A queued picture nothing acknowledged: the pending emoji says it's
+        // coming until it's posted.
+        if record.drawings > 0 && record.reply_message_ids.is_empty() && record.reactions.is_empty()
+        {
+            pending.clear();
+        }
         self.clear_pending(claim.channel_id, &pending);
+        if record.drawings > 0 {
+            self.spawn_drawings(Some(claim.run_id)).await;
+        }
         if result.is_ok() {
             self.spawn_topic_refresh(claim.conversation_id);
         }
@@ -369,6 +387,13 @@ impl Agent {
         let images = self.load_images(&request.id, &result.images).await?;
         let mut plan = delivery::plan(&result.text, &context.settings)?;
         emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
+        if !result.drawings.is_empty() {
+            // Kiki's own words: the heads-up that a picture is coming.
+            let ack: Vec<&str> = plan.messages.iter().map(|m| m.text.as_str()).collect();
+            self.queue_drawings(claim, &context, &request, &result.drawings, &ack.join("\n"))
+                .await?;
+            record.drawings = result.drawings.len();
+        }
         if plan.messages.is_empty() && !images.is_empty() {
             // Someone asked for the picture; don't drop it over a silence marker.
             plan.messages.push(delivery::Message {
@@ -398,6 +423,7 @@ impl Agent {
             claim.conversation_id,
             &plan.messages,
             &images,
+            context.settings.chat_reply_reference,
             record,
         )
         .await

@@ -22,7 +22,7 @@ from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent, UserContent
 
 from .retrieval import HEARD, MENTION, Roster, Scope, channel_names, speakers
-from .vision import MAX_BYTES, ImageRefused, Vision, client, download, look, sniff
+from .vision import MAX_BYTES, ImageRefused, Vision, client, download, look, refresh, sniff
 
 MAX_IMAGES = 10  # Discord's attachment limit per message
 MAX_SIDE = 1568  # larger images are downscaled by Discord's media proxy
@@ -71,6 +71,8 @@ class Image:
     url: str
     media_type: str | None = None
     alt: str | None = None
+    # The attachment's ID (embeds have none), to record which image was used.
+    id: str | None = None
 
 
 def images_in(raw: dict) -> list[Image]:
@@ -82,7 +84,8 @@ def images_in(raw: dict) -> list[Image]:
         if not (content_type.startswith("image/") or IMAGE_NAME.search(name)):
             continue
         if url := sized(a):
-            found.append(Image(name, url, content_type or None, a.get("description")))
+            id = str(a["id"]) if a.get("id") else None
+            found.append(Image(name, url, content_type or None, a.get("description"), id))
     for e in raw.get("embeds") or []:
         media = e.get("thumbnail") if e.get("type") in ("image", "gifv") else None
         media = media or e.get("image")
@@ -139,11 +142,14 @@ async def read_image(
     # CDN, whose links expire.
     drawn = await drawings(connection, scope, images) if m["author_bot"] else {}
     async with client(transport) as http:
+        # Links in older messages have expired; Discord re-signs them.
+        links = [i.url for i in images if i.name not in drawn]
+        fresh = await refresh(http, vision.discord_token, links)
         downloads = await asyncio.gather(
             *(
                 stored(drawn[image.name])
                 if image.name in drawn
-                else download(http, image.url, image.media_type)
+                else download(http, fresh.get(image.url, image.url), image.media_type)
                 for image in images
             )
         )

@@ -3,15 +3,16 @@
 
 - One set of image types, decided by the bytes (`sniff`), for downloads and for
   generated images alike.
-- Downloads only from Discord's media hosts.
+- Downloads only from Discord's media hosts, refreshing expired attachment links.
 - One vision model call that maps provider failures to `ImageRefused`, the one
   image error whose message is safe to show the chat model, and adds billed cost.
 """
 
 import logging
 import os
+import time
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 from pydantic_ai import Agent
@@ -24,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 MAX_BYTES = 5 * 1024 * 1024  # the strictest common provider limit per image
 DOWNLOAD_TIMEOUT_SECONDS = 10
+# Discord's refresh endpoint takes at most 50 links per call.
+REFRESH_BATCH = 50
 
 viewer = Agent()
 
@@ -37,6 +40,8 @@ class Vision:
     fallback: bool = False
     cost: float = 0.0
     calls: int = 0
+    # The bot token, to refresh expired attachment links (`refresh`); none skips it.
+    discord_token: str = ""
 
 
 class ImageRefused(ValueError):
@@ -60,6 +65,46 @@ def allowed(url: str) -> bool:
     host = parts.hostname or ""
     discord = host.endswith((".discordapp.com", ".discordapp.net", ".discord.com"))
     return parts.scheme == "https" and discord and parts.port is None
+
+
+def expired(url: str, now: float | None = None) -> bool:
+    """Whether a signed Discord attachment link has expired (or will within a
+    minute). Links last about a day, so most history is past it."""
+    query = parse_qs(urlsplit(url).query)
+    try:
+        expires = int(query["ex"][0], 16)
+    except (KeyError, ValueError):
+        return False
+    return expires <= (now or time.time()) + 60
+
+
+def discord_api() -> str:
+    """Discord's REST root; `DISCORD_API_URL` points at the local simulator."""
+    return (os.getenv("DISCORD_API_URL") or "https://discord.com/api/v10").rstrip("/")
+
+
+async def refresh(http: httpx.AsyncClient, token: str, urls: list[str]) -> dict[str, str]:
+    """Fresh links for expired attachment links (Discord's `attachments/refresh-urls`),
+    keyed by the old link. Links it can't refresh are left out, so their download
+    reports them as expired."""
+    stale = list(dict.fromkeys(u for u in urls if allowed(u) and expired(u)))
+    if not stale or not token:
+        return {}
+    fresh: dict[str, str] = {}
+    for i in range(0, len(stale), REFRESH_BATCH):
+        try:
+            response = await http.post(
+                f"{discord_api()}/attachments/refresh-urls",
+                json={"attachment_urls": stale[i : i + REFRESH_BATCH]},
+                headers={"Authorization": f"Bot {token}"},
+            )
+            response.raise_for_status()
+            for item in response.json().get("refreshed_urls") or []:
+                if allowed(item.get("refreshed") or ""):
+                    fresh[item["original"]] = item["refreshed"]
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as error:
+            logger.warning("refreshing Discord links failed error_type=%s", type(error).__name__)
+    return fresh
 
 
 async def download(
@@ -112,15 +157,22 @@ async def look(
     *,
     max_tokens: int,
     instructions: str | None = None,
+    think: bool = True,
 ) -> str:
-    """One vision model request; its billed cost is added to `vision.cost`."""
+    """One vision model request; its billed cost is added to `vision.cost`.
+    `think=False` turns off a reasoning model's thinking, for quick yes/no checks:
+    over several photos it can take longer than the answer is worth."""
     vision.calls += 1
+    settings: dict = {"max_tokens": max_tokens, "openrouter_usage": {"include": True}}
+    if not think:
+        settings["openrouter_reasoning"] = {"enabled": False}
+        settings["temperature"] = 0  # the same photos get the same verdicts
     try:
         run = await viewer.run(
             prompt,
             model=vision.model,
             instructions=instructions,
-            model_settings={"max_tokens": max_tokens, "openrouter_usage": {"include": True}},
+            model_settings=settings,
             usage_limits=UsageLimits(request_limit=1),
         )
     except ModelHTTPError as error:

@@ -34,9 +34,10 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 |---|---|
 | `retrieval.py` | SDK-independent: embed, index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
 | `agent.py` | `PydanticExecutor`: agents, trusted deps, its function tools plus OpenRouter's web search/fetch server tools, message/usage mapping, transient-error mapping. |
-| `vision.py` | The common image backing for `read_image`, `generate_image` and emoji descriptions: Discord-only downloads typed by their bytes, the vision model call with its error mapping, and billed cost. |
+| `vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
 | `reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
-| `images.py` | `generate_image`: drawing through OpenRouter's Images API ([image generation](image-generation.md)). |
+| `images.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)). |
+| `drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (in `agent.py`) only queues. |
 | `emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
 | `app.py` | Wires the executor when the key is set; startup and per-job logs. |
 | `0007_retrieval.sql` | Extension, full-text index, `message_embeddings`, staleness trigger. |
@@ -47,6 +48,20 @@ Rust prompt changes, already made:
   readers.
 - The capabilities line says Kiki can search every channel in this server, with
   an optional channel filter, and should cite message links.
+- Threads (issue #24): the system prompt names a thread with its parent channel
+  (`thread "Thread" in #boba`). Discord's thread starter message (type 21) is an
+  empty placeholder pointing at the message the thread was started from, so the
+  run context shows that message instead, on its own line with its real author,
+  text and `[image: …; message <id>]` marker (`read_image` takes that ID). A thread
+  started from a message has the message's ID, which finds it when the placeholder
+  is too old to be shown. `THREAD_CREATED` notices (type 18) stay out of the
+  channel context.
+- Server-specific names (issue #24): words in the newest messages that are also a
+  channel name or a memory subject of the server (`name_norm` match, single words
+  and pairs) are listed in the run context with a nudge to check memory or history
+  before answering from general knowledge, so "describe boba" in a server with a
+  #boba channel doesn't need Kiki to think of looking. The system prompt says the
+  same for bare names and nouns aimed at her.
 
 ## Tools
 
@@ -144,8 +159,10 @@ than for people (agent to agent).
   png/jpg/gif/webp name, then embeds of type `image`/`gifv` (their thumbnail)
   or with an `image`, deduplicated by URL, at most 10. Rust (`MESSAGE_COLUMNS`)
   and Python (`images_in`) apply the same test (Rust doesn't deduplicate).
-  Discord's attachment URLs are signed and expire after about a day, and the
-  host can't refresh them, so older images usually come back as expired.
+  Discord's attachment URLs are signed and expire after about a day; with the
+  bot token (`DISCORD_BOT_TOKEN`), the host refreshes expired ones through
+  `POST /attachments/refresh-urls` before downloading. Without it, older images
+  come back as expired.
 - **Kiki's drawings:** images in a bot message named `kiki-<id>.png` (how Rust
   uploads `generate_image` results) are read from `agent_host_images` when the
   drawing job's guild matches, and labeled for the vision model and in the

@@ -5,7 +5,7 @@ from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 
 from kiki_agent_host.app import Settings, create_app
-from kiki_agent_host.contracts import JobRequest, JobResult
+from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult
 from kiki_agent_host.executor import TransientError
 
 TOKEN = "test-host-token"
@@ -132,6 +132,35 @@ async def test_failure_is_durable_and_does_not_expose_provider_details(database_
     assert "job_id=reply:42" in failures[0].message
     assert "error_type=RuntimeError" in failures[0].message
     assert failures[0].exc_info is None
+
+
+async def test_image_jobs_are_durable_so_a_retry_does_not_draw_again(database_url):
+    class Drawer(FakeExecutor):
+        async def draw(self, request: ImageJobRequest) -> ImageJobResult:
+            self.calls += 1
+            return ImageJobResult(
+                model=request.image_model, error="refused", failure_note="nope, sorry"
+            )
+
+    executor = Drawer()
+    body = {
+        "id": "image:42:1",
+        "scope": {"guild_id": "1", "channel_id": "2", "conversation_id": "3"},
+        "image_model": "test/image",
+        "reply_job": "reply:42",
+        "chat_model": "test/model",
+        "ack": "brb",
+        "drawing": {"prompt": "a frog", "subjects": [{"name": "Nougie", "photos": ["7"]}]},
+    }
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        first = await http.post("/v1/images", json=body, headers=HEADERS)
+        second = await http.post("/v1/images", json=body, headers=HEADERS)
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        assert first.json()["result"]["failure_note"] == "nope, sorry"
+        assert executor.calls == 1
+        changed = {**body, "ack": "different"}
+        assert (await http.post("/v1/images", json=changed, headers=HEADERS)).status_code == 409
 
 
 async def test_timeout_releases_lock_and_same_job_can_be_recovered(database_url):

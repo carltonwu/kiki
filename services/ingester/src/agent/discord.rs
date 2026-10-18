@@ -13,12 +13,13 @@ use crate::store;
 pub(super) const MAX_MESSAGE_CHARS: usize = 1900;
 
 impl Agent {
-    /// Delivers planned messages with bounded pauses and an optional first reply
-    /// reference; generated images go with the first message. Each message is
-    /// stored right away (the Gateway copy may arrive later) and tagged into the
-    /// conversation.
+    /// Delivers planned messages with bounded pauses and, if `reference`, a reply
+    /// reference on the first (which also pings its author); images go with the
+    /// first message. Each message is stored right away (the Gateway copy may
+    /// arrive later) and tagged into the conversation.
     ///
     /// Sends aren't retried: a retry after a timeout could post the reply twice.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
         &self,
         context: &Context,
@@ -26,10 +27,11 @@ impl Agent {
         conversation_id: i64,
         plan: &[super::delivery::Message],
         images: &[Attachment],
+        reference: bool,
         record: &mut RunRecord,
     ) -> anyhow::Result<()> {
         let mentions = AllowedMentions {
-            replied_user: context.settings.chat_reply_reference,
+            replied_user: reference,
             ..Default::default()
         };
         let mut draining = self.draining.subscribe();
@@ -50,7 +52,7 @@ impl Agent {
             if i == 0 && !images.is_empty() {
                 request = request.attachments(images);
             }
-            if i == 0 && context.settings.chat_reply_reference {
+            if i == 0 && reference {
                 request = request
                     .reply(Id::new(context.reply_to as u64))
                     .fail_if_not_exists(false);
