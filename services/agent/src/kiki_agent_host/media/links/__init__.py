@@ -4,7 +4,8 @@ Web fetch reads ordinary pages, but social sites hide posts behind scripts, logi
 or blocks. A reader uses its site's own API instead and returns structured text
 (author, body, stats, top comments), with images described by the vision model
 like `read_image`. A reader is a module with `matches(url) -> bool` and
-`async read(deps, url, question) -> dict`; a new site is one entry in `READERS`.
+`async read(deps, url, question) -> dict`, plus `async photos(url)` (its images'
+links, for drawings) and `media_host(url)`; a new site is one entry in `READERS`.
 
 Readers request only their own site's hosts, so a URL from the model can't make
 the host fetch an arbitrary address. Links no reader takes come back as an error
@@ -12,6 +13,7 @@ that sends the model to web fetch.
 """
 
 import re
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from psycopg import AsyncConnection
@@ -37,6 +39,29 @@ def normalize(url: str) -> str | None:
 
 def reader_for(url: str):
     return next((reader for reader in READERS if reader.matches(url)), None)
+
+
+async def photos(url: str) -> tuple[list[str], Callable[[str], bool]]:
+    """A post's images as its reader finds them (all of a tweet's photos, where
+    Discord's preview shows one or none), in `read_link`'s order, and the hosts
+    they may be downloaded from. Empty when no reader takes the link or it fails."""
+    link = normalize(url)
+    reader = reader_for(link) if link else None
+    if reader is None:
+        return [], nowhere
+    return await reader.photos(link), reader.media_host
+
+
+def nowhere(url: str) -> bool:
+    return False
+
+
+def post_links(content: str, raw: dict) -> list[str]:
+    """The links in a message that a reader takes: the text first, then previews."""
+    embeds = (raw or {}).get("embeds") or []
+    found = [normalize(u) for u in LINK.findall(content or "")]
+    found += [normalize(e["url"]) for e in embeds if isinstance(e.get("url"), str)]
+    return list(dict.fromkeys(u for u in found if u and reader_for(u)))
 
 
 async def read_link(deps, url: str, question: str | None = None) -> dict:

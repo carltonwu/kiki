@@ -91,8 +91,19 @@ The chat model passes:
   message IDs she or the people asking already picked, or a Discord message link
   or attachment link they pasted. An attachment link's message is found by its
   attachment ID in the link's channel; an attachment's snowflake comes just
-  before its message's. A bare string is taken as a name (models slip; two slips
-  failed a prod reply through the tool's retry limit).
+  before its message's, and the link names that one image (`ID:N`). A bare
+  string is taken as a name (models slip; two slips failed a prod reply through
+  the tool's retry limit).
+- `shared`: the messages a picture is made from that don't show a subject (the
+  photo, meme, template or post to redraw), when they aren't among what Rust
+  adds itself (below): a picture from earlier in the chat that a follow-up asks
+  for again. Like `photos`, a message ID, a Discord link, or an X or Reddit post's
+  own link (the newest message in the channel sharing it, under any host or link
+  fixer). `ID:N` takes only a message's Nth image, numbered as `read_image` and
+  `read_link` number them: "the first pic" of a two-photo tweet, without the
+  other. A link fixer's deleted original stands for its repost. Each pick must
+  have an image (an attachment, a link preview, or a post a reader takes), or
+  the call is a tool error.
 - `style` only when asked for or the joke needs it; `aspect_ratio` from what GPT
   Image 2.5 takes on OpenRouter (1:1, 3:2, 2:3, 4:3, 3:4, 16:9, 9:16, 21:9; anything
   else is dropped rather than failing the call); `caption`; and `edit` to change a
@@ -121,11 +132,17 @@ subject and 16 in all (OpenRouter's `input_references` range for GPT Image), bes
 
 **Shared images** come after every subject's references. These are the images
 people shared with the request: attached to a trigger message, or in a message a
-trigger replies to or links (a message link or a pasted attachment link). Kiki's
-own pictures don't count. Rust works these out while building the context. The
-prompt shows what the newest messages reply to or link, with image markers, so
-Kiki can use them as `photos`. Rust adds the ones no subject uses as
-`Drawing.shared`, at most 4 messages. The host sends them unchecked (people
+trigger replies to or links (a message link or a pasted attachment link), and in
+turn what that replies to or links, up to 3 steps and, past the first, half an
+hour back. A message of Kiki's leads to what she was answering, and her picture
+also to what it was drawn from, so "you can do it" replying to her refusal, or
+"redo it" replying to her picture, still means the tweet the request was about.
+A link fixer's deleted original is its repost. Kiki's own pictures don't count,
+and a message linking an X or Reddit post counts even without a preview. Rust
+works these out while building the context. The prompt shows the chain, with
+image markers, so Kiki can use them as `photos`. Rust adds the ones the drawing
+doesn't use as `Drawing.shared`, after Kiki's own `shared` picks (a message she
+picked one image of isn't added whole), at most 4 messages of its own. The host sends them unchecked (people
 picked them, and the check would turn down a meme template) and labels them
 "Reference image N is what they shared with the request (a photo, meme or
 template): use it as the request describes". In prod, "edit this meme" sent as a
@@ -135,6 +152,17 @@ Kiki remembered to name. A given photo that the history search finds again isn't
 checked or sent twice. Shared images and `photos` include link previews' images
 (a tweet's photo), which the history search skips: in prod, "replace Sneaky with
 Reece" about a pasted tweet would have been drawn without the tweet's photo.
+A given message's images are its attachments, then its linked post's photos from
+the site's reader (all of a tweet's, in `read_link`'s order, downloaded only from
+the site's media hosts), or Discord's previews when no reader gets any: Discord's
+preview of an X post shows at most one photo, and a link in <...> none. Given
+photos keep the order they were given, so an edit's photo is the first.
+
+In prod, "replace the person in the twitter picture with reece" was refused, and
+three follow-ups were drawn without the tweet: "no reece is a guy, do exactly as
+instructed" replied to nothing, "you can do it" replied to Kiki's refusal, and
+"yes the selfie one" replied to nothing. Kiki couldn't have named it either: the
+tool took only messages with attachments, and the repost had link previews.
 
 A subject with no usable reference is drawn from her description. Images are
 downloaded from Discord and sent as bytes (data URLs), never as Discord links:

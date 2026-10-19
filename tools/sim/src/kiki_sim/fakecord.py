@@ -1133,8 +1133,9 @@ def reddit_posts(media_base: str) -> dict[str, list]:
 
 
 def x_posts(media_base: str) -> dict[str, dict]:
-    """Two X posts in FxTwitter's `tweet` shape: a photo post, and a video post whose
-    thumbnail is a fakecord PNG (the stub vision model reads labels back)."""
+    """X posts in FxTwitter's `tweet` shape: a photo post, a video post whose
+    thumbnail is a fakecord PNG (the stub vision model reads labels back), and a
+    post with two photos."""
     image = f"{media_base}/fxtwitter/media"
 
     def post(id: str, handle: str, name: str, text: str, media: list[dict]) -> dict:
@@ -1170,6 +1171,16 @@ def x_posts(media_base: str) -> dict[str, dict]:
                     "thumbnail_url": f"{image}/a-person-juggling-five-clubs.png",
                     "duration": 12.4,
                 }
+            ],
+        ),
+        "1800000000000000003": post(
+            "1800000000000000003",
+            "sneakyfan",
+            "Sneaky Fan",
+            "two looks",
+            [
+                {"type": "photo", "url": f"{image}/a-person-in-a-goth-outfit-facing-us.png"},
+                {"type": "photo", "url": f"{image}/the-same-outfit-from-behind.png"},
             ],
         ),
     }

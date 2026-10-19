@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -24,6 +25,7 @@ from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.tools.drawing import MAX_IMAGES
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest, Subject
 from kiki_agent_host.media import drawing, fetch, generation
+from kiki_agent_host.media.links import x
 from kiki_agent_host.media.vision import ImageRefused
 from kiki_agent_host.openrouter.images import (
     MAX_REFERENCES,
@@ -279,6 +281,12 @@ async def test_refresh_asks_discord_for_expired_links_only(monkeypatch):
 GUILD = 1
 
 
+@pytest.fixture(autouse=True)
+def offline_sites(monkeypatch):
+    """Link readers find nothing unless a test serves them: nothing reaches the network."""
+    monkeypatch.setattr(x, "TRANSPORT", httpx.MockTransport(lambda r: httpx.Response(404)))
+
+
 def request(image_model, messages=None):
     return JobRequest.model_validate(
         {
@@ -431,7 +439,11 @@ async def test_pasted_message_and_attachment_links_are_photos(database_url):
     }
     run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
     [queued] = (await run.execute(request("test/image"))).drawings
-    assert [s.photos for s in queued.subjects] == [["1561505604110000237"]] * 2
+    # The attachment link names one image of its message.
+    assert [s.photos for s in queued.subjects] == [
+        ["1561505604110000237"],
+        ["1561505604110000237:1"],
+    ]
 
     results = []
 
@@ -452,6 +464,95 @@ async def test_pasted_message_and_attachment_links_are_photos(database_url):
 
     await executor(database_url, FakeImageModel(), respond).execute(request("test/image"))
     assert "No message in this server has the attachment" in results[0]["error"]
+
+
+# Seen in prod: "replace the person in the twitter picture with reece" was refused,
+# and the follow-ups that asked again ("no, do exactly as instructed") didn't reply
+# to the tweet, so its photos never reached the image model. The tweet was a link
+# fixer's repost (its original deleted), with its photos only as link previews.
+ORIGINAL, REPOST = 1561562612125147176, 1561562613379235890
+FIXER = 1358234666267578368
+TWEET = "https://x.com/Sneaky/status/440322224407314432"
+
+
+def preview(n):
+    proxy = f"https://images-ext-1.discordapp.net/external/{n}/https/pbs.twimg.com/media/{n}.jpg"
+    return {
+        "type": "rich",
+        "url": TWEET.replace("x.com", "fxtwitter.com"),
+        "image": {"url": f"https://pbs.twimg.com/media/{n}.jpg", "proxy_url": proxy},
+    }
+
+
+async def seed_repost(database_url, embeds=2):
+    footer = (
+        "-# The original message sent by <@300> was deleted so the bot could fix the "
+        "broken embed links for easier viewing."
+    )
+    rows = [
+        (ORIGINAL, 300, False, TWEET, {"author": {"id": "300"}}, "now()"),
+        (
+            REPOST,
+            FIXER,
+            True,
+            f"<@300>:\n{TWEET.replace('x.com', 'fxtwitter.com')}\n\n{footer}",
+            {"author": {"id": str(FIXER)}, "embeds": [preview(n) for n in range(1, embeds + 1)]},
+            None,
+        ),
+    ]
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        for id, author, bot, content, raw, deleted in rows:
+            await db.execute(
+                "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name,"
+                " author_bot, content, created_at, raw, deleted_at)"
+                f" VALUES (%s, %s, 2, %s, 'x', %s, %s, now(), %s, {deleted or 'NULL'})",
+                (id, GUILD, author, bot, content, Jsonb(raw)),
+            )
+
+
+async def test_a_picture_to_redraw_can_be_named_from_earlier_in_the_chat(database_url):
+    await seed_repost(database_url)
+    await seed(
+        database_url,
+        (95, 300, "no pictures here", []),
+        (96, 300, "", [attachment(97, "meme.png", "image/png")]),
+    )
+    picks = [
+        # The deleted original stands for its repost; :1 is only the first photo.
+        ([f"{ORIGINAL}:1"], [f"{REPOST}:1"]),
+        # The post's own link, whichever host it was pasted with.
+        ([TWEET], [str(REPOST)]),
+        ([f"https://discord.com/channels/{GUILD}/2/{REPOST}"], [str(REPOST)]),
+    ]
+    for shared, expected in picks:
+        args = {"prompt": "the tweet's first photo with Reece", "shared": shared}
+        run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+        [queued] = (await run.execute(request("test/image"))).drawings
+        assert queued.shared == expected
+    # A link preview is a photo too, as an edit's photo or a subject's.
+    args = {"prompt": "x", "edit": True, "subjects": [{"name": "Sneaky", "photos": [str(REPOST)]}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert queued.subjects[0].photos == [str(REPOST)]
+
+    errors = []
+    for shared in [["95"], ["96:2"], ["https://x.com/someone/status/77"]]:
+
+        def respond(messages, info, shared=shared):
+            if len(messages) == 1:
+                call = {"prompt": "x", "shared": shared}
+                return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+            errors.append(str(messages[-1].parts[0].content))
+            return ModelResponse(parts=[TextPart("hm")])
+
+        result = await executor(database_url, FakeImageModel(), respond).execute(
+            request("test/image")
+        )
+        assert result.drawings == []
+    assert "No images in ['95']" in errors[0]
+    # It has one. (A linked post isn't counted here: the site may have more.)
+    assert "No images in ['96:2']" in errors[1]
+    assert "No message in this channel shares" in errors[2]
 
 
 async def test_at_most_max_images_are_queued_per_reply(database_url):
@@ -660,6 +761,60 @@ async def test_a_shared_link_previews_image_is_a_reference(database_url):
     result = await run.draw(job)
     assert [(r.subject, r.message_id, r.attachment_id, r.url) for r in result.references] == [
         ("shared", "84", None, proxy)
+    ]
+    assert [r.data for r in model.references[0]] == [JPEG + b"tweet"]
+
+
+async def test_picked_images_keep_their_order_and_one_can_be_chosen(database_url):
+    await reply_job(database_url)
+    await seed_repost(database_url)
+    await seed(database_url, (96, 300, "", [attachment(97, "meme.png", "image/png")]))
+    files = {
+        "/attachments/2/97/meme.png": PNG + b"meme",
+        "/external/2/https/pbs.twimg.com/media/2.jpg": JPEG + b"second",
+    }
+    model = FakeImageModel()
+    run = executor(database_url, model, lambda messages, info: None)
+    run.transport = discord(files, [])
+    job = image_job([], prompt="x")
+    # Given in this order (lower IDs aren't first), and only the tweet's 2nd photo.
+    job.drawing.shared = [f"{REPOST}:2", "96"]
+    result = await run.draw(job)
+    assert [(r.message_id, r.attachment_id) for r in result.references] == [
+        (str(REPOST), None),
+        ("96", "97"),
+    ]
+    assert [r.data for r in model.references[0]] == [JPEG + b"second", PNG + b"meme"]
+
+
+async def test_a_linked_posts_photos_come_from_the_site(database_url, monkeypatch):
+    # A link in <...> has no preview at all, and Discord's preview of an X post
+    # shows at most one photo: the post's photos are fetched from the site.
+    await reply_job(database_url)
+    await seed(database_url, (98, 300, f"put me in this <{TWEET}>", []))
+    photo = json.loads(
+        next(
+            (Path(__file__).parent / "fixtures/fxtwitter").glob("*-440322224407314432.json")
+        ).read_text()
+    )
+
+    def fxtwitter(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=photo)
+
+    def site(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "pbs.twimg.com" and request.url.params.get("name") == "medium":
+            return httpx.Response(200, content=JPEG + b"tweet")
+        return httpx.Response(404)
+
+    monkeypatch.setattr(x, "TRANSPORT", httpx.MockTransport(fxtwitter))
+    model = FakeImageModel()
+    run = executor(database_url, model, lambda messages, info: None)
+    run.transport = httpx.MockTransport(site)
+    job = image_job([], prompt="x")
+    job.drawing.shared = ["98"]
+    result = await run.draw(job)
+    assert [(r.message_id, r.url) for r in result.references] == [
+        ("98", "https://pbs.twimg.com/media/BhxWutnCEAAtEQ6.jpg?name=medium")
     ]
     assert [r.data for r in model.references[0]] == [JPEG + b"tweet"]
 

@@ -4,7 +4,10 @@ Kiki's reply names the subjects of a picture (people, pets, things, herself) and
 Rust posts it right away; this job runs after it. For each subject it finds what
 the subject looks like, best first:
 
-1. photos Kiki or the people asking pointed at (`Subject.photos`);
+1. photos Kiki or the people asking pointed at (`Subject.photos`): a message's
+   attached images, then its linked post's photos from the site itself (all of a
+   tweet's, where Discord's preview has one or none) or else Discord's previews,
+   or only the Nth of them ("123:2");
 2. images in the server's history: for a thing, posts whose text names it; for a
    person, their own posts that look like photos of them (captions like "me",
    camera JPEGs rather than screenshots) and other people's posts naming them.
@@ -12,8 +15,8 @@ the subject looks like, best first:
 3. a person's Discord avatar, if the same check says it's a photo of them;
 4. for Kiki herself, her earlier self-portraits.
 
-Images people shared with the request (`Drawing.shared`: attached to it, or in a
-message it replies to or links) go in too, after the subjects', as what the
+Images people shared with the request (`Drawing.shared`: attached to it, in a
+message it replies to or links, or picked by Kiki, read like given photos) go in too, after the subjects', as what the
 request is about: the scene, meme or template to work from.
 
 Then it writes the final prompt around Kiki's, numbering the references ("reference
@@ -25,7 +28,7 @@ the reply's own prompt, so the request never ends in silence.
 import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import httpx
@@ -40,13 +43,15 @@ from ..chat.attachments import images_in
 from ..chat.scope import HEARD, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
 from ..prompt import history
-from .fetch import client, download, refresh, sniff
+from . import links
+from .fetch import allowed, client, download, refresh, sniff
 from .vision import ImageRefused, Vision, billed_cost, look
 
 logger = logging.getLogger(__name__)
 
 PER_SUBJECT = 3  # references per subject: enough for a likeness, room for several subjects
 SHARED_IMAGES = 4  # images shared with the request, after the subjects'
+GIVEN_PER_MESSAGE = 4  # images taken from one picked message, unless one is named
 CANDIDATE_MESSAGES = 10
 CANDIDATES = 8  # images shown to the vision check per subject
 VERIFY_TIMEOUT_SECONDS = 30
@@ -134,6 +139,8 @@ class Candidate:
     url: str = ""
     media_type: str | None = None
     caption: str = ""
+    # The hosts it may come from: Discord's, or a link reader's for a post's photo.
+    allow: Callable[[str], bool] = allowed
 
 
 @dataclass
@@ -192,6 +199,10 @@ WHERE m.guild_id = %(guild)s AND m.id = ANY(%(ids)s) AND m.deleted_at IS NULL AN
 """
 
 
+# A given message's ID, with the one image wanted when it has several ("123:2").
+PICK = re.compile(r"^([0-9]+)(?::([0-9]+))?$")
+
+
 def word(name: str) -> str:
     """A case-insensitive whole-word Postgres pattern for a name."""
     return r"\m" + re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", name.strip()) + r"\M"
@@ -206,7 +217,9 @@ def avatar_url(base: str, user_id: str, user_hash: str | None, guild: int, membe
     return None
 
 
-def candidates_in(rows: list[dict], per_message: int, embeds: bool = False) -> list[Candidate]:
+def candidates_in(
+    rows: list[dict], per_message: int | None, embeds: bool = False
+) -> list[Candidate]:
     """Each message's first images (as `read_image` lists them), as candidates.
     Link previews' images (embeds) only with `embeds`: in the history they're
     other sites' pictures, rarely the subject, but a shared tweet's photo is the
@@ -269,12 +282,8 @@ class Gatherer:
     async def shared(self, message_ids: list[str]) -> list[tuple[Reference, BinaryImage]]:
         """The images shared with the request, used as given (people chose them).
         Empty if they can't be read: the picture is still drawn."""
-        ids = [int(i) for i in message_ids if i.isdigit()]
-        if not ids:
-            return []
         try:
-            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4, embeds=True)
-            fetched = await self.fetch(given[:SHARED_IMAGES])
+            fetched = await self.fetch((await self.given(message_ids))[:SHARED_IMAGES])
         except OperationalError:
             raise
         except Exception as error:  # noqa: BLE001 - shared images must not sink the drawing
@@ -289,8 +298,7 @@ class Gatherer:
         name = subject.name
         chosen: list[tuple[Reference, BinaryImage]] = []
         if subject.photos:
-            ids = [int(p) for p in subject.photos if p.isdigit()]
-            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4, embeds=True)
+            given = await self.given(subject.photos)
             # Picked by Kiki or the people asking: used without a check.
             chosen += [(c.reference, image) for c, image in await self.fetch(given[:PER_SUBJECT])]
         if subject.kiki and len(chosen) < PER_SUBJECT:
@@ -348,6 +356,48 @@ class Gatherer:
         )
         return candidates_in(rows, per_message=2)[:CANDIDATES]
 
+    async def given(self, picks: list[str]) -> list[Candidate]:
+        """The images of messages Kiki or the people asking picked, in the order
+        given (an edit's photo is the first): each message's images, or with
+        "ID:N" only its Nth, numbered as `read_image` and `read_link` number them."""
+        wanted = [(int(m[1]), int(m[2] or 0)) for p in picks if (m := PICK.match(p.strip()))]
+        if not wanted:
+            return []
+        rows = {r["id"]: r for r in await self.rows(PHOTOS, {"ids": [i for i, _ in wanted]})}
+        found: list[Candidate] = []
+        for id, n in wanted:
+            if row := rows.get(id):
+                images = await self.images_of(row)
+                found += images[n - 1 : n] if n else images[:GIVEN_PER_MESSAGE]
+        unique = {key(c.reference): c for c in reversed(found)}  # first wins
+        return [c for c in found if unique[key(c.reference)] is c]
+
+    async def images_of(self, row: dict) -> list[Candidate]:
+        """A message's attached images, then its linked posts' photos from the site
+        (a tweet's every photo, where Discord's preview shows one or none, or none
+        at all for a link in <...>), or Discord's link previews if no site reads."""
+        attached, previews = [], []
+        for c in candidates_in([row], per_message=None, embeds=True):
+            (attached if c.reference.attachment_id else previews).append(c)
+        posted = []
+        for link in links.post_links(row["content"], row["raw"] or {}):
+            try:
+                urls, allow = await links.photos(link)
+            except Exception as error:  # noqa: BLE001 - Discord's previews still serve
+                logger.warning("post photos failed error_type=%s", type(error).__name__)
+                continue
+            posted += [
+                Candidate(
+                    label="",
+                    reference=Reference(subject="", message_id=str(row["id"]), url=url),
+                    url=url,
+                    caption=(row["content"] or "").strip()[:200],
+                    allow=allow,
+                )
+                for url in urls
+            ]
+        return attached + (posted or previews)
+
     async def fetch(self, candidates: list[Candidate]) -> list[tuple[Candidate, BinaryImage]]:
         """Downloads candidates, refreshing expired links; drops what fails or
         isn't a type the image model takes."""
@@ -356,7 +406,10 @@ class Gatherer:
         async with client(self.transport) as http:
             fresh = await refresh(http, self.vision.discord_token, [c.url for c in candidates])
             got = await asyncio.gather(
-                *(download(http, fresh.get(c.url, c.url), c.media_type) for c in candidates)
+                *(
+                    download(http, fresh.get(c.url, c.url), c.media_type, allow=c.allow)
+                    for c in candidates
+                )
             )
         fetched = []
         for c, result in zip(candidates, got, strict=True):

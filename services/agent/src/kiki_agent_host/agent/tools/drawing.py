@@ -10,8 +10,12 @@ from pydantic_ai import RunContext, Tool
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
-from ...chat.scope import resolve_person
+from ...chat.attachments import images_in
+from ...chat.scope import HEARD, resolve_person
 from ...contracts import AspectRatio, Drawing, Subject
+from ...media import links
+from ...media.drawing import PICK
+from ...media.links import reddit, x
 from ..deps import Deps
 from ..guard import guarded
 
@@ -33,8 +37,9 @@ class Pictured(BaseModel):
         default_factory=list,
         description="IDs of messages whose images show them, when you or the people asking "
         "already picked some (like the message in [image: …; message 123]; a Discord message "
-        "or attachment link they pasted works too). Otherwise leave it empty: the drawing "
-        "step finds their photos in the server's history.",
+        "or attachment link they pasted works too). Add :N for only its Nth image (123:2). "
+        "Only photos of them: a picture to redraw them into goes in shared. Otherwise leave "
+        "it empty: the drawing step finds their photos in the server's history.",
     )
     description: str = Field(
         default="",
@@ -62,6 +67,9 @@ ATTACHMENT_LINK = re.compile(
 # An attachment's ID is a snowflake made as it's uploaded, just before its message's:
 # the message is within this many IDs after it (a minute of snowflake time).
 ATTACHMENT_TO_MESSAGE = 60_000 << 22
+# A link fixer deletes a post and reposts it within seconds (migration 0024).
+REPOST_WINDOW = 30_000 << 22
+MAX_SHARED = 4
 
 
 async def generate_image(
@@ -72,6 +80,7 @@ async def generate_image(
     aspect_ratio: Ratio = None,
     caption: str = "",
     edit: bool = False,
+    shared: list[str] | None = None,
 ) -> dict:
     """Make a picture. It's drawn after your reply and posted as its own message.
 
@@ -109,6 +118,14 @@ async def generate_image(
         edit: True to change a posted photo rather than make a new picture: put
             its message ID first in the first subject's photos, and the prompt
             says only what to change; everything else is kept.
+        shared: Messages whose images the picture is made from but that don't
+            show a subject: the photo, meme, template or post to redraw or work
+            from, by message ID (123, or 123:2 for only its 2nd image, numbered
+            as read_image and read_link number them), Discord link, or the
+            post's link (an X or Reddit post shared here). The images the newest
+            messages carry, reply to or link go in anyway; name it here when
+            it's from earlier in the chat, like a tweet asked about a few
+            messages ago, or to send only one of a post's images.
     """
 
     async def work():
@@ -136,8 +153,8 @@ async def generate_image(
                         user_id = str(ids[0])
                         break
             photos = [await photo_message(deps, p.strip()) for p in s.photos if p.strip()]
-            if photos and not await has_images(deps, photos):
-                raise ValueError(f"No message with images among {photos} in this server")
+            if missing := await without_images(deps, photos):
+                raise ValueError(f"No message with images among {missing} in this server")
             pictured.append(
                 Subject(
                     name=name,
@@ -147,6 +164,9 @@ async def generate_image(
                     photos=photos[:4],
                 )
             )
+        given = [await photo_message(deps, p.strip()) for p in shared or [] if p.strip()]
+        if missing := await without_images(deps, given):
+            raise ValueError(f"No images in {missing} in this server")
         if edit and not (pictured and pictured[0].photos):
             raise ValueError(
                 "To edit, put the photo's message ID first in the first subject's photos"
@@ -158,13 +178,18 @@ async def generate_image(
             aspect_ratio=aspect_ratio,
             caption=caption.strip(),
             edit=edit,
+            shared=list(dict.fromkeys(given))[:MAX_SHARED],
         )
+        # Checked again after the awaits above: parallel calls each passed the first.
+        if len(deps.drawings) >= MAX_IMAGES:
+            return {"error": f"At most {MAX_IMAGES} pictures per reply."}
         deps.drawings.append(drawing)
         logger.info(
-            "drawing queued job_id=%s subjects=%d photos=%d styled=%s",
+            "drawing queued job_id=%s subjects=%d photos=%d shared=%d styled=%s",
             deps.job_id,
             len(pictured),
             sum(len(s.photos) for s in pictured),
+            len(drawing.shared),
             drawing.style is not None,
         )
         return {
@@ -179,16 +204,18 @@ async def generate_image(
 
 
 async def photo_message(deps: Deps, photo: str) -> str:
-    """The message ID for a photo given as an ID, a message link, or the link of an
-    attachment (found among its channel's messages)."""
-    if photo.isdigit():
-        return photo
+    """The message (as "ID", or "ID:N" for its Nth image) for a photo given as an
+    ID, a message link, the link of an attachment (found among its channel's
+    messages), or a post's link (the message in this channel that shared it). A link fixer's
+    deleted original is its repost."""
+    if m := PICK.match(photo):
+        return await reposted(deps, int(m[1])) + (f":{m[2]}" if m[2] else "")
     if link := MESSAGE_LINK.search(photo):
-        return link["message"]
+        return await reposted(deps, int(link["message"]))
     if link := ATTACHMENT_LINK.search(photo):
         attachment = int(link["attachment"])
         cursor = await deps.connection.execute(
-            "SELECT id FROM messages WHERE guild_id = %s AND channel_id = %s"
+            "SELECT id, raw FROM messages WHERE guild_id = %s AND channel_id = %s"
             " AND id BETWEEN %s AND %s AND deleted_at IS NULL"
             " AND raw->'attachments' @> jsonb_build_array(jsonb_build_object('id', %s::text))"
             " ORDER BY id LIMIT 1",
@@ -201,18 +228,79 @@ async def photo_message(deps: Deps, photo: str) -> str:
             ),
         )
         if row := await cursor.fetchone():
-            return str(row[0])
+            ids = [i.id for i in images_in(row[1] or {})]
+            n = ids.index(str(attachment)) + 1 if str(attachment) in ids else 0
+            return str(row[0]) + (f":{n}" if n else "")
         raise ValueError(f"No message in this server has the attachment {photo}")
-    raise ValueError("photos must be message IDs or Discord message links")
+    if needles := post_needles(photo):
+        cursor = await deps.connection.execute(
+            # This channel's, newest first: its index stops at the first match.
+            f"SELECT m.id FROM messages m WHERE m.channel_id = %s AND m.guild_id = %s"
+            f" AND m.deleted_at IS NULL AND {HEARD} AND EXISTS (SELECT 1 FROM unnest(%s::text[]) n"
+            "   WHERE strpos(m.content, n) > 0 OR strpos(coalesce(m.raw->>'embeds', ''), n) > 0)"
+            " ORDER BY m.id DESC LIMIT 1",
+            (deps.scope.channel_id, deps.scope.guild_id, needles),
+        )
+        if row := await cursor.fetchone():
+            return str(row[0])
+        raise ValueError(f"No message in this channel shares {photo}")
+    raise ValueError("photos must be message IDs, Discord links or a shared post's link")
 
 
-async def has_images(deps: Deps, message_ids: list[str]) -> bool:
+def post_needles(url: str) -> list[str]:
+    """What a message sharing this X or Reddit post contains, whichever host or
+    link fixer it was pasted with."""
+    link = links.normalize(url)
+    if link is None or not links.reader_for(link):
+        return []
+    if status := x.status_id(link):
+        return [f"/status/{status}"]
+    if found := reddit.post_id(link):
+        post = found[0]
+        return [f"/comments/{post}", f"redd.it/{post}", f"/gallery/{post}"]
+    return [link.split("://", 1)[1]]
+
+
+async def reposted(deps: Deps, message_id: int) -> str:
+    """The message, or the repost standing for it when a link fixer deleted it."""
     cursor = await deps.connection.execute(
-        "SELECT 1 FROM messages WHERE guild_id = %s AND id = ANY(%s) AND deleted_at IS NULL"
-        " AND jsonb_array_length(coalesce(raw->'attachments', '[]')) > 0 LIMIT 1",
-        (deps.scope.guild_id, [int(i) for i in message_ids]),
+        "SELECT r.id FROM messages o JOIN messages r ON r.channel_id = o.channel_id"
+        " AND r.relayed_for = o.author_id AND r.id > o.id AND r.id < o.id + %s"
+        " AND r.deleted_at IS NULL"
+        " WHERE o.id = %s AND o.guild_id = %s AND o.deleted_at IS NOT NULL"
+        " ORDER BY r.id LIMIT 1",
+        (REPOST_WINDOW, message_id, deps.scope.guild_id),
     )
-    return await cursor.fetchone() is not None
+    row = await cursor.fetchone()
+    return str(row[0] if row else message_id)
+
+
+async def without_images(deps: Deps, picks: list[str]) -> list[str]:
+    """The picks with no image to draw from: no message here, or one with no
+    attached image, link preview or readable post (whose photos the drawing
+    fetches), or fewer images than the Nth asked for."""
+    if not picks:
+        return []
+    wanted = [(p, PICK.match(p)) for p in picks]
+    ids = [int(m[1]) for _, m in wanted if m]
+    cursor = await deps.connection.execute(
+        f"SELECT m.id, m.content, m.raw FROM messages m WHERE m.guild_id = %s"
+        f" AND m.id = ANY(%s) AND m.deleted_at IS NULL AND {HEARD}",
+        (deps.scope.guild_id, ids),
+    )
+    rows = {id: (content, raw or {}) for id, content, raw in await cursor.fetchall()}
+    missing = []
+    for pick, m in wanted:
+        row = rows.get(int(m[1])) if m else None
+        if row is None:
+            missing.append(pick)
+            continue
+        count = len(images_in(row[1]))
+        if links.post_links(*row):
+            continue  # the post's photos are counted when it's drawn
+        if count == 0 or (m[2] and int(m[2]) > count):
+            missing.append(pick)
+    return missing
 
 
 async def only_with_image_model(
