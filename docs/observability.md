@@ -23,28 +23,40 @@ agent host (Python) ─OTLP────┘
   minutes without outbound packets, so it never exports on a timer. Its metric
   reader has an infinite interval (no thread at all), and the API flushes all
   three signals after each job request (`/v1/*`, success or error), off the event
-  loop, once the response is out. The span and log batch processors wake every
-  few seconds but send only when they hold something. Shutdown (SIGTERM, via the
-  app's lifespan, and the end of `kiki-agent-host index`) flushes once more.
+  loop, once the response is out; flushes requested while one runs coalesce into
+  one more. The span and log batch processors wake every few seconds but send
+  only when they hold something. Shutdown (SIGTERM, via the app's lifespan, and
+  the end of `kiki-agent-host index`) stops scheduling flushes and flushes once
+  more, all three signals in parallel within 4 s (each export request times out
+  after 3 s): uvicorn may have used most of Railway's 30 s drain by then.
   So the host's metric samples are sparse: a counter has a sample only after a
   job, and an instant query goes stale five minutes later. Query them over a
   range (`increase(kiki_agent_jobs_total[$__range])`, `last_over_time(…[1h])`).
 - **The ingester runs always**, so it exports normally: spans and logs in batches,
   metrics every 60 s. Its main flushes and stops the exporters on every exit path,
-  bounded to 5 s. `ingester migrate` (the pre-deploy step) doesn't export.
+  all three in parallel within 5 s (3 s per export request), so a stalled one
+  can't hold back the others, such as the final `kiki.leader.held = 0`.
+  `ingester migrate` (the pre-deploy step) doesn't export. Stdout is unchanged:
+  the console layer sees events only, never span names or fields.
 - **Temporality is cumulative**, what Mimir (Prometheus) expects.
 - **Traces:** the ingester exports only its own spans (`tracing` spans from the
   `ingester` crate; dependencies' spans, like one per twilight REST call, would
-  each start a trace). The agent host traces inbound requests (FastAPI, `/health`
-  excluded) and outbound HTTP (httpx, and httpx2 for the OpenAI SDK), with the W3C
-  `traceparent` extracted and injected; client span URLs lose their query string
-  (Discord's signed attachment links). GenAI instrumentation (pydantic-ai,
+  each start a trace). An agent run is the `agent_run` span; its requests to the
+  agent host carry its W3C `traceparent` (and only those requests), so the host's
+  FastAPI span (`/health` excluded) joins the same trace. The host extracts trace
+  context but never injects it: its outbound calls (OpenRouter, Discord, fetched
+  links) are third parties. They are still client spans (httpx, and httpx2 for the
+  OpenAI SDK), with URLs stripped of credentials, query and fragment (Discord's
+  signed attachment links carry tokens there). GenAI instrumentation (pydantic-ai,
   logfire) stays off: no prompt or reply text goes into telemetry.
 - **Logs:** the ingester bridges `tracing` events (`opentelemetry-appender-tracing`),
   the agent host the root `logging` logger. Neither exports the exporter's own logs
   (`opentelemetry*`, and its HTTP clients: reqwest/hyper/h2 in Rust,
   urllib3/requests in Python), which would otherwise feed back into the export.
-  The agent's JSON stdout lines carry `trace_id`/`span_id` inside a span.
+  The agent host never exports HTTP client loggers (`httpx`, `httpx2`,
+  `httpcore`, `httpcore2`, `h11`, `openai`) at any `LOG_LEVEL`: their lines hold
+  signed URLs and, at DEBUG, request bodies. The agent's JSON stdout lines carry
+  `trace_id`/`span_id` inside a span; the ingester's logs get them in Loki only.
 
 Code: `services/ingester/src/telemetry.rs`, `services/agent/src/kiki_agent_host/telemetry.py`.
 Each exposes a meter (`telemetry::meter()`, `telemetry.meter()`) that is a no-op
@@ -63,9 +75,9 @@ when export is off; record through it from anywhere.
 
 Resource attributes: `service.name`, `service.namespace=kiki`, `service.version`
 (`RAILWAY_GIT_COMMIT_SHA`), `deployment.environment.name`
-(`RAILWAY_ENVIRONMENT_NAME`, else `local`), `service.instance.id`
-(`RAILWAY_REPLICA_ID`, else the service name; never a random per-process ID,
-which would start new series on every wake of the agent host). In Grafana Cloud
+(`RAILWAY_ENVIRONMENT_NAME`, else `local`), `service.instance.id` (the service
+name: each runs as a single instance, and a random per-process or per-replica ID
+would start new series on every restart, deploy and wake of the agent host). In Grafana Cloud
 metrics carry `job="kiki/<service>"` and `instance=<service.instance.id>`; the
 other resource attributes are on `target_info`.
 

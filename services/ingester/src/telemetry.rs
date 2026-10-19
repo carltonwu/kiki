@@ -6,11 +6,12 @@
 //! standard variables themselves (`OTEL_EXPORTER_OTLP_HEADERS`, percent-decoded,
 //! and the timeouts).
 
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 
+use futures_util::future::join_all;
 use opentelemetry::{KeyValue, global, metrics::Meter, trace::TracerProvider as _};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
-use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter};
+use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
     Resource,
     logs::SdkLoggerProvider,
@@ -19,6 +20,7 @@ use opentelemetry_sdk::{
     trace::SdkTracerProvider,
 };
 use tracing::{Metadata, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::{
     EnvFilter, Layer, filter::filter_fn, fmt, layer::SubscriberExt, util::SubscriberInitExt,
 };
@@ -26,6 +28,8 @@ use tracing_subscriber::{
 /// Instrumentation scope of every span and instrument the ingester makes.
 const SCOPE: &str = "kiki-ingester";
 const METRIC_INTERVAL: Duration = Duration::from_secs(60);
+/// Per request, so one stalled export can't use up [`SHUTDOWN_TIMEOUT`].
+const EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounds the final flush of all three signals together.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -64,8 +68,15 @@ pub fn init(json_logs: bool, export: bool) -> Telemetry {
         .map(|p| OpenTelemetryTracingBridge::new(&p.logger).with_filter(filter_fn(not_exporter)));
     tracing_subscriber::registry()
         .with(filter)
-        .with(json_logs.then(|| fmt::layer().json().flatten_event(true)))
-        .with((!json_logs).then(fmt::layer))
+        // Stdout shows events only, as before there were spans: no span names
+        // or fields on the lines, in either format.
+        .with(json_logs.then(|| {
+            fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_filter(filter_fn(|m| !m.is_span()))
+        }))
+        .with((!json_logs).then(|| fmt::layer().with_filter(filter_fn(|m| !m.is_span()))))
         .with(spans)
         .with(logs)
         .init();
@@ -80,37 +91,55 @@ pub fn meter() -> Meter {
     global::meter(SCOPE)
 }
 
+/// W3C trace context (`traceparent`) of the current span, as request headers.
+/// Only for the agent host, which continues the trace; empty when export is off.
+pub fn trace_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    let context = tracing::Span::current().context();
+    global::get_text_map_propagator(|propagator| propagator.inject_context(&context, &mut headers));
+    headers
+}
+
 impl Telemetry {
     /// Flushes and stops the exporters, giving up after [`SHUTDOWN_TIMEOUT`].
     pub async fn shutdown(self) {
         let Some(providers) = self.providers else {
             return;
         };
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        // A plain thread, not spawn_blocking: the runtime waits for blocking
-        // tasks on exit, and a stuck export must not hold the process up.
-        std::thread::spawn(move || {
-            for (signal, result) in [
-                (
-                    "traces",
-                    providers.tracer.shutdown_with_timeout(SHUTDOWN_TIMEOUT),
-                ),
-                (
-                    "metrics",
-                    providers.meter.shutdown_with_timeout(SHUTDOWN_TIMEOUT),
-                ),
-                (
-                    "logs",
-                    providers.logger.shutdown_with_timeout(SHUTDOWN_TIMEOUT),
-                ),
-            ] {
-                if let Err(e) = result {
+        // Concurrently, so a stalled signal doesn't starve the others (the final
+        // kiki.leader.held = 0 among them). Plain threads, not spawn_blocking:
+        // the runtime waits for blocking tasks on exit, and a stuck export must
+        // not hold the process up.
+        let Providers {
+            tracer,
+            meter,
+            logger,
+        } = providers;
+        let stops: [(&str, Box<dyn FnOnce() -> _ + Send>); 3] = [
+            (
+                "traces",
+                Box::new(move || tracer.shutdown_with_timeout(SHUTDOWN_TIMEOUT)),
+            ),
+            (
+                "metrics",
+                Box::new(move || meter.shutdown_with_timeout(SHUTDOWN_TIMEOUT)),
+            ),
+            (
+                "logs",
+                Box::new(move || logger.shutdown_with_timeout(SHUTDOWN_TIMEOUT)),
+            ),
+        ];
+        let stops = stops.into_iter().map(|(signal, stop)| {
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                if let Err(e) = stop() {
                     warn!(signal, error = %e, "OpenTelemetry flush failed");
                 }
-            }
-            let _ = done_tx.send(());
+                let _ = done_tx.send(());
+            });
+            done_rx
         });
-        if tokio::time::timeout(SHUTDOWN_TIMEOUT, done_rx)
+        if tokio::time::timeout(SHUTDOWN_TIMEOUT, join_all(stops))
             .await
             .is_err()
         {
@@ -125,12 +154,18 @@ impl Providers {
         // The batch processors and the metric reader each run on their own
         // thread, so the blocking HTTP client never blocks the runtime.
         let tracer = SdkTracerProvider::builder()
-            .with_batch_exporter(SpanExporter::builder().with_http().build()?)
+            .with_batch_exporter(
+                SpanExporter::builder()
+                    .with_http()
+                    .with_timeout(EXPORT_TIMEOUT)
+                    .build()?,
+            )
             .with_resource(resource.clone())
             .build();
         // Cumulative, as Prometheus-style backends (Grafana Mimir) expect.
         let metrics = MetricExporter::builder()
             .with_http()
+            .with_timeout(EXPORT_TIMEOUT)
             .with_temporality(Temporality::Cumulative)
             .build()?;
         let meter = SdkMeterProvider::builder()
@@ -142,7 +177,12 @@ impl Providers {
             .with_resource(resource.clone())
             .build();
         let logger = SdkLoggerProvider::builder()
-            .with_batch_exporter(LogExporter::builder().with_http().build()?)
+            .with_batch_exporter(
+                LogExporter::builder()
+                    .with_http()
+                    .with_timeout(EXPORT_TIMEOUT)
+                    .build()?,
+            )
             .with_resource(resource)
             .build();
         global::set_tracer_provider(tracer.clone());
@@ -173,11 +213,9 @@ fn resource(env: impl Fn(&str) -> Option<String>) -> Resource {
             "deployment.environment.name",
             env("RAILWAY_ENVIRONMENT_NAME").unwrap_or_else(|| "local".into()),
         ),
-        // The `instance` label: stable, so a restart continues the same series.
-        KeyValue::new(
-            "service.instance.id",
-            env("RAILWAY_REPLICA_ID").unwrap_or_else(|| name.clone()),
-        ),
+        // The `instance` label. Each service runs as one instance, so the name:
+        // a restart or a new replica continues the same series.
+        KeyValue::new("service.instance.id", name.clone()),
     ];
     if let Some(sha) = env("RAILWAY_GIT_COMMIT_SHA") {
         attributes.push(KeyValue::new("service.version", sha));
@@ -252,7 +290,6 @@ mod tests {
             ("OTEL_SERVICE_NAME", "ingester-staging"),
             ("RAILWAY_ENVIRONMENT_NAME", "production"),
             ("RAILWAY_GIT_COMMIT_SHA", "abc123"),
-            ("RAILWAY_REPLICA_ID", "replica-1"),
         ]));
         assert_eq!(
             get(&railway, "service.name"),
@@ -268,7 +305,7 @@ mod tests {
         );
         assert_eq!(
             get(&railway, "service.instance.id"),
-            Some(Value::from("replica-1"))
+            Some(Value::from("ingester-staging"))
         );
     }
 }
