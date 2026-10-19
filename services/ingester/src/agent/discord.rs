@@ -7,16 +7,67 @@ use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::{channel::message::AllowedMentions, http::attachment::Attachment, id::Id};
 
 use super::{Agent, RunRecord, context::Context, emoji::Reaction, host::ImageRef};
-use crate::store;
+use crate::{guild_settings::reply_channel, store};
 
 /// Discord allows 2000 characters per message; leave room for safety.
 pub(super) const MAX_MESSAGE_CHARS: usize = 1900;
 
+/// Starts the first message of a reply posted in the default channel, because
+/// the channel it answers isn't on the server's allowlist. The prompt leaves
+/// this line out (`context::MESSAGE_COLUMNS`).
+const REDIRECT_PREFIX: &str = "-# ↪ ";
+
+/// Who and what a redirected reply answers: subtext, so it stays out of the way,
+/// and a link back to the message. About 120 characters.
+fn redirect_header(guild_id: i64, channel_id: i64, message_id: i64, author_id: i64) -> String {
+    format!(
+        "{REDIRECT_PREFIX}<@{author_id}> in https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    )
+}
+
+/// Puts the header on the first message, or before it when both don't fit in
+/// one Discord message.
+fn with_header(plan: &mut Vec<(String, std::time::Duration)>, header: &str) {
+    match plan.first_mut() {
+        Some((text, _)) if text.is_empty() => *text = header.to_owned(),
+        Some((text, _)) if header.chars().count() + 1 + text.chars().count() <= 2000 => {
+            *text = format!("{header}\n{text}");
+        }
+        _ => plan.insert(0, (header.to_owned(), std::time::Duration::ZERO)),
+    }
+}
+
+/// Where a reply goes, by [`reply_channel`].
+pub(super) struct Target {
+    pub channel_id: i64,
+    /// The trigger's channel and author, when that isn't `channel_id`.
+    pub redirect: Option<(i64, i64)>,
+}
+
 impl Agent {
+    /// Judged by the trigger's own channel: a conversation redirected to the
+    /// default channel can continue there, where replies need no redirect.
+    pub(super) async fn reply_target(&self, context: &Context) -> anyhow::Result<Option<Target>> {
+        let (channel_id, author_id): (i64, i64) =
+            sqlx::query_as("SELECT channel_id, author_id FROM messages WHERE id = $1")
+                .bind(context.reply_to)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(
+            reply_channel(&context.settings, channel_id).map(|target| Target {
+                channel_id: target,
+                redirect: (target != channel_id).then_some((channel_id, author_id)),
+            }),
+        )
+    }
+
     /// Delivers planned messages with bounded pauses and, if `reference`, a reply
     /// reference on the first (which also pings its author); images go with the
     /// first message. Each message is stored right away (the Gateway copy may
     /// arrive later) and tagged into the conversation.
+    ///
+    /// From a channel off the allowlist, the reply goes to the default channel
+    /// instead, its first message pinging the author with a link back.
     ///
     /// Sends aren't retried: a retry after a timeout could post the reply twice.
     #[allow(clippy::too_many_arguments)]
@@ -30,24 +81,42 @@ impl Agent {
         reference: bool,
         record: &mut RunRecord,
     ) -> anyhow::Result<()> {
+        let target = self
+            .reply_target(context)
+            .await?
+            .context("this channel isn't allowed and the server has no default channel")?;
+        let redirect = target.redirect.map(|(channel_id, author_id)| {
+            (
+                redirect_header(context.guild_id, channel_id, context.reply_to, author_id),
+                author_id,
+            )
+        });
+        // A reply reference can't cross channels; the redirect header links instead.
+        let reference = reference && redirect.is_none();
         let mentions = AllowedMentions {
             replied_user: reference,
+            users: redirect.iter().map(|&(_, a)| Id::new(a as u64)).collect(),
             ..Default::default()
         };
+        let mut plan: Vec<(String, std::time::Duration)> =
+            plan.iter().map(|m| (m.text.clone(), m.delay)).collect();
+        if let Some((header, _)) = &redirect {
+            with_header(&mut plan, header);
+        }
         let mut draining = self.draining.subscribe();
-        for (i, message) in plan.iter().enumerate() {
-            if !*draining.borrow() && !message.delay.is_zero() {
+        for (i, (text, delay)) in plan.iter().enumerate() {
+            if !*draining.borrow() && !delay.is_zero() {
                 tokio::select! {
-                    _ = tokio::time::sleep(message.delay) => {},
+                    _ = tokio::time::sleep(*delay) => {},
                     _ = draining.wait_for(|drain| *drain) => {},
                 }
             }
             let mut request = self
                 .http
-                .create_message(Id::new(context.channel_id as u64))
+                .create_message(Id::new(target.channel_id as u64))
                 .allowed_mentions(Some(&mentions));
-            if !message.text.is_empty() {
-                request = request.content(&message.text);
+            if !text.is_empty() {
+                request = request.content(text);
             }
             if i == 0 && !images.is_empty() {
                 request = request.attachments(images);
@@ -209,7 +278,23 @@ pub(super) fn split_message(text: &str, max: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extension, split_message};
+    use super::{extension, redirect_header, split_message, with_header};
+
+    #[test]
+    fn redirect_header_links_back_on_the_first_message() {
+        let header = redirect_header(1, 2, 3, 4);
+        assert_eq!(header, "-# ↪ <@4> in https://discord.com/channels/1/2/3");
+        let zero = std::time::Duration::ZERO;
+        let mut plan = vec![("hey".to_owned(), zero), ("there".to_owned(), zero)];
+        with_header(&mut plan, &header);
+        assert_eq!(plan[0].0, format!("{header}\nhey"));
+        let mut images_only = vec![(String::new(), zero)];
+        with_header(&mut images_only, &header);
+        assert_eq!(images_only[0].0, header);
+        let mut long = vec![("é".repeat(1990), zero)];
+        with_header(&mut long, &header);
+        assert_eq!((long.len(), long[0].0.as_str()), (2, header.as_str()));
+    }
 
     #[tokio::test]
     async fn loads_only_this_jobs_images() {

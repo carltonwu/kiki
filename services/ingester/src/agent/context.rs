@@ -102,7 +102,10 @@ pub(super) struct MentionedUser {
 /// Image attachments and embeds are the ones `read_image` (services/agent
 /// `images.py` `images_in`) reads, at most 10 of them.
 pub(super) const MESSAGE_COLUMNS: &str = r#"
-    m.id, m.author_id, m.author_name, m.content,
+    m.id, m.author_id, m.author_name,
+    -- Without a redirect header (agent/discord.rs), so the model doesn't copy it.
+    CASE WHEN m.author_bot THEN regexp_replace(m.content, '^-# ↪ [^\n]*\n?', '')
+         ELSE m.content END AS content,
     coalesce(m.raw->'mentions', '[]') AS mentions,
     ARRAY(SELECT coalesce(a->>'filename', 'file')
           FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a

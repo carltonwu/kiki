@@ -1,0 +1,58 @@
+name: allowed channels and the default channel limit where Kiki replies, not what she reads
+steps:
+  # The default channel must be on the allowlist, both ways round, and channels
+  # must be this server's.
+  - slash: {as: alex, in: general, command: config, options: {key: allowed_channels, value: "<#900000000000009999>"}}
+  - expect: {response_contains: "isn't a channel or thread kiki can see"}
+  - slash: {as: alex, in: general, command: config, options: {key: allowed_channels, value: "<#900000000000001001>"}}
+  - slash: {as: alex, in: general, command: config, options: {key: default_channel, value: "<#900000000000001003>"}}
+  - expect: {response_contains: "default_channel must be on allowed_channels"}
+  - expect: {sql: "SELECT count(*) FROM guild_settings WHERE key = 'default_channel'", equals: 0}
+  - slash: {as: sam, in: general, command: config, options: {key: allowed_channels, value: "<#900000000000001001>"}}
+  - expect: {response_contains: "manage server"}
+
+  # Allowlist set, no default channel: Kiki stays out of other channels entirely,
+  # but still stores what's said there.
+  - say: {as: alex, in: lore, text: "@kiki the rig fell over", id: quiet}
+  - expect: {stored: true, classified: false, reply: false}
+  - expect: {of: quiet, reaction: {emoji: "👀", present: false, added: false}}
+
+  # An allowlisted channel is answered in place.
+  - say: {as: alex, in: general, text: "@kiki hi", reply: {text: "hey alex"}}
+  - expect: {run: done, reply: true, text_contains: hey alex, text_lacks: "discord.com/channels"}
+  - expect: {sql: "SELECT channel_id FROM messages WHERE id = (SELECT reply_message_ids[1] FROM agent_runs ORDER BY id DESC LIMIT 1)", equals: 900000000000001001}
+
+  # With a default channel, a call from elsewhere is answered there, pinging the
+  # author with a link back. Her chosen reaction would land in the other channel,
+  # so it's dropped.
+  - slash: {as: alex, in: general, command: config, options: {key: allowed_channels, value: "<#900000000000001001>, <#900000000000001003>"}}
+  - slash: {as: alex, in: general, command: config, options: {key: default_channel, value: "<#900000000000001003>"}}
+  - say: {as: alex, in: lore, text: "@kiki who has the tape", id: redirected, reply: {text: "react: 😂\nchris does"}}
+  - expect:
+      run: done
+      reply: true
+      text_contains: [chris does, "<@900000000000000101> in https://discord.com/channels/900000000000000001/900000000000001002/"]
+      text_lacks: react
+      reaction: {emoji: "😂", present: false, added: false}
+  - expect: {sql: "SELECT channel_id FROM messages WHERE id = (SELECT reply_message_ids[1] FROM agent_runs ORDER BY id DESC LIMIT 1)", equals: 900000000000001003}
+
+  # The conversation continues in the default channel without another redirect,
+  # and the header doesn't reach the model as Kiki's own words.
+  - say: {as: alex, in: staff, text: "thanks, and the gaff tape?", reply_to: kiki, reply: {text: "also chris"}}
+  - expect: {run: done, reply: true, text_contains: also chris, text_lacks: "discord.com/channels", conversation: {same_as: redirected}, prompt_lacks: "discord.com/channels/900000000000000001"}
+  - expect: {sql: "SELECT channel_id FROM messages WHERE id = (SELECT reply_message_ids[1] FROM agent_runs ORDER BY id DESC LIMIT 1)", equals: 900000000000001003}
+
+  # Threads don't inherit their parent's place on the list.
+  - say: {as: alex, in: general-thread, text: "@kiki in here?", reply: {text: "over here"}}
+  - expect: {run: done, reply: true, text_contains: [over here, "/900000000000001004/"]}
+  - expect: {sql: "SELECT channel_id FROM messages WHERE id = (SELECT reply_message_ids[1] FROM agent_runs ORDER BY id DESC LIMIT 1)", equals: 900000000000001003}
+
+  # The default can't be dropped from the allowlist while it's set; after a reset it can.
+  - slash: {as: alex, in: general, command: config, options: {key: allowed_channels, value: "<#900000000000001001>"}}
+  - expect: {response_contains: "default_channel must be on allowed_channels"}
+  - slash: {as: alex, in: general, command: config, options: {key: default_channel, reset: true}}
+  - slash: {as: alex, in: general, command: config, options: {key: allowed_channels, value: ","}}
+  - expect: {sql: "SELECT count(*) FROM guild_settings WHERE key IN ('allowed_channels', 'default_channel')", equals: 1}
+  # An empty allowlist allows every channel again.
+  - say: {as: alex, in: lore, text: "@kiki back in lore", reply: {text: "welcome back"}}
+  - expect: {run: done, reply: true, text_contains: welcome back, text_lacks: "discord.com/channels"}
