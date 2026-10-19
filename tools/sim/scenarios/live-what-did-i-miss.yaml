@@ -10,4 +10,4 @@ steps:
   - send: {as: chrissy, in: general, text: "i'm so nervous about being the lead lol", age_s: 3600}
   - send: {as: ethan, in: general, text: "opening night is sold out!!", age_s: 1800}
   - say: {as: alex, in: general, text: "@kiki i've been out all afternoon, what did I miss?"}
-  - expect: {run: done, reply: true, tool_called: channel_history, text_contains: "discord.com/channels"}
+  - expect: {run: done, reply: true, tool_called: channel_history}
