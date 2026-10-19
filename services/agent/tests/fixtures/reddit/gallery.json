@@ -1,0 +1,98 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "dist": 1,
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "subreddit": "cats",
+            "selftext": "",
+            "title": "Before and after the vet trip",
+            "subreddit_name_prefixed": "r/cats",
+            "upvote_ratio": 0.98,
+            "ups": 4210,
+            "secure_media": null,
+            "is_reddit_media_domain": false,
+            "link_flair_text": null,
+            "score": 4210,
+            "thumbnail": "https://b.thumbs.redditmedia.com/abc.jpg",
+            "is_self": false,
+            "created": 1760100000.0,
+            "removed_by_category": null,
+            "domain": "reddit.com",
+            "url_overridden_by_dest": "https://www.reddit.com/gallery/1gal01",
+            "over_18": false,
+            "spoiler": false,
+            "locked": false,
+            "id": "1gal01",
+            "author": "grey_cat_dad",
+            "num_comments": 88,
+            "permalink": "/r/cats/comments/1gal01/before_and_after_the_vet_trip/",
+            "stickied": false,
+            "url": "https://www.reddit.com/gallery/1gal01",
+            "created_utc": 1760100000.0,
+            "media": null,
+            "is_video": false,
+            "is_gallery": true,
+            "gallery_data": {
+              "items": [
+                {"caption": "before", "media_id": "img1aaa", "id": 501},
+                {"media_id": "img2bbb", "id": 502},
+                {"media_id": "img3ccc", "id": 503}
+              ]
+            },
+            "media_metadata": {
+              "img1aaa": {
+                "status": "valid",
+                "e": "Image",
+                "m": "image/jpg",
+                "p": [
+                  {"y": 144, "x": 108, "u": "https://preview.redd.it/img1aaa.jpg?width=108&format=pjpg&s=1"},
+                  {"y": 640, "x": 480, "u": "https://preview.redd.it/img1aaa.jpg?width=480&format=pjpg&s=2"},
+                  {"y": 1440, "x": 1080, "u": "https://preview.redd.it/img1aaa.jpg?width=1080&format=pjpg&s=3"}
+                ],
+                "s": {"y": 4032, "x": 3024, "u": "https://preview.redd.it/img1aaa.jpg?width=3024&format=pjpg&s=4"},
+                "id": "img1aaa"
+              },
+              "img2bbb": {
+                "status": "valid",
+                "e": "Image",
+                "m": "image/png",
+                "p": [],
+                "s": {"y": 600, "x": 800, "u": "https://i.redd.it/img2bbb.png"},
+                "id": "img2bbb"
+              },
+              "img3ccc": {"status": "failed", "id": "img3ccc"}
+            }
+          }
+        }
+      ],
+      "before": null
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "author": "whisker_fan",
+            "id": "g00001",
+            "body": "The betrayal in the second photo is palpable.",
+            "score": 1503,
+            "stickied": false,
+            "distinguished": null,
+            "replies": "",
+            "depth": 0
+          }
+        }
+      ],
+      "before": null
+    }
+  }
+]

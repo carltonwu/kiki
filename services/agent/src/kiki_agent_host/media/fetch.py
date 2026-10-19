@@ -4,6 +4,7 @@ attachment links refreshed first. One set of image types, decided by the bytes
 
 import logging
 import time
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -74,11 +75,16 @@ async def refresh(http: httpx.AsyncClient, token: str, urls: list[str]) -> dict[
 
 
 async def download(
-    http: httpx.AsyncClient, url: str, declared: str | None = None
+    http: httpx.AsyncClient,
+    url: str,
+    declared: str | None = None,
+    *,
+    allow: Callable[[str], bool] = allowed,
 ) -> BinaryContent | str:
     """The image, or why it couldn't be read. `declared` (the payload's content
-    type) only words the error for an unsupported format."""
-    if not allowed(url):
+    type) only words the error for an unsupported format. `allow` swaps Discord's
+    hosts for another site's (a link reader's media hosts)."""
+    if not allow(url):
         return "not hosted by Discord"
     try:
         async with http.stream("GET", url) as response:

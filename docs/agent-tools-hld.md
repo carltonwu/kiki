@@ -40,6 +40,7 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 | `agent/web.py`, `openrouter/chat.py` | OpenRouter's web search and fetch server tools, and the model subclass that maps fetch. |
 | `media/fetch.py`, `media/vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
 | `media/reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
+| `media/links/` | `read_link`: a dispatcher over one reader per site (`READERS`); `reddit.py` reads Reddit posts. |
 | `openrouter/images.py`, `media/generation.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)), and saving the result. |
 | `media/drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (`agent/tools/drawing.py`) only queues. |
 | `chat/emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
@@ -95,6 +96,9 @@ model arguments, and arguments can only narrow them.
   left. Query logic is in `chat/history.py`; a system prompt line points catch-ups at it.
 - `read_image(message_id, question?)` has another model look at a message's
   images (see below). Search and context hits with images carry `images: n`.
+
+- `read_link(url_or_message_id, question?)` reads a shared link on a site web
+  fetch can't read (see [Links](#links-read_link-issue-41)).
 
 - `search_emojis(query, limit=5)` and `find_emoji(name)`: the guild's custom emoji
   by mood or meaning, or by name (`huh`, `:huh:`, `<:huh:123>`). See
@@ -206,6 +210,35 @@ than for people (agent to agent).
 - **Cost:** the vision call's billed cost is added to the reply's
   `usage.cost`; the job log reports `vision_calls`. Descriptions aren't cached,
   so reading the same image again (or a replay) pays again.
+
+## Links: `read_link` (issue #41)
+
+`media/links/__init__.py` normalizes the URL (or takes the first readable link
+in a stored message, text then link previews) and hands it to the first reader in
+`READERS` whose `matches(url)` is true; a link no reader takes returns an error
+that sends Kiki to web fetch. Readers request only their own site's hosts, and
+images go through `media/vision.py` with `read_image`'s instructions. It's a
+lookup (45 s deadline).
+
+- **Reddit** (`reddit.py`): `reddit.com` and its subdomains, `redd.it/<id>`, and
+  `/r/<sub>/s/<code>` share links (one redirect, read but not followed). It
+  fetches `/comments/<id>.json?raw_json=1&sort=top` (10 s, 2 MB) with a
+  descriptive User-Agent and returns title, subreddit, author, score, ratio,
+  comment count, flair, text (4,000 chars), the outside link, and the top 8
+  top-level comments (600 chars each; pinned mod notes and removed comments
+  skipped). A comment link puts that comment first. Galleries and image posts
+  (at most 10, at preview size, only from `i.redd.it` and `preview.redd.it`) are
+  described in one vision call. `v.redd.it` videos return duration and size with
+  a note that watching isn't supported yet (shared video reader: #43). Private,
+  quarantined, banned, deleted and removed posts get a clear error; removed ones
+  keep what's left. Results are cached in memory per post and question for 10
+  minutes (128 entries); errors aren't.
+- **Blocking:** Reddit refuses anonymous requests from many datacenter IPs (403
+  "blocked by network security"; on 2026-10-18 it also did from a home WSL
+  machine). With `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET` (a Reddit "script"
+  or "web" app; read-only), requests use an app-only token
+  (`client_credentials`) on `oauth.reddit.com`, reused until it expires. Without
+  them, a refusal is logged with a hint to set them.
 
 ## Search: one SQL statement
 

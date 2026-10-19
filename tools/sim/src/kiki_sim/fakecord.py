@@ -645,6 +645,23 @@ class Fakecord:
         self.world.unexpected.append({"method": request.method, "path": f"cdn/{path}"})
         return web.Response(status=404, text="This content is no longer available.")
 
+    # --- stub Reddit (read_link) -------------------------------------------
+
+    async def reddit(self, request: web.Request) -> web.StreamResponse:
+        """Reddit's post JSON for the posts in `reddit_posts`, a share link that
+        redirects to one, and their images as labeled PNGs. Anything else is a 404,
+        like a deleted post."""
+        path = request.match_info["path"].rstrip("/")
+        posts = reddit_posts(self.media_base())
+        if (m := re.fullmatch(r"comments/(\w+)\.json", path)) and m[1] in posts:
+            return web.json_response(posts[m[1]])
+        if (m := re.fullmatch(r"r/\w+/s/(\w+)", path)) and m[1] in REDDIT_SHARES:
+            raise web.HTTPMovedPermanently(REDDIT_SHARES[m[1]])
+        if m := re.fullmatch(r"media/([\w-]+)\.png", path):
+            return web.Response(body=png(m[1].replace("-", " ")), content_type="image/png")
+        self.world.unexpected.append({"method": request.method, "path": f"reddit/{path}"})
+        return web.json_response({"message": "Not Found", "error": 404}, status=404)
+
     def jev(self, body: dict) -> dict:
         state = body["state"]
         new = state["new_messages"]
@@ -1024,8 +1041,76 @@ class Fakecord:
         app.router.add_route("*", "/api/v10/{path:.*}", self.rest)
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
         app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
+        app.router.add_route("*", "/reddit/{path:.*}", self.reddit)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
+
+
+# Share links (`/r/<sub>/s/<code>`) → where Reddit redirects them.
+REDDIT_SHARES = {
+    "SimShare1": "https://www.reddit.com/r/cats/comments/1simgl/before_and_after_the_vet/"
+    "?share_id=sim&utm_source=share"
+}
+
+
+def reddit_posts(media_base: str) -> dict[str, list]:
+    """Two posts in Reddit's `/comments/<id>.json` shape: text with comments, and a
+    two-image gallery whose images are fakecord PNGs (the stub vision model reads
+    their labels back)."""
+
+    def listing(post: dict, comments: list[tuple[str, int, str]]) -> list:
+        children = [
+            {"kind": "t1", "data": {"author": a, "score": s, "body": b, "id": f"c{n}"}}
+            for n, (a, s, b) in enumerate(comments)
+        ]
+        return [
+            {"kind": "Listing", "data": {"children": [{"kind": "t3", "data": post}]}},
+            {"kind": "Listing", "data": {"children": children}},
+        ]
+
+    common = {"upvote_ratio": 0.95, "created_utc": 1760000000, "is_video": False}
+    image = f"{media_base}/reddit/media"
+    return {
+        "1simtx": listing(
+            common
+            | {
+                "id": "1simtx",
+                "title": "Why does act two of every jukebox musical fall apart?",
+                "subreddit_name_prefixed": "r/Musicals",
+                "author": "stagedoor_sam",
+                "score": 1532,
+                "num_comments": 214,
+                "is_self": True,
+                "selftext": "The first act is tight, then it feels like a different show.",
+                "permalink": "/r/Musicals/comments/1simtx/why_act_two_falls_apart/",
+            },
+            [
+                ("orchestra_pit", 812, "Act one gets all the hits; act two is deep cuts."),
+                ("swing_understudy", 97, "Hot take: it's the cast."),
+            ],
+        ),
+        "1simgl": listing(
+            common
+            | {
+                "id": "1simgl",
+                "title": "Before and after the vet trip",
+                "subreddit_name_prefixed": "r/cats",
+                "author": "grey_cat_dad",
+                "score": 4210,
+                "num_comments": 88,
+                "is_self": False,
+                "url": "https://www.reddit.com/gallery/1simgl",
+                "permalink": "/r/cats/comments/1simgl/before_and_after_the_vet/",
+                "is_gallery": True,
+                "gallery_data": {"items": [{"media_id": "a"}, {"media_id": "b"}]},
+                "media_metadata": {
+                    "a": {"status": "valid", "s": {"u": f"{image}/a-grey-cat-at-the-vet.png"}},
+                    "b": {"status": "valid", "s": {"u": f"{image}/the-same-cat-sulking.png"}},
+                },
+            },
+            [("whisker_fan", 1503, "The betrayal in the second photo is palpable.")],
+        ),
+    }
 
 
 def tool_call_message(n: int, tool: dict) -> dict:

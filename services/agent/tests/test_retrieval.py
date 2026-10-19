@@ -294,6 +294,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
         "get_message_context",
         "channel_history",
         "read_image",
+        "read_link",
         "search_emojis",
         "find_emoji",
     }

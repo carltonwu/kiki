@@ -1,0 +1,98 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "dist": 1,
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "subreddit": "Broadway",
+            "selftext": "",
+            "title": "The quick change in act one, from the wings",
+            "subreddit_name_prefixed": "r/Broadway",
+            "upvote_ratio": 0.97,
+            "ups": 2890,
+            "secure_media": {
+              "reddit_video": {
+                "bitrate_kbps": 2400,
+                "fallback_url": "https://v.redd.it/vid0001/DASH_720.mp4?source=fallback",
+                "has_audio": true,
+                "height": 1280,
+                "width": 720,
+                "scrubber_media_url": "https://v.redd.it/vid0001/DASH_96.mp4",
+                "dash_url": "https://v.redd.it/vid0001/DASHPlaylist.mpd",
+                "duration": 34,
+                "hls_url": "https://v.redd.it/vid0001/HLSPlaylist.m3u8",
+                "is_gif": false,
+                "transcoding_status": "completed"
+              }
+            },
+            "is_reddit_media_domain": true,
+            "link_flair_text": "Video",
+            "score": 2890,
+            "is_self": false,
+            "removed_by_category": null,
+            "domain": "v.redd.it",
+            "url_overridden_by_dest": "https://v.redd.it/vid0001",
+            "over_18": false,
+            "spoiler": false,
+            "locked": false,
+            "id": "1vid01",
+            "author": "wardrobe_wizard",
+            "num_comments": 61,
+            "permalink": "/r/Broadway/comments/1vid01/the_quick_change_in_act_one_from_the_wings/",
+            "stickied": false,
+            "url": "https://v.redd.it/vid0001",
+            "created_utc": 1760200000.0,
+            "post_hint": "hosted:video",
+            "preview": {
+              "images": [
+                {
+                  "source": {"url": "https://external-preview.redd.it/vidthumb.png?format=pjpg&s=9", "width": 720, "height": 1280},
+                  "resolutions": [{"url": "https://external-preview.redd.it/vidthumb.png?width=108&s=8", "width": 108, "height": 192}],
+                  "id": "vidthumb"
+                }
+              ],
+              "enabled": false
+            },
+            "media": {
+              "reddit_video": {
+                "fallback_url": "https://v.redd.it/vid0001/DASH_720.mp4?source=fallback",
+                "height": 1280,
+                "width": 720,
+                "duration": 34,
+                "is_gif": false
+              }
+            },
+            "is_video": true
+          }
+        }
+      ],
+      "before": null
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "author": "dresser_dani",
+            "id": "v00001",
+            "body": "Eleven seconds for the full gown. Unreal.",
+            "score": 640,
+            "stickied": false,
+            "distinguished": null,
+            "replies": "",
+            "depth": 0
+          }
+        }
+      ],
+      "before": null
+    }
+  }
+]

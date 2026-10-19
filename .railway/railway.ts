@@ -39,6 +39,10 @@ export default defineRailway(() => {
       OPENROUTER_IMAGE_FALLBACK_MODEL: "qwen/qwen-image-2.1-turbo",
       // Refreshes expired attachment links (read_image, drawing references); read-only use.
       DISCORD_BOT_TOKEN: "${{ingester.DISCORD_BOT_TOKEN}}",
+      // read_link's Reddit reader: a read-only Reddit app, since Reddit blocks
+      // anonymous requests from Railway's IPs. Optional; set with `railway variable set`.
+      REDDIT_CLIENT_ID: preserve(),
+      REDDIT_CLIENT_SECRET: preserve(),
     },
   });
 

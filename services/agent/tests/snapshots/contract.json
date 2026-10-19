@@ -233,6 +233,37 @@
           "strict": null
         },
         {
+          "description": "Read what a shared link contains (a post, tweet or thread) on sites web fetch can't.\n\nReturns the post's author, text, stats and top comments, with its images\ndescribed by another model. For a site without a reader it returns an error;\nfetch the page instead.",
+          "kind": "function",
+          "name": "read_link",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "question": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional: what you want to know about it, so image descriptions\ncover it."
+              },
+              "url_or_message_id": {
+                "description": "The link, or the ID of a message that contains it (its\nfirst readable link is read).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "url_or_message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
           "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>.",
           "kind": "function",
           "name": "search_emojis",
@@ -719,6 +750,37 @@
             },
             "required": [
               "message_id"
+            ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Read what a shared link contains (a post, tweet or thread) on sites web fetch can't.\n\nReturns the post's author, text, stats and top comments, with its images\ndescribed by another model. For a site without a reader it returns an error;\nfetch the page instead.",
+          "kind": "function",
+          "name": "read_link",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "question": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Optional: what you want to know about it, so image descriptions\ncover it."
+              },
+              "url_or_message_id": {
+                "description": "The link, or the ID of a message that contains it (its\nfirst readable link is read).",
+                "type": "string"
+              }
+            },
+            "required": [
+              "url_or_message_id"
             ],
             "type": "object"
           },
