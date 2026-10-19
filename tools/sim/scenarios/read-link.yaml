@@ -1,0 +1,34 @@
+name: read_link reads a shared Reddit post and its comments, and a share link to a gallery through vision
+# fakecord stands in for Reddit (REDDIT_BASE_URL); the prompt tells Kiki about read_link.
+steps:
+  - say:
+      as: alex
+      in: general
+      text: "kiki thoughts? https://www.reddit.com/r/Musicals/comments/1simtx/why_act_two_falls_apart/"
+    reply:
+      tool: {name: read_link, args: {url_or_message_id: "https://www.reddit.com/r/Musicals/comments/1simtx/why_act_two_falls_apart/"}}
+      text: "{result}"
+  - expect:
+      reply: true
+      tool_called: read_link
+      prompt_contains: "call read_link with the URL or the message ID"
+      tool_result_contains:
+        - "Why does act two of every jukebox musical fall apart?"
+        - "u/orchestra_pit"
+        - "r/Musicals"
+      text_contains: "stagedoor_sam"
+  - say:
+      as: sam
+      in: general
+      text: "kiki is the cat ok https://www.reddit.com/r/cats/s/SimShare1"
+    reply:
+      tool: {name: read_link, args: {url_or_message_id: "https://www.reddit.com/r/cats/s/SimShare1", question: "is the cat ok?"}}
+      text: "{result}"
+  - expect:
+      reply: true
+      tool_called: read_link
+      tool_result_contains:
+        - "Before and after the vet trip"
+        - "Image 1: a grey cat at the vet"
+        - "Image 2: the same cat sulking"
+        - "Gallery: 2 images together"

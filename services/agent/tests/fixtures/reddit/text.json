@@ -1,0 +1,212 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "dist": 1,
+      "modhash": "",
+      "geo_filter": "",
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "approved_at_utc": null,
+            "subreddit": "Musicals",
+            "selftext": "Saw the touring production last night and the second act completely lost me. The first act is tight, then everything after intermission feels like a different show.\n\nIs it the book or was it this cast?",
+            "author_fullname": "t2_abc123",
+            "saved": false,
+            "gilded": 0,
+            "clicked": false,
+            "title": "Why does the second act of every jukebox musical fall apart?",
+            "link_flair_richtext": [],
+            "subreddit_name_prefixed": "r/Musicals",
+            "hidden": false,
+            "pwls": 6,
+            "link_flair_css_class": null,
+            "downs": 0,
+            "thumbnail_height": null,
+            "top_awarded_type": null,
+            "hide_score": false,
+            "name": "t3_1abcde",
+            "quarantine": false,
+            "link_flair_text_color": "dark",
+            "upvote_ratio": 0.94,
+            "author_flair_background_color": null,
+            "subreddit_type": "public",
+            "ups": 1532,
+            "total_awards_received": 0,
+            "media_embed": {},
+            "thumbnail_width": null,
+            "author_flair_template_id": null,
+            "is_original_content": false,
+            "user_reports": [],
+            "secure_media": null,
+            "is_reddit_media_domain": false,
+            "is_meta": false,
+            "category": null,
+            "secure_media_embed": {},
+            "link_flair_text": "Discussion",
+            "can_mod_post": false,
+            "score": 1532,
+            "approved_by": null,
+            "is_created_from_ads_ui": false,
+            "author_premium": false,
+            "thumbnail": "self",
+            "edited": false,
+            "author_flair_css_class": null,
+            "author_flair_richtext": [],
+            "gildings": {},
+            "content_categories": null,
+            "is_self": true,
+            "mod_note": null,
+            "created": 1760000000.0,
+            "link_flair_type": "text",
+            "wls": 6,
+            "removed_by_category": null,
+            "banned_by": null,
+            "author_flair_type": "text",
+            "domain": "self.Musicals",
+            "allow_live_comments": false,
+            "selftext_html": "&lt;!-- SC_OFF --&gt;...",
+            "likes": null,
+            "suggested_sort": null,
+            "banned_at_utc": null,
+            "view_count": null,
+            "archived": false,
+            "no_follow": false,
+            "is_crosspostable": true,
+            "pinned": false,
+            "over_18": false,
+            "all_awardings": [],
+            "awarders": [],
+            "media_only": false,
+            "can_gild": false,
+            "spoiler": false,
+            "locked": false,
+            "author_flair_text": null,
+            "treatment_tags": [],
+            "visited": false,
+            "removed_by": null,
+            "num_reports": null,
+            "distinguished": null,
+            "subreddit_id": "t5_2qh1a",
+            "author_is_blocked": false,
+            "mod_reason_by": null,
+            "removal_reason": null,
+            "link_flair_background_color": "",
+            "id": "1abcde",
+            "is_robot_indexable": true,
+            "report_reasons": null,
+            "author": "stagedoor_sam",
+            "discussion_type": null,
+            "num_comments": 214,
+            "send_replies": true,
+            "contest_mode": false,
+            "mod_reports": [],
+            "author_patreon_flair": false,
+            "author_flair_text_color": null,
+            "permalink": "/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/",
+            "stickied": false,
+            "url": "https://www.reddit.com/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/",
+            "subreddit_subscribers": 98000,
+            "created_utc": 1760000000.0,
+            "num_crossposts": 0,
+            "media": null,
+            "is_video": false
+          }
+        }
+      ],
+      "before": null
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "after": null,
+      "dist": null,
+      "modhash": "",
+      "geo_filter": "",
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "subreddit_id": "t5_2qh1a",
+            "author": "AutoModerator",
+            "id": "mod001",
+            "body": "Reminder: be kind in the comments. Spoilers need tags.",
+            "score": 1,
+            "stickied": true,
+            "distinguished": "moderator",
+            "replies": "",
+            "permalink": "/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/mod001/",
+            "created_utc": 1760000001.0,
+            "depth": 0
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "subreddit_id": "t5_2qh1a",
+            "author": "orchestra_pit",
+            "id": "c00002",
+            "body": "The first act gets to use all the hits. By act two they're down to deep cuts, so the plot has to do the work it skipped earlier.",
+            "score": 812,
+            "stickied": false,
+            "distinguished": null,
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "more",
+                    "data": {"count": 12, "name": "t1_c00009", "id": "c00009", "depth": 1, "children": ["c00009"]}
+                  }
+                ]
+              }
+            },
+            "permalink": "/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/c00002/",
+            "created_utc": 1760000300.0,
+            "depth": 0
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "subreddit_id": "t5_2qh1a",
+            "author": "[deleted]",
+            "id": "c00003",
+            "body": "[removed]",
+            "score": 40,
+            "stickied": false,
+            "distinguished": null,
+            "replies": "",
+            "permalink": "/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/c00003/",
+            "created_utc": 1760000400.0,
+            "depth": 0
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "subreddit_id": "t5_2qh1a",
+            "author": "swing_understudy",
+            "id": "c00004",
+            "body": "Hot take: it's the cast. I saw the original company and act two was the best part.",
+            "score": 97,
+            "stickied": false,
+            "distinguished": null,
+            "replies": "",
+            "permalink": "/r/Musicals/comments/1abcde/why_does_the_second_act_of_every_jukebox_musical/c00004/",
+            "created_utc": 1760000500.0,
+            "depth": 0
+          }
+        },
+        {
+          "kind": "more",
+          "data": {"count": 180, "name": "t1_c00010", "id": "c00010", "parent_id": "t3_1abcde", "depth": 0, "children": ["c00010", "c00011"]}
+        }
+      ],
+      "before": null
+    }
+  }
+]

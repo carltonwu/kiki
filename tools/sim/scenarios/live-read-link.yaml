@@ -1,0 +1,7 @@
+name: a real model reads a shared Reddit link with read_link without being told to
+# Needs `kiki-sim up --live`. Reddit is still fakecord's stub (REDDIT_BASE_URL), so
+# this checks the model's choice of tool, not Reddit itself.
+live: only
+steps:
+  - say: {as: alex, in: general, text: "@kiki what do you make of this one https://www.reddit.com/r/Musicals/comments/1simtx/why_act_two_falls_apart/"}
+  - expect: {run: done, reply: true, tool_called: read_link}

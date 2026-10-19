@@ -81,6 +81,13 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   cost); reading is `media/reading.py`, drawing `media/drawing.py` and
   `media/generation.py`. `read_image` reads Kiki's own
   drawings (`kiki-<id>.png`) from `agent_host_images`, scoped to the guild.
+- `read_link(url_or_message_id, question?)`: a shared link on a site web fetch can't
+  read, through one reader per site (`media/links/`, `READERS`). Reddit
+  (`reddit.py`): the post, its top comments, and gallery or image posts described by
+  the vision model; videos are metadata only for now. Reddit blocks anonymous
+  requests from many server IPs, so set `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`
+  (a read-only Reddit app) on Railway to use app-only OAuth. Other sites return an
+  error pointing to web fetch.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).
 - `find_emoji(name)`: by name (exact, else substring), or an emoji as written in a

@@ -60,3 +60,18 @@ def cdn_base() -> str:
 def extra_media_hosts() -> set[str]:
     """Hosts besides Discord's that images may come from (the simulator)."""
     return {h.strip() for h in os.getenv("DISCORD_MEDIA_EXTRA_HOSTS", "").split(",")} - {""}
+
+
+def reddit_base() -> str:
+    """Reddit's site root for posts and share links; `REDDIT_BASE_URL` points at the
+    local simulator."""
+    return (os.getenv("REDDIT_BASE_URL") or "https://www.reddit.com").rstrip("/")
+
+
+def reddit_credentials() -> tuple[str, str] | None:
+    """A Reddit app's ID and secret (`REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`) for
+    read-only app-only OAuth, since Reddit blocks anonymous requests from datacenter
+    IPs. Unset: anonymous requests."""
+    id = os.getenv("REDDIT_CLIENT_ID", "").strip()
+    secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
+    return (id, secret) if id and secret else None
