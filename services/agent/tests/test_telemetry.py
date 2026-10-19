@@ -2,6 +2,9 @@ import logging
 import os
 import subprocess
 import sys
+import time
+
+import pytest
 
 from kiki_agent_host import telemetry
 from kiki_agent_host.api.app import create_app
@@ -81,8 +84,7 @@ class Receiver(BaseHTTPRequestHandler):
 
     def reply(self):
         RECEIVED.append((self.path, dict(self.headers)))
-        if os.environ.get("RECEIVER_STALLS"):
-            time.sleep(30)
+        time.sleep(float(os.environ.get("RECEIVER_DELAY", "0")))
         self.send_response(200)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -142,7 +144,10 @@ assert len(RECEIVED) == 3, RECEIVED
     )
 
 
-def test_trace_context_comes_in_but_never_goes_out():
+@pytest.mark.parametrize("semconv", ["", "http/dup"])
+def test_trace_context_comes_in_but_never_goes_out(semconv):
+    """Client spans are still recorded, with no credentials, query or fragment in
+    any URL attribute, even when legacy semantic conventions are asked for."""
     run(
         """
 import httpx, httpx2
@@ -176,7 +181,11 @@ assert len(probes) == 2, RECEIVED
 assert not any("traceparent" in {k.lower() for k in h} for h in probes), probes
 clients = [s for s in spans.get_finished_spans() if s.name == "GET"]
 assert [s.attributes["url.full"] for s in clients] == [BASE + "/probe"] * 2, clients
-"""
+for span in spans.get_finished_spans():
+    assert "http.url" not in span.attributes, span.attributes
+    assert not any("secret" in str(v) for v in span.attributes.values()), span.attributes
+""",
+        OTEL_SEMCONV_STABILITY_OPT_IN=semconv,
     )
 
 
@@ -194,5 +203,38 @@ elapsed = time.monotonic() - started
 assert elapsed < telemetry.SHUTDOWN_SECONDS + 0.5, elapsed
 assert telemetry.flush_soon() is None
 """,
-        RECEIVER_STALLS="1",
+        RECEIVER_DELAY="30",
     )
+
+
+def test_process_exit_keeps_to_the_shutdown_deadline():
+    """A flush in flight, batches queued and a slow backend: neither the flush
+    thread nor the SDK's exit handlers may hold the process past shutdown()."""
+    script = """
+from opentelemetry import trace
+
+async def main():
+    tracer = trace.get_tracer("test")
+    for _ in range(200):
+        tracer.start_span("queued").end()
+    telemetry.flush_soon()
+    await asyncio.sleep(0.2)  # the flush is now waiting on the receiver
+    print("shutdown at", time.monotonic(), flush=True)
+    await asyncio.to_thread(telemetry.shutdown)
+
+asyncio.run(main())
+"""
+    env = {
+        **os.environ,
+        "OTEL_SDK_DISABLED": "false",
+        "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "10",
+        "RECEIVER_DELAY": "1.6",
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", RECEIVER + script], env=env, stdout=subprocess.PIPE, text=True
+    )
+    line = next(line for line in process.stdout if line.startswith("shutdown at"))
+    shutting_down = float(line.split()[-1])
+    assert process.wait(timeout=60) == 0
+    elapsed = time.monotonic() - shutting_down
+    assert elapsed < telemetry.SHUTDOWN_SECONDS + 1, elapsed

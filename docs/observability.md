@@ -28,7 +28,11 @@ agent host (Python) ─OTLP────┘
   only when they hold something. Shutdown (SIGTERM, via the app's lifespan, and
   the end of `kiki-agent-host index`) stops scheduling flushes and flushes once
   more, all three signals in parallel within 4 s (each export request times out
-  after 3 s): uvicorn may have used most of Railway's 30 s drain by then.
+  after 3 s): uvicorn may have used most of Railway's 30 s drain by then. That
+  is the only wait at exit: per-job flushes run on daemon threads, and the
+  providers register no atexit handlers (both would drain batches unbounded).
+  HTTP spans use the stable semantic conventions only (`OTEL_SEMCONV_STABILITY_OPT_IN`
+  is forced to `http`; `http/dup` would add the legacy `http.url`).
   So the host's metric samples are sparse: a counter has a sample only after a
   job, and an instant query goes stale five minutes later. Query them over a
   range (`increase(kiki_agent_jobs_total[$__range])`, `last_over_time(…[1h])`).

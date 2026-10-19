@@ -10,6 +10,7 @@ job, and the span and log batches send only when they hold something.
 """
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -98,10 +99,12 @@ def configure() -> bool:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    # Stable HTTP semantic conventions: http.server.request.duration in seconds.
-    os.environ.setdefault("OTEL_SEMCONV_STABILITY_OPT_IN", "http")
+    # Stable HTTP semantic conventions only (http.server.request.duration in
+    # seconds), forced: "http/dup" would add the legacy http.url, query and all.
+    os.environ["OTEL_SEMCONV_STABILITY_OPT_IN"] = "http"
     resource = Resource.create(resource_attributes())
-    tracer_provider = TracerProvider(resource=resource)
+    # No atexit handlers: they flush without a deadline. shutdown() has one.
+    tracer_provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     timeout = EXPORT_TIMEOUT_SECONDS
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(timeout=timeout)))
     # An infinite interval starts no export thread; flush() collects instead.
@@ -111,8 +114,10 @@ def configure() -> bool:
     )
     # Request and response size histograms: series spent on nothing we read.
     drop_sizes = View(instrument_name="http.server.*.body.size", aggregation=DropAggregation())
-    meter_provider = MeterProvider(resource=resource, metric_readers=[reader], views=[drop_sizes])
-    logger_provider = LoggerProvider(resource=resource)
+    meter_provider = MeterProvider(
+        resource=resource, metric_readers=[reader], views=[drop_sizes], shutdown_on_exit=False
+    )
+    logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
     logger_provider.add_log_record_processor(
         BatchLogRecordProcessor(OTLPLogExporter(timeout=timeout))
     )
@@ -165,7 +170,7 @@ async def flush() -> None:
 
 def flush_soon() -> asyncio.Task | None:
     """Starts a flush, or, while one runs, has it go once more when it ends: one
-    worker thread at a time however many jobs finish. None once shutting down."""
+    flush thread at a time however many jobs finish. None once shutting down."""
     global _flushing, _flush_again
     if _providers is None or _closing:
         return None
@@ -180,9 +185,30 @@ async def _flush_until_caught_up() -> None:
     global _flush_again
     while True:
         _flush_again = False
-        await asyncio.to_thread(_force_flush)
+        await _on_daemon_thread(_force_flush)
         if not _flush_again or _closing:
             return
+
+
+async def _on_daemon_thread(work) -> None:
+    """Like asyncio.to_thread, but exit doesn't wait for it: batch force_flush
+    ignores its timeout, and only shutdown() may hold the process up."""
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def finish() -> None:
+        if not done.done():
+            done.set_result(None)
+
+    def run() -> None:
+        try:
+            work()
+        finally:
+            with contextlib.suppress(RuntimeError):  # the loop has closed
+                loop.call_soon_threadsafe(finish)
+
+    threading.Thread(target=run, name="OtelFlush", daemon=True).start()
+    await done
 
 
 def shutdown() -> None:
@@ -236,8 +262,10 @@ def redact_url(span, request) -> None:
     """A client span's URL without credentials, query or fragment: Discord's signed
     attachment links (and fetched pages' links) carry access tokens there."""
     if span.is_recording():
-        url = request.url.copy_with(username=None, password=None, query=None, fragment=None)
-        span.set_attribute("url.full", str(url))
+        url = str(request.url.copy_with(username=None, password=None, query=None, fragment=None))
+        span.set_attribute("url.full", url)
+        if "http.url" in (getattr(span, "attributes", None) or {}):  # legacy semconv
+            span.set_attribute("http.url", url)
 
 
 async def async_redact_url(span, request) -> None:

@@ -38,4 +38,6 @@ def configure_logging() -> None:
     if level != "DEBUG":
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
-        logging.getLogger("httpx2").setLevel(logging.WARNING)  # the OpenAI SDK's
+        # The OpenAI SDK's client. Security: its INFO lines put full signed Discord
+        # URLs on stdout (Railway's logs).
+        logging.getLogger("httpx2").setLevel(logging.WARNING)
