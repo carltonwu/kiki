@@ -14,8 +14,9 @@ from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 
 from .scope import (
-    HEARD,
+    AUTHOR,
     NO_ROSTER,
+    PEOPLES,
     Roster,
     Scope,
     channel_names,
@@ -38,14 +39,14 @@ STATEMENT_TIMEOUT = "6s"
 # formatted into the query.
 KEYS = {
     None: "NULL::bigint",
-    "person": "m.author_id",
+    "person": AUTHOR,
     "channel": "m.channel_id",
     "month": "date_trunc('month', m.created_at AT TIME ZONE 'UTC')",
     "year": "date_trunc('year', m.created_at AT TIME ZONE 'UTC')",
 }
 FILTERS = {
     "channels": "m.channel_id = ANY(%(channels)s)",
-    "authors": "m.author_id = ANY(%(authors)s)",
+    "authors": f"{AUTHOR} = ANY(%(authors)s)",
     "after": "m.created_at >= %(after)s",
     "before": "m.created_at < %(before)s",
     "query": "to_tsvector('english', m.content) @@ websearch_to_tsquery('english', %(query)s)",
@@ -62,7 +63,7 @@ WORD_BOUNDARY = re.compile(r"(?<!\\)((?:\\\\)*)\\b")
 
 def count_sql(group_by: GroupBy | None, filters: list[str]) -> str:
     where = " AND ".join(
-        [f"m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}"]
+        [f"m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {PEOPLES}"]
         + [FILTERS[f] for f in filters]
     )
     return f"""

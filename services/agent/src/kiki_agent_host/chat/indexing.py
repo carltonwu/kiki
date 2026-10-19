@@ -9,7 +9,7 @@ from psycopg import AsyncConnection
 from .. import db
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import EMBED_BATCH, Embedder
-from .scope import HEARD
+from .scope import PEOPLES, TEXT
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +18,10 @@ INDEX_LIMIT = 256
 
 
 PENDING = f"""
-SELECT m.id, m.content, md5(m.content) AS hash FROM messages m
+SELECT m.id, {TEXT} AS content, md5(m.content) AS hash FROM messages m
 WHERE (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
   AND (%(below)s::bigint IS NULL OR m.id < %(below)s)
-  AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD} AND btrim(m.content) <> ''
+  AND m.deleted_at IS NULL AND {PEOPLES} AND btrim({TEXT}) <> ''
   AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
 ORDER BY m.id DESC LIMIT %(limit)s
 """

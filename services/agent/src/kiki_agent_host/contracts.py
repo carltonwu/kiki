@@ -145,6 +145,8 @@ class Reference(Contract):
     subject: str
     message_id: str | None = None
     attachment_id: str | None = None
+    # A link preview's image (an embed has no attachment ID).
+    url: str | None = None
     # The person whose Discord avatar it is.
     avatar_of: str | None = None
     # An earlier drawing of Kiki (`agent_host_images`).

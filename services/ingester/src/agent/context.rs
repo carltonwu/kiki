@@ -102,9 +102,12 @@ pub(super) struct MentionedUser {
 /// Image attachments and embeds are the ones `read_image` (services/agent
 /// `images.py` `images_in`) reads, at most 10 of them.
 pub(super) const MESSAGE_COLUMNS: &str = r#"
-    m.id, m.author_id, m.author_name,
+    -- A link fixer's repost is its author's message (migration 0024).
+    m.id, coalesce(m.relayed_for, m.author_id) AS author_id,
+    CASE WHEN m.relayed_for IS NULL THEN m.author_name END AS author_name,
     -- Without a redirect header (agent/discord.rs), so the model doesn't copy it.
-    CASE WHEN m.author_bot THEN regexp_replace(m.content, '^-# ↪ [^\n]*\n?', '')
+    CASE WHEN m.relayed_for IS NOT NULL THEN m.relayed_text
+         WHEN m.author_bot THEN regexp_replace(m.content, '^-# ↪ [^\n]*\n?', '')
          ELSE m.content END AS content,
     coalesce(m.raw->'mentions', '[]') AS mentions,
     ARRAY(SELECT coalesce(a->>'filename', 'file')
@@ -254,6 +257,7 @@ impl Agent {
                  So your reply is the heads-up: it tells them a picture is coming, in your own words for this moment and this person (or just a reaction, when that says it). \
                  Vary it like a person would; don't fall back on a stock phrase or the same emoji each time, and don't describe the picture as if it's already posted. \
                  Name the people, pets and things whose real look matters as its subjects: the drawing step finds their photos here and shows them to the image model. \
+                 Asking to swap someone into a shared photo, meme or post (\"replace X with Y in that tweet\", \"put me in this\") usually means that picture redrawn with them, not its text reworded: read_image it, then draw it with them as a subject (the images shared with the request go to the image model too), unless it would sexualize or humiliate a real person. \
                  Pictures are candid, photorealistic phone photos unless they asked for a style or the joke needs one. \
                  Write the picture's prompt literally, for a model that hasn't seen the chat: what kind of image, then the scene, framing and light as concrete details, and any text in quotes. ",
             );
@@ -367,7 +371,7 @@ impl Agent {
                 SELECT DISTINCT ON (m.id) targets.from_author, targets.how, {MESSAGE_COLUMNS}
                 FROM targets JOIN messages m ON m.id = targets.target
                 WHERE m.guild_id = $2 AND m.deleted_at IS NULL AND m.id <> ALL($1)
-                  AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+                  AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
                 ORDER BY m.id, targets.from_id
             ) pointed ORDER BY id LIMIT 6
             "#
@@ -437,7 +441,7 @@ impl Agent {
             SELECT {MESSAGE_COLUMNS} FROM messages m
             WHERE m.channel_id = $1 AND m.deleted_at IS NULL AND m.type <> $5
               AND m.created_at > now() - make_interval(secs => $2)
-              AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+              AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
               AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
                               WHERE cm.message_id = m.id AND cm.conversation_id = $3)
             ORDER BY m.id DESC LIMIT $4
@@ -483,7 +487,7 @@ impl Agent {
             r#"
             SELECT {MESSAGE_COLUMNS} FROM messages m
             WHERE m.id = $1 AND m.guild_id = $2 AND m.channel_id <> $3 AND m.deleted_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+              AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
             "#
         ))
         .bind(id)
@@ -1346,6 +1350,56 @@ pub(super) mod tests {
         let last = &context.messages.last().unwrap().content;
         assert!(!last.contains("] Thread"), "{last}");
         assert!(context.messages[0].content.contains("channel #boba."));
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn link_fixer_reposts_are_their_authors_messages() {
+        // Seen in prod: a link fixer (an ignored author) deleted a tweet link and
+        // reposted it, so "the most recent twitter link" was invisible to Kiki.
+        let Some(test) = crate::test_db::migrated("ingester_relay_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let fixer = json!({"id": "500", "username": "PilzBrots", "bot": true});
+        let mut relay = message(
+            30,
+            fixer.clone(),
+            json!({}),
+            "<@101>: look\nhttps://fxtwitter.com/a/status/1 \n\n-# The original message sent by <@101> was deleted so the bot could fix the broken embed links for easier viewing.",
+            json!([{"id": "101", "username": "carltonwu"}]),
+        );
+        relay["embeds"] =
+            json!([{"type": "rich", "image": {"url": "https://pbs.twimg.com/x.jpg"}}]);
+        let chatter = message(31, fixer, json!({}), "I'm a chatbot too", json!([]));
+        store::upsert_messages(&db, GUILD, &[relay, chatter])
+            .await
+            .unwrap();
+        sqlx::raw_sql("INSERT INTO ignored_authors (user_id) VALUES (500)")
+            .execute(&db)
+            .await
+            .unwrap();
+        let settings = agent(db.clone()).settings.snapshot(GUILD);
+
+        let shown = agent(db.clone())
+            .channel_messages(CHANNEL, 0, &settings)
+            .await
+            .unwrap();
+        let shown: Vec<_> = shown
+            .iter()
+            .map(|m| {
+                (
+                    m.id,
+                    m.author_id,
+                    m.author_name.as_deref(),
+                    m.content.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [(30, 101, None, "look\nhttps://fxtwitter.com/a/status/1")]
+        );
         test.drop().await;
     }
 

@@ -20,7 +20,7 @@ from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent, UserContent
 
 from ..chat.attachments import Image, images_in
-from ..chat.scope import HEARD, MENTION, Roster, Scope, channel_names, speakers
+from ..chat.scope import AUTHOR, HEARD, MENTION, TEXT, Roster, Scope, channel_names, speakers
 from .fetch import client, download, refresh, sniff
 from .vision import ImageRefused, Vision, look
 
@@ -65,7 +65,8 @@ anything that only makes sense across them>"""
 
 
 MESSAGE = f"""
-SELECT m.id, m.channel_id, m.author_id, m.author_name, m.author_bot, m.content, m.raw
+SELECT m.id, m.channel_id, {AUTHOR} AS author_id, m.relayed_for IS NULL AND m.author_bot AS author_bot,
+       CASE WHEN m.relayed_for IS NULL THEN m.author_name END AS author_name, {TEXT} AS content, m.raw
 FROM messages m
 WHERE m.id = %(id)s AND m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {HEARD}
 """

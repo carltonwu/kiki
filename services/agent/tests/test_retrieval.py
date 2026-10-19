@@ -281,6 +281,28 @@ async def test_ignored_authors_are_never_read(db):
     assert [m["id"] for m in result["messages"]] == ["60", "62"]
 
 
+async def test_a_link_fixers_repost_is_its_authors_message(db):
+    # Seen in prod: the link fixer (an ignored author) deleted a tweet link and
+    # reposted it, and the repost, the only copy, was invisible to Kiki.
+    relay = (
+        "<@100>: release plan\nhttps://fxtwitter.com/a/status/1 \n\n-# The original message"
+        " sent by <@100> was deleted so the bot could fix the broken embed links for easier"
+        " viewing."
+    )
+    fixer = {"author": "PilzBrots", "author_id": 1358234666267578368, "bot": True}
+    await add(db, 60, relay, **fixer)
+    await add(db, 61, "release plan from the chatbot", **fixer)
+    await add(db, 62, "hi")
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (2, None)
+    assert await ids(db, "release plan", person="alex") == [60]
+    message, hi = (await message_context(db, SCOPE, 60))["messages"]
+    assert hi["id"] == "62"
+    assert (message["author"], message["text"]) == (
+        "alex",
+        "release plan\nhttps://fxtwitter.com/a/status/1",
+    )
+
+
 class ToolsOnlyModel(TestModel):
     """Calls every tool but `load_capability`: skill loading is covered in test_skills,
     and a placeholder skill id only errors."""

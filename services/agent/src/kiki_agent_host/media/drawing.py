@@ -206,18 +206,24 @@ def avatar_url(base: str, user_id: str, user_hash: str | None, guild: int, membe
     return None
 
 
-def candidates_in(rows: list[dict], per_message: int) -> list[Candidate]:
-    """Each message's first images (as `read_image` lists them), as candidates."""
+def candidates_in(rows: list[dict], per_message: int, embeds: bool = False) -> list[Candidate]:
+    """Each message's first images (as `read_image` lists them), as candidates.
+    Link previews' images (embeds) only with `embeds`: in the history they're
+    other sites' pictures, rarely the subject, but a shared tweet's photo is the
+    picture people mean."""
     found = []
     for m in rows:
         for image in images_in(m["raw"] or {})[:per_message]:
-            if image.id is None:
-                continue  # embeds are other sites' pictures, rarely the subject
+            if image.id is None and not embeds:
+                continue
             found.append(
                 Candidate(
                     label="",
                     reference=Reference(
-                        subject="", message_id=str(m["id"]), attachment_id=image.id
+                        subject="",
+                        message_id=str(m["id"]),
+                        attachment_id=image.id,
+                        url=None if image.id else image.url,
                     ),
                     url=image.url,
                     media_type=image.media_type,
@@ -267,7 +273,7 @@ class Gatherer:
         if not ids:
             return []
         try:
-            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4)
+            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4, embeds=True)
             fetched = await self.fetch(given[:SHARED_IMAGES])
         except OperationalError:
             raise
@@ -284,7 +290,7 @@ class Gatherer:
         chosen: list[tuple[Reference, BinaryImage]] = []
         if subject.photos:
             ids = [int(p) for p in subject.photos if p.isdigit()]
-            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4)
+            given = candidates_in(await self.rows(PHOTOS, {"ids": ids}), per_message=4, embeds=True)
             # Picked by Kiki or the people asking: used without a check.
             chosen += [(c.reference, image) for c, image in await self.fetch(given[:PER_SUBJECT])]
         if subject.kiki and len(chosen) < PER_SUBJECT:
@@ -401,6 +407,7 @@ def key(reference: Reference) -> tuple:
     return (
         reference.message_id,
         reference.attachment_id,
+        reference.url,
         reference.avatar_of,
         reference.drawing_id,
     )

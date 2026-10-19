@@ -15,9 +15,12 @@ from psycopg.rows import dict_row
 from ..openrouter.embeddings import Embedder
 from .attachments import images_in
 from .scope import (
+    AUTHOR,
     HEARD,
     MENTION,
     NO_ROSTER,
+    PEOPLES,
+    TEXT,
     Roster,
     Scope,
     channel_names,
@@ -52,9 +55,9 @@ Semantic = Literal["full", "partial", "off"]
 
 
 SCOPE = f"""
-m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
+m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {PEOPLES}
 AND (%(channels)s::bigint[] IS NULL OR m.channel_id = ANY(%(channels)s))
-AND (%(authors)s::bigint[] IS NULL OR m.author_id = ANY(%(authors)s))
+AND (%(authors)s::bigint[] IS NULL OR {AUTHOR} = ANY(%(authors)s))
 AND (%(after)s::timestamptz IS NULL OR m.created_at >= %(after)s)
 AND (%(before)s::timestamptz IS NULL OR m.created_at < %(before)s)
 AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
@@ -63,7 +66,8 @@ AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
 
 
 COLUMNS = (
-    "m.id, m.channel_id, m.author_name, m.author_id, m.content, m.created_at,"
+    "m.id, m.channel_id, CASE WHEN m.relayed_for IS NULL THEN m.author_name END AS author_name,"
+    f" {AUTHOR} AS author_id, {TEXT} AS content, m.created_at,"
     " m.raw->'attachments' AS attachments, m.raw->'embeds' AS embeds"
 )
 
