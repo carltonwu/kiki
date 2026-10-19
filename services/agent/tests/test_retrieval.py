@@ -11,6 +11,7 @@ from pydantic_ai.models.test import TestModel
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.tools import memory as memory_tools
 from kiki_agent_host.agent.tools.messages import OptionalTime
+from kiki_agent_host.chat import search as search_module
 from kiki_agent_host.chat.indexing import SAVE, index_pending
 from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.chat.search import message_context, search
@@ -195,6 +196,37 @@ async def test_recency_breaks_near_ties_but_not_explicit_dates(db):
     assert await ids(db, "release plan") == [21, 20]
     before = NOW - timedelta(days=30)
     assert await ids(db, "release plan", before=before) == [20]
+
+
+async def test_semantic_search_can_use_the_vector_index(db):
+    # The index is on an expression the query must repeat exactly; without it,
+    # every search reads every embedding. Sorting off, so the tiny table
+    # doesn't make the planner prefer one anyway: the index is then the only
+    # cheap way to get neighbours in order.
+    await add(db, 30, "we shipped the release")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    [query] = await embedder()(["deploy"], query=True)
+    await db.execute(search_module.INDEX_SETTINGS)
+    await db.execute("SET enable_sort = off")
+    params = {
+        "guild": GUILD,
+        "channels": None,
+        "conversation": CONVERSATION,
+        "authors": None,
+        "before": None,
+        "after": None,
+        "query": "deploy",
+        "vector": query,
+        "candidates": search_module.CANDIDATES,
+        "shortlist": search_module.SHORTLIST,
+        "k": search_module.RRF_K,
+        "min_similarity": search_module.MIN_SIMILARITY,
+        "half_life": search_module.HALF_LIFE_DAYS,
+        "recency": search_module.RECENCY_WEIGHT,
+        "limit": 10,
+    }
+    plan = await (await db.execute("EXPLAIN " + search_module.SEARCH, params)).fetchall()
+    assert "message_embeddings_hnsw_idx" in "\n".join(row[0] for row in plan)
 
 
 async def test_edits_and_deletes_invalidate_embeddings(db):

@@ -246,9 +246,11 @@ lookup (45 s deadline).
    lexemes, so stopwords and unmatched words don't block hits:
    `replace(plainto_tsquery('english', q)::text, ' & ', ' | ')::tsquery`,
    matched against the `to_tsvector('english', content)` GIN index.
-2. **Semantic:** top 50 by cosine distance, as an exact scan within the guild
-   (or selected channel),
-   keeping only candidates with similarity ≥ `MIN_SIMILARITY` (0.25). Without a
+2. **Semantic:** top 50 by cosine distance within the guild (or selected
+   channel). An HNSW index on the embeddings' first 512 dimensions shortlists
+   200 neighbours (iterative scans keep going when filters drop some), and the
+   full 1024-dimension vectors rank the shortlist. Afterwards it keeps only
+   candidates with similarity ≥ `MIN_SIMILARITY` (0.25). Without a
    floor, nearest neighbors of a nonsense query still rank, and the recency
    bonus would promote recent noise.
 3. **Fuse:**
@@ -296,8 +298,11 @@ queries are an argument error returned to the model.
 - **Cost:** about 25 tokens per message, so roughly $0.25 per million messages.
   Storage, about 2 GB per million, is the larger cost. A reply's embedding cost
   is added to its `usage.cost`.
-- **Scale:** add HNSW on `halfvec` only when measured scan latency requires it,
-  and check filtered recall when you do.
+- **Scale:** the exact scan read every embedding per search (2.7 s and ~1 GB of
+  page cache at 208k messages), so migration 0023 added HNSW on the 512-dimension
+  prefix. On production's embeddings the shortlist-and-rerank finds 96% of the
+  exact top 50; the index is 241 MB, half the full-width one, so it stays cached
+  under Postgres's memory limit.
 
 ## Custom emoji
 
