@@ -38,9 +38,9 @@ message ID from the trigger's image marker, else the newest one in the conversat
 takes memory entry IDs from the previous call's result, and `"{cursor}"` its
 paging cursor (channel_history).
 `web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
-tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
-it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the
-last reply request (stub mode).
+tools; `expect: {tool_called: web_search}` reads the agent host's saved result, and
+other tools its log, so `tool_called` also holds in live mode; `tools_offered:
+openrouter:web_fetch` checks the last reply request (stub mode).
 """
 
 import json
@@ -81,6 +81,8 @@ class Run:
         self.last_slash: dict | None = None
         self.failures: list[str] = []
         self.history: set[str] = set()
+        # Where this scenario's part of the agent host log starts (tool_called, live).
+        self.agent_log_start = stack.log_size("agent")
 
     def fail(self, step: int, message: str) -> None:
         self.failures.append(f"step {step}: {message}")
@@ -328,7 +330,9 @@ class Run:
         for name in as_list(args.get("tool_called")):
             if name in WEB_TOOLS:
                 self.expect_web(step, name, o, label)
-            elif not any((r.get("tool_call") or {}).get("name") == name for r in records):
+            elif not any(
+                (r.get("tool_call") or {}).get("name") == name for r in records
+            ) and not self.logged_tool_call(o, name):
                 self.fail(step, f"{label}: no {name} tool call")
         offered = set()
         if records:
@@ -349,6 +353,13 @@ class Run:
         for needle in as_list(args.get("prompt_lacks")):
             if str(needle).lower() in prompt.lower():
                 self.fail(step, f"{label}: prompt contains {needle!r}")
+
+    def logged_tool_call(self, o: Observation, name: str) -> bool:
+        """The agent host's log line for a tool call in this run. Live models don't
+        go through fakecord's stub, so this is the evidence in live mode."""
+        return o.run_id is not None and stack.log_contains(
+            "agent", f"job_id=reply:{o.run_id} tool={name} ", self.agent_log_start
+        )
 
     def expect_web(self, step: int, name: str, o: Observation, label: str) -> None:
         """OpenRouter runs web tools itself, so the agent host's saved result (which
