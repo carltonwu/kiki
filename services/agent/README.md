@@ -86,7 +86,9 @@ trusted run context, never by model arguments ([design](../../docs/agent-tools-h
   (`reddit.py`): the post, its top comments, and gallery or image posts described by
   the vision model; videos are metadata only for now. Reddit blocks anonymous
   requests from many server IPs, so set `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`
-  (a read-only Reddit app) on Railway to use app-only OAuth. Other sites return an
+  (a read-only Reddit app) on Railway to use app-only OAuth. X (`x.py`): posts and
+  quoted posts through the FxTwitter API, photos and video thumbnails described by
+  the vision model. Other sites return an
   error pointing to web fetch.
 - `search_emojis(query, limit)`: the server's usable custom emoji by mood or meaning
   (full text over name and description, plus vectors of `:name: description`).

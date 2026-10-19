@@ -1,0 +1,45 @@
+name: read_link reads a shared X post (text, photo, video thumbnail) and explains a deleted one
+# FxTwitter is fakecord's stub (`x_posts` in the fixture); the stub vision model
+# reads back each image's label.
+steps:
+  - say:
+      as: alex
+      in: general
+      text: "kiki what's this tweet https://x.com/simnews/status/1800000000000000001"
+    reply:
+      tool: {name: read_link, args: {url_or_message_id: "https://x.com/simnews/status/1800000000000000001"}}
+      text: "{result}"
+  - expect:
+      reply: true
+      tool_called: read_link
+      prompt_contains: "call read_link with the URL or the message ID"
+      tool_result_contains:
+        - "Sim News (@simnews)"
+        - "the opening night crowd tonight"
+        - "Image 1: a packed theatre lobby with a red carpet"
+        - "sim vision via sim/vision"
+      text_contains: "opening night crowd"
+  # A video post through an embed fixer's link: its thumbnail, and a note that the
+  # video itself isn't read.
+  - say:
+      as: sam
+      in: lore
+      text: "kiki is this real https://vxtwitter.com/jugglerjo/status/1800000000000000002"
+    reply:
+      tool: {name: read_link, args: {url_or_message_id: "https://vxtwitter.com/jugglerjo/status/1800000000000000002", question: "how many clubs?"}}
+      text: "{result}"
+  - expect:
+      reply: true
+      tool_result_contains:
+        - "a person juggling five clubs"
+        - "Full video reading isn't supported yet"
+  - say:
+      as: ethan
+      in: general
+      text: "kiki what did this say https://twitter.com/someone/status/1800000000000000009"
+    reply:
+      tool: {name: read_link, args: {url_or_message_id: "https://twitter.com/someone/status/1800000000000000009"}}
+      text: "{result}"
+  - expect:
+      reply: true
+      text_contains: "doesn't exist or was deleted"

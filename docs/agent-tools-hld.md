@@ -40,7 +40,7 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 | `agent/web.py`, `openrouter/chat.py` | OpenRouter's web search and fetch server tools, and the model subclass that maps fetch. |
 | `media/fetch.py`, `media/vision.py` | The common image backing for `read_image`, drawings and emoji descriptions: Discord-only downloads typed by their bytes, refreshing expired attachment links (with `DISCORD_BOT_TOKEN`), the vision model call with its error mapping, and billed cost. |
 | `media/reading.py` | `read_image`: image extraction from the stored payload (Kiki's own drawings from `agent_host_images`) and the detailed agent-to-agent prompt. |
-| `media/links/` | `read_link`: a dispatcher over one reader per site (`READERS`); `reddit.py` reads Reddit posts. |
+| `media/links/` | `read_link`: a dispatcher over one reader per site (`READERS`); `reddit.py` reads Reddit posts, `x.py` X posts. |
 | `openrouter/images.py`, `media/generation.py` | OpenRouter's Images API as a Pydantic AI image model, with reference images ([image generation](image-generation.md)), and saving the result. |
 | `media/drawing.py` | Image jobs (`POST /v1/images`): reference photos per subject, the vision check, the final prompt, and Kiki's note when drawing fails. `generate_image` itself (`agent/tools/drawing.py`) only queues. |
 | `chat/emojis.py` | Custom emoji: description batches, embeddings, search and lookup. |
@@ -116,7 +116,7 @@ model arguments, and arguments can only narrow them.
   hits, for counts.
 
 - `read_link(url_or_message_id, question?)` reads a shared link on a site web
-  fetch can't read (see [Links](#links-read_link-issue-41)).
+  fetch can't read (see [Links](#links-read_link-issues-41-40)).
 
 - `search_emojis(query, limit=5)` and `find_emoji(name)`: the guild's custom emoji
   by mood or meaning, or by name (`huh`, `:huh:`, `<:huh:123>`). See
@@ -229,7 +229,7 @@ than for people (agent to agent).
   `usage.cost`; the job log reports `vision_calls`. Descriptions aren't cached,
   so reading the same image again (or a replay) pays again.
 
-## Links: `read_link` (issue #41)
+## Links: `read_link` (issues #41, #40)
 
 `media/links/__init__.py` normalizes the URL (or takes the first readable link
 in a stored message, text then link previews) and hands it to the first reader in
@@ -257,6 +257,17 @@ lookup (45 s deadline).
   or "web" app; read-only), requests use an app-only token
   (`client_credentials`) on `oauth.reddit.com`, reused until it expires. Without
   them, a refusal is logged with a hint to set them.
+- **X / Twitter** (`x.py`, issue #40): status links on `x.com`, `twitter.com` and
+  the embed fixers (`vxtwitter`, `fxtwitter`, `fixupx`, `fixvx`) go to the
+  FxTwitter JSON API (`api.fxtwitter.com/status/<id>`; no X keys; 8 s, 1 MB; it
+  turns away httpx's default User-Agent). It returns author, text (4,000 chars),
+  time, stats, poll, community note and media types for the post and a quoted
+  post. Photos, and video and GIF thumbnails (at most 8, X's 1200 px rendition,
+  only from `pbs.twimg.com`), are described in one vision call; videos get a note
+  that only the thumbnail was seen (#43). Deleted (404) and private (401) posts get
+  a clear error. Cached like Reddit (10 minutes, 256 entries). Discord's stored
+  embed isn't used: it has the text and at most one image, but no stats, quoted
+  post or video, and links in `<...>` have none.
 
 ## Search: one SQL statement
 
