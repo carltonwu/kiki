@@ -67,6 +67,10 @@ covering the listener, `store` and catch-up.
   mode (`--live`) leaves it unset and copies only `OPENROUTER_CHAT_API_KEY` and
   `OPENROUTER_DECISION_API_KEY` from the environment or repo `.env` (environment
   wins). Discord stays fake.
+- **Telemetry is off.** Neither service gets `OTEL_EXPORTER_OTLP_ENDPOINT`
+  unless `KIKI_SIM_OTEL_ENDPOINT` (localhost only, e.g.
+  `http://localhost:4318` with `grafana/otel-lgtm`) is set when running `up`;
+  then both export there (docs/observability.md).
 
 ## Product changes (env-gated, default off)
 

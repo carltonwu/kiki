@@ -6,6 +6,16 @@ const REPO = "carltonwu/kiki";
 // Railway's US East (Ashburn, Virginia). Keep every service next to Postgres.
 const REGION = "iad";
 
+// OpenTelemetry straight to Grafana Cloud's OTLP gateway, no collector
+// (docs/observability.md). Each service adds OTEL_SERVICE_NAME.
+const telemetry = {
+  OTEL_EXPORTER_OTLP_ENDPOINT: "https://otlp-gateway-prod-us-east-2.grafana.net/otlp",
+  OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf",
+  // Secret: "Authorization=Basic%20<base64 of instance ID:token>", set by
+  // tools/railway-sync-env from GRAFANA_CLOUD_ID and GRAFANA_APP_TOKEN.
+  OTEL_EXPORTER_OTLP_HEADERS: preserve(),
+};
+
 export default defineRailway(() => {
   const db = postgres("postgres", { region: REGION });
   const dbVolume = volume("postgres-volume", { sizeMB: 5000, region: REGION });
@@ -43,6 +53,8 @@ export default defineRailway(() => {
       // anonymous requests from Railway's IPs. Optional; set with `railway variable set`.
       REDDIT_CLIENT_ID: preserve(),
       REDDIT_CLIENT_SECRET: preserve(),
+      ...telemetry,
+      OTEL_SERVICE_NAME: "agent",
     },
   });
 
@@ -83,6 +95,8 @@ export default defineRailway(() => {
       AGENT_HOST_URL: preserve(),
       AGENT_HOST_TOKEN: "${{shared.AGENT_HOST_TOKEN}}",
       DISCORD_GUILD_IDS: "1358240830887952575,348273727298863104",
+      ...telemetry,
+      OTEL_SERVICE_NAME: "ingester",
     },
   });
 

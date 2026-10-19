@@ -63,7 +63,12 @@ railway variable set --service ingester DISCORD_BOT_TOKEN=...
 railway variable set --service agent OPENROUTER_CHAT_API_KEY=...
 railway ssh --service agent kiki-agent-host index   # optional: embed existing history
 railway variable set --service ingester 'AGENT_HOST_URL=http://${{agent.RAILWAY_PRIVATE_DOMAIN}}:8081'
+tools/railway-sync-env --apply       # incl. OTEL_EXPORTER_OTLP_HEADERS from GRAFANA_* in .env
 ```
+
+Both services send traces, metrics and logs to Grafana Cloud over OTLP; see
+[observability](docs/observability.md) for the setup, the cardinality rules and
+the metric catalog.
 
 On start, the ingester connects to the Gateway and stores live message, edit, delete
 and channel events. Each `GUILD_CREATE` starts a REST catch-up in the background,
