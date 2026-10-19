@@ -193,6 +193,16 @@ impl Router {
             debug!(message_id = msg.id, age_ms, "not routing an old message");
             return None;
         }
+        // Stored and read as context, but Kiki has nowhere to reply from here.
+        let settings = self.settings.snapshot(msg.guild_id);
+        if crate::guild_settings::reply_channel(&settings, msg.channel_id).is_none() {
+            debug!(
+                message_id = msg.id,
+                channel_id = msg.channel_id,
+                "not routing: channel not allowed and no default channel"
+            );
+            return None;
+        }
 
         let router = self.clone();
         tokio::spawn(async move {
@@ -208,7 +218,7 @@ impl Router {
         let now = Instant::now();
         let pool = pools.entry(key).or_insert_with(|| Pool {
             guild_id: msg.guild_id,
-            settings: self.settings.snapshot(msg.guild_id),
+            settings,
             message_ids: Vec::new(),
             first_at: now,
             deadline: now,

@@ -23,7 +23,14 @@ pub enum Kind {
     Duration(u64, u64, u64),
     Keywords,
     Model,
+    /// Channel or thread IDs; empty means every channel.
+    Channels,
+    /// One channel or thread ID, or none.
+    Channel,
 }
+
+/// Most channels a server can allowlist.
+pub const MAX_CHANNELS: usize = 50;
 
 pub struct Spec {
     pub key: &'static str,
@@ -76,6 +83,19 @@ settings! { r, a;
     topic_every_messages: i64 = a.topic_every_messages, Kind::Integer(1, 50), "New messages before refreshing a topic";
     topic_sample_messages: i64 = 12, Kind::Integer(4, 50), "Messages shown to the topic summarizer";
     lingo_nudge: i64 = 35, Kind::Integer(0, 100), "Chance (%) a reply is nudged to use one of the server's phrases";
+    allowed_channels: Vec<i64> = vec![], Kind::Channels, "Channels Kiki replies in; empty allows every channel. Threads are listed separately";
+    default_channel: Option<i64> = None, Kind::Channel, "Where Kiki replies when called from another channel; unset means she stays quiet there";
+}
+
+/// Where Kiki's reply to a message in `channel_id` goes: the channel itself
+/// when allowed, else the default channel, else nowhere. The allowlist covers
+/// replies only; every channel is still stored and read as context.
+pub fn reply_channel(settings: &GuildSettings, channel_id: i64) -> Option<i64> {
+    if settings.allowed_channels.is_empty() || settings.allowed_channels.contains(&channel_id) {
+        Some(channel_id)
+    } else {
+        settings.default_channel
+    }
 }
 
 type Overrides = BTreeMap<String, Value>;
@@ -112,6 +132,8 @@ impl Spec {
             }
             Kind::Keywords => "0–20 words, ≤32 characters each".into(),
             Kind::Model => "provider/model, ≤200 bytes".into(),
+            Kind::Channels => format!("0–{MAX_CHANNELS} channel mentions or IDs"),
+            Kind::Channel => "one channel mention or ID, on allowed_channels".into(),
         }
     }
 
@@ -156,6 +178,17 @@ impl Spec {
                     .collect::<Vec<_>>()
             ),
             Kind::Model => json!(text),
+            Kind::Channels => {
+                let mut ids = Vec::new();
+                for part in text.split([',', ' ']).filter(|s| !s.is_empty()) {
+                    let id = channel_id(part)?;
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                json!(ids)
+            }
+            Kind::Channel => json!(channel_id(text)?),
         };
         self.validate(&value)?;
         Ok(value)
@@ -181,10 +214,28 @@ impl Spec {
                     })
             }),
             Kind::Model => value.as_str().is_some_and(valid_model_id),
+            Kind::Channels => value.as_array().is_some_and(|ids| {
+                ids.len() <= MAX_CHANNELS
+                    && ids.iter().all(|id| id.as_i64().is_some_and(|id| id > 0))
+            }),
+            Kind::Channel => value.is_null() || value.as_i64().is_some_and(|id| id > 0),
         };
         ensure!(valid, "{} must be {}", self.key, self.bounds());
         Ok(())
     }
+}
+
+/// `<#123>` (how Discord writes a channel picked in a text option) or `123`.
+fn channel_id(text: &str) -> anyhow::Result<i64> {
+    let text = text.trim();
+    let id = text
+        .strip_prefix("<#")
+        .and_then(|t| t.strip_suffix('>'))
+        .unwrap_or(text);
+    id.parse::<i64>()
+        .ok()
+        .filter(|&id| id > 0)
+        .with_context(|| format!("{text} isn't a channel; mention it with # or use its ID"))
 }
 
 pub fn valid_model_id(model: &str) -> bool {
@@ -195,6 +246,14 @@ pub fn valid_model_id(model: &str) -> bool {
         && model
             .bytes()
             .all(|c| c.is_ascii_alphanumeric() || b"/-_.:~".contains(&c))
+}
+
+/// An empty allowlist allows every channel, the default included.
+fn default_allowed(values: &GuildSettings) -> bool {
+    values.allowed_channels.is_empty()
+        || values
+            .default_channel
+            .is_none_or(|id| values.allowed_channels.contains(&id))
 }
 
 pub struct Store {
@@ -277,6 +336,10 @@ impl Store {
             values.chat_min_messages <= values.chat_max_messages,
             "chat_min_messages must not exceed chat_max_messages"
         );
+        ensure!(
+            default_allowed(values),
+            "default_channel must be on allowed_channels: add it there first, or reset default_channel before removing it"
+        );
         Ok(())
     }
 
@@ -307,6 +370,7 @@ impl Store {
                 ["pool_debounce", "pool_max_wait"],
                 ["decide_min_confidence", "stale_min_confidence"],
                 ["chat_min_messages", "chat_max_messages"],
+                ["allowed_channels", "default_channel"],
             ] {
                 // Resolve each independent constraint group using defaults for the other.
                 let encoded = |key: &str| {
@@ -323,6 +387,12 @@ impl Store {
                     "chat_min_messages" => {
                         encoded("chat_min_messages").as_u64().unwrap()
                             > encoded("chat_max_messages").as_u64().unwrap()
+                    }
+                    "allowed_channels" => {
+                        let allowed = encoded("allowed_channels");
+                        let allowed = allowed.as_array().unwrap();
+                        let default = encoded("default_channel");
+                        !allowed.is_empty() && !default.is_null() && !allowed.contains(&default)
                     }
                     "decide_min_confidence" => {
                         encoded("stale_min_confidence").as_f64().unwrap()
@@ -434,7 +504,8 @@ pub mod tests {
             "reply_max_tokens": 2000, "topic_every_messages": 4, "topic_sample_messages": 12,
             "lingo_nudge": 35, "chat_min_messages": 1, "chat_max_messages": 3,
             "chat_max_delay": 3000, "chat_allow_silence": true,
-            "chat_reply_reference": false, "chat_reactions": true, "status_reactions": true
+            "chat_reply_reference": false, "chat_reactions": true, "status_reactions": true,
+            "allowed_channels": [], "default_channel": null
         }))
         .unwrap()
     }
@@ -460,6 +531,9 @@ pub mod tests {
             ("keywords", " KIKI, Héllo ", json!(["kiki", "héllo"])),
             ("keywords", "", json!([])),
             ("reply_max_tokens", "3000", json!(3000)),
+            ("allowed_channels", "<#12>, 34 <#12>", json!([12, 34])),
+            ("allowed_channels", "", json!([])),
+            ("default_channel", " <#12> ", json!(12)),
         ] {
             assert_eq!(spec(key).unwrap().parse(text).unwrap(), expected);
         }
@@ -474,10 +548,26 @@ pub mod tests {
             ("pool_debounce", "18446744073709551615h"),
             ("keywords", "hi-there"),
             ("chat_model", "bad model"),
+            ("allowed_channels", "#general"),
+            ("allowed_channels", "<@12>"),
+            ("default_channel", "12, 34"),
+            ("default_channel", ""),
+            ("default_channel", "0"),
         ] {
             assert!(spec(key).unwrap().parse(text).is_err(), "{key}: {text}");
         }
         assert!(spec("secret").is_err());
+    }
+
+    #[test]
+    fn replies_in_allowed_channels_else_the_default_else_nowhere() {
+        let mut settings = defaults();
+        assert_eq!(reply_channel(&settings, 7), Some(7));
+        settings.allowed_channels = vec![5, 6];
+        assert_eq!(reply_channel(&settings, 6), Some(6));
+        assert_eq!(reply_channel(&settings, 7), None);
+        settings.default_channel = Some(5);
+        assert_eq!(reply_channel(&settings, 7), Some(5));
     }
 
     #[tokio::test]
@@ -503,6 +593,24 @@ pub mod tests {
         ] {
             assert!(store.merge(&overrides).is_err());
             assert!(store.resolve(overrides).ignored.len() == 1);
+        }
+        // The default channel must stay on a non-empty allowlist.
+        for (allowed, default, valid) in [
+            (json!([]), json!(5), true),
+            (json!([5, 6]), json!(5), true),
+            (json!([6]), json!(null), true),
+            (json!([6]), json!(5), false),
+        ] {
+            let overrides: Overrides = [
+                ("allowed_channels".into(), allowed),
+                ("default_channel".into(), default),
+            ]
+            .into();
+            assert_eq!(store.merge(&overrides).is_ok(), valid);
+            assert_eq!(
+                store.resolve(overrides).ignored.len(),
+                if valid { 0 } else { 2 }
+            );
         }
         let mut invalid = defaults();
         invalid.history_messages = 0;

@@ -351,6 +351,11 @@ impl Agent {
         else {
             bail!("trigger messages were deleted");
         };
+        // The allowlist changed after routing, leaving nowhere to reply.
+        let Some(target) = self.reply_target(&context).await? else {
+            debug!(run_id = claim.run_id, "channel no longer allowed; skipping");
+            return Ok(());
+        };
 
         let request = match &claim.host_request {
             Some(value) => serde_json::from_value(value.clone())?,
@@ -387,6 +392,10 @@ impl Agent {
         let images = self.load_images(&request.id, &result.images).await?;
         let mut plan = delivery::plan(&result.text, &context.settings)?;
         emoji::resolve(&self.db, context.guild_id, &mut plan).await?;
+        if target.redirect.is_some() {
+            // Reactions would land in the channel the allowlist keeps her out of.
+            plan.reactions.clear();
+        }
         if !result.drawings.is_empty() {
             // Kiki's own words: the heads-up that a picture is coming.
             let ack: Vec<&str> = plan.messages.iter().map(|m| m.text.as_str()).collect();

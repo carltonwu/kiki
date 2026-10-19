@@ -4,7 +4,7 @@ Status: implemented v1 after Opus 5.5 review, with the narrower scope below.
 
 ## Implemented v1
 
-The single Rust registry in `guild_settings.rs` defines 22 typed server settings, bounds,
+The single Rust registry in `guild_settings.rs` defines typed server settings, bounds,
 descriptions and defaults. Existing env variables supply startup defaults; the remaining
 behavioral defaults are in the registry. Overrides live in `guild_settings`, keyed by guild and
 setting, with actor and timestamp. Missing rows inherit current defaults.
@@ -14,7 +14,7 @@ The settings are `chat_model`, `image_generation`, `image_model`, `keywords`, `p
 `decide_keyword_min_confidence`, `follow_up_window`, `follow_up_max_no_confidence`, `stale_after`,
 `stale_min_confidence`, `decide_recent_messages`, `decide_conversation_preview`, `history_messages`,
 `channel_context`, `channel_context_age`, `reply_max_tokens`, `topic_every_messages`,
-`topic_sample_messages`, and `lingo_nudge`. Duration inputs accept whole `ms`, `s`, `m`, `h`, or a bare number in
+`topic_sample_messages`, `lingo_nudge`, `allowed_channels` and `default_channel`. Duration inputs accept whole `ms`, `s`, `m`, `h`, or a bare number in
 the native unit displayed by `/kiki config` (pool timings in ms; other durations in seconds).
 Keywords are comma-separated, lowercased alphanumeric words. An empty list disables keyword
 triggers; `value:,` can be used to supply an empty list in Discord.
@@ -61,6 +61,29 @@ rows. Selection derives from the trigger message ID and remains stable on retry.
 At 0 no suggestion is added; the complete guild phrase list still appears in the
 system prompt. An empty phrase list produces no suggestion at any percentage.
 This does not enable automatic learning or provide phrase-editing commands.
+
+`allowed_channels` (default empty) and `default_channel` (default unset) limit where Kiki
+replies ([#33](https://github.com/carltonwu/kiki/issues/33)). Values are channel mentions
+(`<#id>`, which Discord inserts when you pick a channel with `#`) or IDs, separated by commas or
+spaces; `value:,` empties the list. Both must name channels or threads of this server. An empty
+list allows every channel. A thread is its own channel and doesn't inherit its parent's place on
+the list. A message is judged by its own channel (`guild_settings::reply_channel`):
+
+- On the list (or the list is empty): Kiki replies there as usual.
+- Off the list, with a default channel: she replies in the default channel. The first message
+  starts with a subtext line, `-# ↪ @author in <link to the message>`, which pings the author;
+  a Discord reply reference can't cross channels. Her own emoji reactions are dropped, since they
+  would land in the restricted channel. Routing and status reactions are unchanged, and the
+  conversation stays the original channel's. Replies to her redirected message in the default
+  channel continue it there, with no further header. The prompt leaves the header line out.
+- Off the list, with no default: the router doesn't pool the message, so there's no Decide call,
+  status reaction or reply.
+
+The allowlist covers replies only: every channel is still stored, searched and shown as context.
+A cross-field rule keeps `default_channel` on a non-empty `allowed_channels`. Setting a default
+that isn't listed, or removing the default from the list, is rejected; reset `default_channel`
+first. Allowlist changes after routing are honored at reply time: a run with nowhere left to reply
+is skipped.
 
 The leader loads all configured guilds after acquiring leadership. Commands, router and agent
 share one cache. A writer mutex covers transaction commit and cache publication, preserving write

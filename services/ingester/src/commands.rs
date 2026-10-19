@@ -747,6 +747,11 @@ impl Commands {
             {
                 check_catalog_model(key, model).await?;
             }
+            if let Some(value) = &value
+                && matches!(key, "allowed_channels" | "default_channel")
+            {
+                self.check_channels(invocation.guild_id, value).await?;
+            }
             self.settings
                 .guilds
                 .change(invocation.guild_id, key, value, actor)
@@ -789,6 +794,31 @@ impl Commands {
             key,
             &global,
         ))
+    }
+
+    /// Channel settings may only name channels and threads of this server.
+    async fn check_channels(&self, guild_id: i64, value: &Value) -> anyhow::Result<()> {
+        let ids: Vec<i64> = match value {
+            Value::Array(ids) => ids.iter().filter_map(Value::as_i64).collect(),
+            Value::Number(id) => id.as_i64().into_iter().collect(),
+            _ => return Ok(()),
+        };
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let known: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM channels WHERE guild_id = $1 AND id = ANY($2)")
+                .bind(guild_id)
+                .bind(&ids)
+                .fetch_all(&self.db)
+                .await?;
+        if let Some(unknown) = ids.iter().find(|id| !known.contains(id)) {
+            return Err(UserError(format!(
+                "<#{unknown}> isn't a channel or thread Kiki can see in this server."
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     async fn whois(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
