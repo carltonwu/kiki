@@ -32,7 +32,7 @@ bounds retrieval, while `scope.channel_id` identifies the reply destination.
 
 | File | Contents |
 |---|---|
-| `chat/search.py`, `chat/indexing.py` | SDK-independent: index pending, search, context, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
+| `chat/search.py`, `chat/indexing.py`, `chat/history.py` | SDK-independent: index pending, search, context, channel history, and `index_all`. Plain SQL; vectors pass as text cast to `halfvec`, so there's no pgvector client. |
 | `chat/scope.py`, `chat/attachments.py` | The job's scope and people, name and channel resolution, and the images a stored message carries. |
 | `openrouter/embeddings.py` | The embedder: OpenRouter embeddings as `halfvec` literals, with their cost. |
 | `agent/executor.py` | `PydanticExecutor`: agents, message/usage mapping, transient-error mapping, image jobs and emoji descriptions. |
@@ -83,6 +83,16 @@ model arguments, and arguments can only narrow them.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
   target message's own channel (at most 10 on each side) and the reply parent
   if it is in the same guild.
+- `channel_history(channel?, after?, before?, limit=100, cursor?)` (issue #39) reads a
+  channel and its threads in time order, for catch-ups ("what did I miss"). `channel`
+  defaults to the current one and resolves like search's; `after`/`before` are ISO
+  times (UTC unless offset) or message IDs, exclusive for IDs. With `after` it reads
+  forward, otherwise it returns the newest messages; a page holds at most 100
+  messages and about 40,000 characters of text, and `cursor` (`newer:<id>` or
+  `older:<id>`) continues it. Unlike search it keeps bot messages (marked `bot`; voice
+  transcripts) and the current conversation, so the timeline has no holes, and lists
+  attachment names as `files`. `total_in_range` lets the model judge how much is
+  left. Query logic is in `chat/history.py`; a system prompt line points catch-ups at it.
 - `read_image(message_id, question?)` has another model look at a message's
   images (see below). Search and context hits with images carry `images: n`.
 

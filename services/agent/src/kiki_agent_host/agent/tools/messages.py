@@ -1,4 +1,5 @@
-"""Message history tools: search the server and read around a message."""
+"""Message history tools: search the server, read around a message, and read a
+channel in order."""
 
 import asyncio
 import contextlib
@@ -11,6 +12,7 @@ from pydantic import BeforeValidator
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
+from ...chat.history import channel_history as read_history
 from ...chat.indexing import index_pending
 from ...chat.search import Semantic, message_context, search
 from ..deps import Deps
@@ -96,6 +98,51 @@ async def get_message_context(
     return await guarded(ctx, "get_message_context", work)
 
 
+async def channel_history(
+    ctx: RunContext[Deps],
+    channel: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    limit: int = 100,
+    cursor: str | None = None,
+) -> dict:
+    """Read a channel's messages in time order, threads included: everything said
+    between two points, not ranked matches.
+
+    Use it to catch someone up ("what did I miss", "what happened last night",
+    "summarize #general today") or to follow a stretch of conversation from start to
+    finish. Use search_messages to find something specific, and get_message_context
+    for just the few messages around one hit.
+
+    With `after`, it reads forward from that point; without it, it returns the newest
+    messages (before `before`, if given). Long stretches come in pages: when
+    `cursor` is in the result, pass it back with the same other arguments for the
+    next page. `total_in_range` says how many messages the whole stretch has.
+
+    Args:
+        channel: The channel to read, like #general. Leave it out for this channel.
+        after: Only messages after this point: an ISO 8601 time (UTC unless it has an
+            offset, like 2026-10-18T02:00-04:00) or a message ID.
+        before: Only messages before this point: a time or a message ID, as `after`.
+        limit: Maximum messages in this page, up to 100.
+        cursor: The `cursor` from the previous page.
+    """
+
+    async def work():
+        return await read_history(
+            ctx.deps.connection,
+            ctx.deps.scope,
+            channel=channel,
+            after=after,
+            before=before,
+            limit=limit,
+            cursor=cursor,
+            roster=ctx.deps.roster,
+        )
+
+    return await guarded(ctx, "channel_history", work)
+
+
 async def index_guild(deps: Deps) -> Semantic:
     try:
         found, more = await index_pending(deps.connection, deps.embed, guild_id=deps.scope.guild_id)
@@ -128,4 +175,4 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-toolset = FunctionToolset([search_messages, get_message_context])
+toolset = FunctionToolset([search_messages, get_message_context, channel_history])

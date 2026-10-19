@@ -292,12 +292,14 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     assert set(json.loads(result.text)) - set(memory_tools.toolset.tools) == {
         "search_messages",
         "get_message_context",
+        "channel_history",
         "read_image",
         "search_emojis",
         "find_emoji",
     }
-    # Message indexing plus the two searches' query embeddings.
-    assert result.usage.cost == pytest.approx(0.003)
+    # Message indexing plus search_messages' query embedding: search_emojis comes
+    # after the 4-call lookup budget.
+    assert result.usage.cost == pytest.approx(0.002)
     cursor = await db.execute("SELECT count(*) FROM message_embeddings")
     assert (await cursor.fetchone())[0] == 1
 
