@@ -20,6 +20,7 @@ mod leader;
 mod rest;
 mod router;
 mod store;
+mod telemetry;
 #[cfg(test)]
 mod test_db;
 
@@ -46,8 +47,14 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok(); // local development only; Railway sets real env vars
     let _ = rustls::crypto::ring::default_provider().install_default();
     let config = Config::from_env()?;
-    init_tracing(&config);
+    // `migrate` runs as Railway's pre-deploy step; only the service exports.
+    let telemetry = telemetry::init(config.json_logs, std::env::args().nth(1).is_none());
+    let result = run(config).await;
+    telemetry.shutdown().await;
+    result
+}
 
+async fn run(config: Config) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .acquire_timeout(Duration::from_secs(10))
@@ -87,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
     info!("leader lock acquired");
+    let leader_held = telemetry::meter()
+        .u64_gauge("kiki.leader.held")
+        .with_description("1 while this instance holds the leader lock")
+        .build();
+    leader_held.record(1, &[]);
 
     let mut ingest = tokio::spawn(ingest(
         pool,
@@ -106,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
     };
     // Only now may the next instance connect to the Gateway.
     leader.release().await;
+    leader_held.record(0, &[]);
     result?;
 
     info!("stopped");
@@ -194,17 +207,6 @@ async fn ingest(
 
 fn joined(result: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
     result.context("task panicked")?
-}
-
-fn init_tracing(config: &Config) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,sqlx=warn,twilight_http_ratelimiting=warn".into());
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    if config.json_logs {
-        builder.json().flatten_event(true).init();
-    } else {
-        builder.init();
-    }
 }
 
 async fn shutdown_signal() {

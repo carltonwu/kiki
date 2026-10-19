@@ -279,6 +279,15 @@ impl Agent {
         }))
     }
 
+    #[tracing::instrument(
+        name = "agent_run",
+        skip_all,
+        fields(
+            run_id = claim.run_id,
+            conversation_id = claim.conversation_id,
+            channel_id = claim.channel_id
+        )
+    )]
     async fn answer(self: &Arc<Self>, claim: Claim) {
         let started = Instant::now();
         let mut record = RunRecord::default();
