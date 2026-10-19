@@ -1,0 +1,16 @@
+name: counting questions get exact per-person and per-year counts with links
+steps:
+  - say: {as: sam, in: general, text: "slay"}
+  - say: {as: sam, in: lore, text: "she slayed that audition"}
+  - say: {as: ethan, in: general, text: "SLAY honestly"}
+  - say: {as: pilz, in: general, text: "slay (the bot never counts)"}
+  - say: {as: alex, in: general, text: "kiki who says slay the most?"}
+    reply: {tool: {name: count_messages, args: {query: "slay", group_by: "person"}}, text: "counted {result}"}
+  # The question itself counts too: sam 2, Ethan 1, Alex 1, and no bot.
+  - expect:
+      reply: true
+      tool_called: count_messages
+      tool_result_contains: ['"total":4', '"groups_total":3', '"count":2', "Sam", "https://discord.com/channels/900000000000000001/"]
+  - say: {as: alex, in: general, text: "kiki how much do we talk about lighting per year?"}
+    reply: {tool: {name: count_messages, args: {query: "lighting", group_by: "year"}}, text: "counted {result}"}
+  - expect: {reply: true, tool_called: count_messages, tool_result_contains: ['"total":3', '"group_by":"year"']}

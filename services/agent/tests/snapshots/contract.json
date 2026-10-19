@@ -202,6 +202,115 @@
           "strict": null
         },
         {
+          "description": "Count messages in this server exactly: totals and leaderboards.\n\nUse this, not search_messages, for \"who says X the most\", \"how often does Y\ncome up\", \"how many times\", \"who talks most in #channel\" or trends over time:\nsearch only returns a few examples, so counting its hits is wrong. Returns the\ntotal and, with `group_by`, the top groups by count, each with an example\nmessage link to cite. Counts messages (not repeats within one), excluding bots\nand deleted messages.",
+          "kind": "function",
+          "name": "count_messages",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent at or after this time (ISO 8601, UTC)."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent before this time (ISO 8601, UTC)."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages in this channel, like #general."
+              },
+              "group_by": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "person",
+                      "channel",
+                      "month",
+                      "year"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "\"person\" or \"channel\" for a ranking, \"month\" or \"year\" (UTC)\nfor counts over time. Leave it out for just the total."
+              },
+              "limit": {
+                "default": 10,
+                "description": "How many top groups to return, up to 50.",
+                "type": "integer"
+              },
+              "pattern": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "A case-insensitive regex the text must match, for exact\nspellings, short or common words, emoji or slang (`\\bslay\\b`).\nWith a query, it narrows the query's matches, which is faster."
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages by this person: a ref like u2 (best), an @username,\nor a name they've gone by."
+              },
+              "query": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Full-text words a message must all contain, matched by stem (\"slay\"\nalso finds \"slayed\"). Supports \"exact phrase\", `or` and -word. Leave\nboth query and pattern out to count every message."
+              }
+            },
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
           "description": "Look at the images in one message: a single image or a whole gallery.\n\nAnother model looks at them and describes each image in detail (with any\ntext in it), and a gallery as a whole.",
           "kind": "function",
           "name": "read_image",
@@ -718,6 +827,115 @@
                 "default": 100,
                 "description": "Maximum messages in this page, up to 100.",
                 "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Count messages in this server exactly: totals and leaderboards.\n\nUse this, not search_messages, for \"who says X the most\", \"how often does Y\ncome up\", \"how many times\", \"who talks most in #channel\" or trends over time:\nsearch only returns a few examples, so counting its hits is wrong. Returns the\ntotal and, with `group_by`, the top groups by count, each with an example\nmessage link to cite. Counts messages (not repeats within one), excluding bots\nand deleted messages.",
+          "kind": "function",
+          "name": "count_messages",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent at or after this time (ISO 8601, UTC)."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "format": "date-time",
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages sent before this time (ISO 8601, UTC)."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages in this channel, like #general."
+              },
+              "group_by": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "person",
+                      "channel",
+                      "month",
+                      "year"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "\"person\" or \"channel\" for a ranking, \"month\" or \"year\" (UTC)\nfor counts over time. Leave it out for just the total."
+              },
+              "limit": {
+                "default": 10,
+                "description": "How many top groups to return, up to 50.",
+                "type": "integer"
+              },
+              "pattern": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "A case-insensitive regex the text must match, for exact\nspellings, short or common words, emoji or slang (`\\bslay\\b`).\nWith a query, it narrows the query's matches, which is faster."
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages by this person: a ref like u2 (best), an @username,\nor a name they've gone by."
+              },
+              "query": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Full-text words a message must all contain, matched by stem (\"slay\"\nalso finds \"slayed\"). Supports \"exact phrase\", `or` and -word. Leave\nboth query and pattern out to count every message."
               }
             },
             "type": "object"

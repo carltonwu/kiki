@@ -96,6 +96,24 @@ model arguments, and arguments can only narrow them.
   left. Query logic is in `chat/history.py`; a system prompt line points catch-ups at it.
 - `read_image(message_id, question?)` has another model look at a message's
   images (see below). Search and context hits with images carry `images: n`.
+- `count_messages(query?, pattern?, person?, channel?, before?, after?, group_by?,
+  limit=10)` (issue #38, `chat/counting.py`) answers "who says X the most" and
+  "how often per year" exactly, where search could only show 10 hits. One
+  aggregate query counts matching messages (not repeats within one): `query` is
+  `websearch_to_tsquery` against `messages_fts_idx` (stems, `"phrases"`, `or`,
+  `-word`), `pattern` a case-insensitive regex (`\b` is rewritten to Postgres's
+  `\y`); no semantic match, since nearest neighbors always exist. `group_by` is
+  `person`, `channel`, `month` or `year` (UTC). It returns `total`,
+  `groups_total` and the top `limit` groups (at most 50) by count, each with its
+  newest matching message as a link (outside the current conversation when
+  there is one, so it isn't the question itself). Scope is search's (guild,
+  roster resolution, no bots, deleted messages or ignored authors), except that
+  the current conversation counts. It runs on its own connection with
+  `SET LOCAL statement_timeout = '6s'` (below the 10 s tool deadline), so a
+  regex scan over the whole guild comes back as "narrow it" rather than running
+  on; a stopword-only query or a bad regex is an argument error. It shares the
+  4-call lookup budget. The system prompt tells Kiki to use it, not search
+  hits, for counts.
 
 - `read_link(url_or_message_id, question?)` reads a shared link on a site web
   fetch can't read (see [Links](#links-read_link-issue-41)).
