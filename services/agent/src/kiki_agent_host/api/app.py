@@ -5,6 +5,7 @@ import logging
 import resource
 import secrets
 import time
+from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -12,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg import OperationalError
 
-from .. import STARTED
+from .. import STARTED, telemetry
 from ..config import Settings
 from ..contracts import (
     DescribeEmojisRequest,
@@ -27,10 +28,23 @@ from .jobs import RequestConflict, run_image_job, run_job
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    # Here, not after uvicorn.run(): uvicorn re-raises SIGTERM once it stops.
+    await asyncio.to_thread(telemetry.shutdown)
+
+
 def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
-    app = FastAPI(title="Kiki agent host", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(
+        title="Kiki agent host", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
+    )
     slots = asyncio.Semaphore(settings.max_concurrent_jobs)
     bearer = HTTPBearer(auto_error=False)
+    telemetry.instrument_app(app)
+    jobs = telemetry.meter().create_counter(
+        "kiki.agent.jobs", unit="{job}", description="Job requests by kind and outcome"
+    )
 
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
@@ -69,6 +83,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 (time.monotonic() - started) * 1000,
                 max_rss_mb(),
             )
+            jobs.add(1, {"kind": kind, "outcome": result.status})
             return JSONResponse(
                 status_code=202 if result.status == "running" else 200,
                 content=result.model_dump(mode="json"),
@@ -89,6 +104,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 type(error).__name__,
                 (time.monotonic() - started) * 1000,
             )
+            jobs.add(1, {"kind": kind, "outcome": "interrupted"})
             raise HTTPException(
                 status_code=503, detail="job interrupted; retry the same ID"
             ) from None
