@@ -325,6 +325,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
         "search_messages",
         "get_message_context",
         "channel_history",
+        "count_messages",
         "read_image",
         "read_link",
         "search_emojis",

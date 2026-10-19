@@ -1,5 +1,5 @@
-"""Message history tools: search the server, read around a message, and read a
-channel in order."""
+"""Message history tools: search the server, read around a message, read a
+channel in order, and count."""
 
 import asyncio
 import contextlib
@@ -12,6 +12,8 @@ from pydantic import BeforeValidator
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
+from ... import db
+from ...chat.counting import GroupBy, count
 from ...chat.history import channel_history as read_history
 from ...chat.indexing import index_pending
 from ...chat.search import Semantic, message_context, search
@@ -143,6 +145,64 @@ async def channel_history(
     return await guarded(ctx, "channel_history", work)
 
 
+async def count_messages(
+    ctx: RunContext[Deps],
+    query: str | None = None,
+    pattern: str | None = None,
+    person: str | None = None,
+    channel: str | None = None,
+    before: OptionalTime = None,
+    after: OptionalTime = None,
+    group_by: GroupBy | None = None,
+    limit: int = 10,
+) -> dict:
+    """Count messages in this server exactly: totals and leaderboards.
+
+    Use this, not search_messages, for "who says X the most", "how often does Y
+    come up", "how many times", "who talks most in #channel" or trends over time:
+    search only returns a few examples, so counting its hits is wrong. Returns the
+    total and, with `group_by`, the top groups by count, each with an example
+    message link to cite. Counts messages (not repeats within one), excluding bots
+    and deleted messages.
+
+    Args:
+        query: Full-text words a message must all contain, matched by stem ("slay"
+            also finds "slayed"). Supports "exact phrase", `or` and -word. Leave
+            both query and pattern out to count every message.
+        pattern: A case-insensitive regex the text must match, for exact
+            spellings, short or common words, emoji or slang (`\\bslay\\b`).
+            With a query, it narrows the query's matches, which is faster.
+        person: Only messages by this person: a ref like u2 (best), an @username,
+            or a name they've gone by.
+        channel: Only messages in this channel, like #general.
+        before: Only messages sent before this time (ISO 8601, UTC).
+        after: Only messages sent at or after this time (ISO 8601, UTC).
+        group_by: "person" or "channel" for a ranking, "month" or "year" (UTC)
+            for counts over time. Leave it out for just the total.
+        limit: How many top groups to return, up to 50.
+    """
+
+    async def work():
+        # Its own connection: the count's statement timeout lives in a transaction,
+        # which mustn't interleave with indexing on the run's shared one.
+        async with await db.connect(ctx.deps.memory.database_url) as connection:
+            return await count(
+                connection,
+                ctx.deps.scope,
+                query=query,
+                pattern=pattern,
+                person=person,
+                channel=channel,
+                roster=ctx.deps.roster,
+                before=before,
+                after=after,
+                group_by=group_by,
+                limit=limit,
+            )
+
+    return await guarded(ctx, "count_messages", work)
+
+
 async def index_guild(deps: Deps) -> Semantic:
     try:
         found, more = await index_pending(deps.connection, deps.embed, guild_id=deps.scope.guild_id)
@@ -175,4 +235,4 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-toolset = FunctionToolset([search_messages, get_message_context, channel_history])
+toolset = FunctionToolset([search_messages, get_message_context, channel_history, count_messages])

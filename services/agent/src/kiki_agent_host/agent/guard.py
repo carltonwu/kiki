@@ -64,7 +64,10 @@ async def guarded(
     except ValueError as e:
         outcome = "invalid_arguments"
         result = {"error": str(e)}
-    hits = next((result[k] for k in ("messages", "images", "emojis", "entries") if k in result), [])
+    hits = next(
+        (result[k] for k in ("messages", "images", "emojis", "entries", "groups") if k in result),
+        [],
+    )
     logger.info(
         "tool completed job_id=%s tool=%s channel_id=%s conversation_id=%s "
         "latency_ms=%d hits=%d semantic=%s outcome=%s",
