@@ -3,6 +3,9 @@ name: kiki
 services:
   postgres:
     image: pgvector/pgvector:pg18-trixie  # Postgres 18 + pgvector, like Railway's image
+    # Railway's memory settings (ALTER SYSTEM there): small shared buffers, since
+    # the OS page cache holds the same pages and Railway bills both.
+    command: ["postgres", "-c", "shared_buffers=32MB", "-c", "max_connections=100", "-c", "jit=off"]
     environment:
       POSTGRES_USER: kiki
       POSTGRES_PASSWORD: kiki

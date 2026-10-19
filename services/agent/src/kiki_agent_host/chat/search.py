@@ -38,6 +38,14 @@ MIN_SIMILARITY = 0.25
 RECENCY_WEIGHT = 0.15
 HALF_LIFE_DAYS = 30
 SNIPPET_CHARS = 1000
+# Semantic candidates are reranked from this many index neighbours: 200 found
+# 96% of the exact top 50 on production's embeddings.
+SHORTLIST = 200
+# The HNSW index returns its nearest `ef_search` before filters apply, so a
+# scoped search (one person, one channel) could come back short. Iterative
+# scans keep walking the graph until the LIMIT is met; relaxed order is fine
+# because the shortlist is reranked.
+INDEX_SETTINGS = "SET hnsw.ef_search = 200; SET hnsw.iterative_scan = relaxed_order"
 
 
 Semantic = Literal["full", "partial", "off"]
@@ -69,13 +77,24 @@ WITH lexical AS (
                  AS query) q
     WHERE {SCOPE} AND to_tsvector('english', m.content) @@ q.query
     ORDER BY r LIMIT %(candidates)s
+), nearest AS (
+    -- The index holds the embeddings' first 512 dimensions (Qwen's are
+    -- Matryoshka, so a prefix is a coarser embedding): it shortlists by those,
+    -- then the full vectors rank the shortlist. Ordered by the bare indexed
+    -- expression and limited, so the index can serve it; the similarity floor
+    -- applies after, or Postgres would scan every vector.
+    SELECT id, distance FROM (
+        SELECT m.id, e.embedding <=> %(vector)s::halfvec AS distance
+        FROM messages m JOIN message_embeddings e ON e.message_id = m.id
+        WHERE %(vector)s::halfvec IS NOT NULL AND {SCOPE}
+        ORDER BY subvector(e.embedding, 1, 512)::halfvec(512)
+                 <=> subvector(%(vector)s::halfvec, 1, 512)::halfvec(512)
+        LIMIT %(shortlist)s
+    ) shortlist
+    ORDER BY distance LIMIT %(candidates)s
 ), semantic AS (
-    SELECT m.id, 1 - (e.embedding <=> %(vector)s::halfvec) AS similarity,
-           row_number() OVER (ORDER BY e.embedding <=> %(vector)s::halfvec) AS r
-    FROM messages m JOIN message_embeddings e ON e.message_id = m.id
-    WHERE %(vector)s::halfvec IS NOT NULL AND {SCOPE}
-      AND e.embedding <=> %(vector)s::halfvec <= 1 - %(min_similarity)s
-    ORDER BY r LIMIT %(candidates)s
+    SELECT id, 1 - distance AS similarity, row_number() OVER (ORDER BY distance) AS r
+    FROM nearest WHERE distance <= 1 - %(min_similarity)s
 ), fused AS (
     SELECT coalesce(l.id, s.id) AS id, s.similarity,
            coalesce(1.0 / (%(k)s + l.r), 0) + coalesce(1.0 / (%(k)s + s.r), 0) AS relevance
@@ -137,6 +156,7 @@ async def search(
         "query": query,
         "vector": vector,
         "candidates": CANDIDATES,
+        "shortlist": SHORTLIST,
         "k": RRF_K,
         "min_similarity": MIN_SIMILARITY,
         "half_life": HALF_LIFE_DAYS,
@@ -145,6 +165,7 @@ async def search(
         "limit": max(1, min(limit, 10)),
     }
     cursor = connection.cursor(row_factory=dict_row)
+    await cursor.execute(INDEX_SETTINGS)
     await cursor.execute(SEARCH, params)
     rows = await cursor.fetchall()
     similarities = [m["similarity"] for m in rows if m["similarity"] is not None]
