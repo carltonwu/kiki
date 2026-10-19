@@ -1083,7 +1083,7 @@
                     "description": "Their ref, like u2, when it's someone in this server."
                   },
                   "photos": {
-                    "description": "IDs of messages whose images show them, when you or the people asking already picked some (like the message in [image: …; message 123]; a Discord message or attachment link they pasted works too). Otherwise leave it empty: the drawing step finds their photos in the server's history.",
+                    "description": "IDs of messages whose images show them, when you or the people asking already picked some (like the message in [image: …; message 123]; a Discord message or attachment link they pasted works too). Add :N for only its Nth image (123:2). Only photos of them: a picture to redraw them into goes in shared. Otherwise leave it empty: the drawing step finds their photos in the server's history.",
                     "items": {
                       "type": "string"
                     },
@@ -1134,6 +1134,21 @@
               "prompt": {
                 "description": "The picture, self-contained and literal (the image model knows\nnothing of the chat or the joke). Say what kind of image it is first,\nthen the scene: who does what, where, with framing, gaze, hands and\nhow they interact with things (\"full body, looking down at the\nneedle\"); then camera and light as concrete cues (\"phone photo at eye\nlevel, harsh fluorescent light\") rather than mood words alone; then\nconstraints. Any text in it goes in quotes with where it sits and\n\"no other text\". Call subjects by their names. Get real-world details\nright (a lumbar puncture goes in the lower back between the\nvertebrae). To edit, say only what changes.",
                 "type": "string"
+              },
+              "shared": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Messages whose images the picture is made from but that don't\nshow a subject: the photo, meme, template or post to redraw or work\nfrom, by message ID (123, or 123:2 for only its 2nd image, numbered\nas read_image and read_link number them), Discord link, or the\npost's link (an X or Reddit post shared here). The images the newest\nmessages carry, reply to or link go in anyway; name it here when\nit's from earlier in the chat, like a tweet asked about a few\nmessages ago, or to send only one of a post's images."
               },
               "style": {
                 "anyOf": [

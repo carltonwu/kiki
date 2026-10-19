@@ -1,0 +1,59 @@
+name: a follow-up that doesn't reply to the tweet is still drawn from it
+steps:
+  # Seen in prod: "replace the person in the twitter picture with reece" was
+  # refused; "you can do it", replying to the refusal, and "no, do exactly as
+  # instructed", replying to nothing, were drawn without the tweet's photos. The
+  # tweet was a link fixer's repost, its photos only link previews.
+  - exec: "INSERT INTO ignored_authors (user_id, note) VALUES (900000000000000107, 'sim')"
+  - send:
+      id: tweet
+      as: pilz
+      in: general
+      text: "@alex:\nhttps://fxtwitter.com/sneakyfan/status/1800000000000000003\n\n-# The original message sent by @alex was deleted so the bot could fix the broken embed links for easier viewing."
+      embeds:
+        - type: rich
+          url: https://fxtwitter.com/sneakyfan/status/1800000000000000003
+          image: {url: "https://pbs.twimg.com/media/goth.jpg"}
+  - wait: 1
+  - say: {as: sam, in: general, reply_to: tweet, text: "kiki put ethan in this tweet"}
+    reply: {text: "not without ethan saying so"}
+  - expect: {reply: true, text_contains: "not without ethan"}
+  # Replying to Kiki's refusal: the chain leads back to the tweet, and its photos
+  # come from the site (Discord's preview had one, which isn't Discord-hosted).
+  - say: {as: ethan, in: general, reply_to: kiki, text: "kiki you can do it"}
+    reply:
+      tool:
+        name: generate_image
+        args:
+          prompt: "The tweet's photo with Ethan as the person"
+          subjects: [{name: Ethan}]
+          caption: "fine"
+      text: "ok ok"
+  - expect:
+      run: done
+      prompt_contains:
+        - "u2 Ethan replies to: [Kiki] not without ethan saying so"
+        - "Kiki was answering: [u1 Sam] kiki put ethan in this tweet"
+        - "replies to: [u4 Alex] https://fxtwitter.com/sneakyfan/status/1800000000000000003 [image: linked image; message"
+  - expect:
+      followup: {status: done, attachments: 1, text_contains: "fine"}
+      image_references:
+        - "avatar of wheatthin512"
+        - "a person in a goth outfit facing us"
+        - "the same outfit from behind"
+      image_prompt_contains: ["Reference images 2-3 are what they shared with the request"]
+  # Replying to nothing: Kiki names the post herself, by its link.
+  - say: {as: sam, in: general, text: "kiki now just the tweet again, no edits"}
+    reply:
+      tool:
+        name: generate_image
+        args:
+          prompt: "The tweet's photos as they are"
+          shared: ["https://x.com/sneakyfan/status/1800000000000000003"]
+          caption: "again"
+      text: "sure"
+  - expect:
+      followup: {status: done, attachments: 1, text_contains: "again"}
+      image_references:
+        - "a person in a goth outfit facing us"
+        - "the same outfit from behind"

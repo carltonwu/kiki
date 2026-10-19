@@ -131,6 +131,31 @@ async def read(deps, url: str, question: str | None = None) -> dict:
     return result
 
 
+async def photos(url: str) -> list[str]:
+    """The post's images as `read` describes them; empty when it can't be read."""
+    async with httpx.AsyncClient(
+        timeout=TIMEOUT_SECONDS,
+        follow_redirects=False,
+        headers={"User-Agent": USER_AGENT},
+        transport=TRANSPORT,
+    ) as http:
+        try:
+            ids = await resolve(http, url)
+            if ids is None:
+                return []
+            status, data = await fetch(http, *ids)
+        except httpx.HTTPError as error:
+            logger.warning("reddit photos failed error_type=%s", type(error).__name__)
+            return []
+    if status != 200:
+        return []
+    try:
+        _, images = parse(data, ids[1])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return []
+    return [link for link, _ in images]
+
+
 async def fetch(http: httpx.AsyncClient, post: str, comment: str | None) -> tuple[int, object]:
     """The post's JSON (status 200) or the failing status with Reddit's error body.
     Anonymous unless credentials are set."""

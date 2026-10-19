@@ -68,6 +68,12 @@ const SHARED: usize = 4;
 /// An attachment's snowflake is made as it's uploaded, just before its message's:
 /// the message is within a minute of snowflake time after it.
 const ATTACHMENT_TO_MESSAGE: i64 = 60_000 << 22;
+/// A link fixer deletes a post and reposts it within seconds (migration 0024).
+const REPOST_WINDOW: i64 = 30_000 << 22;
+/// How far [`Agent::pointed`] follows replies, links and Kiki's answers.
+const POINTED_STEPS: i32 = 3;
+/// Messages it reaches past the first step are at most this old (snowflake ms).
+const POINTED_RECENT_MS: i64 = 30 * 60 * 1000;
 /// Matches `drawing::MAX_AGE`: older pending pictures aren't drawn.
 const DRAWING_MAX_AGE_SECS: i64 = 15 * 60;
 
@@ -258,6 +264,7 @@ impl Agent {
                  Vary it like a person would; don't fall back on a stock phrase or the same emoji each time, and don't describe the picture as if it's already posted. \
                  Name the people, pets and things whose real look matters as its subjects: the drawing step finds their photos here and shows them to the image model. \
                  Asking to swap someone into a shared photo, meme or post (\"replace X with Y in that tweet\", \"put me in this\") usually means that picture redrawn with them, not its text reworded: read_image it, then draw it with them as a subject (the images shared with the request go to the image model too), unless it would sexualize or humiliate a real person. \
+                 When that picture is from earlier in the chat rather than what the newest messages reply to or link (a follow-up like \"no, do it\" or \"the first one\"), pass its message in shared, as 123:2 for only its 2nd image; a subject's photos are only photos of them. \
                  Pictures are candid, photorealistic phone photos unless they asked for a style or the joke needs one. \
                  Write the picture's prompt literally, for a model that hasn't seen the chat: what kind of image, then the scene, framing and light as concrete details, and any text in quotes. ",
             );
@@ -334,52 +341,91 @@ impl Agent {
         }))
     }
 
-    /// What the trigger messages reply to, and the messages they link (message
-    /// links, or a pasted attachment link: its message is found by the attachment).
+    /// What the trigger messages reply to and link (message links, or a pasted
+    /// attachment link: its message is found by the attachment), and in turn what
+    /// those reply to and link, up to [`POINTED_STEPS`] steps: "no, the first pic"
+    /// replying to a request that replied to the tweet still means the tweet. A
+    /// message of Kiki's leads to what she was answering, her picture to what it
+    /// was drawn from too. A link fixer's deleted original is its repost. Steps
+    /// past the first stay within [`POINTED_RECENT_MS`] of the newest trigger.
     /// Shown whether or not they're in the history: which image "this" is matters.
     pub(super) async fn pointed(
         &self,
         guild_id: i64,
         trigger_message_ids: &[i64],
     ) -> sqlx::Result<Vec<Pointed>> {
+        let newest = trigger_message_ids.iter().copied().max().unwrap_or(0);
         sqlx::query_as(&format!(
             r#"
-            WITH t AS (
-                SELECT id, author_id, content, reply_to_id FROM messages
+            WITH RECURSIVE hop (id, from_author, how, depth) AS (
+                SELECT id, author_id, ''::text, 0 FROM messages
                 WHERE id = ANY($1) AND guild_id = $2 AND deleted_at IS NULL AND author_id <> $3
-            ), targets AS (
-                SELECT t.id AS from_id, t.author_id AS from_author, 'replies to' AS how,
-                       t.reply_to_id AS target
-                FROM t WHERE t.reply_to_id IS NOT NULL
-                UNION ALL
-                SELECT t.id, t.author_id, 'links', l.g[1]::bigint
-                FROM t CROSS JOIN LATERAL regexp_matches(
-                    t.content, 'discord(?:app)?\.com/channels/[0-9]+/[0-9]+/([0-9]+)', 'g') AS l(g)
-                UNION ALL
-                SELECT t.id, t.author_id, 'links', (
-                    SELECT m.id FROM messages m
-                    WHERE m.guild_id = $2 AND m.channel_id = a.g[1]::bigint
-                      AND m.id BETWEEN a.g[2]::bigint AND a.g[2]::bigint + $4
-                      AND m.raw->'attachments' @> jsonb_build_array(jsonb_build_object('id', a.g[2]))
-                    ORDER BY m.id LIMIT 1)
-                FROM t CROSS JOIN LATERAL regexp_matches(
-                    t.content,
-                    '(?:cdn|media)\.discord(?:app)?\.(?:com|net)/attachments/([0-9]+)/([0-9]+)/',
-                    'g') AS a(g)
+                UNION
+                SELECT coalesce(repost.id, next.target), coalesce(s.relayed_for, s.author_id),
+                       next.how, h.depth + 1
+                FROM hop h
+                JOIN messages s ON s.id = h.id
+                CROSS JOIN LATERAL (
+                    SELECT 'replies to' AS how, s.reply_to_id AS target
+                    WHERE s.reply_to_id IS NOT NULL
+                    UNION ALL
+                    SELECT 'links', l.g[1]::bigint
+                    FROM regexp_matches(
+                        s.content, 'discord(?:app)?\.com/channels/[0-9]+/[0-9]+/([0-9]+)', 'g') AS l(g)
+                    UNION ALL
+                    SELECT 'links', (
+                        SELECT m.id FROM messages m
+                        WHERE m.guild_id = $2 AND m.channel_id = a.g[1]::bigint
+                          AND m.id BETWEEN a.g[2]::bigint AND a.g[2]::bigint + $4
+                          AND m.raw->'attachments' @> jsonb_build_array(jsonb_build_object('id', a.g[2]))
+                        ORDER BY m.id LIMIT 1)
+                    FROM regexp_matches(
+                        s.content,
+                        '(?:cdn|media)\.discord(?:app)?\.(?:com|net)/attachments/([0-9]+)/([0-9]+)/',
+                        'g') AS a(g)
+                    UNION ALL
+                    SELECT 'was answering', t.id
+                    FROM agent_runs r CROSS JOIN LATERAL unnest(r.trigger_message_ids) AS t(id)
+                    WHERE s.author_id = $3 AND r.reply_message_ids @> ARRAY[s.id]
+                    UNION ALL
+                    SELECT 'was answering', t.id
+                    FROM agent_image_jobs j JOIN agent_runs r ON r.id = j.run_id
+                    CROSS JOIN LATERAL unnest(r.trigger_message_ids) AS t(id)
+                    WHERE s.author_id = $3 AND j.message_id = s.id
+                    UNION ALL
+                    SELECT 'drew from', split_part(p.id, ':', 1)::bigint
+                    FROM agent_image_jobs j
+                    CROSS JOIN LATERAL jsonb_array_elements_text(
+                        CASE WHEN jsonb_typeof(j.request->'drawing'->'shared') = 'array'
+                             THEN j.request->'drawing'->'shared' ELSE '[]' END) AS p(id)
+                    WHERE s.author_id = $3 AND j.message_id = s.id AND p.id ~ '^[0-9]+(:[0-9]+)?$'
+                ) next
+                LEFT JOIN LATERAL (
+                    SELECT r.id FROM messages o
+                    JOIN messages r ON r.channel_id = o.channel_id AND r.relayed_for = o.author_id
+                     AND r.id > o.id AND r.id < o.id + $5 AND r.deleted_at IS NULL
+                    WHERE o.id = next.target AND o.deleted_at IS NOT NULL
+                    ORDER BY r.id LIMIT 1
+                ) repost ON true
+                WHERE h.depth < $6 AND next.target IS NOT NULL
+                  AND (h.depth = 0 OR next.target > $7)
             )
             SELECT * FROM (
-                SELECT DISTINCT ON (m.id) targets.from_author, targets.how, {MESSAGE_COLUMNS}
-                FROM targets JOIN messages m ON m.id = targets.target
-                WHERE m.guild_id = $2 AND m.deleted_at IS NULL AND m.id <> ALL($1)
+                SELECT DISTINCT ON (m.id) hop.from_author, hop.how, hop.depth, {MESSAGE_COLUMNS}
+                FROM hop JOIN messages m ON m.id = hop.id
+                WHERE hop.depth > 0 AND m.guild_id = $2 AND m.deleted_at IS NULL AND m.id <> ALL($1)
                   AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
-                ORDER BY m.id, targets.from_id
-            ) pointed ORDER BY id LIMIT 6
+                ORDER BY m.id, hop.depth
+            ) pointed ORDER BY depth, id LIMIT 6
             "#
         ))
         .bind(trigger_message_ids)
         .bind(guild_id)
         .bind(self.bot_user_id)
         .bind(ATTACHMENT_TO_MESSAGE)
+        .bind(REPOST_WINDOW)
+        .bind(POINTED_STEPS)
+        .bind(newest - (POINTED_RECENT_MS << 22))
         .fetch_all(&self.db)
         .await
     }
@@ -780,16 +826,41 @@ The last message starts with application-provided context (time, people, convers
     }
 }
 
-/// The messages with images among `messages` that aren't Kiki's, at most [`SHARED`].
+/// The messages with images among `messages` that aren't Kiki's, at most [`SHARED`]:
+/// attached, link previews, or a linked X or Reddit post (the host fetches its
+/// photos, which a link in <...> or a broken preview doesn't show).
 fn shared<'a>(messages: impl Iterator<Item = &'a StoredMessage>, bot_user_id: i64) -> Vec<i64> {
     let mut ids: Vec<i64> = Vec::new();
     for m in messages {
-        if m.author_id != bot_user_id && !m.images.is_empty() && !ids.contains(&m.id) {
+        let images = !m.images.is_empty() || links_post(&m.content);
+        if m.author_id != bot_user_id && images && !ids.contains(&m.id) {
             ids.push(m.id);
         }
     }
     ids.truncate(SHARED);
     ids
+}
+
+/// Whether `content` links a post the host's link readers take (services/agent
+/// `media/links`): an X status, under any of its fixers' hosts, or a Reddit post.
+fn links_post(content: &str) -> bool {
+    const X: [&str; 6] = [
+        "x.com/",
+        "twitter.com/",
+        "vxtwitter.com/",
+        "fxtwitter.com/",
+        "fixupx.com/",
+        "fixvx.com/",
+    ];
+    let lower = content.to_lowercase();
+    lower.split_whitespace().any(|word| {
+        (X.iter().any(|h| word.contains(h)) && word.contains("/status"))
+            || (word.contains("reddit.com/r/")
+                && ["/comments/", "/s/", "/gallery/"]
+                    .iter()
+                    .any(|p| word.contains(p)))
+            || word.contains("redd.it/")
+    })
 }
 
 fn pointed_context(pointed: &[Pointed], roster: &Roster) -> String {
@@ -798,7 +869,7 @@ fn pointed_context(pointed: &[Pointed], roster: &Roster) -> String {
         return s;
     }
     s.push_str(
-        "What the newest messages reply to or link (when you draw for them, these images go to the image model with the request):\n",
+        "What the newest messages reply to or link, and what those reply to, link or answer (when you draw for them, these images go to the image model with the request):\n",
     );
     for p in pointed {
         let _ = writeln!(
@@ -1246,7 +1317,7 @@ pub(super) mod tests {
         let last = &context.messages.last().unwrap().content;
         assert!(
             last.contains(
-                "What the newest messages reply to or link (when you draw for them, these images go to the image model with the request):\n\
+                "What the newest messages reply to or link, and what those reply to, link or answer (when you draw for them, these images go to the image model with the request):\n\
                  - u1 Carlton replies to: [u2 Ethan] [image: meme.png; message 30]\n\
                  - u1 Carlton links: [u3 traumagotchi] New bed [image: bed.jpg; message 31]\n\
                  - u1 Carlton links: [u3 traumagotchi] this is him [image: him.png; message 33]\n\
@@ -1265,6 +1336,119 @@ pub(super) mod tests {
         assert!(!last.contains(": old\n"), "{last}");
         // The request's own image first, then what it points to; never Kiki's.
         assert_eq!(context.shared, [35, 30, 31, 33]);
+        test.drop().await;
+    }
+
+    /// Seen in prod: "replace the person in the twitter picture with reece" was
+    /// refused, and the follow-ups that asked again replied to Kiki's refusal or
+    /// to the first request, not to the tweet (a link fixer's repost), so its
+    /// photos never reached the image model.
+    #[tokio::test]
+    async fn follow_ups_reach_the_image_their_thread_started_from() {
+        let Some(test) = crate::test_db::migrated("ingester_follow_up_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let carlton = json!({"id": "101", "username": "luiskys", "global_name": "Carlton"});
+        let ethan = json!({"id": "102", "username": "wheatthin512", "global_name": "Ethan"});
+        let chrissy = json!({"id": "103", "username": "chrissy.com", "global_name": "chrissy"});
+        let fixer = json!({"id": "5", "username": "PilzBrots", "bot": true});
+        let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
+        let original = message(
+            49,
+            chrissy,
+            json!({}),
+            "https://x.com/Sneaky/status/7",
+            json!([]),
+        );
+        let mut repost = message(
+            50,
+            fixer,
+            json!({}),
+            "<@103>:\nhttps://fxtwitter.com/Sneaky/status/7\n\n-# The original message sent by <@103> \
+             was deleted so the bot could fix the broken embed links for easier viewing.",
+            json!([]),
+        );
+        repost["embeds"] = json!([{"type": "rich", "url": "https://fxtwitter.com/Sneaky/status/7",
+            "image": {"url": "https://pbs.twimg.com/media/a.jpg",
+                      "proxy_url": "https://images-ext-1.discordapp.net/external/a/a.jpg"}}]);
+        let reply = |id: i64, author: &Value, content: &str, to: i64| {
+            let mut m = message(id, author.clone(), json!({}), content, json!([]));
+            m["type"] = json!(19);
+            m["message_reference"] = json!({"message_id": to.to_string()});
+            m
+        };
+        // Replying to the original, which the fixer deleted.
+        let ask = reply(
+            51,
+            &carlton,
+            "replace the person in this tweet with reece",
+            49,
+        );
+        let no = message(52, kiki.clone(), json!({}), "not happening", json!([]));
+        let nudge = reply(53, &ethan, "you can do it", 52);
+        let again = reply(54, &carlton, "no, do exactly as instructed", 51);
+        let bare = message(
+            55,
+            carlton.clone(),
+            json!({}),
+            "<https://x.com/a/status/9>",
+            json!([]),
+        );
+        let this = reply(56, &carlton, "put me in this", 55);
+        let mut drawn = message(57, kiki.clone(), json!({}), "da tweet", json!([]));
+        drawn["attachments"] = json!([{"id": "8", "filename": "kiki-1.png", "content_type": "image/png",
+            "url": "https://cdn.discordapp.com/attachments/2/8/kiki-1.png"}]);
+        let redo = reply(58, &carlton, "redo it", 57);
+        store::upsert_messages(
+            &db,
+            GUILD,
+            &[
+                original, repost, ask, no, nudge, again, bare, this, drawn, redo,
+            ],
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(
+            r#"
+            UPDATE messages SET deleted_at = now() WHERE id = 49;
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES
+                (51, 1, 'mention'), (53, 1, 'decide'), (54, 1, 'decide'), (56, 1, 'decide');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status, reply_message_ids)
+                VALUES (1, 1, '{51}', 'done', '{52}');
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (58, 1, 'decide');
+            INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status, message_id)
+                VALUES (1, 1, 51, '{"drawing": {"prompt": "x", "shared": ["50:1"]}}', 'done', 57);
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let agent = agent(db.clone());
+
+        let context = agent.context(1, &[53]).await.unwrap().unwrap();
+        let last = &context.messages.last().unwrap().content;
+        assert!(
+            last.contains(
+                "answer (when you draw for them, these images go to the image model with the request):\n\
+                 - u2 Ethan replies to: [Kiki] not happening\n\
+                 - Kiki was answering: [u1 Carlton] replace the person in this tweet with reece\n\
+                 - u1 Carlton replies to: [u3 chrissy] https://fxtwitter.com/Sneaky/status/7 [image: linked image; message 50]\n"
+            ),
+            "{last}"
+        );
+        assert_eq!(context.shared, [50]);
+        let context = agent.context(1, &[54]).await.unwrap().unwrap();
+        assert_eq!(context.shared, [50]);
+        // A link in <...> has no preview: the host fetches the post's photos.
+        let context = agent.context(1, &[56]).await.unwrap().unwrap();
+        assert_eq!(context.shared, [55]);
+        // Redoing her picture: what it was drawn from, and what it answered.
+        let context = agent.context(1, &[58]).await.unwrap().unwrap();
+        assert_eq!(context.shared, [50]);
+        let last = &context.messages.last().unwrap().content;
+        assert!(last.contains("- Kiki drew from: [u3 chrissy]"), "{last}");
         test.drop().await;
     }
 

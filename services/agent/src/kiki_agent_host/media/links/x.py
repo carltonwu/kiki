@@ -138,6 +138,26 @@ async def read(deps, url: str, question: str | None = None) -> dict:
     return remember(key, result)
 
 
+async def photos(url: str) -> list[str]:
+    """The post's photos (and video thumbnails), then its quoted post's, as `read`
+    lists them; empty when it can't be read."""
+    id = status_id(url)
+    if id is None:
+        return []
+    async with httpx.AsyncClient(
+        timeout=API_TIMEOUT_SECONDS,
+        follow_redirects=False,
+        headers={"User-Agent": USER_AGENT},
+        transport=TRANSPORT,
+    ) as http:
+        try:
+            tweet = await fetch(http, id)
+        except Unreadable:
+            return []
+    found = pictures(tweet, "") + pictures(tweet.get("quote") or {}, " in the quoted post")
+    return [link for _, link in found[:MAX_IMAGES]]
+
+
 async def fetch(http: httpx.AsyncClient, id: str) -> dict:
     """The API's `tweet` object, or `Unreadable` with the reason."""
     try:

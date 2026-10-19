@@ -39,30 +39,46 @@ struct Job {
     queued_ms: i64,
 }
 
-/// `drawing` with the images shared with the request that none of its subjects
-/// use (`Drawing.shared` on the host), so the attachment, the meme replied to or
-/// the photo linked reaches the image model even when Kiki didn't name it.
+/// `drawing` with the images shared with the request that it doesn't use yet
+/// (`Drawing.shared` on the host), after the ones Kiki picked, so the attachment,
+/// the meme replied to or the photo linked reaches the image model even when Kiki
+/// didn't name it. A pick is a message ID, or one of its images (`30:2`): a
+/// message picked either way isn't added again.
 fn with_shared(drawing: &serde_json::Value, shared: &[i64]) -> serde_json::Value {
     let mut drawing = drawing.clone();
+    let picked: Vec<String> = drawing["shared"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .collect();
     let used: Vec<&str> = drawing["subjects"]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|s| s["photos"].as_array().into_iter().flatten())
         .filter_map(|p| p.as_str())
+        .chain(picked.iter().map(String::as_str))
+        .map(|p| p.split(':').next().unwrap_or(p))
         .collect();
-    let unused: Vec<String> = shared
+    let added: Vec<String> = shared
         .iter()
         .map(i64::to_string)
         .filter(|id| !used.contains(&id.as_str()))
         .collect();
-    if !unused.is_empty()
+    if !added.is_empty()
         && let Some(object) = drawing.as_object_mut()
     {
-        object.insert("shared".into(), unused.into());
+        let mut all = picked;
+        all.extend(added);
+        all.truncate(SHARED_MAX);
+        object.insert("shared".into(), all.into());
     }
     drawing
 }
+
+/// `Drawing.shared`'s limit on the host.
+const SHARED_MAX: usize = 8;
 
 impl Agent {
     /// Saves the reply's drawings as pending image jobs, before anything is
@@ -371,5 +387,14 @@ mod tests {
         // Nothing to add: the drawing is sent as the host returned it.
         assert_eq!(super::with_shared(&drawing, &[30]), drawing);
         assert_eq!(super::with_shared(&drawing, &[]), drawing);
+    }
+
+    /// Kiki's picks stay first; a message she picked one image of isn't added whole.
+    #[test]
+    fn shared_images_follow_kikis_picks() {
+        let drawing = json!({"prompt": "x", "subjects": [], "shared": ["40:1"]});
+        let with = super::with_shared(&drawing, &[40, 35]);
+        assert_eq!(with["shared"], json!(["40:1", "35"]));
+        assert_eq!(super::with_shared(&drawing, &[40]), drawing);
     }
 }
