@@ -635,6 +635,35 @@ async def test_shared_images_come_last_and_given_photos_are_not_sent_twice(datab
     assert "Reference image 2 is what they shared with the request" in prompt
 
 
+async def test_a_shared_link_previews_image_is_a_reference(database_url):
+    # Seen in prod: "replace Sneaky with Reece" about a pasted tweet; the tweet's
+    # photo is a link preview (an embed, no attachment ID) and was dropped.
+    await reply_job(database_url)
+    proxy = "https://images-ext-1.discordapp.net/external/abc/https/pbs.twimg.com/media/x.jpg"
+    embed = {
+        "type": "rich",
+        "url": "https://fxtwitter.com/Sneaky/status/1",
+        "image": {"url": "https://pbs.twimg.com/media/x.jpg", "proxy_url": proxy},
+    }
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
+            " created_at, raw) VALUES (84, %s, 2, 300, 'user300', 'https://fxtwitter.com/x',"
+            " now(), %s)",
+            (GUILD, Jsonb({"author": {"id": "300"}, "embeds": [embed]})),
+        )
+    model = FakeImageModel()
+    run = executor(database_url, model, lambda messages, info: None)
+    run.transport = discord({"/external/abc/https/pbs.twimg.com/media/x.jpg": JPEG + b"tweet"}, [])
+    job = image_job([], prompt="The tweet's photo with Reece instead of Sneaky")
+    job.drawing.shared = ["84"]
+    result = await run.draw(job)
+    assert [(r.subject, r.message_id, r.attachment_id, r.url) for r in result.references] == [
+        ("shared", "84", None, proxy)
+    ]
+    assert [r.data for r in model.references[0]] == [JPEG + b"tweet"]
+
+
 def test_models_get_the_references_and_ratios_they_take():
     assert reference_limit("openai/gpt-image-2.5-flare") == 16
     assert reference_limit("qwen/qwen-image-2.1-turbo") == 4

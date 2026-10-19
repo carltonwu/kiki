@@ -111,7 +111,15 @@ async def speakers(
     return found
 
 
-# Authors Kiki never reads (migration 0010), for messages aliased `m`. Not an
+# Authors Kiki never reads (migration 0010), for messages aliased `m`, except
+# their reposts of someone's message (a link fixer's; migration 0024). Not an
 # anti-join: the one-row table is never auto-analyzed, and the planner's guess
 # of 1,200 rows turned the guild-wide pending scan into an 84 s nested loop.
-HEARD = "m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors))"
+HEARD = (
+    "(m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)) OR m.relayed_for IS NOT NULL)"
+)
+# People's messages Kiki reads: no bots', but a link fixer's reposts of theirs.
+PEOPLES = f"(NOT m.author_bot OR m.relayed_for IS NOT NULL) AND {HEARD}"
+# Who wrote a message and what they wrote, a repost's as its author's.
+AUTHOR = "coalesce(m.relayed_for, m.author_id)"
+TEXT = "coalesce(m.relayed_text, m.content)"

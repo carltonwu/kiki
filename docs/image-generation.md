@@ -132,7 +132,9 @@ template): use it as the request describes". In prod, "edit this meme" sent as a
 reply to the meme, a linked photo of a pet, and a photo attached to the request
 all failed to reach the image model, because the drawing used only the photos
 Kiki remembered to name. A given photo that the history search finds again isn't
-checked or sent twice.
+checked or sent twice. Shared images and `photos` include link previews' images
+(a tweet's photo), which the history search skips: in prod, "replace Sneaky with
+Reece" about a pasted tweet would have been drawn without the tweet's photo.
 
 A subject with no usable reference is drawn from her description. Images are
 downloaded from Discord and sent as bytes (data URLs), never as Discord links:
@@ -185,8 +187,8 @@ and the live API. GPT Image models get `quality: medium`.
 ## Observability
 
 Each `agent_host_images` row has the final `prompt`, `model`, `subjects`,
-`reference_images` (in order: `message_id` and `attachment_id`, `avatar_of`, or
-`drawing_id`), `cost_usd` and `latency_ms`. Each `agent_image_jobs` row has its
+`reference_images` (in order: `message_id` and `attachment_id` or a link
+preview's `url`, `avatar_of`, or `drawing_id`), `cost_usd` and `latency_ms`. Each `agent_image_jobs` row has its
 status, `error` (`refused`, `failed`, `expired`, `interrupted` or the host error),
 the image and the follow-up message IDs, total cost (references, image and any
 note) and queued-to-posted latency; conversation costs include it. The host logs

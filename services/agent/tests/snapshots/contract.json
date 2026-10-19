@@ -1780,6 +1780,18 @@
             "subject": {
               "title": "Subject",
               "type": "string"
+            },
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Url"
             }
           },
           "required": [
@@ -2326,6 +2338,18 @@
             "subject": {
               "title": "Subject",
               "type": "string"
+            },
+            "url": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Url"
             }
           },
           "required": [

@@ -38,7 +38,7 @@ AND (%(before_id)s::bigint IS NULL OR (m.created_at, m.id) < (
 # is ASC reading forward from a start, DESC reading back from the end.
 PAGE = f"""
 SELECT * FROM (
-    SELECT {COLUMNS}, m.author_bot FROM messages m
+    SELECT {COLUMNS}, m.author_bot AND m.relayed_for IS NULL AS author_bot FROM messages m
     WHERE {RANGE}
       AND (%(newer)s::bigint IS NULL OR (m.created_at, m.id) > (
            SELECT created_at, id FROM messages WHERE id = %(newer)s))

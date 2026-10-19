@@ -1,0 +1,23 @@
+name: a link fixer's repost of someone's link is their message in Kiki's context
+steps:
+  # Seen in prod: PilzBrots (an ignored author, a chatbot too) deletes a post whose
+  # link preview is broken and reposts it, so "the most recent twitter link" was
+  # invisible to Kiki. Its own chatter stays ignored.
+  - exec: "INSERT INTO ignored_authors (user_id, note) VALUES (900000000000000107, 'sim')"
+  - send:
+      as: pilz
+      in: general
+      text: "@alex: look at this\nhttps://fxtwitter.com/a/status/1 \n\n-# The original message sent by @alex was deleted so the bot could fix the broken embed links for easier viewing."
+      embeds:
+        - type: rich
+          url: https://fxtwitter.com/a/status/1
+          image: {url: "https://pbs.twimg.com/media/x.jpg"}
+  - send: {as: pilz, in: general, text: "I'm a chatbot too"}
+  - wait: 1
+  - say: {as: sam, in: general, text: "kiki what's the newest twitter link in here"}
+  - expect:
+      reply: true
+      prompt_contains:
+        - "[u2 Alex] look at this"
+        - "https://fxtwitter.com/a/status/1 [image: linked image; message"
+      prompt_lacks: ["was deleted so the bot", "I'm a chatbot too", "PilzBrots"]
