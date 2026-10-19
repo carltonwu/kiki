@@ -662,6 +662,24 @@ class Fakecord:
         self.world.unexpected.append({"method": request.method, "path": f"reddit/{path}"})
         return web.json_response({"message": "Not Found", "error": 404}, status=404)
 
+    # --- stub FxTwitter (read_link) ----------------------------------------
+
+    async def fxtwitter(self, request: web.Request) -> web.StreamResponse:
+        """The FxTwitter API (`/status/<id>`) for the posts in `x_posts`, and their
+        images as labeled PNGs. Other IDs are deleted posts, as FxTwitter says."""
+        path = request.match_info["path"].rstrip("/")
+        posts = x_posts(self.media_base())
+        if m := re.fullmatch(r"status/(\d+)", path):
+            if m[1] in posts:
+                return web.json_response({"code": 200, "message": "OK", "tweet": posts[m[1]]})
+            return web.json_response(
+                {"code": 404, "message": "NOT_FOUND", "tweet": None}, status=404
+            )
+        if m := re.fullmatch(r"media/([\w-]+)\.png", path):
+            return web.Response(body=png(m[1].replace("-", " ")), content_type="image/png")
+        self.world.unexpected.append({"method": request.method, "path": f"fxtwitter/{path}"})
+        return web.json_response({"code": 404, "message": "NOT_FOUND"}, status=404)
+
     def jev(self, body: dict) -> dict:
         state = body["state"]
         new = state["new_messages"]
@@ -1042,6 +1060,7 @@ class Fakecord:
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
         app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/reddit/{path:.*}", self.reddit)
+        app.router.add_route("*", "/fxtwitter/{path:.*}", self.fxtwitter)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
 
@@ -1109,6 +1128,49 @@ def reddit_posts(media_base: str) -> dict[str, list]:
                 },
             },
             [("whisker_fan", 1503, "The betrayal in the second photo is palpable.")],
+        ),
+    }
+
+
+def x_posts(media_base: str) -> dict[str, dict]:
+    """Two X posts in FxTwitter's `tweet` shape: a photo post, and a video post whose
+    thumbnail is a fakecord PNG (the stub vision model reads labels back)."""
+    image = f"{media_base}/fxtwitter/media"
+
+    def post(id: str, handle: str, name: str, text: str, media: list[dict]) -> dict:
+        return {
+            "url": f"https://x.com/{handle}/status/{id}",
+            "id": id,
+            "text": text,
+            "author": {"screen_name": handle, "name": name},
+            "replies": 4,
+            "retweets": 8,
+            "likes": 120,
+            "created_timestamp": 1760000000,
+            "media": {"all": media},
+        }
+
+    return {
+        "1800000000000000001": post(
+            "1800000000000000001",
+            "simnews",
+            "Sim News",
+            "the opening night crowd tonight",
+            [{"type": "photo", "url": f"{image}/a-packed-theatre-lobby-with-a-red-carpet.png"}],
+        ),
+        "1800000000000000002": post(
+            "1800000000000000002",
+            "jugglerjo",
+            "Jo",
+            "new trick",
+            [
+                {
+                    "type": "video",
+                    "url": f"{media_base}/fxtwitter/media/trick.mp4",
+                    "thumbnail_url": f"{image}/a-person-juggling-five-clubs.png",
+                    "duration": 12.4,
+                }
+            ],
         ),
     }
 

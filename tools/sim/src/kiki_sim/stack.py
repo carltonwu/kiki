@@ -398,6 +398,8 @@ class Config:
             "DISCORD_BOT_TOKEN": "sim-token",
             # read_link's Reddit reader gets fakecord's posts, in live mode too.
             "REDDIT_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/reddit",
+            # ... and its X reader fakecord's FxTwitter.
+            "FXTWITTER_API_URL": f"http://127.0.0.1:{self.ports.fakecord}/fxtwitter",
         }
         if self.live:
             keys = live_keys()

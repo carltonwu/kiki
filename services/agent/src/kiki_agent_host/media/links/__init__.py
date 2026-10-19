@@ -18,9 +18,9 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from ...chat.scope import HEARD, Scope
-from . import reddit
+from . import reddit, x
 
-READERS = [reddit]
+READERS = [reddit, x]
 
 # Ends at whitespace and at the `<>` of Discord's no-preview links.
 LINK = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)

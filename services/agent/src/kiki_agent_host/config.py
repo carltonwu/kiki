@@ -75,3 +75,9 @@ def reddit_credentials() -> tuple[str, str] | None:
     id = os.getenv("REDDIT_CLIENT_ID", "").strip()
     secret = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
     return (id, secret) if id and secret else None
+
+
+def fxtwitter_api() -> str:
+    """The FxTwitter API root for X posts; `FXTWITTER_API_URL` points at the local
+    simulator."""
+    return (os.getenv("FXTWITTER_API_URL") or "https://api.fxtwitter.com").rstrip("/")
