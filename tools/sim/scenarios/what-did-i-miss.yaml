@@ -1,0 +1,34 @@
+name: a "what did I miss" request reads the channel and its threads in order, a page at a time
+steps:
+  # A busy few hours in #general, a side thread, a voice transcript from PilzBrots
+  # (a bot) and a shared file, all before Alex asks.
+  - send: {as: sam, in: general, text: "rehearsal moved to thursday 7pm", age_s: 10800}
+  - send: {as: ethan, in: general, text: "can someone bring the extension cords", age_s: 9000}
+  - send: {as: chris, in: general-thread, text: "costume fittings are in the thread now", age_s: 7200}
+  - send: {as: pilz, in: general, text: "Voice transcript: sam and ethan picked the cast list", age_s: 5400}
+  - send:
+      as: sam
+      in: general
+      text: "budget sheet attached"
+      age_s: 3600
+      attachments: [{filename: budget.xlsx, content_type: application/vnd.ms-excel}]
+  - send: {as: ethan, in: general, text: "opening night is sold out!!", age_s: 1800}
+  # The newest page first (with the question itself), then one back with the cursor.
+  - say: {as: alex, in: general, text: "kiki what did I miss"}
+    reply:
+      tools:
+        - {name: channel_history, args: {limit: 4}}
+        - {name: channel_history, args: {limit: 4, cursor: "{cursor}"}}
+      text: "caught up: {result}"
+  - expect:
+      reply: true
+      tool_called: channel_history
+      prompt_contains: "use channel_history to read that stretch in order"
+      tool_result_contains:
+        - '"total_in_range":'
+        - '"cursor":"older:'
+        - "opening night is sold out"
+        - '"files":["budget.xlsx"]'
+        - '"bot":true'
+        - "#general-thread"
+        - "rehearsal moved to thursday 7pm"

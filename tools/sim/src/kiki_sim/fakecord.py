@@ -1044,10 +1044,13 @@ def tool_call_message(n: int, tool: dict) -> dict:
 
 def fill_args(tool: dict, previous: str) -> dict:
     """`{entry_id}` is the first memory entry ID (e12) in the previous tool result;
-    `{entry_ids:N}` the first N, as a list."""
+    `{entry_ids:N}` the first N, as a list; `{cursor}` its paging cursor."""
     entries = list(dict.fromkeys(re.findall(r"\be[0-9]+\b", previous)))
+    cursor = re.search(r'"cursor":\s*"([^"]+)"', previous)
 
     def fill(value):
+        if value == "{cursor}":
+            return cursor[1] if cursor else value
         if value == "{entry_id}":
             return entries[0] if entries else value
         if isinstance(value, str) and (m := re.fullmatch(r"\{entry_ids:(\d+)\}", value)):

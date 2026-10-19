@@ -35,7 +35,8 @@ link only downloads after Discord's refresh), and the sugar
 stub's answer to exactly this message. In tool arguments, `{image_message}` is the
 message ID from the trigger's image marker, else the newest one in the conversation.
 `tools` is a sequence of calls; an argument `"{entry_id}"` (or `"{entry_ids:N}"`)
-takes memory entry IDs from the previous call's result.
+takes memory entry IDs from the previous call's result, and `"{cursor}"` its
+paging cursor (channel_history).
 `web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
 tools; `expect: {tool_called: web_search}` reads the agent host's saved result, so
 it also holds in live mode, and `tools_offered: openrouter:web_fetch` checks the

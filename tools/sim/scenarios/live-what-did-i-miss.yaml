@@ -1,0 +1,13 @@
+name: real models catch someone up with channel_history and link what they cite
+# Needs `kiki-sim up --live`. Read the transcript for an accurate, linked summary.
+live: only
+steps:
+  - send: {as: sam, in: general, text: "rehearsal moved to thursday 7pm, same room", age_s: 10800}
+  - send: {as: ethan, in: general, text: "can someone bring the extension cords on thursday", age_s: 9600}
+  - send: {as: chris, in: general-thread, text: "costume fittings are saturday at noon, sign up here", age_s: 8400}
+  - send: {as: pilz, in: general, text: "Voice transcript: sam and ethan agreed on the cast list; chrissy is the lead", age_s: 7200}
+  - send: {as: sam, in: general, text: "the set budget is $400, please don't go over", age_s: 5400}
+  - send: {as: chrissy, in: general, text: "i'm so nervous about being the lead lol", age_s: 3600}
+  - send: {as: ethan, in: general, text: "opening night is sold out!!", age_s: 1800}
+  - say: {as: alex, in: general, text: "@kiki i've been out all afternoon, what did I miss?"}
+  - expect: {run: done, reply: true, tool_called: channel_history, text_contains: "discord.com/channels"}

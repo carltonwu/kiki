@@ -137,6 +137,71 @@
           "strict": null
         },
         {
+          "description": "Read a channel's messages in time order, threads included: everything said\nbetween two points, not ranked matches.\n\nUse it to catch someone up (\"what did I miss\", \"what happened last night\",\n\"summarize #general today\") or to follow a stretch of conversation from start to\nfinish. Use search_messages to find something specific, and get_message_context\nfor just the few messages around one hit.\n\nWith `after`, it reads forward from that point; without it, it returns the newest\nmessages (before `before`, if given). Long stretches come in pages: when\n`cursor` is in the result, pass it back with the same other arguments for the\nnext page. `total_in_range` says how many messages the whole stretch has.",
+          "kind": "function",
+          "name": "channel_history",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages after this point: an ISO 8601 time (UTC unless it has an\noffset, like 2026-10-18T02:00-04:00) or a message ID."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages before this point: a time or a message ID, as `after`."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The channel to read, like #general. Leave it out for this channel."
+              },
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The `cursor` from the previous page."
+              },
+              "limit": {
+                "default": 100,
+                "description": "Maximum messages in this page, up to 100.",
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
           "description": "Look at the images in one message: a single image or a whole gallery.\n\nAnother model looks at them and describes each image in detail (with any\ntext in it), and a gallery as a whole.",
           "kind": "function",
           "name": "read_image",
@@ -559,6 +624,71 @@
             "required": [
               "message_id"
             ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Read a channel's messages in time order, threads included: everything said\nbetween two points, not ranked matches.\n\nUse it to catch someone up (\"what did I miss\", \"what happened last night\",\n\"summarize #general today\") or to follow a stretch of conversation from start to\nfinish. Use search_messages to find something specific, and get_message_context\nfor just the few messages around one hit.\n\nWith `after`, it reads forward from that point; without it, it returns the newest\nmessages (before `before`, if given). Long stretches come in pages: when\n`cursor` is in the result, pass it back with the same other arguments for the\nnext page. `total_in_range` says how many messages the whole stretch has.",
+          "kind": "function",
+          "name": "channel_history",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "after": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages after this point: an ISO 8601 time (UTC unless it has an\noffset, like 2026-10-18T02:00-04:00) or a message ID."
+              },
+              "before": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only messages before this point: a time or a message ID, as `after`."
+              },
+              "channel": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The channel to read, like #general. Leave it out for this channel."
+              },
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The `cursor` from the previous page."
+              },
+              "limit": {
+                "default": 100,
+                "description": "Maximum messages in this page, up to 100.",
+                "type": "integer"
+              }
+            },
             "type": "object"
           },
           "strict": null
