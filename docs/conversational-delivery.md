@@ -51,7 +51,7 @@ reply (`Agent::post_failure_note`). The run is still recorded as failed; a crash
 after the send fails it at startup rather than posting the note again. The run is
 flagged `failure_note` (migration 0033) before the send, and every prompt
 source leaves out the messages such a run posted: the conversation, what a
-message replies to, recent channel context, Jev's routing context and the
+message replies to, recent channel context, Jev's routing context, Kiki's search of her own messages and the
 host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). The same filter
 also leaves out any bot message that is exactly the note's text, alone or under
 the redirect header (`-# ↪ <@author> in <link>`, when the reply went to the
