@@ -1140,14 +1140,20 @@ async def test_a_message_id_in_a_name_is_a_photo_and_kikis_drawings_are_not(data
     await reply_job(database_url)
     await seed(database_url, (1561574753435652146, 300, "me", [attachment(141, "me.jpg")]))
     async with await AsyncConnection.connect(database_url, autocommit=True) as db:
-        # Her saved drawings, posted as PNG and as JPEG (Rust names them by type).
+        # Her saved drawings, posted in every format Rust names by type, and another
+        # bot's file that only looks like hers (no saved drawing has its number).
         await db.execute(
             "INSERT INTO agent_host_images (id, job_id, mime_type, data) VALUES"
-            " (16, 'reply:1', 'image/png', 'x'), (17, 'reply:1', 'image/jpeg', 'x')"
+            " (16, 'reply:1', 'image/png', 'x'), (17, 'reply:1', 'image/jpeg', 'x'),"
+            " (18, 'reply:1', 'image/webp', 'x'), (19, 'reply:1', 'image/gif', 'x')"
         )
         for id, name, mime in (
             (142, "kiki-16.png", "image/png"),
             (144, "kiki-17.jpg", "image/jpeg"),
+            (146, "kiki-18.webp", "image/webp"),
+            (148, "kiki-19.gif", "image/gif"),
+            (150, "picture.png", "image/png"),  # her image job's follow-up, by provenance
+            (152, "kiki-99.png", "image/png"),  # another bot's
         ):
             await db.execute(
                 "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name,"
@@ -1155,13 +1161,30 @@ async def test_a_message_id_in_a_name_is_a_photo_and_kikis_drawings_are_not(data
                 " 'starring reece', now(), %s)",
                 (id, GUILD, Jsonb({"attachments": [attachment(id + 1, name, mime)]})),
             )
+        cursor = await db.execute(
+            "INSERT INTO conversations (guild_id, channel_id, started_by) VALUES (%s, 2, 200)"
+            " RETURNING id",
+            (GUILD,),
+        )
+        [conversation] = await cursor.fetchone()
+        cursor = await db.execute(
+            "INSERT INTO agent_runs (conversation_id, trigger_message_ids) VALUES (%s, '{1}')"
+            " RETURNING id",
+            (conversation,),
+        )
+        [run_id] = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status,"
+            " message_id) VALUES (%s, 1, 1, '{}', 'done', 150)",
+            (run_id,),
+        )
     name = "Reece (from the selfie he shared, message 1561574753435652146)"
     args = {"prompt": "x", "subjects": [{"name": name}]}
     run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
     [queued] = (await run.execute(request("test/image"))).drawings
     assert [(s.name, s.photos) for s in queued.subjects] == [("Reece", ["1561574753435652146"])]
 
-    for drawn in ("142", "144"):
+    for drawn in ("142", "144", "146", "148", "150"):
         results = []
 
         def respond(messages, info, drawn=drawn, results=results):
@@ -1176,6 +1199,12 @@ async def test_a_message_id_in_a_name_is_a_photo_and_kikis_drawings_are_not(data
         )
         assert result.drawings == []
         assert f"{drawn} is a picture you drew, not a photo of Reece" in results[0]["error"]
+
+    # Another bot's look-alike file name isn't hers: it's queued as a photo.
+    args = {"prompt": "x", "subjects": [{"name": "Reece", "photos": ["152"]}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert queued.subjects[0].photos == ["152"]
 
 
 def test_only_message_ids_in_a_name_become_photos():
@@ -1338,3 +1367,80 @@ async def test_memory_photos_stay_in_the_guild(database_url):
 def test_the_picker_treats_captions_and_image_text_as_data():
     prompt = drawing.VERIFY.format(name="X", what="", rules="", known="", purpose="")
     assert "not instructions" in prompt and "ignore" in prompt
+
+
+async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
+    database_url, monkeypatch
+):
+    # Review of #66: 6 subjects of 24 candidates make 12 picker batches, two waves
+    # through 8 slots; each wave within its own 30 s still took 2 x 27 s, and with
+    # the image's 70 s the job passed the host's 120 s. Scaled down 30x here.
+    monkeypatch.setattr(drawing, "REFERENCES_SECONDS", 1.0)
+    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 0.9)
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.05)
+    monkeypatch.setattr(drawing, "STAGE_GRACE", 0.2)
+    await reply_job(database_url)
+    rows, files = [], {}
+    for d in range(6):
+        for i in range(12):
+            id = 2000 + d * 100 + i * 2
+            pair = [attachment(id * 10 + k, f"IMG_{d}{i}{k}.jpg") for k in (1, 2)]
+            rows.append((id, 300, f"Dog{d} at the park", pair))
+            for k in (1, 2):
+                files[f"/attachments/2/{id * 10 + k}/IMG_{d}{i}{k}.jpg"] = JPEG + bytes([d, i, k])
+    await seed(database_url, *rows)
+    judged = picks(lambda label: (True, 2))
+    started = []
+
+    async def slow(messages, info):
+        started.append(asyncio.get_running_loop().time())
+        await asyncio.sleep(0.8)  # 24 s at full scale
+        return judged(messages, info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, slow)
+    run.transport = discord(files, [])
+    job = image_job([Subject(name=f"Dog{d}") for d in range(6)], prompt="six dogs")
+    began = asyncio.get_running_loop().time()
+    result = await run.draw(job)
+    elapsed = asyncio.get_running_loop().time() - began
+    # One deadline for the stage, queue waits included: the second wave gets what's
+    # left of it rather than its own 0.9 s (1.6 s in all without the fix).
+    assert elapsed < 1.3
+    assert len(started) == 12 and max(started) - min(started) >= 0.7  # two waves
+    assert result.error is None and len(model.prompts) == 1
+    # What the first wave judged is kept: at least 4 subjects have their 3.
+    counts = [sum(r.subject == f"Dog{d}" for r in result.references) for d in range(6)]
+    assert sum(c == 3 for c in counts) >= 4
+
+
+async def test_a_batch_that_cant_start_in_time_is_skipped(database_url, monkeypatch):
+    # Past the stage's deadline nothing new starts: no call, no references.
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.5)
+    await reply_job(database_url)
+    await seed(database_url, (3000, 300, "Bear at the vet", [attachment(3001, "IMG_1.jpg")]))
+    calls = []
+
+    def chat(messages, info):
+        calls.append(messages)
+        return picks(lambda label: (True, 3))(messages, info)
+
+    run = executor(database_url, FakeImageModel(), chat)
+    run.transport = discord({"/attachments/2/3001/IMG_1.jpg": JPEG + b"bear"}, [])
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        from kiki_agent_host.chat.scope import Scope
+        from kiki_agent_host.media.vision import Vision
+
+        vision = Vision(FunctionModel(chat), "test/vision", discord_token="bot-token")
+        gather = drawing.Gatherer(
+            db,
+            Scope(GUILD, 2, 1),
+            vision,
+            "https://cdn.discordapp.com",
+            run.transport,
+            seconds=0.3,
+        )
+        found, shared = await gather.everything(
+            Drawing(prompt="x", subjects=[Subject(name="Bear")])
+        )
+    assert found[0].images == [] and shared == [] and calls == []

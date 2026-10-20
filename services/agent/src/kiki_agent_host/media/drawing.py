@@ -72,6 +72,12 @@ PICK_BATCH = 12  # images per picker request; the batches run in parallel
 PICKS_AT_ONCE = 8
 ANCHORS = 2  # given photos shown to the picker as what the subject looks like
 VERIFY_TIMEOUT_SECONDS = 30
+# The whole reference stage (search, downloads, picker queue and calls) gets this
+# much of the job's 120 s, so the image call keeps its 75 s. In review, 6 subjects
+# of 24 candidates made 12 batches, two waves of 27 s: 124 s with the image.
+REFERENCES_SECONDS = 35
+MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
+STAGE_GRACE = 5  # past the deadline, for downloads in flight; then the stage is cut
 # A short verdict per photo, without thinking (`think=False`): a reasoning model
 # spent over 2,000 tokens and 20 s on five photos, past the check's deadline.
 VERIFY_MAX_TOKENS = 2000
@@ -277,7 +283,9 @@ WHERE m.guild_id = %(guild)s AND m.id = ANY(%(ids)s)
   AND (EXISTS (SELECT 1 FROM agent_image_jobs j WHERE j.message_id = m.id)
        OR (m.author_bot AND EXISTS (
          SELECT 1 FROM jsonb_array_elements(coalesce(m.raw->'attachments', '[]')) a
-         JOIN agent_host_images i ON i.id::text = substring(a->>'filename' FROM '^kiki-([0-9]+)\\.')
+         -- bigint, so the key's index is used; 18 digits can't overflow the cast.
+         JOIN agent_host_images i
+           ON i.id = substring(a->>'filename' FROM '^kiki-([0-9]{1,18})\\.')::bigint
          WHERE a->>'filename' ~ '^kiki-[0-9]+\\.(png|jpg|webp|gif)$')))
 """
 # Camera files ("IMG_8637.jpg", "PXL_…", "DSC07881.jpg") and screenshots by name.
@@ -399,6 +407,7 @@ class Gatherer:
         cdn: str,
         transport: httpx.AsyncBaseTransport | None = None,
         purpose: str = "",
+        seconds: float | None = None,
     ):
         self.connection = connection
         self.scope = scope
@@ -408,6 +417,45 @@ class Gatherer:
         # The picture's prompt, so the picker prefers photos showing what it needs.
         self.purpose = purpose
         self.picking = asyncio.Semaphore(PICKS_AT_ONCE)
+        # The whole reference stage's deadline (loop time), queue waits included,
+        # so the image call keeps its time in the job's; None for no deadline.
+        # `time_left` and `within` match deadline.py's (#69), to switch to it.
+        self.deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
+
+    def time_left(self) -> float | None:
+        """Seconds until the stage's deadline, or None without one."""
+        if self.deadline is None:
+            return None
+        return self.deadline - asyncio.get_running_loop().time()
+
+    def within(self, seconds: float) -> float:
+        """A step's timeout: `seconds`, or what the deadline leaves if less (never
+        below 0)."""
+        left = self.time_left()
+        return max(0.0, seconds if left is None else min(seconds, left))
+
+    async def everything(
+        self, plan: Drawing
+    ) -> tuple[list[Found], list[tuple[Reference, BinaryImage]]]:
+        """Every subject's references and the shared images, in parallel. Past the
+        stage's deadline (and STAGE_GRACE for downloads in flight), what's done is
+        kept and the rest is drawn without: the image call keeps its time."""
+        subjects = [asyncio.ensure_future(self.find(s)) for s in plan.subjects]
+        shared = asyncio.ensure_future(self.shared(plan.shared))
+        left = self.time_left()
+        done, late = await asyncio.wait(
+            [*subjects, shared], timeout=None if left is None else max(0.0, left) + STAGE_GRACE
+        )
+        for task in late:
+            task.cancel()
+        await asyncio.gather(*late, return_exceptions=True)
+        if late:
+            logger.warning("references cut at the deadline late=%d", len(late))
+        found = [
+            task.result() if task in done else Found(subject, [])
+            for task, subject in zip(subjects, plan.subjects, strict=True)
+        ]
+        return found, shared.result() if shared in done else []
 
     async def rows(self, query: str, params: dict) -> list[dict]:
         cursor = self.connection.cursor(row_factory=dict_row)
@@ -648,36 +696,48 @@ class Gatherer:
             if c.caption:
                 label += f'; caption: "{c.caption}"'
             prompt += [label, BinaryContent(image.data, media_type=image.media_type)]
+        kind = "person" if subject.user_id else "thing"
         try:
-            # The deadline starts once a slot is free: waiting isn't the model's time.
-            async with self.picking:
-                self.vision.calls += 1
-                with telemetry.llm_call(self.vision.purpose, self.vision.name) as call:
-                    async with asyncio.timeout(VERIFY_TIMEOUT_SECONDS):
-                        run = await picker.run(
-                            prompt,
-                            model=self.vision.model,
-                            deps=len(batch),
-                            model_settings={
-                                "max_tokens": VERIFY_MAX_TOKENS,
-                                "openrouter_usage": {"include": True},
-                                # A quick judgment, not a reasoned one; the same
-                                # photos get the same verdicts.
-                                "openrouter_reasoning": {"enabled": False},
-                                "temperature": 0,
-                            },
-                            retries={"output": PICK_RETRIES},
-                            usage_limits=UsageLimits(request_limit=1 + PICK_RETRIES),
-                        )
-                        bill(call, run)
+            # Waiting for a slot counts against the stage, not the call's own 30 s.
+            async with asyncio.timeout(self.time_left()):
+                await self.picking.acquire()
+        except TimeoutError:
+            logger.warning("reference check skipped subject_kind=%s reason=deadline", kind)
+            return {}
+        try:
+            timeout = self.within(VERIFY_TIMEOUT_SECONDS)
+            if timeout < MIN_PICK_SECONDS:  # too late to start: keep what's judged
+                logger.warning("reference check skipped subject_kind=%s reason=deadline", kind)
+                return {}
+            self.vision.calls += 1
+            with telemetry.llm_call(self.vision.purpose, self.vision.name) as call:
+                async with asyncio.timeout(timeout):
+                    run = await picker.run(
+                        prompt,
+                        model=self.vision.model,
+                        deps=len(batch),
+                        model_settings={
+                            "max_tokens": VERIFY_MAX_TOKENS,
+                            "openrouter_usage": {"include": True},
+                            # A quick judgment, not a reasoned one; the same
+                            # photos get the same verdicts.
+                            "openrouter_reasoning": {"enabled": False},
+                            "temperature": 0,
+                        },
+                        retries={"output": PICK_RETRIES},
+                        usage_limits=UsageLimits(request_limit=1 + PICK_RETRIES),
+                    )
+                    bill(call, run)
         except (TimeoutError, AgentRunError) as error:  # ModelAPIError is one
             logger.warning(
                 "reference check failed subject_kind=%s candidates=%d error_type=%s",
-                "person" if subject.user_id else "thing",
+                kind,
                 len(batch),
                 type(error).__name__,
             )
             return {}
+        finally:
+            self.picking.release()
         self.vision.cost += billed_cost(run) or 0.0
         return {v.image: v.clarity for v in run.output.verdicts if v.subject and v.kind == "photo"}
 

@@ -241,9 +241,14 @@ and the live API. GPT Image models get `quality: medium`.
   no drawing guidance in the prompt.
 - 2 pictures per reply. The image call has 75 s; the whole image job runs inside the
   host's job timeout (`AGENT_HOST_JOB_TIMEOUT_SECS`, 120 s in prod) and Rust's host
-  deadline (`AGENT_HOST_TIMEOUT_MS`, 180 s). Each picker batch has 30 s; past it,
-  that batch's candidates are dropped (the subject is drawn from the others, or
-  from its description). Measured on prod data with DeepSeek V4.1 Flash: about
+  deadline (`AGENT_HOST_TIMEOUT_MS`, 180 s). The whole reference stage (searches,
+  downloads, picker batches and their waits for one of the 8 slots) has one 35 s
+  deadline (`REFERENCES_SECONDS`), so the image call keeps its 75 s: each batch
+  gets 30 s or what's left, whichever is less, and one that can't have 3 s isn't
+  started. What was judged by then is kept; a batch past it is dropped (the
+  subject is drawn from its other batches, or from its description), and 5 s
+  after it the stage is cut. In review, 6 subjects of 24 candidates made two waves
+  of 27 s batches: 124 s with the image, past the job's 120 s. Measured on prod data with DeepSeek V4.1 Flash: about
   2-4 s to search, 7-17 s to pick from 24 candidates in two batches, $0.001-0.003
   per subject. That runs after the ack, while the conversation carries on; the
   old single check of 8 took 2-7 s and about $0.0001-0.005.
