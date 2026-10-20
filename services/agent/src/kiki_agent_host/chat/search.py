@@ -9,7 +9,7 @@ import re
 from datetime import datetime
 from typing import Literal
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 
 from ..openrouter.embeddings import Embedder
@@ -49,6 +49,9 @@ SHORTLIST = 200
 # scans keep walking the graph until the LIMIT is met; relaxed order is fine
 # because the shortlist is reranked.
 INDEX_SETTINGS = "SET hnsw.ef_search = 200; SET hnsw.iterative_scan = relaxed_order"
+# The search query's part of the tool deadline (agent/tools/messages.py
+# INDEX_WAIT_SECONDS). A cold HNSW cache made one take 5.7 s in production.
+STATEMENT_TIMEOUT = "3s"
 
 
 Semantic = Literal["full", "partial", "off"]
@@ -169,9 +172,20 @@ async def search(
         "limit": max(1, min(limit, 10)),
     }
     cursor = connection.cursor(row_factory=dict_row)
-    await cursor.execute(INDEX_SETTINGS)
-    await cursor.execute(SEARCH, params)
-    rows = await cursor.fetchall()
+    try:
+        async with connection.transaction():
+            await cursor.execute(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'")
+            await cursor.execute(INDEX_SETTINGS)
+            await cursor.execute(SEARCH, params)
+            rows = await cursor.fetchall()
+    except errors.QueryCanceled:
+        logger.info(
+            "search timed out channel_id=%s conversation_id=%s semantic=%s",
+            scope.channel_id,
+            scope.conversation_id,
+            semantic,
+        )
+        return {"error": "The search took too long. Try again, or narrow it down."}
     similarities = [m["similarity"] for m in rows if m["similarity"] is not None]
     logger.debug(
         "search completed channel_id=%s conversation_id=%s hits=%d top_similarity=%s semantic=%s",

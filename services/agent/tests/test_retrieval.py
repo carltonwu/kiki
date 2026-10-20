@@ -6,16 +6,19 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, OperationalError
 from pydantic import TypeAdapter, ValidationError
 from pydantic_ai.models.test import TestModel
 
+from kiki_agent_host import db as db_module
+from kiki_agent_host.agent.deps import MemorySession
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.tools import memory as memory_tools
 from kiki_agent_host.agent.tools import messages as message_tools
 from kiki_agent_host.agent.tools.messages import OptionalTime
+from kiki_agent_host.chat import indexing
 from kiki_agent_host.chat import search as search_module
-from kiki_agent_host.chat.indexing import ENQUEUE_ALL, SAVE, index_pending
+from kiki_agent_host.chat.indexing import ENQUEUE_ALL, SAVE, SEARCHABLE, index_pending
 from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.chat.search import message_context, search
 from kiki_agent_host.contracts import JobRequest
@@ -434,7 +437,7 @@ async def test_pending_reads_the_queue_and_drops_what_nothing_will_embed(db):
     assert (await cursor.fetchone())[0] == 3
 
 
-async def test_a_search_does_not_wait_long_for_indexing(db, monkeypatch):
+async def test_a_search_does_not_wait_long_for_indexing(db, database_url, monkeypatch):
     # Seen in prod: saving vectors took 11 s, and the search waiting on it hit
     # the tool's 10 s deadline with nothing (reply:391).
     await add(db, 95, "release plan")
@@ -454,6 +457,7 @@ async def test_a_search_does_not_wait_long_for_indexing(db, monkeypatch):
         spent=Counter(),
         job_id="reply:test",
         indexing=asyncio.create_task(indexing()),
+        memory=MemorySession(database_url),
     )
     result = await message_tools.search_messages(SimpleNamespace(deps=deps), "release plan")
     assert result["semantic"] == "partial"
@@ -462,3 +466,161 @@ async def test_a_search_does_not_wait_long_for_indexing(db, monkeypatch):
     assert not deps.indexing.done()
     stuck.set()
     assert await deps.indexing == "full"
+
+
+async def test_a_slow_search_query_is_an_error_for_kiki(db, monkeypatch):
+    # Within its 10 s tool deadline, behind the index wait and the query embedding.
+    await add(db, 96, "release plan")
+    monkeypatch.setattr(search_module, "STATEMENT_TIMEOUT", "50ms")
+    monkeypatch.setattr(search_module, "SEARCH", "SELECT pg_sleep(1) FROM (SELECT %(limit)s) x")
+    result = await search(db, embedder(), SCOPE, "release plan")
+    assert result == {"error": "The search took too long. Try again, or narrow it down."}
+    # The connection is usable afterwards, without the timeout.
+    cursor = await db.execute("SELECT pg_sleep(0.1), current_setting('statement_timeout')")
+    assert (await cursor.fetchone())[1] == "0"
+
+
+async def test_database_errors_in_indexing_leave_search_partial(monkeypatch):
+    async def connect(database_url):
+        raise OperationalError("too many clients")
+
+    monkeypatch.setattr(db_module, "connect", connect)
+    deps = SimpleNamespace(
+        memory=MemorySession("unused"), embed=embedder(), scope=SCOPE, job_id="reply:test"
+    )
+    assert await message_tools.index_guild(deps) == "partial"
+
+
+FOOTER = (
+    "-# The original message sent by <@100> was deleted so the bot could fix the broken"
+    " embed links for easier viewing."
+)
+VARIETY = [
+    # (id, content, author_id, bot): what the triggers and the host must agree on.
+    (100, "release plan", 100, False),
+    (101, "", 100, False),
+    (102, " \n ", 100, False),
+    (103, "a bot's message", 300, True),
+    (104, "the ignored chatbot", 1358234666267578368, True),
+    (105, "an ignored person", 1358234666267578368, False),
+    (
+        106,
+        "<@100>: plan\n\n" + FOOTER,
+        1358234666267578368,
+        True,
+    ),
+    (
+        107,
+        "<@100>:\n\n" + FOOTER,
+        1358234666267578368,
+        True,
+    ),
+    (108, "lunch", 100, False),
+]
+
+
+async def test_the_triggers_and_the_host_agree_on_what_is_searchable(db):
+    """The rule is written twice: in migration 0029's trigger function and in
+    chat/indexing.py SEARCHABLE (from chat/scope.py)."""
+    for id, content, author_id, bot in VARIETY:
+        await add(db, id, content, author_id=author_id, bot=bot)
+    await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 108")
+    cursor = await db.execute(f"SELECT m.id FROM messages m WHERE {SEARCHABLE} ORDER BY 1")
+    searchable = [row[0] for row in await cursor.fetchall()]
+    # (btrim strips spaces only, so whitespace with a newline counts as text,
+    # 102, and so does a relay of nothing but the footer, 107: the rule as it was.)
+    assert {100, 106} <= set(searchable) and not {101, 103, 104, 105, 108} & set(searchable)
+    assert await queued(db) == searchable
+    # And the migration's one-off backfill, the same rule a third time.
+    await db.execute("DELETE FROM message_embedding_queue")
+    await db.execute(backfill())
+    assert await queued(db) == searchable
+
+
+def backfill() -> str:
+    """Migration 0029's closing INSERT, its backfill."""
+    from conftest import MIGRATIONS
+
+    [path] = MIGRATIONS.glob("*_message_embedding_queue.sql")
+    text = path.read_text()
+    return text[text.rindex("INSERT INTO message_embedding_queue") :]
+
+
+async def test_the_migration_queues_what_is_already_pending(empty_database_url):
+    from conftest import MIGRATIONS, apply_migrations
+
+    [queue] = MIGRATIONS.glob("*_message_embedding_queue.sql")
+    await apply_migrations(empty_database_url, before=queue.name)
+    async with await AsyncConnection.connect(empty_database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO channels (id, guild_id, name, type) VALUES (%s, %s, 'general', 0)",
+            (CHANNEL, GUILD),
+        )
+        for id, content, author_id, bot in VARIETY:
+            await add(db, id, content, author_id=author_id, bot=bot)
+        await add(db, 109, "already embedded")
+        [embedding] = await embedder()(["already embedded"])
+        await db.execute(
+            "INSERT INTO message_embeddings (message_id, embedding) VALUES (109, %s::halfvec)",
+            (embedding,),
+        )
+        cursor = await db.execute(
+            f"SELECT m.id FROM messages m WHERE {SEARCHABLE} AND m.id <> 109 ORDER BY 1"
+        )
+        pending = [row[0] for row in await cursor.fetchall()]
+        assert 108 in pending
+        await db.execute(queue.read_text())
+        assert await queued(db) == pending
+        # The triggers it adds work on the data it found.
+        await db.execute("UPDATE messages SET content = 'friday' WHERE id = 109")
+        assert await queued(db) == [*pending, 109]
+
+
+async def test_a_concurrent_edit_keeps_its_message_queued(db, database_url):
+    await add(db, 110, "pizza")
+    [embedding] = await embedder()(["pizza"])
+    cursor = await db.execute("SELECT md5(content) FROM messages WHERE id = 110")
+    [old_hash] = await cursor.fetchone()
+    async with await AsyncConnection.connect(database_url) as editor:
+        # The edit holds the row; SAVE's FOR SHARE waits for it, then sees new text.
+        await editor.execute("UPDATE messages SET content = 'lunch' WHERE id = 110")
+        save = asyncio.create_task(db.execute(SAVE, ([110], [old_hash], [embedding])))
+        await asyncio.sleep(0.2)
+        assert not save.done()
+        await editor.commit()
+        await save
+    cursor = await db.execute("SELECT count(*) FROM message_embeddings")
+    assert (await cursor.fetchone())[0] == 0
+    assert await queued(db) == [110]
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (1, None)
+
+
+async def test_an_edit_during_a_full_requeue_is_not_lost(db, database_url):
+    # Seen in review: the trigger's insert hit `kiki-agent-host index`'s
+    # uncommitted queue row, failing the edit and so the ingester's write.
+    await add(db, 120, "pizza")
+    await db.execute("DELETE FROM message_embedding_queue")
+    async with await AsyncConnection.connect(database_url) as index:
+        await index.execute(ENQUEUE_ALL)  # uncommitted
+        async with await AsyncConnection.connect(database_url, autocommit=True) as ingester:
+            edit = asyncio.create_task(
+                ingester.execute("UPDATE messages SET content = 'lunch' WHERE id = 120")
+            )
+            await asyncio.sleep(0.2)
+            await index.commit()
+            await edit
+    cursor = await db.execute("SELECT content FROM messages WHERE id = 120")
+    assert (await cursor.fetchone())[0] == "lunch"
+    assert await queued(db) == [120]
+
+
+async def test_stale_rows_are_dropped_from_the_newest_of_the_guild_only(db, monkeypatch):
+    monkeypatch.setattr(indexing, "STALE_WINDOW", 2)
+    for id in (130, 131, 132):
+        await add(db, id, "pizza")
+    await add(db, 133, "lunch", guild=OTHER_GUILD, channel=50)
+    # All four become stale: their author is ignored since.
+    await db.execute("UPDATE messages SET author_id = 1358234666267578368")
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (0, None)
+    # The guild's two newest went; the older one waits, the other guild's stays.
+    assert await queued(db) == [130, 133]

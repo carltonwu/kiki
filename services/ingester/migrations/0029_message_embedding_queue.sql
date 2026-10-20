@@ -10,9 +10,18 @@
 -- (its vector is dropped, migration 0007), a delete or an edit to nothing
 -- unqueues it. The host removes a row once its vector is saved. The host's
 -- query still checks every condition, so a stale row is skipped, never
--- embedded, and the host deletes it. `kiki-agent-host index` re-queues anything
--- searchable without a vector before draining, so it still reconciles
--- everything (after a change to ignored_authors, say).
+-- embedded, and the host deletes it. Nothing re-queues a message when its
+-- author is taken off ignored_authors: run `kiki-agent-host index` after that.
+-- It re-queues anything searchable without a vector before draining.
+--
+-- The searchability rule is the host's (chat/scope.py PEOPLES and TEXT,
+-- chat/indexing.py SEARCHABLE), repeated here; test_retrieval.py checks that
+-- they agree.
+--
+-- Locks: CREATE TRIGGER takes SHARE ROW EXCLUSIVE on messages until the
+-- migration commits, so ingestion waits out the backfill below (about 7 to 10 s
+-- on production at 236k messages). Messages are stored late; one whose write
+-- gives up is fetched again by catch-up (live events never advance it).
 CREATE TABLE message_embedding_queue (
     message_id BIGINT PRIMARY KEY REFERENCES messages (id) ON DELETE CASCADE
 );
@@ -30,7 +39,12 @@ CREATE FUNCTION queue_message_embedding(BIGINT) RETURNS void LANGUAGE sql AS $$
       AND (m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors))
            OR m.relayed_for IS NOT NULL)
       AND btrim(coalesce(m.relayed_text, m.content)) <> ''
-      AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id);
+      AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
+    -- A row another transaction queued and hasn't committed yet (`kiki-agent-host
+    -- index` queuing everything) is invisible to the DELETE above. Without this
+    -- the insert would fail on it, and so would the ingester's write of the
+    -- message, losing an edit.
+    ON CONFLICT (message_id) DO NOTHING;
 $$;
 
 CREATE FUNCTION queue_inserted_message() RETURNS trigger LANGUAGE plpgsql AS $$

@@ -7,7 +7,6 @@ import logging
 from datetime import datetime
 from typing import Annotated
 
-from psycopg import OperationalError
 from pydantic import BeforeValidator
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
@@ -22,10 +21,12 @@ from ..guard import guarded
 
 logger = logging.getLogger(__name__)
 
-# How long a search waits for the reply's indexing before searching what's
-# indexed (reported as "partial"): it shares the tool's 10 s deadline with the
-# query embedding and the search itself.
-INDEX_WAIT_SECONDS = 4
+# A search's share of the tool's 10 s deadline (guard.TOOL_TIMEOUT_SECONDS):
+# up to 2 s waiting for the reply's indexing (then it searches what's indexed,
+# reported as "partial"), up to 4 s for the query embedding
+# (executor.EMBEDDING_TIMEOUT_SECONDS) and up to 3 s for the SQL
+# (search.STATEMENT_TIMEOUT), leaving about 1 s for its connection and lookups.
+INDEX_WAIT_SECONDS = 2
 
 
 # Some models fill every optional argument, sending "" for a time they mean to leave
@@ -70,19 +71,22 @@ async def search_messages(
             semantic = await asyncio.wait_for(asyncio.shield(deps.indexing), INDEX_WAIT_SECONDS)
         except TimeoutError:
             semantic = "partial"
-        return await search(
-            deps.connection,
-            deps.embed,
-            deps.scope,
-            query,
-            person=person,
-            channel=channel,
-            roster=deps.roster,
-            before=before,
-            after=after,
-            limit=limit,
-            semantic=semantic,
-        )
+        # Its own connection: the search's statement timeout lives in a
+        # transaction, which mustn't interleave with other tools on the run's one.
+        async with await db.connect(deps.memory.database_url) as connection:
+            return await search(
+                connection,
+                deps.embed,
+                deps.scope,
+                query,
+                person=person,
+                channel=channel,
+                roster=deps.roster,
+                before=before,
+                after=after,
+                limit=limit,
+                semantic=semantic,
+            )
 
     return await guarded(ctx, "search_messages", work)
 
@@ -217,8 +221,9 @@ async def index_guild(deps: Deps) -> Semantic:
         # insert), and the run's other tools mustn't queue behind it.
         async with await db.connect(deps.memory.database_url) as connection:
             found, more = await index_pending(connection, deps.embed, guild_id=deps.scope.guild_id)
-    except OperationalError:
-        raise
+    # Database errors too (a connect timeout, too many clients, a cancelled or
+    # deadlocked statement): they only affect indexing's own connection, so the
+    # reply goes on with what's already indexed.
     except Exception as error:  # noqa: BLE001 - preserve search without logging provider payloads
         logger.warning(
             "indexing failed job_id=%s guild_id=%s error_type=%s; using partial index",

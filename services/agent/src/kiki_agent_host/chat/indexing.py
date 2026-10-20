@@ -2,7 +2,7 @@
 `kiki-agent-host index`.
 
 Pending messages are the ones in `message_embedding_queue`, which triggers keep
-(migration 0027): finding them reads the queue, not every message."""
+(migration 0029): finding them reads the queue, not every message."""
 
 import asyncio
 import logging
@@ -36,12 +36,21 @@ ORDER BY q.message_id DESC LIMIT %(limit)s
 
 # Rows nothing will embed: already embedded (by another run, or by a host from
 # before the queue during a deploy) or no longer searchable (an author ignored
-# since). The queue is small, so this reads little.
+# since). Only among the guild's newest `window` queued rows, the ones PENDING
+# reads next, so a reply's cost doesn't grow with a backlog: stale rows
+# further down go as the queue drains to them.
 DROP_STALE = f"""
 DELETE FROM message_embedding_queue q
-WHERE EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = q.message_id)
-   OR NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = q.message_id AND {SEARCHABLE})
+USING (
+    SELECT w.message_id FROM message_embedding_queue w JOIN messages m ON m.id = w.message_id
+    WHERE (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
+    ORDER BY w.message_id DESC LIMIT %(window)s
+) newest, messages m
+WHERE q.message_id = newest.message_id AND m.id = newest.message_id
+  AND (NOT ({SEARCHABLE})
+       OR EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id))
 """
+STALE_WINDOW = 4 * INDEX_LIMIT
 
 # Writes only if the text is unchanged; FOR SHARE waits out a concurrent edit,
 # whose trigger would otherwise miss this row. A saved message leaves the
@@ -84,7 +93,7 @@ async def index_pending(
     seen: more may be pending below it.
     """
     if below is None:
-        await connection.execute(DROP_STALE)
+        await connection.execute(DROP_STALE, {"guild": guild_id, "window": STALE_WINDOW})
     cursor = await connection.execute(PENDING, {"guild": guild_id, "below": below, "limit": limit})
     rows = await cursor.fetchall()
     batches = [rows[i : i + EMBED_BATCH] for i in range(0, len(rows), EMBED_BATCH)]
