@@ -4,14 +4,29 @@
 //! Discord objects are passed through as JSON and mapped to columns in SQL, so the
 //! `raw` column keeps exactly what Discord sent.
 
+use std::time::Duration;
+
 use serde_json::Value;
 use sqlx::{PgExecutor, PgPool, types::Json};
+
+/// How long after a failure note's run started sending its message may be
+/// created, to be attributed to it (`upsert_messages`), and how long before.
+const NOTE_WINDOW: Duration = Duration::from_secs(120);
+const NOTE_WINDOW_BEFORE: Duration = Duration::from_secs(10);
 
 /// Insert or refresh full message objects (REST pages, `MESSAGE_CREATE`).
 ///
 /// An existing row is only overwritten by a version at least as new (by edit time),
 /// so a stale REST page can't undo a live edit. `deleted_at` is never touched: REST
 /// can't return deleted messages, and a live delete must stick.
+///
+/// A failure note whose send response was lost (Discord posted it, the ingester
+/// never heard back, or crashed first) is attributed to its run here, when the
+/// Gateway or catch-up stores it: a bot's message with the note's exact text, in
+/// the channel the run was sending to, within `NOTE_WINDOW` of it, for a run
+/// with none attributed yet. REST history has no nonce, so this is the match
+/// both paths share. The gap left: a genuine message of Kiki's with exactly the
+/// note's text, in that channel and window, would be taken for the note.
 pub async fn upsert_messages(
     db: impl PgExecutor<'_>,
     guild_id: i64,
@@ -19,6 +34,7 @@ pub async fn upsert_messages(
 ) -> sqlx::Result<()> {
     sqlx::query(
         r#"
+        WITH stored AS (
         INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, author_bot,
                               content, type, reply_to_id, created_at, edited_at, raw)
         SELECT (m->>'id')::bigint,
@@ -46,10 +62,22 @@ pub async fn upsert_messages(
             -- Merge: Gateway objects carry fields REST ones don't (guild_id, member).
             raw         = messages.raw || EXCLUDED.raw
         WHERE coalesce(EXCLUDED.edited_at, '-infinity') >= coalesce(messages.edited_at, '-infinity')
+        RETURNING id, channel_id, author_bot, content, created_at
+        )
+        UPDATE agent_runs r SET reply_message_ids = ARRAY[s.id]
+        FROM stored s
+        WHERE r.failure_note AND cardinality(coalesce(r.reply_message_ids, '{}')) = 0
+          AND s.author_bot AND s.content = $3 AND s.channel_id = r.failure_note_channel_id
+          AND s.created_at BETWEEN r.failure_note_at - make_interval(secs => $4)
+                               AND r.failure_note_at + make_interval(secs => $5)
         "#,
     )
     .bind(guild_id)
     .bind(Json(messages))
+    .bind(crate::agent::FAILURE_NOTE)
+    // Discord's clock against Postgres's, and a send that took its time.
+    .bind(NOTE_WINDOW_BEFORE.as_secs_f64())
+    .bind(NOTE_WINDOW.as_secs_f64())
     .execute(db)
     .await?;
     Ok(())

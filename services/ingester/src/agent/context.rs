@@ -1962,4 +1962,73 @@ pub(super) mod tests {
         );
         test.drop().await;
     }
+
+    /// Discord posts the note but the response never arrives (or the ingester
+    /// crashes before attributing it): the Gateway's or catch-up's copy is
+    /// attributed to the run by channel, text and time, so prompts still leave
+    /// it out. The same words elsewhere, or much later, stay Kiki's.
+    #[tokio::test]
+    async fn a_failure_note_whose_response_was_lost_is_still_known() {
+        let Some(test) = crate::test_db::migrated("ingester_failure_note_lost").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let (address, _) = fake_discord(500).await; // accepted, but no answer we can use
+        seed_failed_run(&db).await;
+        let mut agent = agent(db.clone());
+        proxied(&mut agent, address);
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let mut record = crate::agent::RunRecord::default();
+        agent
+            .post_failure_note(&failed_claim(1, 1, 10), &context, &mut record)
+            .await;
+        assert!(record.reply_message_ids.is_empty());
+
+        let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
+        let note = crate::agent::FAILURE_NOTE;
+        let mut elsewhere = message(901, kiki.clone(), json!({}), note, json!([]));
+        elsewhere["channel_id"] = json!("77");
+        let mut later = message(902, kiki.clone(), json!({}), note, json!([]));
+        let in_ten_minutes = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        later["timestamp"] = json!(humantime(in_ten_minutes));
+        // As the Gateway (or a catch-up page) stores them; the note itself last.
+        store::upsert_messages(&db, GUILD, &[elsewhere, later])
+            .await
+            .unwrap();
+        let posted = message(900, kiki, json!({}), note, json!([]));
+        store::upsert_messages(&db, GUILD, std::slice::from_ref(&posted))
+            .await
+            .unwrap();
+        // Stored again (catch-up after the Gateway): no change.
+        store::upsert_messages(&db, GUILD, &[posted]).await.unwrap();
+        let ids: Option<Vec<i64>> =
+            sqlx::query_scalar("SELECT reply_message_ids FROM agent_runs WHERE id = 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(ids, Some(vec![900]));
+
+        let alex = json!({"id": "101", "username": "alex"});
+        let again = message(903, alex, json!({}), "??", json!([]));
+        store::upsert_messages(&db, GUILD, &[again]).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (2, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (903, 2, 'mention');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        // The note (900) is in the channel context's reach and left out; 902,
+        // the same words much later, is Kiki's and shows.
+        let prompt = agent.context(2, &[903]).await.unwrap().unwrap();
+        let shown: String = prompt.messages.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(shown.matches(note).count(), 1, "{shown}");
+        test.drop().await;
+    }
 }

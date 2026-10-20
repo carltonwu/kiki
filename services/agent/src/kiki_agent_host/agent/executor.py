@@ -167,9 +167,14 @@ class PydanticExecutor:
             name, provider=self.provider, settings={"openrouter_reasoning": {"enabled": False}}
         )
 
-    async def warm(self) -> None:
-        """At startup (api.app): which chat models think, before a reply needs it."""
-        await catalog.refresh()
+    def warm(self) -> None:
+        """At startup (api.app): which chat models think, fetched in the background
+        before a reply needs it."""
+        catalog.start()
+
+    async def close(self) -> None:
+        """At shutdown (api.app), even an exceptional one: no refresh outlives it."""
+        await catalog.stop()
 
     async def thinks(self, name: str) -> bool:
         return catalog.reasons(name)  # the copy at hand: replies don't wait on it

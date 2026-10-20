@@ -30,14 +30,18 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # What the executor fetches ahead of the first job (which chat models think).
-    warm = getattr(app.state.executor, "warm", None)
-    warming = asyncio.create_task(warm()) if warm else None
-    yield
-    if warming:
-        warming.cancel()
-    # Here, not after uvicorn.run(): uvicorn re-raises SIGTERM once it stops.
-    await asyncio.to_thread(telemetry.shutdown)
+    executor = app.state.executor
+    # What the executor fetches ahead of the first job (which chat models think),
+    # and stops at shutdown.
+    if warm := getattr(executor, "warm", None):
+        warm()
+    try:
+        yield
+    finally:
+        if close := getattr(executor, "close", None):
+            await close()
+        # Here, not after uvicorn.run(): uvicorn re-raises SIGTERM once it stops.
+        await asyncio.to_thread(telemetry.shutdown)
 
 
 def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:

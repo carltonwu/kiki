@@ -56,11 +56,27 @@ def due(model: str, now: float) -> bool:
     return now - _fetched_at > CACHE_SECONDS or model not in _catalog
 
 
+def start() -> None:
+    """Refreshes in the background, unless a refresh is already running (call it
+    on the event loop)."""
+    global _refreshing
+    if _refreshing is None or _refreshing.done():
+        _refreshing = asyncio.get_running_loop().create_task(refresh())
+
+
+async def stop() -> None:
+    """Cancels a running refresh and waits for it: at shutdown, nothing is left
+    running after the app."""
+    task = _refreshing
+    if task is not None and not task.done():
+        task.cancel()
+        await asyncio.wait([task])  # its CancelledError stays in it; ours still propagates
+
+
 def reasons(model: str) -> bool:
     """Whether `model` thinks, from the copy at hand; starts a background refresh
     when one is due (call it on the event loop)."""
-    global _refreshing
-    if due(model, time.monotonic()) and (_refreshing is None or _refreshing.done()):
-        _refreshing = asyncio.get_running_loop().create_task(refresh())
+    if due(model, time.monotonic()):
+        start()
     parameters = _catalog.get(model)
     return parameters is None or "reasoning" in parameters

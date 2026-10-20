@@ -4,6 +4,7 @@ nothing; pydantic-ai raised UnexpectedModelBehavior and the reply was lost. Runs
 now give thinking room beyond the answer's, and a response that is all thinking
 goes again with thinking off, keeping the run's tool results."""
 
+import contextlib
 from types import SimpleNamespace
 
 import pytest
@@ -260,3 +261,41 @@ async def test_the_host_fetches_the_catalog_at_startup(model_catalog, monkeypatc
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert not catalog.reasons("openai/gpt-4o-mini")  # known before any reply
+
+
+@pytest.mark.parametrize("failing", [False, True])
+async def test_shutdown_stops_a_refresh_still_running(monkeypatch, failing):
+    """A later refresh (the hourly one, or for a new model) doesn't outlive the
+    app, even when teardown comes from an error (review of #68)."""
+    import asyncio
+
+    from kiki_agent_host.api import app as host
+    from kiki_agent_host.config import Settings
+    from kiki_agent_host.openrouter import catalog
+
+    monkeypatch.setattr(host.telemetry, "shutdown", lambda: None)
+    started, cancelled = asyncio.Event(), []
+
+    async def hangs():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    app = host.create_app(
+        Settings("postgresql://unused.invalid/kiki", "t"), executor("unused", None, None)
+    )
+    with pytest.raises(RuntimeError) if failing else contextlib.nullcontext():
+        async with host.lifespan(app):
+            await catalog._refreshing  # the startup fetch (the fixture's: instant)
+            monkeypatch.setattr(catalog, "_fetched_at", -float("inf"))  # an hour on
+            monkeypatch.setattr(catalog, "_attempted_at", -float("inf"))
+            monkeypatch.setattr(catalog, "fetch", hangs)
+            catalog.reasons("test/model")
+            await started.wait()
+            if failing:
+                raise RuntimeError("teardown from an error")
+    assert cancelled == [True]
+    assert catalog._refreshing.done()
