@@ -100,12 +100,18 @@ def bill(call: telemetry.Call, run) -> None:
     call.bill(billed_cost(run), run.usage.input_tokens, run.usage.output_tokens)
 
 
+def response_cost(response: ModelResponse) -> float | None:
+    """OpenRouter's billed cost for one response; Pydantic's price table lags new
+    models."""
+    return (response.provider_details or {}).get("cost")
+
+
 def billed_cost(result) -> float | None:
-    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
+    """OpenRouter's billed cost per response, summed."""
     billed = [
-        m.provider_details["cost"]
+        cost
         for m in result.new_messages()
-        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
+        if isinstance(m, ModelResponse) and (cost := response_cost(m)) is not None
     ]
     if billed:
         return sum(billed)

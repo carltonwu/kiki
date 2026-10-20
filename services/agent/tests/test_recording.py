@@ -9,13 +9,14 @@ from collections import Counter
 from types import SimpleNamespace
 
 import pytest
-from pydantic_ai.exceptions import ContentFilterError
+from pydantic_ai.exceptions import ContentFilterError, UsageLimitExceeded
 from pydantic_ai.images import GeneratedImage, ImageGenerationResult, TestImageGenerationModel
-from pydantic_ai.messages import BinaryImage, ModelResponse, TextPart
+from pydantic_ai.messages import BinaryImage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from kiki_agent_host import telemetry
+from kiki_agent_host.agent import executor as agent_executor
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.guard import Budget, guarded
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest
@@ -90,6 +91,30 @@ async def test_a_failed_call_is_an_error_without_its_message(recorded):
     assert not span.events and "secret" not in str(span.status.description)
 
 
+async def test_a_run_that_fails_later_still_bills_the_requests_it_made(recorded, monkeypatch):
+    # A priced response, then the run hits its request limit before the next.
+    monkeypatch.setattr(agent_executor, "MAX_MODEL_REQUESTS", 1)
+
+    def respond(messages, info):
+        return ModelResponse(
+            parts=[ToolCallPart("no_such_tool", {})],
+            usage=RequestUsage(input_tokens=200, output_tokens=12),
+            provider_details={
+                "cost": 0.003,
+                "server_tool_use": {"web_search_requests": 1, "tool_calls_executed": 1},
+            },
+        )
+
+    with pytest.raises(UsageLimitExceeded):
+        await executor(FunctionModel(respond)).execute(topic_job())
+    labels = {"purpose": "topic", "model": "test/chat"}
+    assert recorded.value("kiki.llm.calls", **labels, result="error") == 1
+    assert recorded.value("kiki.llm.cost_usd", **labels) == 0.003
+    assert recorded.value("kiki.llm.tokens", **labels, type="input") == 200
+    assert recorded.value("kiki.llm.tokens", **labels, type="output") == 12
+    assert recorded.value("kiki.web.calls", kind="search") == 1
+
+
 async def test_vision_and_embedding_calls_are_billed_where_they_are_made(recorded):
     vision = Vision(billed("a cat", cost=0.001, input_tokens=900), "vision/model")
     assert await look(vision, ["what is this"], max_tokens=50) == "a cat"
@@ -114,15 +139,15 @@ async def test_vision_and_embedding_calls_are_billed_where_they_are_made(recorde
 
 
 class ImageModel(TestImageGenerationModel):
-    def __init__(self, error=None):
+    def __init__(self, error=None, image=PNG):
         super().__init__("test/image")
-        self.error = error
+        self.error, self.image = error, image
 
     async def generate(self, prompt, *, images=None, settings=None):
         if self.error:
             raise self.error
         return ImageGenerationResult(
-            [GeneratedImage(BinaryImage(PNG, media_type="image/png"))],
+            [GeneratedImage(BinaryImage(self.image, media_type="image/png"))],
             prompt=prompt,
             model_name=self.model_name,
             provider_name="test",
@@ -168,6 +193,17 @@ async def test_a_safety_block_counts_the_fallback_and_how_it_went(recorded):
         await run.generate(image_job(), [], [])
     assert recorded.value("kiki.images.attempts", model=PRIMARY, result="refused") == 1
     assert recorded.value("kiki.images.attempts", model=FALLBACK, result="safety_blocked") == 1
+
+
+async def test_an_image_refused_after_it_arrived_was_still_paid_for(recorded):
+    run = executor()
+    run.image_models = {PRIMARY: ImageModel(image=b"not an image at all")}
+    with pytest.raises(ImageRefused):
+        await run.generate(image_job(), [], [])
+    assert recorded.value("kiki.images.attempts", model=PRIMARY, result="refused") == 1
+    image = {"purpose": "image", "model": PRIMARY}
+    assert recorded.value("kiki.llm.calls", **image, result="error") == 1
+    assert recorded.value("kiki.llm.cost_usd", **image) == 0.04
 
 
 async def test_every_tool_outcome_is_counted(recorded):

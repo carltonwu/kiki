@@ -14,6 +14,7 @@ from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import BinaryContent, ModelResponse
 from pydantic_ai.models import Model
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
 
@@ -34,7 +35,7 @@ from ..contracts import (
 )
 from ..executor import TransientError
 from ..media import drawing, generation
-from ..media.vision import ImageRefused, Vision, bill, billed_cost, look
+from ..media.vision import ImageRefused, Vision, billed_cost, look, response_cost
 from ..openrouter.chat import WebOpenRouterModel
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
@@ -55,6 +56,24 @@ EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadli
 IMAGE_TIMEOUT_SECONDS = 75
 
 topic_agent = Agent()
+
+
+class Metered(WrapperModel):
+    """A run's model, billing each response to the run's telemetry call as it
+    arrives, with its web searches and fetches: a run that fails later (a usage
+    limit, a tool, the provider) still paid for the requests before."""
+
+    def __init__(self, wrapped: Model, call: telemetry.Call):
+        super().__init__(wrapped)
+        self.call = call
+
+    async def request(self, *args, **kwargs) -> ModelResponse:
+        response = await super().request(*args, **kwargs)
+        usage = response.usage
+        self.call.bill(response_cost(response), usage.input_tokens, usage.output_tokens)
+        web = web_use([response])
+        telemetry.web_calls(web.searches, web.fetches)
+        return response
 
 
 class PydanticExecutor:
@@ -101,8 +120,11 @@ class PydanticExecutor:
         if request.messages[-1].role != "user":
             raise ValueError("the last message must be from the user")
         prompt, earlier = request.messages[-1].content, history(request.messages[:-1])
+        # One telemetry call for the run, however many model requests it makes;
+        # its tools' calls are their own (guard.py).
+        billed = telemetry.Call()
         options = {
-            "model": self.model(request.model),
+            "model": Metered(self.model(request.model), billed),
             "message_history": earlier,
             "model_settings": {
                 "max_tokens": request.max_output_tokens,
@@ -117,9 +139,8 @@ class PydanticExecutor:
         deps = None
         try:
             if request.kind == "topic":
-                with telemetry.llm_call("topic", request.model) as call:
+                with telemetry.llm_call("topic", request.model, call=billed):
                     result = await topic_agent.run(prompt, **options)
-                    bill(call, result)
             else:
                 async with await db.connect(self.database_url) as connection:
                     scope = Scope(
@@ -141,13 +162,10 @@ class PydanticExecutor:
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
-                        # One call for the run, however many model requests it makes;
-                        # its tools' calls are their own (guard.py).
-                        with telemetry.llm_call("reply", request.model) as call:
+                        with telemetry.llm_call("reply", request.model, call=billed):
                             result = await reply_agent.run(
                                 prompt, deps=deps, capabilities=self.web_tools, **options
                             )
-                            bill(call, result)
                     finally:
                         await finish(deps.indexing)
                         await deps.memory.close()
@@ -162,7 +180,6 @@ class PydanticExecutor:
         responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
         web = web_use(responses)
         telemetry.model_requests(usage.requests)
-        telemetry.web_calls(web.searches, web.fetches)
         cost = billed_cost(result)  # includes OpenRouter's web tool fees
         extra = embed.cost + vision.cost
         if extra:
@@ -233,8 +250,8 @@ class PydanticExecutor:
                             prompt,
                             aspect_ratio_for(model, plan.aspect_ratio),
                             pictures,
+                            attempt,
                         )
-                    attempt.bill(cost)
                 return data, mime_type, cost, model, prompt, references
             except generation.SafetyRefused:
                 if fallback is None:

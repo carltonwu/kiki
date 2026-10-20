@@ -49,9 +49,12 @@ EXCLUDED_LOGGERS = (
     "openai",
 )
 JOB_PATHS = "/v1/"
-# Histogram buckets (docs/observability.md, "Cardinality rules").
-DURATION_BUCKETS = (0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
-COUNT_BUCKETS = (1, 2, 5, 10, 20, 50)
+# Histogram buckets, fewer than the shared sets (docs/observability.md,
+# "Cardinality rules"): tools and vision take seconds, runs and images tens of
+# seconds, and nothing outlasts the 120 s job deadline. A run makes at most 10
+# model requests.
+DURATION_BUCKETS = (0.5, 2.5, 10, 30, 120)
+COUNT_BUCKETS = (1, 2, 5, 10)
 # Distinct `model` label values per process. Admins configure any model, and
 # aliases resolve to new versioned IDs over time; later ones become "other".
 MAX_MODELS = 16
@@ -158,8 +161,8 @@ def configure() -> bool:
             request_hook=redact_url,
             async_request_hook=async_redact_url,
         )
-    # Query spans with the SQL text; parameters stay out (capture_parameters is
-    # off, and no query inlines a value). InRequestOnly drops errors' messages.
+    # Query spans named by the operation, without the SQL text or parameters
+    # (InRequestOnly), and errors' messages.
     PsycopgInstrumentor().instrument(tracer_provider=InRequestOnly.Provider(tracer_provider))
     _closing = False
     _providers = (tracer_provider, meter_provider, logger_provider)
@@ -384,8 +387,9 @@ def quiet_span(tracer, name: str, **options) -> Iterator[trace.Span]:
 
 
 class InRequestOnly(trace.Tracer):
-    """psycopg's tracer: quiet spans, and only inside a recorded one (a request's),
-    so `kiki-agent-host index` doesn't start a trace per query."""
+    """psycopg's tracer: quiet spans named by the operation (`SELECT`), without
+    the SQL text, and only inside a recorded one (a request's), so
+    `kiki-agent-host index` doesn't start a trace per query."""
 
     def __init__(self, tracer: trace.Tracer) -> None:
         self.tracer = tracer
@@ -402,10 +406,11 @@ class InRequestOnly(trace.Tracer):
         if not trace.get_current_span(context).is_recording():
             yield trace.INVALID_SPAN
             return
+        attributes = {k: v for k, v in (attributes or {}).items() if k not in SQL_TEXT}
         with quiet_span(
             self.tracer, name, context=context, kind=kind, attributes=attributes
         ) as span:
-            yield span
+            yield WithoutSql(span)
 
     class Provider(trace.TracerProvider):
         def __init__(self, provider: trace.TracerProvider) -> None:
@@ -413,6 +418,28 @@ class InRequestOnly(trace.Tracer):
 
         def get_tracer(self, *args, **kwargs) -> trace.Tracer:
             return InRequestOnly(self.provider.get_tracer(*args, **kwargs))
+
+
+# The SQL text: psycopg's instrumentation renders composed SQL (`sql.Literal`)
+# with its values, so no query's text is kept.
+SQL_TEXT = frozenset({"db.statement", "db.query.text"})
+
+
+class WithoutSql:
+    """A query span that drops the SQL text the instrumentation sets."""
+
+    def __init__(self, span: trace.Span) -> None:
+        self.span = span
+
+    def set_attribute(self, key: str, value) -> None:
+        if key not in SQL_TEXT:
+            self.span.set_attribute(key, value)
+
+    def set_attributes(self, attributes) -> None:
+        self.span.set_attributes({k: v for k, v in attributes.items() if k not in SQL_TEXT})
+
+    def __getattr__(self, name: str):
+        return getattr(self.span, name)
 
 
 @dataclass
@@ -427,8 +454,10 @@ class Call:
     span: trace.Span = field(default=trace.INVALID_SPAN, repr=False)
 
     def bill(self, cost: float | None, input_tokens: int | None = 0, output_tokens=0) -> None:
-        self.cost = cost or 0.0
-        self.input_tokens, self.output_tokens = input_tokens or 0, output_tokens or 0
+        """Adds one billed response: a run bills each as it arrives."""
+        self.cost += cost or 0.0
+        self.input_tokens += input_tokens or 0
+        self.output_tokens += output_tokens or 0
 
 
 def model_label(model: str) -> str:
@@ -436,8 +465,11 @@ def model_label(model: str) -> str:
     names, later ones are "other". Spans keep the full ID."""
     if model in _models:
         return model
+    # Not atomic, and needn't be: every caller records on the event loop thread
+    # (the API's, or `index`'s asyncio.run). Recording from a worker thread would
+    # need a lock here.
     if len(_models) < MAX_MODELS:
-        _models.add(model)  # recorded on the event loop only: no race
+        _models.add(model)
         return model
     return "other"
 
@@ -456,11 +488,14 @@ def call_result(error: BaseException) -> str:
 
 
 @contextlib.contextmanager
-def llm_call(purpose: str, model: str, *, span: str = "") -> Iterator[Call]:
+def llm_call(
+    purpose: str, model: str, *, span: str = "", call: Call | None = None
+) -> Iterator[Call]:
     """One model call as kiki.llm.* (`purpose` and the model actually called) and a
-    span with its cost and tokens. An exception makes it an error or a timeout.
-    Cancelled, it is only a span."""
-    call = Call()
+    span with its cost and tokens, billed so far even if it fails. An exception
+    makes it an error or a timeout; cancelled, it is only a span. `call` is one
+    already being billed (a run's, by its model)."""
+    call = call or Call()
     if (recorder := _recorder) is None:
         yield call
         return

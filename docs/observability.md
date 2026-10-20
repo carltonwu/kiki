@@ -114,6 +114,10 @@ is one more.
   - latencies to a reply (s): `1, 2, 5, 10, 20, 40, 80`
   - ratios and confidences: `0.1, 0.25, 0.5, 0.75, 0.9, 1`
   - counts (messages, model requests): `1, 2, 5, 10, 20, 50`
+  - The agent host uses fewer, as its histograms are per tool, model and kind:
+    durations `0.5, 2.5, 10, 30, 120` (tools and vision take seconds, runs and
+    images tens of seconds, and the job deadline is 120 s) and model requests
+    `1, 2, 5, 10` (a run makes at most 10).
 - Instrumentation-made metrics are kept to what we read: the agent host keeps
   FastAPI's `http.server.request.duration` and `http.server.active_requests`
   (three routes) and drops the body-size histograms; httpx client metrics are off
@@ -174,10 +178,14 @@ share; spans keep the full ID.
 A reply or topic run is one call however many model requests it makes:
 `duration` is the whole run, its tools' time included, `cost_usd` its billed cost
 with OpenRouter's web fees, and `tokens` its requests' sum (the requests per run
-are in `kiki.agent.job.model_requests`). Vision, embedding and drawing calls made
-during a reply count under their own purposes. An image attempt that doesn't draw
-(a safety block included) is an `error`; the Images API reports no tokens, so
-`image` has cost only. `timeout` is a client or tool deadline. A call given up
+are in `kiki.agent.job.model_requests`). Cost and tokens are billed per response
+as it arrives, so a run that fails later (its request limit, a tool, the
+provider) still counts what it paid for, once per attempt that made the
+requests. Vision, embedding and drawing calls made during a reply count under
+their own purposes. An image attempt that doesn't draw (a safety block included)
+is an `error`; its cost is billed when the provider returns, so an image refused
+after that (too large, an unsupported type) still counts. The Images API reports
+no tokens, so `image` has cost only. `timeout` is a client or tool deadline. A call given up
 on (indexing a reply stopped waiting for, a run past the job's deadline) has no
 result, so it is only a span (`error.type=CancelledError`); a run cut off that
 way still shows as an `interrupted` job.
@@ -298,8 +306,8 @@ emoji-description endpoint is not a job.
   …). `error` is an error result or an exception; `budget_exhausted` a call
   turned away by the per-reply budget, which never ran, so has no duration. As
   for model calls, a cancelled tool call or image attempt is only a span.
-- `kiki.web.calls` is OpenRouter's web searches and fetches per reply run, as its
-  server tool usage reports them.
+- `kiki.web.calls` is OpenRouter's web searches and fetches, as its server tool
+  usage reports them per model response (counted as each arrives, like cost).
 
 Agent host spans (no prompt, reply, message or SQL values in any; a failure keeps
 its `error.type` only, never the exception's message):
@@ -311,8 +319,9 @@ its `error.type` only, never the exception's message):
 - `image attempt`, one per image model attempt: the same, plus `kiki.image.result`.
 - `execute_tool <tool>`: `gen_ai.tool.name`, `kiki.tool.outcome`.
 - Postgres queries (psycopg instrumentation), named by operation (`SELECT`), with
-  the SQL text (`db.statement`, placeholders only: parameters aren't captured,
-  and no query inlines a value). Only inside a request's trace, so the `index`
+  `db.system` and `db.name` but no SQL text: the instrumentation renders composed
+  SQL (`sql.Literal`) with its values, so `db.statement` is dropped, and
+  parameters aren't captured. Only inside a request's trace, so the `index`
   command doesn't start one per query.
 
 The agent host's log lines keep their `key=value` text, so Loki parses them with
