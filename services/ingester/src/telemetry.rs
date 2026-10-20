@@ -6,7 +6,11 @@
 //! standard variables themselves (`OTEL_EXPORTER_OTLP_HEADERS`, percent-decoded,
 //! and the timeouts).
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use futures_util::future::join_all;
 use opentelemetry::{KeyValue, global, metrics::Meter, trace::TracerProvider as _};
@@ -32,6 +36,9 @@ const METRIC_INTERVAL: Duration = Duration::from_secs(60);
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Bounds the final flush of all three signals together.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set once export is on, for work that only feeds telemetry (the platform poller).
+static EXPORTING: AtomicBool = AtomicBool::new(false);
 
 /// Holds the providers until [`Telemetry::shutdown`] flushes them.
 pub struct Telemetry {
@@ -83,12 +90,18 @@ pub fn init(json_logs: bool, export: bool) -> Telemetry {
     if let Some(e) = error {
         warn!(error = %e, "OpenTelemetry export is off: exporter setup failed");
     }
+    EXPORTING.store(providers.is_some(), Ordering::Relaxed);
     Telemetry { providers }
 }
 
 /// The meter for the ingester's instruments. A no-op when export is off.
 pub fn meter() -> Meter {
     global::meter(SCOPE)
+}
+
+/// Whether telemetry is exported. Off, metrics only some poll would feed aren't worth polling.
+pub fn exporting() -> bool {
+    EXPORTING.load(Ordering::Relaxed)
 }
 
 /// W3C trace context (`traceparent`) of the current span, as request headers.
