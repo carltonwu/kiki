@@ -111,8 +111,10 @@ python3 -m unittest discover -s tools/grafana         # its tests (token redacti
 
 It reads `GRAFANA_URL` (`https://<stack>.grafana.net`) and `GRAFANA_APP_TOKEN`,
 or `GRAFANA_SA_TOKEN` when set, from the environment or the repo's `.env`, and
-never prints the token. Everything lands in the folder **Kiki** (uid `kiki`),
-matched by uid, so a run overwrites what's there: dashboard edits made in the UI
+never prints the token. `GRAFANA_URL` must be https (plain http only for
+localhost), without credentials, query or fragment, and redirects are followed
+only within the same scheme, host and port, since urllib would resend the token.
+Everything lands in the folder **Kiki** (uid `kiki`), matched by uid, so a run overwrites what's there: dashboard edits made in the UI
 are lost unless exported back into the JSON (Share → Export, keep the `uid`, drop
 `id`). If the token may write dashboards but not alerting provisioning (HTTP
 403), the dashboards are applied, the alerts skipped, and it exits 1: create a
@@ -159,7 +161,7 @@ minute). Parameters are the file's `params`, overridable with `--param`:
 
 | Rule (uid) | Fires when | Pending | No data |
 |---|---|---|---|
-| Ingester down (`kiki-ingester-down`) | `max(last_over_time(kiki_leader_held{job="kiki/ingester"}[5m]))` below 1: no instance held the leader lock in 5 min | 5m | Alerting: a missing series counts as 0 (`or vector(0)`), since a dead or silent ingester is the point |
+| Ingester down (`kiki-ingester-down`) | `max(last_over_time(kiki_leader_held{job="kiki/ingester"}[5m]))` below 1: the newest sample in 5 min isn't 1 (about 5 min after a clean stop, which exports 0; up to 10 min after one that dies silently) | 5m | Alerting: a missing series counts as 0 (`or vector(0)`), since a dead or silent ingester is the point |
 | Gateway reconnect storm (`kiki-gateway-reconnects`) | more than `gateway_reconnects_per_15m` (5) reconnects in 15 min | 5m | OK |
 | Agent run pending (`kiki-run-pending`) | oldest pending agent run older than `run_pending_seconds` (120) | 1m | OK |
 | Stuck agent runs (`kiki-runs-stuck`) | `kiki_agent_runs_stuck` > 0 | 10m | OK |

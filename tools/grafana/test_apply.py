@@ -11,6 +11,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import ClassVar
 
 HERE = Path(__file__).resolve().parent
 _loader = importlib.machinery.SourceFileLoader("grafana_apply", str(HERE / "apply"))
@@ -24,10 +25,23 @@ TOKEN = "glsa_secretSECRET_1234"
 class EchoAuth(BaseHTTPRequestHandler):
     """Answers every request with an error whose body echoes the Authorization header."""
 
+    away = ""  # set to another server's URL: a different origin
+
     def do_GET(self):
         if self.path == "/html":
             body = b"<html>login</html>"
             self.send_response(200)
+        elif self.path in ("/redirect-away", "/redirect-here"):
+            body = b""
+            self.send_response(302)
+            self.send_header("Location", self.away + "/ok" if self.path == "/redirect-away" else "/ok")
+        elif self.path == "/ok":
+            body = json.dumps({"auth": bool(self.headers["Authorization"])}).encode()
+            self.send_response(200)
+        elif self.path == "/straddle":
+            # The token crosses the 500-character cut of an error body.
+            body = ("x" * 490 + self.headers["Authorization"].removeprefix("Bearer ")).encode()
+            self.send_response(500)
         else:
             body = json.dumps({"message": f"bad auth: {self.headers['Authorization']}"}).encode()
             self.send_response(int(self.path.strip("/") or 500))
@@ -39,16 +53,35 @@ class EchoAuth(BaseHTTPRequestHandler):
         pass
 
 
+class Recorder(BaseHTTPRequestHandler):
+    seen: ClassVar[list] = []
+
+    def do_GET(self):
+        Recorder.seen.append(self.headers["Authorization"])
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *args):
+        pass
+
+
 class TokenHandling(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = HTTPServer(("127.0.0.1", 0), EchoAuth)
-        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.other = HTTPServer(("127.0.0.1", 0), Recorder)
+        for server in (cls.server, cls.other):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
         cls.url = f"http://127.0.0.1:{cls.server.server_port}"
+        EchoAuth.away = f"http://127.0.0.1:{cls.other.server_port}"
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.shutdown()
+        for server in (cls.server, cls.other):
+            server.shutdown()
+            server.server_close()
 
     def assertNoToken(self, text):
         self.assertNotIn(TOKEN, text)
@@ -88,6 +121,46 @@ class TokenHandling(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             closed.call("GET", "/api/folders")
         self.assertNoToken(str(caught.exception))
+
+    def test_redirects_to_another_origin_are_refused(self):
+        grafana = apply.Grafana(self.url, TOKEN)
+        Recorder.seen.clear()
+        with self.assertRaises(SystemExit) as caught:
+            grafana.call("GET", "/redirect-away")
+        self.assertIn("not following it", str(caught.exception))
+        self.assertNoToken(str(caught.exception))
+        self.assertEqual(Recorder.seen, [])
+
+    def test_same_origin_redirects_are_followed(self):
+        self.assertEqual(apply.Grafana(self.url, TOKEN).call("GET", "/redirect-here"), {"auth": True})
+
+    def test_redaction_happens_before_truncation(self):
+        with self.assertRaises(SystemExit) as caught:
+            apply.Grafana(self.url, TOKEN).call("GET", "/straddle")
+        self.assertNotIn(TOKEN[:4], str(caught.exception))
+
+
+class Urls(unittest.TestCase):
+    def test_accepted(self):
+        self.assertEqual(apply.check_url("https://kiki.grafana.net/"), "https://kiki.grafana.net")
+        self.assertEqual(apply.check_url(" http://localhost:3000 "), "http://localhost:3000")
+        self.assertEqual(apply.check_url("http://127.0.0.1:3000/grafana/"), "http://127.0.0.1:3000/grafana")
+
+    def test_rejected_without_quoting_the_url(self):
+        for url in (
+            "http://kiki.grafana.net",
+            "ftp://kiki.grafana.net",
+            "https://user:SECRETPW@kiki.grafana.net",
+            "https://kiki.grafana.net/?auth=SECRETPW",
+            "https://kiki.grafana.net/#SECRETPW",
+            "https://kiki.grafana.net:notaport",
+            "kiki.grafana.net",
+            "",
+        ):
+            with self.subTest(url=url), self.assertRaises(SystemExit) as caught:
+                apply.check_url(url)
+            self.assertNotIn("SECRETPW", str(caught.exception))
+            self.assertNotIn("grafana.net:", str(caught.exception))
 
 
 class Dotenv(unittest.TestCase):

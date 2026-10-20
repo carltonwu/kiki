@@ -26,6 +26,7 @@ import os
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -244,12 +245,54 @@ def check_rule(rule: dict) -> list[str]:
 
 
 HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def check_url(url: str) -> str:
+    """GRAFANA_URL without a trailing slash: https (http only for localhost), no
+    credentials, query or fragment. Errors never quote the URL itself."""
+    try:
+        parts = urllib.parse.urlsplit(url.strip())
+        host = parts.hostname
+        parts.port  # noqa: B018 - raises ValueError for a bad port
+    except ValueError:
+        raise SystemExit("GRAFANA_URL isn't a valid URL.") from None
+    if not host:
+        raise SystemExit("GRAFANA_URL needs a host, e.g. https://<stack>.grafana.net.")
+    if parts.scheme != "https" and not (parts.scheme == "http" and host in LOCAL_HOSTS):
+        raise SystemExit("GRAFANA_URL must use https (plain http only for localhost or 127.0.0.1).")
+    if parts.username is not None or parts.password is not None:
+        raise SystemExit("GRAFANA_URL must not contain credentials; the token goes in GRAFANA_APP_TOKEN.")
+    if parts.query or parts.fragment or "?" in url or "#" in url:
+        raise SystemExit("GRAFANA_URL must not have a query or fragment.")
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+
+def origin(url: str) -> tuple:
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme, parts.hostname, parts.port or {"https": 443, "http": 80}.get(parts.scheme)
+
+
+class RedirectRefused(Exception):
+    pass
+
+
+class SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies Authorization onto redirected requests, so follow a redirect only
+    within the same scheme, host and port."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        if origin(target) != origin(req.full_url):
+            raise RedirectRefused(code)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 class Grafana:
     def __init__(self, url: str, token: str):
-        self.url = url.rstrip("/")
+        self.url = check_url(url)
         self._token = token.strip()
+        self._opener = urllib.request.build_opener(SameOriginRedirects)
         # Checked here, with a message that can't contain the token: urllib's own error
         # for a bad header value (a newline, say) quotes the whole Authorization header.
         if not HEADER_SAFE.fullmatch(self._token):
@@ -271,10 +314,16 @@ class Grafana:
         # No error text below may carry request headers: messages are built from the
         # status, the response body and the exception type only, all with the token redacted.
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self._opener.open(request, timeout=30) as response:
                 raw = response.read()
+        except RedirectRefused as e:
+            raise SystemExit(
+                f"{method} {path}: HTTP {e.args[0]} redirects to another scheme, host or port; not following it "
+                "with the token. Set GRAFANA_URL to the stack's final https URL."
+            ) from None
         except urllib.error.HTTPError as e:
-            detail = self.redact(e.read().decode(errors="replace")[:500])
+            # Redact before truncating, so a token cut in half can't slip through.
+            detail = self.redact(e.read().decode(errors="replace"))[:500]
             if e.code == 404 and ok404:
                 return None
             if e.code in (401, 403):
@@ -367,7 +416,7 @@ def main() -> int:
         )
         return 1
     grafana = Grafana(url, token)
-    print(f"Grafana {grafana.url} (token from {token_name})")
+    print(grafana.redact(f"Grafana {grafana.url} (token from {token_name})"))
 
     try:
         # Listing, not GET /api/folders/<uid>: Grafana answers 403 there for a folder that doesn't exist.
@@ -408,7 +457,10 @@ def main() -> int:
         try:
             result = grafana.call("POST", "/api/dashboards/db", body)
             print(
-                f"Dashboard {model['title']!r}: {result.get('status', 'saved')} (version {result.get('version')}) {grafana.url}{result.get('url', '')}"
+                grafana.redact(
+                    f"Dashboard {model['title']!r}: {result.get('status', 'saved')} "
+                    f"(version {result.get('version')}) {grafana.url}{result.get('url', '')}"
+                )
             )
         except Refused as e:
             print(f"Dashboard {model['title']!r}: refused: {e}", file=sys.stderr)

@@ -52,8 +52,8 @@
       "for": "5m",
       "labels": {"service": "kiki", "severity": "critical"},
       "annotations": {
-        "summary": "No ingester has held the leader lock for 10 minutes.",
-        "description": "kiki_leader_held{job=\"kiki/ingester\"} has had no 1 in the last 5 minutes, for 5 minutes: the ingester is down, crash-looping, not exporting, or running without the leader lock (so nothing ingests or polls). A missing series counts as 0. Deploys hand the lock over within seconds and don't trip it.",
+        "summary": "The ingester hasn't reported holding the leader lock for 5 minutes.",
+        "description": "The newest kiki_leader_held{job=\"kiki/ingester\"} sample of the last 5 minutes isn't 1 (or there is none), and that has lasted 5 minutes: the ingester is down, crash-looping, not exporting, or running without the leader lock (so nothing ingests or polls). A stopped ingester exports 0 on its way out, so this fires about 5 minutes after it stops; one that dies without exporting goes silent instead, and fires up to 10 minutes after its last sample. A deploy hands the lock to the new instance within about a minute, inside the pending period. A missing series counts as 0.",
         "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
       }
     },
