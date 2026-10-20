@@ -451,14 +451,19 @@ class Gatherer:
     ) -> tuple[list[Found], list[tuple[Reference, BinaryImage]]]:
         """Every subject's references and the shared images, in parallel. Past the
         stage's deadline (and STAGE_GRACE for downloads in flight), what's done is
-        kept and the rest is drawn without: the image call keeps its time."""
+        kept and the rest is drawn without: the image call keeps its time. With
+        no time at all (a job resumed late), there's no stage, and no grace: that
+        would come out of the image call's time."""
+        left = self.time_left()
+        if left is not None and left <= 0:
+            logger.warning("no time for references subjects=%d", len(plan.subjects))
+            return [Found(subject, []) for subject in plan.subjects], []
         subjects = [asyncio.ensure_future(self.find(s)) for s in plan.subjects]
         shared = asyncio.ensure_future(self.shared(plan.shared))
         tasks = [*subjects, shared]
-        left = self.time_left()
         try:
             done, late = await asyncio.wait(
-                tasks, timeout=None if left is None else max(0.0, left) + STAGE_GRACE
+                tasks, timeout=None if left is None else left + STAGE_GRACE
             )
         finally:
             # Also when this is cancelled (the job's deadline, a shutdown):

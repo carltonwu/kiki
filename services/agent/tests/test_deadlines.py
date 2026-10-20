@@ -387,3 +387,43 @@ async def test_a_resumed_drawing_runs_its_stage_out_and_still_draws(monkeypatch)
         assert found[0].subject.name == "Nougie"
         data, *_ = await run.generate(image_job(), found, shared)
     assert data  # the image model was called and drew
+
+
+async def test_a_drawing_with_no_time_for_references_skips_them_and_draws(monkeypatch):
+    """Review round 4, with the real constants: 38 s left, under the 43 s the
+    image keeps, so the stage has nothing. It still took its 5 s grace, leaving
+    32.994 s; less the note's 15 s that's under MIN_IMAGE_SECONDS, so the attempt
+    was skipped. Now there's no stage at all, and the attempt gets 23 s."""
+    from kiki_agent_host.contracts import Drawing, Subject
+    from kiki_agent_host.media import drawing
+
+    finds = []
+
+    async def find_forever(subject):
+        finds.append(subject)
+        await asyncio.sleep(60)
+
+    async def no_shared(ids):
+        return []
+
+    run = executor()
+    timeouts = []
+
+    class Drawn(ImageModel):
+        async def generate(self, prompt, *, images=None, settings=None):
+            timeouts.append(time_left())
+            return await super().generate(prompt, images=images, settings=settings)
+
+    run.image_models = {PRIMARY: Drawn()}
+    plan = Drawing(prompt="x", subjects=[Subject(name="Nougie")])
+    started = time.monotonic()
+    with run_deadline(38):
+        gather = drawing.Gatherer(None, None, None, "", seconds=drawing.REFERENCES_SECONDS)
+        monkeypatch.setattr(gather, "find", find_forever)
+        monkeypatch.setattr(gather, "shared", no_shared)
+        found, shared = await gather.everything(plan)
+        data, *_ = await run.generate(image_job(), found, shared)
+    assert data and timeouts, "the image model was called"
+    assert not finds, "no reference work started"
+    assert found[0].subject.name == "Nougie" and shared == []
+    assert time.monotonic() - started < 1
