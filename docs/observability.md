@@ -76,7 +76,9 @@ agent host (Python) ─OTLP────┘
     series' first job. Exact billing totals come from the database, which
     `/kiki stats` sums per server; it misses a few costs the metrics count
     (see Cost categories). If Grafana Cloud ever turns the modifier off, these queries
-    fail with a parse error; dropping ` anchored` brings back the estimates.
+    fail with a parse error: the panels show it, and the alert rules that use it
+    go to Error and notify (see Alert rules). Dropping ` anchored` brings back
+    the estimates.
   - **A partly rejected export counts as acknowledged.** The SDK's OTLP
     exporter reports success on HTTP 200 without looking at
     `partial_success.rejected_data_points`. If Mimir rejected a zero but
@@ -137,8 +139,16 @@ Grafana Cloud also promotes `service_name`, `service_namespace`,
 `service_instance_id`, `service_version` and `deployment_environment_name` to
 labels on every series (all resource attributes are on `target_info` too). So a
 deploy starts new series under the new `service_version` (the old ones go
-stale): queries always aggregate (`sum`, `max`, `sum by (le, …)`), never read a
-bare series, or a deploy would show as two lines or two stat values.
+stale), and queries never read a bare series, or a deploy would show as two
+lines or two stat values:
+
+- **Counters**: `sum(increase(…))` and `sum by (le, …) (increase(…))` are
+  deploy-safe. The old series stops growing, so it adds nothing after the deploy.
+- **Gauges**: only `max` (or `min`) is. The old series keeps its last value for
+  the 5 min lookback until it goes stale, so a plain `sum` of a gauge reads
+  double for about 5 minutes after each deploy. To total a gauge, take `max` per
+  real dimension first, then sum: `sum(max by (service) (kiki_railway_cpu))`,
+  `sum(max by (state) (kiki_pg_connections))`.
 
 ## Seeing it locally
 
@@ -267,7 +277,10 @@ minute). Parameters are the file's `params`, overridable with `--param`:
 | Run failures or Discord send errors (`kiki-error-spike`) | failed + expired runs plus send errors in 15 min above `error_spike_count` (3); interrupted runs (deploys) excluded | 5m | OK |
 | Postgres memory near limit (`kiki-postgres-memory`) | Railway memory of `postgres` above `postgres_memory_ratio` (0.9) of `postgres_memory_limit_bytes` (384 MB) | 10m | OK: Railway metrics are optional |
 
-All of them keep the last state on query errors (`KeepLast`) and carry
+The rules that read counters with `increase(… anchored)` (reconnect storm,
+daily spend, error spike) go to Error on a query error, after their pending
+period, so they notify if the modifier ever stops parsing instead of staying OK
+for good; the others keep the last state (`KeepLast`). All carry
 `service=kiki`. There is deliberately no "no Gateway events" rule: Kiki's intents
 are guilds and guild messages, so a healthy guild that is quiet overnight goes
 long stretches without a dispatch. Liveness comes from the leader gauge, which the

@@ -715,7 +715,7 @@
     {
       "type": "stat",
       "title": "Deadlocks (range)",
-      "description": "Deadlocks detected in the selected range.",
+      "description": "Deadlocks detected in the selected range. A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"

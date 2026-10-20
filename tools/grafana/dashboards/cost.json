@@ -85,7 +85,7 @@
     {
       "type": "stat",
       "title": "Spend",
-      "description": "Total LLM cost over the selected range, both services: sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored)). All purposes; see docs/observability.md, Cost categories, for how they map to /kiki stats.",
+      "description": "Total LLM cost over the selected range, both services: sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored)). All purposes; see docs/observability.md, Cost categories, for how they map to /kiki stats. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -152,7 +152,7 @@
     {
       "type": "stat",
       "title": "Average per day",
-      "description": "Spend over the selected range, scaled to a day. A range longer than the data (the first days after export started) reads low. The daily spend alert is $5 per rolling 24 h by default.",
+      "description": "Spend over the selected range, scaled to a day. A range longer than the data (the first days after export started) reads low. The daily spend alert is $5 per rolling 24 h by default. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -227,7 +227,7 @@
     {
       "type": "stat",
       "title": "Month at the range's pace",
-      "description": "30 days at the selected range's pace. Short ranges swing with the time of day; prefer the 7-day projection.",
+      "description": "30 days at the selected range's pace. Short ranges swing with the time of day; prefer the 7-day projection. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -294,7 +294,7 @@
     {
       "type": "stat",
       "title": "Month at the 7-day pace",
-      "description": "30 days at the last 7 days' pace, independent of the time picker.",
+      "description": "30 days at the last 7 days' pace, independent of the time picker. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -369,7 +369,7 @@
     {
       "type": "stat",
       "title": "Calls",
-      "description": "LLM calls over the selected range (a reply or topic run is one call however many model requests it makes).",
+      "description": "LLM calls over the selected range (a reply or topic run is one call however many model requests it makes). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"

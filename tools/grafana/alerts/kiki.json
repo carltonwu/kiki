@@ -87,7 +87,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {
@@ -204,7 +204,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {
@@ -261,7 +261,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {

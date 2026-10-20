@@ -193,7 +193,7 @@
     {
       "type": "timeseries",
       "title": "Reconnects and store errors",
-      "description": "Dropped Gateway connections by cause (requested: opcode 7, invalid_session: opcode 9, transport: 1006, closed: a close code), and dispatches that failed to store. Count per interval (at least 5 min).",
+      "description": "Dropped Gateway connections by cause (requested: opcode 7, invalid_session: opcode 9, transport: 1006, closed: a close code), and dispatches that failed to store. Count per interval (at least 5 min). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1632,7 +1632,7 @@
     {
       "type": "timeseries",
       "title": "Agent host retries",
-      "description": "Why a job was asked again: timeout, connection, http (an error status), running (the host is still on it).",
+      "description": "Why a job was asked again: timeout, connection, http (an error status), running (the host is still on it). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -2261,7 +2261,7 @@
     {
       "type": "timeseries",
       "title": "Reactions",
-      "description": "Reactions Kiki chose (not the pending emoji), by result.",
+      "description": "Reactions Kiki chose (not the pending emoji), by result. A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -2390,7 +2390,7 @@
     {
       "type": "timeseries",
       "title": "REST retries",
-      "description": "Discord REST GET retries by reason (rate_limit, server, network).",
+      "description": "Discord REST GET retries by reason (rate_limit, server, network). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"

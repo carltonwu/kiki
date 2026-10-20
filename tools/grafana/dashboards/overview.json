@@ -98,7 +98,7 @@
     {
       "type": "stat",
       "title": "Messages in",
-      "description": "Live MESSAGE_CREATEs from people in the selected range (catch-up pages excluded).",
+      "description": "Live MESSAGE_CREATEs from people in the selected range (catch-up pages excluded). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -165,7 +165,7 @@
     {
       "type": "stat",
       "title": "Replies sent",
-      "description": "Reply messages Kiki sent in the selected range (a reply can be several messages).",
+      "description": "Reply messages Kiki sent in the selected range (a reply can be several messages). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -812,7 +812,7 @@
     {
       "type": "stat",
       "title": "Spend today",
-      "description": "OpenRouter cost since midnight (browser time zone), both services. The daily spend alert fires above $5 over a rolling 24 h.",
+      "description": "OpenRouter cost since midnight (browser time zone), both services. The daily spend alert fires above $5 over a rolling 24 h. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -889,7 +889,7 @@
     {
       "type": "stat",
       "title": "Spend, last 7 days",
-      "description": "OpenRouter cost over the last 7 days, both services.",
+      "description": "OpenRouter cost over the last 7 days, both services. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1216,7 +1216,7 @@
     {
       "type": "timeseries",
       "title": "Errors (rolling 1 h)",
-      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Failures in the hour before each point: agent runs failed, expired or interrupted; Discord sends that failed; LLM calls not `ok`; agent host responses other than 2xx (503 while it wakes is normal); Gateway payloads that failed to store.",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Failures in the hour before each point: agent runs failed, expired or interrupted; Discord sends that failed; LLM calls not `ok`; agent host responses other than 2xx (503 while it wakes is normal); Gateway payloads that failed to store. A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1728,7 +1728,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(kiki_railway_cpu{job=\"kiki/ingester\"})",
+          "expr": "sum(max by (service) (kiki_railway_cpu{job=\"kiki/ingester\"}))",
           "legendFormat": "vCPU",
           "editorMode": "code",
           "instant": false,
@@ -1860,7 +1860,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(kiki_pg_connections{job=\"kiki/ingester\"})",
+          "expr": "sum(max by (state) (kiki_pg_connections{job=\"kiki/ingester\"}))",
           "legendFormat": "connections",
           "editorMode": "code",
           "instant": false,
