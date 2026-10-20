@@ -98,17 +98,24 @@ model arguments, and arguments can only narrow them.
   in an index expression on every bot message's insert, so nothing raises: IDs are
   range-checked before the cast (a malformed link is NULL), and anything
   unexpected is "not a quote post". 0031 indexes the posts per guild, built
-  `CONCURRENTLY` (`-- no-transaction`). Each quote is the saved message itself,
+  `CONCURRENTLY` (`-- no-transaction`). A failed or cancelled build leaves the index
+  INVALID and 0031 unrecorded, and the file can't drop it itself (sqlx sends it as
+  one query string, an implicit transaction block), so `ingester migrate` first
+  drops an INVALID index that a pending no-transaction migration builds
+  (`src/migrate.rs`). Each quote is the saved message itself,
   so the text is verbatim and the author is who said it, not the bot; a quote
   posted many times counts once. A deleted original is left out. One never
   ingested is the bot's copy, marked `saved_copy`, only if its link is to this
   guild and it isn't attributed to an ignored author or a bot (a mention, a bare
-  ID, or a name resolved through `user_names`). PilzBrots is an ignored author,
+  ID, or a name resolved through `user_names`: the whole name between the
+  format's own delimiters, and a bot also by `people.bot`). PilzBrots is an ignored author,
   but its quote cards only point at people's messages, like a link fixer's
   reposts. Without `query` it lists newest first (`total`, `next_offset`); with
   one it ranks by keywords over every quote's text (copies included) and by
   meaning over stored ones (reciprocal rank fusion, exact distances over a few
-  hundred rows). Its own connection, the lookup budget. In prod: 1,394 quote
+  hundred rows). Quotes come whole, not as 1,000-character snippets; a page
+  stops at 40,000 characters. Its own connection and search's 9 s deadline
+  (`Deadline`, each step `bounded`), the lookup budget. In prod: 1,394 quote
   posts, 419 quotes, 394 originals stored.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
   target message's own channel (at most 10 on each side) and the reply parent

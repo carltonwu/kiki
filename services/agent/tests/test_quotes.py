@@ -2,7 +2,9 @@
 bots' posts, bots' cards in history, Kiki's own messages, and what a lookup says
 when it finds nothing."""
 
+import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +17,7 @@ from kiki_agent_host.chat.history import channel_history
 from kiki_agent_host.chat.indexing import index_pending
 from kiki_agent_host.chat.quotes import PAGE_CHARS, attributed, find_quotes
 from kiki_agent_host.chat.scope import Roster, Scope
-from kiki_agent_host.chat.search import SNIPPET_CHARS, message_context, search
+from kiki_agent_host.chat.search import SNIPPET_CHARS, Deadline, message_context, search
 from kiki_agent_host.openrouter.embeddings import Embedder
 
 GUILD, GENERAL, QUOTES, CONVERSATION = 1, 2, 3, 1
@@ -471,3 +473,24 @@ async def test_a_page_of_long_quotes_stops_at_its_text_budget(db):
     assert all(len(q["text"]) == 4001 for q in first["messages"])
     rest = await quotes(db, limit=50, offset=kept)
     assert len(rest["messages"]) == 15 - kept and "next_offset" not in rest
+
+
+class HangingEmbeddings:
+    async def create(self, model, input):
+        await asyncio.sleep(30)
+
+
+async def test_finding_quotes_keeps_to_its_deadline(db):
+    # #63's deadline: each step gets what's left, inside the tool's 10 s.
+    await add(db, 10, "pizza for lunch", days_ago=1)
+    await ub3r_quote(db, 20, 1, 10, ALEX, "pizza for lunch")
+    late = await find_quotes(db, embedder(), SCOPE, roster=ROSTER, deadline=Deadline(0))
+    assert "took too long" in late["error"]
+    # A hung embedding ranks by keywords instead, in time.
+    hanging = Embedder(SimpleNamespace(embeddings=HangingEmbeddings()))
+    started = time.monotonic()
+    result = await find_quotes(
+        db, hanging, SCOPE, query="pizza", roster=ROSTER, deadline=Deadline(3)
+    )
+    assert time.monotonic() - started < 3
+    assert [int(q["id"]) for q in result["messages"]] == [10]
