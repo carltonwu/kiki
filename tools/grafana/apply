@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+"""Upsert Kiki's Grafana dashboards and alert rules into a Grafana stack.
+
+    tools/grafana/apply --dry-run     # validate the files and show the plan (no network)
+    tools/grafana/apply               # create or update the folder, dashboards and alerts
+    tools/grafana/apply --param daily_llm_spend_usd=10
+
+Reads GRAFANA_URL (https://<stack>.grafana.net) and a token from the environment,
+else from the repo's .env: GRAFANA_SA_TOKEN if set, otherwise GRAFANA_APP_TOKEN.
+The token needs dashboard and folder write; alert rules also need alerting
+(provisioning) write. If alerting is refused, the dashboards are still applied,
+the alerts are skipped and the exit status is 1. The token is never printed.
+
+Everything goes into the "Kiki" folder (uid kiki): dashboards from
+tools/grafana/dashboards/*.json by uid (overwritten), alert rules from
+tools/grafana/alerts/*.json by uid, in one rule group. Dashboards pick their
+datasources through ${prom}, ${loki} and ${tempo} variables; alert rules need
+concrete UIDs, so apply looks the datasources up by type (or takes --prom-uid).
+Details: docs/observability.md, "Dashboards and alerts".
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent.parent
+HERE = Path(__file__).resolve().parent
+DASHBOARDS = HERE / "dashboards"
+ALERTS = HERE / "alerts"
+
+DS_TYPES = {"prom": "prometheus", "loki": "loki", "tempo": "tempo"}
+# Grafana Cloud's usual UIDs and name suffixes for the stack's own datasources.
+DS_PREFERRED_UID = {"prom": "grafanacloud-prom", "loki": "grafanacloud-logs", "tempo": "grafanacloud-traces"}
+DS_NAME_SUFFIX = {"prom": "-prom", "loki": "-logs", "tempo": "-traces"}
+DS_AVOID = re.compile(r"usage|ml-metrics|alert-state-history|insights|cost", re.IGNORECASE)
+VAR_REF = re.compile(r"^\$\{?(\w+)\}?$")
+PARAM = re.compile(r"\$\{(\w+)\}")
+NO_DATA = {"NoData", "Alerting", "OK", "KeepLast"}
+EXEC_ERR = {"Error", "Alerting", "OK", "KeepLast"}
+
+
+class Refused(Exception):
+    """HTTP 401/403."""
+
+
+def parse_dotenv(path: Path) -> dict[str, str]:
+    values = {}
+    if not path.exists():
+        return values
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.removeprefix("export ")
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def setting(name: str, dotenv: dict[str, str]) -> str:
+    return os.environ.get(name) or dotenv.get(name, "")
+
+
+# --- validation ----------------------------------------------------------------
+
+
+def load_dashboards() -> tuple[list[tuple[Path, dict]], list[str]]:
+    out, errors = [], []
+    uids = {}
+    for path in sorted(DASHBOARDS.glob("*.json")):
+        try:
+            model = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            errors.append(f"{path.name}: invalid JSON: {e}")
+            continue
+        errors += [f"{path.name}: {e}" for e in check_dashboard(model)]
+        uid = model.get("uid")
+        if uid in uids:
+            errors.append(f"{path.name}: uid {uid!r} also used by {uids[uid]}")
+        uids[uid] = path.name
+        out.append((path, model))
+    if not out:
+        errors.append(f"no dashboards in {DASHBOARDS}")
+    return out, errors
+
+
+def walk_panels(panels: list[dict]):
+    for panel in panels:
+        yield panel
+        yield from walk_panels(panel.get("panels", []))
+
+
+def check_dashboard(model: dict) -> list[str]:
+    errors = []
+    for key in ("uid", "title", "panels", "schemaVersion"):
+        if not model.get(key):
+            errors.append(f"missing {key}")
+    if model.get("id") is not None:
+        errors.append("has an id; leave it out so the dashboard matches by uid")
+    variables = {v.get("name"): v for v in model.get("templating", {}).get("list", [])}
+    for name, var in variables.items():
+        if var.get("type") == "datasource" and name in DS_TYPES and var.get("query") != DS_TYPES[name]:
+            errors.append(f"variable {name} should be a {DS_TYPES[name]} datasource variable")
+    ids = set()
+    for panel in walk_panels(model.get("panels", [])):
+        title = panel.get("title") or f"panel {panel.get('id')}"
+        if panel.get("id") in ids:
+            errors.append(f"{title}: duplicate panel id {panel.get('id')}")
+        ids.add(panel.get("id"))
+        pos = panel.get("gridPos") or {}
+        if not all(isinstance(pos.get(k), int) for k in ("x", "y", "w", "h")) or pos["x"] + pos["w"] > 24:
+            errors.append(f"{title}: bad gridPos {pos}")
+        if panel.get("type") in ("row", "text"):
+            continue
+        refs = [panel.get("datasource")] + [t.get("datasource") for t in panel.get("targets", [])]
+        for ref in refs:
+            uid = (ref or {}).get("uid", "")
+            match = VAR_REF.match(uid)
+            if not match or match.group(1) not in variables:
+                errors.append(f"{title}: datasource {uid!r} is not one of the dashboard's datasource variables")
+        if not panel.get("targets"):
+            errors.append(f"{title}: no queries")
+        for target in panel.get("targets", []):
+            query = target.get("expr") or target.get("query")
+            if not query:
+                errors.append(f"{title}: query {target.get('refId')} is empty")
+            elif query.count("(") != query.count(")") or query.count("{") != query.count("}"):
+                errors.append(f"{title}: query {target.get('refId')} has unbalanced brackets")
+    return errors
+
+
+def substitute(value, params: dict):
+    """Replace ${name} with params[name]; a string that is only ${name} becomes the value itself."""
+    if isinstance(value, dict):
+        return {k: substitute(v, params) for k, v in value.items()}
+    if isinstance(value, list):
+        return [substitute(v, params) for v in value]
+    if isinstance(value, str):
+        whole = re.fullmatch(r"\$\{(\w+)\}", value)
+        if whole and whole.group(1) in params:
+            return params[whole.group(1)]
+        return PARAM.sub(lambda m: str(params[m.group(1)]) if m.group(1) in params else m.group(0), value)
+    return value
+
+
+def load_alerts(overrides: dict[str, str]) -> tuple[list[dict], list[str]]:
+    groups, errors = [], []
+    uids = set()
+    for path in sorted(ALERTS.glob("*.json")):
+        try:
+            spec = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            errors.append(f"{path.name}: invalid JSON: {e}")
+            continue
+        params = dict(spec.get("params", {}))
+        for key, raw in overrides.items():
+            if key not in params:
+                errors.append(f"--param {key}: not a parameter of {path.name} (has {', '.join(params)})")
+                continue
+            try:
+                params[key] = json.loads(raw)
+            except json.JSONDecodeError:
+                params[key] = raw
+        for key in ("group", "interval", "rules", "folder"):
+            if not spec.get(key):
+                errors.append(f"{path.name}: missing {key}")
+        rules = substitute(spec.get("rules", []), params)
+        for rule in rules:
+            errors += [f"{path.name}: {rule.get('uid')}: {e}" for e in check_rule(rule)]
+            if rule.get("uid") in uids:
+                errors.append(f"{path.name}: duplicate rule uid {rule.get('uid')}")
+            uids.add(rule.get("uid"))
+        leftover = sorted(set(PARAM.findall(json.dumps(rules))) - set(DS_TYPES))
+        if leftover:
+            errors.append(f"{path.name}: unknown parameters {leftover}")
+        groups.append({**spec, "params": params, "rules": rules, "file": path.name})
+    return groups, errors
+
+
+def check_rule(rule: dict) -> list[str]:
+    errors = []
+    uid = rule.get("uid", "")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{1,40}", uid):
+        errors.append("uid must be 1-40 letters, digits, - or _")
+    for key in ("title", "condition", "data", "for"):
+        if not rule.get(key):
+            errors.append(f"missing {key}")
+    if rule.get("noDataState") not in NO_DATA:
+        errors.append(f"noDataState must be one of {sorted(NO_DATA)}")
+    if rule.get("execErrState") not in EXEC_ERR:
+        errors.append(f"execErrState must be one of {sorted(EXEC_ERR)}")
+    ref_ids = [q.get("refId") for q in rule.get("data", [])]
+    if len(set(ref_ids)) != len(ref_ids):
+        errors.append("duplicate refIds")
+    if rule.get("condition") not in ref_ids:
+        errors.append(f"condition {rule.get('condition')!r} is not a refId")
+    for query in rule.get("data", []):
+        ds = query.get("datasourceUid", "")
+        model = query.get("model", {})
+        if ds == "__expr__":
+            expression = model.get("expression", "")
+            used = set(re.findall(r"\$\{?([A-Z]\w*)", expression)) if model.get("type") == "math" else {expression}
+            if not used or not used <= set(ref_ids):
+                errors.append(f"{query.get('refId')}: expression refers to unknown refIds {sorted(used)}")
+            for cond in model.get("conditions", []):
+                for p in cond.get("evaluator", {}).get("params", []):
+                    if not isinstance(p, (int, float)):
+                        errors.append(f"{query.get('refId')}: threshold {p!r} is not a number")
+        elif VAR_REF.match(ds) and VAR_REF.match(ds).group(1) in DS_TYPES:
+            if not model.get("expr"):
+                errors.append(f"{query.get('refId')}: empty expr")
+            if not isinstance(query.get("relativeTimeRange", {}).get("from"), int):
+                errors.append(f"{query.get('refId')}: relativeTimeRange.from must be seconds")
+        else:
+            errors.append(
+                f"{query.get('refId')}: datasourceUid {ds!r} should be ${{prom}} (or another datasource variable)"
+            )
+    return errors
+
+
+# --- Grafana API ------------------------------------------------------------------
+
+
+class Grafana:
+    def __init__(self, url: str, token: str):
+        self.url = url.rstrip("/")
+        self._token = token
+
+    def call(self, method: str, path: str, body=None, headers=None, ok404=False):
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(self.url + path, data=data, method=method)
+        request.add_header("Authorization", f"Bearer {self._token}")
+        request.add_header("Accept", "application/json")
+        request.add_header("User-Agent", "kiki-grafana-apply")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        for k, v in (headers or {}).items():
+            request.add_header(k, v)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:500]
+            if e.code == 404 and ok404:
+                return None
+            if e.code in (401, 403):
+                raise Refused(f"{method} {path}: HTTP {e.code} {detail}") from None
+            raise SystemExit(f"{method} {path}: HTTP {e.code} {detail}") from None
+        except urllib.error.URLError as e:
+            raise SystemExit(f"{method} {path}: {e.reason}") from None
+        return json.loads(raw) if raw.strip() else {}
+
+
+def pick_datasource(kind: str, datasources: list[dict]) -> dict | None:
+    candidates = [d for d in datasources if d.get("type") == DS_TYPES[kind]]
+
+    def score(d):
+        return (
+            d.get("uid") == DS_PREFERRED_UID[kind],
+            not DS_AVOID.search(d.get("name", "")),
+            bool(d.get("isDefault")),
+            d.get("name", "").endswith(DS_NAME_SUFFIX[kind]),
+        )
+
+    return max(candidates, key=score, default=None)
+
+
+def set_datasource_defaults(model: dict, chosen: dict[str, dict]) -> None:
+    for var in model.get("templating", {}).get("list", []):
+        ds = chosen.get(var.get("name"))
+        if var.get("type") == "datasource" and ds:
+            var["current"] = {"text": ds["name"], "value": ds["uid"], "selected": True}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dry-run", action="store_true", help="validate and print the plan; no network")
+    parser.add_argument(
+        "--param", action="append", default=[], metavar="NAME=VALUE", help="override an alert parameter"
+    )
+    for kind, typ in DS_TYPES.items():
+        parser.add_argument(f"--{kind}-uid", help=f"{typ} datasource UID (default: looked up by type)")
+    parser.add_argument("--env-file", type=Path, default=REPO / ".env")
+    args = parser.parse_args()
+    sys.stdout.reconfigure(line_buffering=True)
+
+    overrides = {}
+    for item in args.param:
+        key, sep, value = item.partition("=")
+        if not sep:
+            parser.error(f"--param {item!r}: expected NAME=VALUE")
+        overrides[key] = value
+
+    dashboards, errors = load_dashboards()
+    groups, alert_errors = load_alerts(overrides)
+    errors += alert_errors
+    if errors:
+        print("Validation failed:", file=sys.stderr)
+        for e in errors:
+            print(f"  {e}", file=sys.stderr)
+        return 1
+    folders = {(g["folder"]["uid"], g["folder"]["title"]) for g in groups} | {("kiki", "Kiki")}
+    if len(folders) != 1:
+        print(f"All dashboards and alerts belong in one folder, got {sorted(folders)}", file=sys.stderr)
+        return 1
+    folder_uid, folder_title = folders.pop()
+
+    if args.dry_run:
+        print(f"Folder {folder_title!r} (uid {folder_uid}): create or keep")
+        for path, model in dashboards:
+            panels = sum(1 for p in walk_panels(model["panels"]) if p.get("type") != "row")
+            print(f"Dashboard {model['title']!r} (uid {model['uid']}, {panels} panels, {path.name}): upsert")
+        for g in groups:
+            params = ", ".join(f"{k}={v}" for k, v in g["params"].items())
+            print(f"Rule group {g['group']!r} every {g['interval']} ({g['file']}; {params}):")
+            for rule in g["rules"]:
+                print(f"  {rule['uid']}: {rule['title']!r} for {rule['for']}, no data → {rule['noDataState']}: upsert")
+        print("\nDry run: files are valid. Run without --dry-run to apply.")
+        return 0
+
+    dotenv = parse_dotenv(args.env_file)
+    url = setting("GRAFANA_URL", dotenv)
+    token_name = "GRAFANA_SA_TOKEN" if setting("GRAFANA_SA_TOKEN", dotenv) else "GRAFANA_APP_TOKEN"
+    token = setting(token_name, dotenv)
+    if not url or not token:
+        print(
+            "Set GRAFANA_URL and GRAFANA_APP_TOKEN (or GRAFANA_SA_TOKEN) in the environment or .env.", file=sys.stderr
+        )
+        return 1
+    grafana = Grafana(url, token)
+    print(f"Grafana {grafana.url} (token from {token_name})")
+
+    try:
+        # Listing, not GET /api/folders/<uid>: Grafana answers 403 there for a folder that doesn't exist.
+        folder = next((f for f in grafana.call("GET", "/api/folders?limit=1000") if f.get("uid") == folder_uid), None)
+        if folder is None:
+            grafana.call("POST", "/api/folders", {"uid": folder_uid, "title": folder_title})
+            print(f"Folder {folder_title!r}: created")
+        elif folder.get("title") != folder_title:
+            grafana.call("PUT", f"/api/folders/{folder_uid}", {"title": folder_title, "overwrite": True})
+            print(f"Folder {folder_title!r}: renamed from {folder.get('title')!r}")
+        else:
+            print(f"Folder {folder_title!r}: exists")
+    except Refused as e:
+        print(f"Refused: {e}\nThe token needs folder and dashboard write.", file=sys.stderr)
+        return 1
+
+    chosen: dict[str, dict] = {}
+    try:
+        datasources = grafana.call("GET", "/api/datasources")
+    except Refused:
+        datasources = []
+        print("Can't list datasources (refused); dashboards keep Grafana's default per type.")
+    for kind in DS_TYPES:
+        uid = getattr(args, f"{kind}_uid")
+        ds = (
+            next((d for d in datasources if d.get("uid") == uid), {"uid": uid, "name": uid})
+            if uid
+            else pick_datasource(kind, datasources)
+        )
+        if ds:
+            chosen[kind] = ds
+            print(f"Datasource ${{{kind}}}: {ds['name']} (uid {ds['uid']})")
+
+    failed = False
+    for path, model in dashboards:
+        set_datasource_defaults(model, chosen)
+        body = {"dashboard": model, "folderUid": folder_uid, "overwrite": True, "message": "tools/grafana/apply"}
+        try:
+            result = grafana.call("POST", "/api/dashboards/db", body)
+            print(
+                f"Dashboard {model['title']!r}: {result.get('status', 'saved')} (version {result.get('version')}) {grafana.url}{result.get('url', '')}"
+            )
+        except Refused as e:
+            print(f"Dashboard {model['title']!r}: refused: {e}", file=sys.stderr)
+            failed = True
+
+    if "prom" not in chosen:
+        print("Alert rules skipped: no Prometheus datasource found; pass --prom-uid.", file=sys.stderr)
+        return 1
+    uids = {f"${{{k}}}": v["uid"] for k, v in chosen.items()}
+    # X-Disable-Provenance keeps the rules editable in the UI (apply overwrites them anyway).
+    headers = {"X-Disable-Provenance": "true"}
+    try:
+        for g in groups:
+            rules = []
+            for rule in g["rules"]:
+                for query in rule["data"]:
+                    query["datasourceUid"] = uids.get(query["datasourceUid"], query["datasourceUid"])
+                rule = {**rule, "folderUID": folder_uid, "ruleGroup": g["group"], "orgID": 1}
+                existing = grafana.call("GET", f"/api/v1/provisioning/alert-rules/{rule['uid']}", ok404=True)
+                if existing is None:
+                    saved = grafana.call("POST", "/api/v1/provisioning/alert-rules", rule, headers)
+                    verb = "created"
+                else:
+                    rule["orgID"] = existing.get("orgID", 1)
+                    saved = grafana.call("PUT", f"/api/v1/provisioning/alert-rules/{rule['uid']}", rule, headers)
+                    verb = "updated"
+                rules.append(saved)
+                print(f"Alert {rule['title']!r} ({rule['uid']}): {verb}")
+            # The group sets the evaluation interval (and drops rules no longer in the file).
+            grafana.call(
+                "PUT",
+                f"/api/v1/provisioning/folder/{folder_uid}/rule-groups/{g['group']}",
+                {"title": g["group"], "folderUid": folder_uid, "interval": seconds(g["interval"]), "rules": rules},
+                headers,
+            )
+            print(f"Rule group {g['group']!r}: every {g['interval']}, {len(rules)} rules")
+    except Refused as e:
+        print(
+            f"\nAlert rules skipped: Grafana refused the alerting provisioning API ({e}).\n"
+            "The dashboards were applied. Give the token alerting write (a service account with the Editor role, "
+            "set as GRAFANA_SA_TOKEN) and run again.",
+            file=sys.stderr,
+        )
+        return 1
+    return 1 if failed else 0
+
+
+def seconds(interval: str) -> int:
+    match = re.fullmatch(r"(\d+)([smh])", interval)
+    if not match:
+        raise SystemExit(f"interval {interval!r}: expected e.g. 60s, 1m or 1h")
+    return int(match.group(1)) * {"s": 1, "m": 60, "h": 3600}[match.group(2)]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

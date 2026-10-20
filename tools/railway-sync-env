@@ -7,7 +7,8 @@
 Secret values (tokens, keys, URLs with credentials) are never printed. Variables
 that only make sense locally (database URLs, ports, simulator overrides, local
 OTEL_* settings) are skipped. GRAFANA_CLOUD_ID and GRAFANA_APP_TOKEN aren't synced
-themselves: they become both services' OTEL_EXPORTER_OTLP_HEADERS. Run from the
+themselves: they become both services' OTEL_EXPORTER_OTLP_HEADERS. GRAFANA_URL and
+GRAFANA_SA_TOKEN are only for tools/grafana/apply. Run from the
 repo root with the Railway project linked.
 """
 
@@ -74,6 +75,8 @@ LOCAL_ONLY = {
 # Grafana Cloud credentials (docs/observability.md). The endpoint itself is in
 # .railway/railway.ts; GRAFANA_CLOUD_INGESTION_URL is only for reference.
 GRAFANA = {"GRAFANA_APP_TOKEN", "GRAFANA_CLOUD_ID", "GRAFANA_CLOUD_INGESTION_URL"}
+# The Grafana stack's API, for tools/grafana/apply (dashboards and alerts).
+GRAFANA_API = {"GRAFANA_SA_TOKEN", "GRAFANA_URL"}
 SECRET = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|DATABASE_URL|HEADERS")
 
 
@@ -142,6 +145,9 @@ def main() -> None:
     for key, value in sorted(local.items()):
         if key in LOCAL_ONLY or key.startswith("OTEL_"):
             print(f"  skip   {key} (local only)")
+            continue
+        if key in GRAFANA_API:
+            print(f"  skip   {key} (Grafana API for tools/grafana/apply; local only)")
             continue
         if key in GRAFANA:
             print(f"  skip   {key} (Grafana Cloud: synced as OTEL_EXPORTER_OTLP_HEADERS)")

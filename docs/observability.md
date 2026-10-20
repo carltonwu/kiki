@@ -76,6 +76,7 @@ when export is off; record through it from anywhere.
 | `OTEL_SERVICE_NAME` | both | `ingester` / `agent` (also the defaults). |
 | `OTEL_SDK_DISABLED=true` | both | Kill switch. |
 | `GRAFANA_CLOUD_ID`, `GRAFANA_APP_TOKEN`, `GRAFANA_CLOUD_INGESTION_URL` | local `.env` only | Grafana Cloud stack details; not synced to Railway themselves. |
+| `GRAFANA_URL`, `GRAFANA_SA_TOKEN` (optional) | local only | The stack's API for `tools/grafana/apply` (see Dashboards and alerts); never synced. |
 
 Resource attributes: `service.name`, `service.namespace=kiki`, `service.version`
 (`RAILWAY_GIT_COMMIT_SHA`), `deployment.environment.name`
@@ -95,6 +96,94 @@ Then set `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318` for a service, or
 run the simulator with `KIKI_SIM_OTEL_ENDPOINT=http://localhost:4318
 tools/sim/kiki-sim up` (localhost only; off by default), and open Grafana on
 http://localhost:3000 (Explore: Tempo, Loki, Prometheus).
+
+## Dashboards and alerts
+
+Dashboards and Grafana-managed alert rules are code in `tools/grafana/`, applied
+to the Grafana Cloud stack by `tools/grafana/apply` (stdlib Python):
+
+```
+tools/grafana/apply --dry-run                        # validate, show the plan; no network (CI runs this)
+tools/grafana/apply                                  # upsert folder, dashboards and alert rules
+tools/grafana/apply --param daily_llm_spend_usd=10   # override an alert parameter
+```
+
+It reads `GRAFANA_URL` (`https://<stack>.grafana.net`) and `GRAFANA_APP_TOKEN`,
+or `GRAFANA_SA_TOKEN` when set, from the environment or the repo's `.env`, and
+never prints the token. Everything lands in the folder **Kiki** (uid `kiki`),
+matched by uid, so a run overwrites what's there: dashboard edits made in the UI
+are lost unless exported back into the JSON (Share → Export, keep the `uid`, drop
+`id`). If the token may write dashboards but not alerting provisioning (HTTP
+403), the dashboards are applied, the alerts skipped, and it exits 1: create a
+service account with the Editor role (Administration → Service accounts), put its
+token in `GRAFANA_SA_TOKEN`, and run again. The rules are written with
+`X-Disable-Provenance`, so they stay editable in the UI.
+
+Dashboards select their datasources with `${prom}`, `${loki}` and `${tempo}`
+variables, never hard-coded UIDs. Alert rules need a concrete UID, so apply lists
+the stack's datasources and picks one per type (Grafana Cloud's `grafanacloud-prom`,
+`-logs`, `-traces` over usage, ML and alert-history ones); it sets that as each
+dashboard variable's default too. `--prom-uid` (and `--loki-uid`, `--tempo-uid`)
+overrides the choice.
+
+| Dashboard (uid) | What |
+|---|---|
+| Kiki / Overview (`kiki-overview`) | Messages in/out per hour, reply rate, run success, reply latency p50/p95 (links to Tempo), spend today, 7 days and rolling 24 h by purpose, spend by model, errors per hour, agent queue, resource tiles |
+| Kiki / Pipeline (`kiki-pipeline`) | Gateway events, reconnects, lag; router admissions; classifications check × outcome; Jev confidence, latency, calls and cost; agent runs, duration, host requests and retries, workers, drawings; conversations; Discord sends, errors, reactions, REST retries; DB pool; leader |
+| Kiki / Cost (`kiki-cost`) | Spend, average per day, monthly projection (selected range and last 7 days), cost by purpose and by model over time, cumulative spend, tokens, purpose × model table, calls by result |
+| Kiki / Agent host (`kiki-agent`) | Jobs by kind × outcome, rejections, job duration, model requests per run, agent LLM calls and duration, image attempts model × result, fallback, tool calls tool × outcome and duration, web calls, FastAPI requests |
+| Kiki / Infra (`kiki-infra`) | Railway CPU, memory, network, disk per service; Postgres size, cache hit ratio, oldest transaction, deadlocks, connections, transactions, temp bytes, table sizes, dead tuples; queues, stuck runs, embedding backlog |
+| Kiki / Logs and traces (`kiki-logs`) | Log volume, ingester and agent host logs (level and text filters; the agent's lines parsed with `logfmt`), Tempo tables: recent agent runs, slow runs, traces with errors |
+
+Query notes:
+
+- The agent host's series are sparse (see Architecture), so its panels use
+  `increase()` over the interval or the selected range, never instant values.
+  `increase()` needs two samples of a series in its window: a job whose previous
+  sample is older than the window (the first after a long sleep) is missed by
+  that interval's bar, though not by the range totals.
+- Grafana ends a range query on a multiple of its step, so a panel with a 1 h
+  step never shows the current hour. Bars use a 15 min minimum interval for that
+  reason, and the 7-day spend chart is a rolling 24 h sum (what the alert reads)
+  rather than daily bars.
+- The agent host's duration histograms have coarse buckets (0.5, 2.5, 10, 30,
+  120 s), so their quantiles are interpolated within them.
+
+Alert rules (`tools/grafana/alerts/kiki.json`, group `kiki`, evaluated every
+minute). Parameters are the file's `params`, overridable with `--param`:
+
+| Rule (uid) | Fires when | Pending | No data |
+|---|---|---|---|
+| No Gateway events (`kiki-gateway-silent`) | `kiki_gateway_events_total` grew by less than 1 in `gateway_silence_seconds` (900) | 5m | Alerting: a missing series counts as 0 (`or vector(0)`), since a dead or silent ingester is the point |
+| Agent run pending (`kiki-run-pending`) | oldest pending agent run older than `run_pending_seconds` (120) | 1m | OK |
+| Stuck agent runs (`kiki-runs-stuck`) | `kiki_agent_runs_stuck` > 0 | 10m | OK |
+| Daily LLM spend (`kiki-daily-llm-spend`) | spend over a rolling 24 h above `daily_llm_spend_usd` (**$5**) | 5m | OK |
+| Run failures or Discord send errors (`kiki-error-spike`) | failed + expired runs plus send errors in 15 min above `error_spike_count` (3); interrupted runs (deploys) excluded | 5m | OK |
+| Postgres memory near limit (`kiki-postgres-memory`) | Railway memory of `postgres` above `postgres_memory_ratio` (0.9) of `postgres_memory_limit_bytes` (384 MB) | 10m | No Data: without Railway metrics the rule reports No Data, never Alerting |
+
+All of them keep the last state on query errors (`KeepLast`) and carry
+`service=kiki`. Gateway events are dispatches only (Kiki's intents are guilds and
+guild messages), so a guild that is silent for 15 minutes trips the first rule
+too; raise `gateway_silence_seconds` if that happens at night. A rule in No Data
+sends Grafana's `DatasourceNoData` notification after its pending period; set
+the Postgres rule's `noDataState` to `OK` if Railway metrics stay off.
+
+**Notifications.** The rules set no contact point, so they follow the stack's
+default notification policy (Grafana Cloud starts with `grafana-default-email`,
+with no address). To receive them:
+
+- **Email:** Alerting → Contact points → edit `grafana-default-email`, add the
+  addresses.
+- **Discord:** in Discord, channel settings → Integrations → Webhooks → New
+  webhook, copy its URL. In Grafana, Alerting → Contact points → Add, integration
+  Discord, paste the URL. Then Alerting → Notification policies → edit the default
+  policy (or add a child policy matching `service=kiki`) to use it.
+
+**Locally:** `docker run -d -p 3000:3000 -p 4318:4318 grafana/otel-lgtm`, create
+a service account token (admin/admin, Administration → Service accounts, role
+Editor), then `GRAFANA_URL=http://localhost:3000 GRAFANA_SA_TOKEN=… tools/grafana/apply`.
+Feed it with the simulator, `KIKI_SIM_OTEL_ENDPOINT=http://localhost:4318` set
+on both `kiki-sim up` and `kiki-sim test` (the tests restart services).
 
 ## Cardinality rules
 
