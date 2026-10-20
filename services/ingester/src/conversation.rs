@@ -43,7 +43,7 @@ const SELECT: &str = r#"
            c.topic_through_message_id, c.message_count,
            (extract(epoch FROM c.created_at) * 1000)::bigint AS created_at_ms,
            (extract(epoch FROM c.last_active_at) * 1000)::bigint AS last_active_at_ms,
-           c.topic_cost_usd
+           coalesce((SELECT sum(t.cost_usd) FROM topic_summaries t WHERE t.conversation_id = c.id), 0)
                + coalesce((SELECT sum(r.cost_usd) FROM agent_runs r WHERE r.conversation_id = c.id), 0)
                + coalesce((SELECT sum(j.cost_usd) FROM agent_image_jobs j
                            JOIN agent_runs r ON r.id = j.run_id WHERE r.conversation_id = c.id), 0)

@@ -21,6 +21,12 @@ pub struct TestDb {
 
 /// A fresh, migrated schema named after `prefix`.
 pub async fn migrated(prefix: &str) -> Option<TestDb> {
+    migrated_through(prefix, i64::MAX).await
+}
+
+/// A fresh schema with the migrations up to `version` only, to test an
+/// upgrade: seed it, then run `crate::MIGRATOR` for the rest.
+pub async fn migrated_through(prefix: &str, version: i64) -> Option<TestDb> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
     let admin = PgPool::connect(&url).await.unwrap();
     ensure_vector(&admin).await;
@@ -36,7 +42,14 @@ pub async fn migrated(prefix: &str) -> Option<TestDb> {
     let options: PgConnectOptions = url.parse().unwrap();
     let options = options.options([("search_path", format!("{schema},public"))]);
     let db = PgPoolOptions::new().connect_with(options).await.unwrap();
-    crate::MIGRATOR.run(&db).await.unwrap();
+    let mut migrator = sqlx::migrate::Migrator::DEFAULT;
+    migrator.migrations = crate::MIGRATOR
+        .iter()
+        .filter(|m| m.version <= version)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    migrator.run(&db).await.unwrap();
     Some(TestDb { admin, db, schema })
 }
 

@@ -75,6 +75,7 @@ impl Agent {
             c.topic.as_deref().unwrap_or("(none yet)"),
             transcript.join("\n"),
         );
+        // Its cost is recorded where the host saves the result (topic_summaries).
         let completion = self
             .host
             .execute(&JobRequest {
@@ -87,11 +88,6 @@ impl Agent {
                 people: roster.wire(),
                 image_model: None,
             })
-            .await?;
-        sqlx::query("UPDATE conversations SET topic_cost_usd = topic_cost_usd + $2 WHERE id = $1")
-            .bind(conversation_id)
-            .bind(completion.usage.cost.unwrap_or(0.0))
-            .execute(&self.db)
             .await?;
         let Some(topic) = clean_topic(&completion.text) else {
             anyhow::bail!("agent host returned an empty topic");
