@@ -1,4 +1,6 @@
+import asyncio
 import json
+from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -10,9 +12,10 @@ from pydantic_ai.models.test import TestModel
 
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.tools import memory as memory_tools
+from kiki_agent_host.agent.tools import messages as message_tools
 from kiki_agent_host.agent.tools.messages import OptionalTime
 from kiki_agent_host.chat import search as search_module
-from kiki_agent_host.chat.indexing import SAVE, index_pending
+from kiki_agent_host.chat.indexing import ENQUEUE_ALL, SAVE, index_pending
 from kiki_agent_host.chat.scope import Roster, Scope
 from kiki_agent_host.chat.search import message_context, search
 from kiki_agent_host.contracts import JobRequest
@@ -369,3 +372,93 @@ def test_blank_search_times_mean_no_bound():
     assert times.validate_python("2026-10-18") == datetime(2026, 10, 18)
     with pytest.raises(ValidationError):
         times.validate_python("yesterday")
+
+
+async def queued(db) -> list[int]:
+    cursor = await db.execute("SELECT message_id FROM message_embedding_queue ORDER BY 1")
+    return [row[0] for row in await cursor.fetchall()]
+
+
+async def test_triggers_queue_exactly_the_searchable_messages(db):
+    # Seen in prod: with nothing pending, finding pending messages walked all
+    # 236k messages (5 to 7 s) at the start of every reply.
+    await add(db, 80, "release plan")
+    await add(db, 81, "   ")
+    await add(db, 82, "a bot", bot=True)
+    await add(db, 83, "the noisy bot", author_id=1358234666267578368)
+    relay = (
+        "<@100>: plan\nhttps://fxtwitter.com/a/status/1\n\n-# The original message sent by"
+        " <@100> was deleted so the bot could fix the broken embed links for easier viewing."
+    )
+    await add(db, 84, relay, author_id=1358234666267578368, bot=True)
+    await add(db, 85, "lunch")
+    assert await queued(db) == [80, 84, 85]
+
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (3, None)
+    assert await queued(db) == []
+    # An edit drops the vector and queues the message again; an edit to
+    # nothing or a delete takes it out.
+    await db.execute("UPDATE messages SET content = 'pizza' WHERE id = 80")
+    await db.execute("UPDATE messages SET content = 'friday' WHERE id = 81")
+    assert await queued(db) == [80, 81]
+    await db.execute("UPDATE messages SET content = '' WHERE id = 81")
+    await db.execute("UPDATE messages SET deleted_at = now() WHERE id = 85")
+    assert await queued(db) == [80]
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (1, None)
+    assert await queued(db) == []
+
+
+async def test_pending_reads_the_queue_and_drops_what_nothing_will_embed(db):
+    await add(db, 90, "release plan")
+    await add(db, 91, "pizza")
+    await add(db, 92, "lunch")
+    # Not queued (as if lost): replies don't look for it.
+    await db.execute("DELETE FROM message_embedding_queue WHERE message_id = 90")
+    # Embedded without leaving the queue (a host from before the queue, mid-deploy).
+    [embedding] = await embedder()(["pizza"])
+    await db.execute(
+        "INSERT INTO message_embeddings (message_id, embedding) VALUES (91, %s::halfvec)",
+        (embedding,),
+    )
+    # No longer searchable: its author has been ignored since.
+    await db.execute("UPDATE messages SET author_id = 1358234666267578368 WHERE id = 92")
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (0, None)
+    assert await queued(db) == []
+
+    # `kiki-agent-host index` queues whatever is missing before draining.
+    await db.execute("UPDATE messages SET author_id = 100 WHERE id = 92")
+    cursor = await db.execute(ENQUEUE_ALL)
+    assert cursor.rowcount == 2
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (2, None)
+    cursor = await db.execute("SELECT count(*) FROM message_embeddings")
+    assert (await cursor.fetchone())[0] == 3
+
+
+async def test_a_search_does_not_wait_long_for_indexing(db, monkeypatch):
+    # Seen in prod: saving vectors took 11 s, and the search waiting on it hit
+    # the tool's 10 s deadline with nothing (reply:391).
+    await add(db, 95, "release plan")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    monkeypatch.setattr(message_tools, "INDEX_WAIT_SECONDS", 0.05)
+    stuck = asyncio.Event()
+
+    async def indexing():
+        await stuck.wait()
+        return "full"
+
+    deps = SimpleNamespace(
+        connection=db,
+        embed=embedder(),
+        scope=SCOPE,
+        roster=Roster(),
+        spent=Counter(),
+        job_id="reply:test",
+        indexing=asyncio.create_task(indexing()),
+    )
+    result = await message_tools.search_messages(SimpleNamespace(deps=deps), "release plan")
+    assert result["semantic"] == "partial"
+    assert [m["id"] for m in result["messages"]] == ["95"]
+    # Still running, for the next search.
+    assert not deps.indexing.done()
+    stuck.set()
+    assert await deps.indexing == "full"

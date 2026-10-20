@@ -22,6 +22,11 @@ from ..guard import guarded
 
 logger = logging.getLogger(__name__)
 
+# How long a search waits for the reply's indexing before searching what's
+# indexed (reported as "partial"): it shares the tool's 10 s deadline with the
+# query embedding and the search itself.
+INDEX_WAIT_SECONDS = 4
+
 
 # Some models fill every optional argument, sending "" for a time they mean to leave
 # out. Rejecting it costs a tool retry, and a second slip fails the whole reply.
@@ -60,8 +65,11 @@ async def search_messages(
         deps = ctx.deps
         if deps.indexing is None:
             deps.indexing = asyncio.create_task(index_guild(deps))
-        # Shielded: a search timing out must not cancel indexing for the next one.
-        semantic = await asyncio.shield(deps.indexing)
+        # Shielded: a search giving up on it must not cancel indexing for the next one.
+        try:
+            semantic = await asyncio.wait_for(asyncio.shield(deps.indexing), INDEX_WAIT_SECONDS)
+        except TimeoutError:
+            semantic = "partial"
         return await search(
             deps.connection,
             deps.embed,
@@ -184,7 +192,7 @@ async def count_messages(
 
     async def work():
         # Its own connection: the count's statement timeout lives in a transaction,
-        # which mustn't interleave with indexing on the run's shared one.
+        # which mustn't interleave with other tools on the run's shared one.
         async with await db.connect(ctx.deps.memory.database_url) as connection:
             return await count(
                 connection,
@@ -205,7 +213,10 @@ async def count_messages(
 
 async def index_guild(deps: Deps) -> Semantic:
     try:
-        found, more = await index_pending(deps.connection, deps.embed, guild_id=deps.scope.guild_id)
+        # Its own connection: saving vectors can take seconds (each is an HNSW
+        # insert), and the run's other tools mustn't queue behind it.
+        async with await db.connect(deps.memory.database_url) as connection:
+            found, more = await index_pending(connection, deps.embed, guild_id=deps.scope.guild_id)
     except OperationalError:
         raise
     except Exception as error:  # noqa: BLE001 - preserve search without logging provider payloads

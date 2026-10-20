@@ -309,11 +309,20 @@ queries are an argument error returned to the model.
 
 ## Embeddings
 
-- **Pending** means a non-bot, non-empty, undeleted message with no row in
-  `message_embeddings`. There's no queue.
+- **Pending** means a searchable (non-bot or relayed, non-empty, undeleted, not
+  ignored) message with no row in `message_embeddings`. Pending messages are
+  listed in `message_embedding_queue` (migration 0027): replies read the queue,
+  not every message. Before it, finding pending messages walked all 236k
+  messages from the newest down, 5 to 7 s per reply in production, and
+  searches timed out behind it.
+- **Queue:** an `AFTER INSERT` trigger queues a new searchable message. A
+  saved vector takes its row out in the same statement. The host's query
+  checks every condition again, and drops rows that are already embedded or no
+  longer searchable.
 - **Staleness:** an `AFTER UPDATE OF content, deleted_at` trigger deletes the
-  vector. That covers every Rust write path (live update and REST upsert), so
-  Rust has no indexing code.
+  vector and queues the message again, or takes it out of the queue if it's
+  deleted or empty. That covers every Rust write path (live update and REST
+  upsert), so Rust has no indexing code.
 - **Write:** an `INSERT … SELECT … FOR SHARE` saves only when `md5(content)`
   still matches the embedded text. A concurrent edit is waited out and then
   rejected.
@@ -323,12 +332,16 @@ queries are an argument error returned to the model.
 - **When indexing happens:**
   - When a reply job starts, the guild's 256 newest pending messages are
     embedded in the background, in batches of 64, while the model reads the
-    prompt. The first search waits for this to finish; if the run ends without
-    a search, indexing is cancelled. If 256 were found, the guild reports
+    prompt, on a connection of its own (saving vectors means HNSW inserts,
+    which took up to 11 s on a cold cache). A search waits up to 4 s for
+    indexing, then searches what's already indexed and reports `"partial"`;
+    if the run ends without a search, indexing is cancelled. If 256 were found, the guild reports
     `"partial"`. A sleeping service does nothing; a reply can index pending
     messages from other channels in its guild.
   - History uses `kiki-agent-host index` (for example, through `railway ssh`).
-    It walks all pending messages newest first with a keyset cursor, logs
+    It first queues every searchable message without a vector (the one full
+    scan, so it also repairs the queue after a change to `ignored_authors`),
+    then walks the queue newest first with a keyset cursor, logs
     progress and cost, and exits. Rerun it any time.
 - **Cost:** about 25 tokens per message, so roughly $0.25 per million messages.
   Storage, about 2 GB per million, is the larger cost. A reply's embedding cost
