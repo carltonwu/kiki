@@ -112,7 +112,7 @@ async def find_quotes(
     person: str | None = None,
     query: str | None = None,
     limit: int = 25,
-    offset: int = 0,
+    cursor: str | None = None,
 ) -> dict:
     """Find this server's saved quotes: messages people saved with a quote bot
     (the `.quote` replies and "Quote #N" cards in a channel like #quotes).
@@ -127,7 +127,8 @@ async def find_quotes(
             a name they've gone by.
         query: Rank by meaning and keywords. Leave it out to list them newest first.
         limit: Maximum quotes, up to 50; a page of long ones holds fewer.
-        offset: Skip this many, to read on: the previous result's `next_offset`.
+        cursor: The previous result's `cursor`, to read on (with the same other
+            arguments).
     """
 
     async def work():
@@ -148,7 +149,7 @@ async def find_quotes(
                 query=query,
                 roster=ctx.deps.roster,
                 limit=limit,
-                offset=offset,
+                cursor=cursor,
                 deadline=deadline,
             )
 

@@ -114,14 +114,21 @@
           "parameters": {
             "additionalProperties": false,
             "properties": {
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The previous result's `cursor`, to read on (with the same other\narguments)."
+              },
               "limit": {
                 "default": 25,
                 "description": "Maximum quotes, up to 50; a page of long ones holds fewer.",
-                "type": "integer"
-              },
-              "offset": {
-                "default": 0,
-                "description": "Skip this many, to read on: the previous result's `next_offset`.",
                 "type": "integer"
               },
               "person": {
@@ -792,14 +799,21 @@
           "parameters": {
             "additionalProperties": false,
             "properties": {
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The previous result's `cursor`, to read on (with the same other\narguments)."
+              },
               "limit": {
                 "default": 25,
                 "description": "Maximum quotes, up to 50; a page of long ones holds fewer.",
-                "type": "integer"
-              },
-              "offset": {
-                "default": 0,
-                "description": "Skip this many, to read on: the previous result's `next_offset`.",
                 "type": "integer"
               },
               "person": {

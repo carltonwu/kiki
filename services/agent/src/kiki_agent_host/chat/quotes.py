@@ -15,7 +15,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from ..openrouter.embeddings import Embedder
-from .scope import MENTION, NO_ROSTER, PEOPLES, REF, USER_ID, Roster, Scope
+from .scope import MENTION, NO_ROSTER, PEOPLES, REF, USER_ID, Roster, Scope, speakers
 from .search import (
     CITE_SECONDS,
     COLUMNS,
@@ -228,12 +228,13 @@ async def find_quotes(
     query: str | None = None,
     roster: Roster = NO_ROSTER,
     limit: int = 25,
-    offset: int = 0,
+    cursor: str | None = None,
     deadline: Deadline = NO_DEADLINE,
 ) -> dict:
     """Each step gets what's left of `deadline` (search's caps, `bounded`): a slow
     embedding ranks by keywords only; citing late shows IDs; anything else late is
     an error rather than running the tool out of time."""
+    older, seen = parse_cursor(cursor)
     authors = None
     if person and person.strip():
         try:
@@ -270,17 +271,29 @@ async def find_quotes(
             logger.info("ranking quotes timed out channel_id=%s", scope.channel_id)
             return TOO_LONG
     else:
-        rows.sort(key=lambda r: r["created_at"], reverse=True)
-    offset, limit = max(0, offset), max(1, min(limit, MAX_LIMIT))
-    page = fit(rows[offset : offset + limit])
+        # Newest first, by (time, ID): a page boundary is a fixed point
+        # (`older:<ms>:<id>`), so quotes arriving meanwhile can't shift it.
+        rows.sort(key=position, reverse=True)
+    total = len(rows)
+    if older is not None:
+        rows = [r for r in rows if position(r) < older]
+    # Ranked order isn't fixed (new quotes change ranks), so its pages skip
+    # what earlier pages returned instead.
+    rows = [r for r in rows if r["id"] not in seen]
+    page = fit(rows[: max(1, min(limit, MAX_LIMIT))])
     # Whole texts, not search's snippets: a quote is quoted verbatim.
-    result: dict = {"total": len(rows)}
+    result: dict = {"total": total}
+
+    async def enrich():
+        cited = await cite_all(connection, scope, roster, page, chars=None)
+        names = {}
+        if authors and len(authors) > 1:
+            names = await speakers(connection, scope, roster, set(authors))
+        return cited, names
+
+    names = {}
     try:
-        result["messages"] = await bounded(
-            connection,
-            deadline.left(),
-            lambda: cite_all(connection, scope, roster, page, chars=None),
-        )
+        result["messages"], names = await bounded(connection, deadline.left(), enrich)
     except TimeoutError:
         # The quotes stand; only the lookups that label them ran out of time.
         result["messages"] = [cite(scope, r, dict(roster.speakers), {}, None) for r in page]
@@ -289,14 +302,48 @@ async def find_quotes(
     for quote, row in zip(result["messages"], page, strict=True):
         if not row["found"]:
             quote["saved_copy"] = True  # the quote bot's copy; the message isn't stored
-    if offset + len(page) < len(rows):
-        result["next_offset"] = offset + len(page)
-    if not rows:
+    if len(page) < len(rows):
+        if query and query.strip():
+            result["cursor"] = "seen:" + ",".join(str(i) for i in [*seen, *(r["id"] for r in page)])
+        else:
+            ms, id = position(page[-1])
+            result["cursor"] = f"older:{ms}:{id}"
+    if authors and len(authors) > 1:
+        # As search's: one name, several people, so attribute each quote with care.
+        result["note"] = (
+            f"{person!r} matches {len(authors)} different people: "
+            + "; ".join(names.get(a, str(a)) for a in authors)
+            + ". Quotes are from all of them; check who said each."
+        )
+    if not total:
         result["note"] = (
             "No saved quotes match. Quotes are what people saved with a quote bot;"
             " search_messages finds anything else they said."
         )
     return result
+
+
+CURSOR = re.compile(
+    r"^(?:older:(-?[0-9]{1,16}):([0-9]{1,19})|seen:([0-9]{1,19}(?:,[0-9]{1,19})*))$"
+)
+
+
+def position(row: dict) -> tuple[int, int]:
+    """A quote's place in newest-first order: its time (Unix ms), then its ID."""
+    return int(row["created_at"].timestamp() * 1000), row["id"]
+
+
+def parse_cursor(cursor: str | None) -> tuple[tuple[int, int] | None, set[int]]:
+    """`older:<ms>:<id>` (newest first: quotes before that one) or `seen:<id>,…`
+    (ranked: quotes not yet returned)."""
+    if cursor is None or not cursor.strip():
+        return None, set()
+    match = CURSOR.match(cursor.strip())
+    if not match:
+        raise ValueError("cursor must be the `cursor` from the previous result")
+    if match[3] is None:
+        return (int(match[1]), int(match[2])), set()
+    return None, {int(i) for i in match[3].split(",")}
 
 
 def fit(rows: list[dict]) -> list[dict]:

@@ -169,9 +169,11 @@ async def test_saved_quotes_are_the_messages_they_saved(db):
 
     # Paging.
     page = await quotes(db, limit=3)
-    assert len(page["messages"]) == 3 and page["next_offset"] == 3
-    rest = await quotes(db, limit=3, offset=3)
-    assert len(rest["messages"]) == 1 and "next_offset" not in rest
+    assert len(page["messages"]) == 3 and page["cursor"].startswith("older:")
+    rest = await quotes(db, limit=3, cursor=page["cursor"])
+    assert len(rest["messages"]) == 1 and "cursor" not in rest
+    with pytest.raises(ValueError):
+        await quotes(db, cursor="3")
 
     # Ranked by a query: keywords or meaning (only stored messages can be ranked).
     await index_pending(db, embedder(), guild_id=GUILD)
@@ -464,12 +466,13 @@ async def test_a_page_of_long_quotes_stops_at_its_text_budget(db):
     for i in range(15):
         await add(db, 10 + i, f"{i} {text}", days_ago=i + 1)
         await ub3r_quote(db, 100 + i, i, 10 + i, ALEX, "the quote")
-    pages, offset = [], 0
-    while offset is not None:
-        page = await quotes(db, limit=50, offset=offset)
+    pages, cursor = [], None
+    while True:
+        page = await quotes(db, limit=50, cursor=cursor)
         pages.append(len(page["messages"]))
         assert all(q["text"].endswith(text) for q in page["messages"])  # whole
-        offset = page.get("next_offset")
+        if (cursor := page.get("cursor")) is None:
+            break
     per_page = PAGE_CHARS // 4001
     assert sum(pages) == 15 and pages[0] == per_page and max(pages) == per_page
 
@@ -510,3 +513,37 @@ async def test_quotes_of_someone_with_no_stored_message_of_their_own(db):
             result,
         )
     assert "error" in await quotes(db, person="@nobody")
+
+
+async def test_pages_stay_put_when_a_quote_arrives_between_them(db):
+    # Review round 4: offsets over a list rebuilt each call repeated a quote.
+    for i in range(4):
+        await ub3r_quote(db, 20 + i, i, 1000000000000000001 + i, SAM, f"quote {i}")
+    first = await quotes(db, limit=2)
+    assert [q["text"] for q in first["messages"]] == ["quote 3", "quote 2"]
+    await ub3r_quote(db, 30, 9, 1000000000000000009, SAM, "a newer quote")
+    rest = await quotes(db, limit=2, cursor=first["cursor"])
+    assert [q["text"] for q in rest["messages"]] == ["quote 1", "quote 0"]
+    assert "cursor" not in rest
+    # Ranked pages skip what earlier ones returned, whatever ranks do meanwhile.
+    ranked = await quotes(db, query="quote", limit=2)
+    assert ranked["cursor"].startswith("seen:")
+    await ub3r_quote(db, 31, 10, 1000000000000000010, SAM, "quote quote quote")
+    again = await quotes(db, query="quote", limit=10, cursor=ranked["cursor"])
+    returned = [q["id"] for q in ranked["messages"]] + [q["id"] for q in again["messages"]]
+    assert len(returned) == len(set(returned)) == 6
+
+
+async def test_a_name_several_people_share_says_so(db):
+    # Review round 4: their quotes were merged without search's warning.
+    await add(db, 5, "hi", author_id=ALEX)
+    await add(db, 6, "hi", author_id=SAM)
+    await name(db, ALEX, "nick", "Chris")
+    await name(db, SAM, "global_name", "Chris")
+    await ub3r_quote(db, 20, 1, 1000000000000000001, ALEX, "alex's words")
+    await ub3r_quote(db, 21, 2, 1000000000000000002, SAM, "sam's words")
+    result = await quotes(db, person="Chris")
+    assert result["total"] == 2
+    assert "matches 2 different people" in result["note"]
+    assert "u1 Alex" in result["note"] and "u2 Sam" in result["note"]
+    assert "note" not in await quotes(db, person="u1")

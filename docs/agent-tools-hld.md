@@ -85,7 +85,7 @@ model arguments, and arguments can only narrow them.
   embedded. Her user ID is the author of her latest reply in the guild
   (`agent_runs.reply_message_ids`); the request doesn't carry it. A search with no
   hits, or an unknown `person`, says what to try instead.
-- `find_quotes(person?, query?, limit=25, offset=0)` (`chat/quotes.py`) returns the
+- `find_quotes(person?, query?, limit=25, cursor?)` (`chat/quotes.py`) returns the
   server's saved quotes: what people saved with a quote bot (UB3R-B0T's `.quote`
   embeds, PilzBrots' "Quote #N" Components V2 cards). Those posts have no
   `content`, so search skips them as bots' and history showed them blank; asked
@@ -109,11 +109,14 @@ model arguments, and arguments can only narrow them.
   but its quote cards only point at people's messages, like a link fixer's
   reposts. `person` matches anyone the guild has seen (`user_names`, mentions
   included), not only authors of stored messages: a quote's author often isn't
-  one. Without `query` it lists newest first (`total`, `next_offset`); with
+  one. Without `query` it lists newest first (`total`; `cursor` is `older:<ms>:<id>`, a
+  fixed point, so a quote arriving between pages can't repeat one); with
   one it ranks by keywords over every quote's text (copies included) and by
   meaning over stored ones (reciprocal rank fusion, exact distances over a few
   hundred rows). Quotes come whole, not as 1,000-character snippets; a page
-  stops at 12,000 characters (`next_offset` reads on). Its own connection and search's 9 s deadline
+  stops at 12,000 characters (`cursor` reads on; ranked pages, whose order can
+  change, skip what earlier ones returned: `seen:<ids>`). A name several people
+  share gets search's note naming each. Its own connection and search's 9 s deadline
   (`Deadline`, each step `bounded`), the lookup budget. In prod: 1,394 quote
   posts, 419 quotes, 394 originals stored.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
