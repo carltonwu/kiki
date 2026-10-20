@@ -52,16 +52,18 @@ after the send fails it at startup rather than posting the note again. The run i
 flagged `failure_note` (migration 0033) before the send, and every prompt
 source leaves out the messages such a run posted: the conversation, what a
 message replies to, recent channel context, Jev's routing context and the
-host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). If Discord posts the note
-but its response is lost (or the ingester crashes before recording it), the
-Gateway's or catch-up's copy is attributed to the run when it's stored
-(`store::upsert_messages`): a bot message with the note's exact text, in the
-channel the run was sending to, within two minutes of it, for a run with none
-recorded yet. REST history carries no nonce, so that's the match both paths
-share. What's left: a genuine message of Kiki's with exactly the note's text in
-that channel and window would be taken for the note. Normal replies have the
-same lost-response gap and no such repair: a reply posted without a response
-is stored, but isn't tagged into its conversation or attributed to its run.
+host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). The same filter
+also leaves out any bot message that is exactly the note's text, alone or under
+the redirect header (`-# ↪ <@author> in <link>`, when the reply went to the
+default channel). That covers a note Discord posted whose response was lost, or
+a crash before it was recorded on its run, with no work at ingest. Only bots'
+rows get either check, the text equality first, so the hot context queries pay
+next to nothing (0.06 ms against 0.01 ms for a channel-context query on 200k
+messages, 0.4 ms for a history page with 1,000 notes among 100k runs). The one
+false positive is Kiki writing exactly that parenthesised sentence herself,
+which would only hide that message. Normal replies have the same lost-response
+gap, with no repair: a reply posted without a response is stored, but isn't
+tagged into its conversation or attributed to its run.
 
 ## Files and behavior
 

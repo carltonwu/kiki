@@ -118,12 +118,20 @@ async def speakers(
 AUTHORS_HEARD = (
     "(m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)) OR m.relayed_for IS NOT NULL)"
 )
-# Nor the ingester's failure notes, known by the run that posted them (migration
-# 0033; Rust `agent::NOT_A_FAILURE_NOTE`), also evaluated once.
-HEARD = (
-    f"({AUTHORS_HEARD} AND m.id <> ALL (ARRAY(SELECT unnest(n.reply_message_ids)"
-    " FROM agent_runs n WHERE n.failure_note)))"
+# The ingester's failure notes: a bot's message with their exact text, alone or
+# under the redirect header (which covers one whose send response was lost), or
+# one their run recorded (migration 0033); only bots' rows get any of it. Rust's
+# `agent::NOT_A_FAILURE_NOTE`, character for character (test_history.py checks).
+NOT_A_FAILURE_NOTE = (
+    r"NOT (m.author_bot AND m.relayed_for IS NULL AND"
+    r" (m.content = '(couldn''t answer that one, try again?)'"
+    r" OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in"
+    r" https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one,"
+    r" try again\?\)$')"
+    r" OR m.id = ANY (ARRAY(SELECT unnest(n.reply_message_ids) FROM agent_runs n"
+    r" WHERE n.failure_note))))"
 )
+HEARD = f"({AUTHORS_HEARD} AND {NOT_A_FAILURE_NOTE})"
 # People's messages Kiki reads: no bots', but a link fixer's reposts of theirs.
 # Failure notes are Kiki's, so excluded already; this stays the rule migration
 # 0029's embedding queue repeats.

@@ -26,7 +26,12 @@ const REDIRECT_PREFIX: &str = "-# ↪ ";
 
 /// Who and what a redirected reply answers: subtext, so it stays out of the way,
 /// and a link back to the message. About 120 characters.
-fn redirect_header(guild_id: i64, channel_id: i64, message_id: i64, author_id: i64) -> String {
+pub(super) fn redirect_header(
+    guild_id: i64,
+    channel_id: i64,
+    message_id: i64,
+    author_id: i64,
+) -> String {
     format!(
         "{REDIRECT_PREFIX}<@{author_id}> in https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
     )

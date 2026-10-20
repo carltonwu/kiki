@@ -1869,9 +1869,8 @@ pub(super) mod tests {
         test.drop().await;
     }
 
-    /// The note is known by the run that posted it, so no prompt shows it:
-    /// not the conversation, not a reply to it, not another conversation's
-    /// channel context. Kiki's own words that happen to match it still show.
+    /// No prompt shows the note: not the conversation, not a reply to it, not
+    /// another conversation's channel context. Kiki's own words still show.
     #[tokio::test]
     async fn no_prompt_shows_a_failure_note() {
         let Some(test) = crate::test_db::migrated("ingester_failure_note_prompts").await else {
@@ -1896,8 +1895,8 @@ pub(super) mod tests {
         answer["type"] = json!(19);
         answer["message_reference"] = json!({"message_id": "500"});
         let elsewhere = message(602, sam, json!({}), "kiki what's for lunch", json!([]));
-        // Kiki saying the same words herself, in a normal reply.
-        let hers = message(603, kiki, json!({}), crate::agent::FAILURE_NOTE, json!([]));
+        // Kiki's own reply, later.
+        let hers = message(603, kiki, json!({}), "here's the meme", json!([]));
         store::upsert_messages(&db, GUILD, &[answer, elsewhere])
             .await
             .unwrap();
@@ -1929,7 +1928,7 @@ pub(super) mod tests {
         assert!(other.contains("help kiki where my meme at"), "{other}");
         assert!(!other.contains(crate::agent::FAILURE_NOTE), "{other}");
 
-        // Her own reply with the same words is hers, and shows.
+        // Her own reply is hers, and shows.
         store::upsert_messages(&db, GUILD, &[hers]).await.unwrap();
         sqlx::raw_sql(
             r#"
@@ -1955,20 +1954,17 @@ pub(super) mod tests {
             .await
             .unwrap();
         let later = shown(&agent.context(1, &[604]).await.unwrap().unwrap());
-        assert_eq!(
-            later.matches(crate::agent::FAILURE_NOTE).count(),
-            1,
-            "{later}"
-        );
+        assert!(later.contains("here's the meme"), "{later}");
+        assert!(!later.contains(crate::agent::FAILURE_NOTE), "{later}");
         test.drop().await;
     }
 
     /// Discord posts the note but the response never arrives (or the ingester
-    /// crashes before attributing it): the Gateway's or catch-up's copy is
-    /// attributed to the run by channel, text and time, so prompts still leave
-    /// it out. The same words elsewhere, or much later, stay Kiki's.
+    /// crashes before recording it), so no run claims the Gateway's or
+    /// catch-up's copy: it's left out by its text, as is a note redirected to
+    /// the default channel under its header. Kiki's other words still show.
     #[tokio::test]
-    async fn a_failure_note_whose_response_was_lost_is_still_known() {
+    async fn a_failure_note_whose_response_was_lost_is_left_out_by_its_text() {
         let Some(test) = crate::test_db::migrated("ingester_failure_note_lost").await else {
             return;
         };
@@ -1986,35 +1982,28 @@ pub(super) mod tests {
 
         let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
         let note = crate::agent::FAILURE_NOTE;
-        let mut elsewhere = message(901, kiki.clone(), json!({}), note, json!([]));
-        elsewhere["channel_id"] = json!("77");
-        let mut later = message(902, kiki.clone(), json!({}), note, json!([]));
-        let in_ten_minutes = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 600;
-        later["timestamp"] = json!(humantime(in_ten_minutes));
-        // As the Gateway (or a catch-up page) stores them; the note itself last.
-        store::upsert_messages(&db, GUILD, &[elsewhere, later])
+        // As the Gateway (or a catch-up page) stores them.
+        let posted = message(900, kiki.clone(), json!({}), note, json!([]));
+        let header = super::super::discord::redirect_header(GUILD, 44, 45, 101);
+        let redirected = message(
+            901,
+            kiki.clone(),
+            json!({}),
+            &format!("{header}\n{note}"),
+            json!([]),
+        );
+        let hers = message(902, kiki, json!({}), "found it, one sec", json!([]));
+        let alex = json!({"id": "101", "username": "alex"});
+        let again = message(903, alex, json!({}), "??", json!([]));
+        store::upsert_messages(&db, GUILD, &[posted, redirected, hers, again])
             .await
             .unwrap();
-        let posted = message(900, kiki, json!({}), note, json!([]));
-        store::upsert_messages(&db, GUILD, std::slice::from_ref(&posted))
-            .await
-            .unwrap();
-        // Stored again (catch-up after the Gateway): no change.
-        store::upsert_messages(&db, GUILD, &[posted]).await.unwrap();
         let ids: Option<Vec<i64>> =
             sqlx::query_scalar("SELECT reply_message_ids FROM agent_runs WHERE id = 1")
                 .fetch_one(&db)
                 .await
                 .unwrap();
-        assert_eq!(ids, Some(vec![900]));
-
-        let alex = json!({"id": "101", "username": "alex"});
-        let again = message(903, alex, json!({}), "??", json!([]));
-        store::upsert_messages(&db, GUILD, &[again]).await.unwrap();
+        assert_eq!(ids, None, "nothing ties them to the run");
         sqlx::raw_sql(
             r#"
             INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (2, 9, 2, 101);
@@ -2024,11 +2013,10 @@ pub(super) mod tests {
         .execute(&db)
         .await
         .unwrap();
-        // The note (900) is in the channel context's reach and left out; 902,
-        // the same words much later, is Kiki's and shows.
         let prompt = agent.context(2, &[903]).await.unwrap().unwrap();
         let shown: String = prompt.messages.iter().map(|m| m.content.as_str()).collect();
-        assert_eq!(shown.matches(note).count(), 1, "{shown}");
+        assert!(shown.contains("found it, one sec"), "{shown}");
+        assert!(!shown.contains(note), "{shown}");
         test.drop().await;
     }
 }

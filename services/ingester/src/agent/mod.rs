@@ -48,11 +48,15 @@ const NOTIFY_CHANNEL: &str = "agent_run_queued";
 /// Posted when a reply run fails after its trigger was accepted, like a
 /// drawing's `(couldn't make that picture)`: the request must not end in silence.
 pub(crate) const FAILURE_NOTE: &str = "(couldn't answer that one, try again?)";
-/// Leaves out the failure notes (`m` is the message), by the run that posted
-/// them, not their text: one InitPlan, like the ignored-authors filter.
-/// `chat/scope.py` HEARD has the same for the host's tools.
-pub(crate) const NOT_A_FAILURE_NOTE: &str = "m.id <> ALL (ARRAY(SELECT unnest(n.reply_message_ids) \
-     FROM agent_runs n WHERE n.failure_note))";
+/// Leaves out the failure notes (`m` is the message): a bot's own message that
+/// is exactly `FAILURE_NOTE`, or `FAILURE_NOTE` under the redirect header
+/// (`discord::redirect_header`), which also covers a note whose send response
+/// was lost or a crash before it was recorded; or one a `failure_note` run
+/// recorded (by provenance: one InitPlan over a partial index). Only bots'
+/// rows get any of it, the text equality first. The one false positive: Kiki
+/// writing exactly that sentence herself. `chat/scope.py` has the same for the
+/// host's tools (test_history.py checks they match).
+pub(crate) const NOT_A_FAILURE_NOTE: &str = r"NOT (m.author_bot AND m.relayed_for IS NULL AND (m.content = '(couldn''t answer that one, try again?)' OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one, try again\?\)$') OR m.id = ANY (ARRAY(SELECT unnest(n.reply_message_ids) FROM agent_runs n WHERE n.failure_note))))";
 /// Pending runs are also checked this often, in case a notification was lost
 /// while the listener reconnected.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -487,7 +491,7 @@ impl Agent {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
-        self.mark_delivering(claim.run_id, context.reply_to, None)
+        self.mark_delivering(claim.run_id, context.reply_to, false)
             .await?;
         self.react(&context, &plan.reactions, record).await;
         if plan.messages.is_empty() {
@@ -521,17 +525,11 @@ impl Agent {
             delay: Duration::ZERO,
         }];
         // As for a reply: once it may have been posted, a crash fails the run at
-        // startup instead of requeueing it, which would post the note again. Where
-        // it goes, so ingestion can attribute it if the send's response is lost.
-        let marked = match self.reply_target(context).await {
-            Ok(Some(target)) => self
-                .mark_delivering(claim.run_id, context.reply_to, Some(target.channel_id))
-                .await
-                .map_err(anyhow::Error::from),
-            Ok(None) => return, // nowhere it may go
-            Err(e) => Err(e),
-        };
-        if let Err(e) = marked {
+        // startup instead of requeueing it, which would post the note again.
+        if let Err(e) = self
+            .mark_delivering(claim.run_id, context.reply_to, true)
+            .await
+        {
             warn!(run_id = claim.run_id, error = %e, "couldn't post the failure note");
             return;
         }
@@ -554,19 +552,16 @@ impl Agent {
 
     /// Commit before any Discord send: a crash from here may have posted, so
     /// startup fails the run (`recover_runs`) instead of sending again.
-    /// `failure_note`: the channel the failure note goes to; prompts leave it out
-    /// (`NOT_A_FAILURE_NOTE`), and ingestion attributes it by channel and time
-    /// (`store::upsert_messages`).
+    /// `failure_note`: what's sent is the failure note, which prompts leave out
+    /// (`NOT_A_FAILURE_NOTE`).
     async fn mark_delivering(
         &self,
         run_id: i64,
         reply_to: i64,
-        failure_note: Option<i64>,
+        failure_note: bool,
     ) -> sqlx::Result<()> {
         sqlx::query(
-            "UPDATE agent_runs SET status = 'delivering', reply_to_id = $2, \
-             failure_note = $3 IS NOT NULL, failure_note_channel_id = $3, \
-             failure_note_at = CASE WHEN $3 IS NOT NULL THEN now() END \
+            "UPDATE agent_runs SET status = 'delivering', reply_to_id = $2, failure_note = $3 \
              WHERE id = $1",
         )
         .bind(run_id)
