@@ -125,15 +125,15 @@ it to other roles under Server Settings → Integrations → Kiki.
 | --- | --- |
 | `/kiki conversations` | The active pool: channel, messages, people, last activity and cost per conversation, then each one's topic and participants. |
 | `/kiki clear` | Closes every active conversation in the server (`closed_reason = 'cleared'`), so the next message starts fresh. History and costs stay. Requires Manage Server. |
-| `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost (chat, Decide, topics). Each over 24 h, 7 d and all time. |
+| `/kiki stats` | Conversations, replies, failures and reply latency (p50/p95); messages by routing check; LLM cost by kind: replies (with their searches, images read and web fees), drawings, Decide, topic summaries and emoji descriptions. Each over 24 h, 7 d and all time; the same billed costs as Grafana's Kiki / Cost dashboard, except failed replies, emoji embeddings and backfills, which only Grafana counts. |
 | `/kiki runs [status] [limit]` | The latest agent runs (default 10, max 25): channel, status, time, cost and age, with error text for failed runs. |
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
 | `/kiki users [period] [sort]` | Top 20 active people by cost (default), messages or conversations. Period: `24h`, `7d` (default) or `all`. Shows total messages, messages with Kiki, conversations and attributed LLM cost. |
 | `/kiki emojis [resync] [redescribe]` | The server's custom emoji with Kiki's description of each. `resync:true` copies the list from Discord, marks deleted emoji removed, and has a vision model describe new ones; `redescribe:true` also replaces existing descriptions. Resyncing requires Manage Server. |
 | `/kiki whois <user>` | Up to 15 recently seen names (nickname, display name, username), first/last seen, join and message dates, plus messages, conversations and attributed cost over 24 h, 7 d and all time. |
 
-Per-person cost splits reply cost across the triggering messages and includes Decide;
-it excludes topic summaries. `/kiki runs` accepts `pending`, `running`, `delivering`,
+Per-person cost splits the cost of a reply and its drawings across the triggering
+messages and includes Decide; it excludes topic summaries. `/kiki runs` accepts `pending`, `running`, `delivering`,
 `done`, `failed` or `superseded` as its status filter.
 
 The bot must be invited with the `applications.commands` scope for registration to succeed.

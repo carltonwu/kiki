@@ -1,0 +1,14 @@
+name: /kiki stats and /kiki users count a drawing's cost (the stub image model bills $0.04)
+steps:
+  - say: {as: alex, in: general, text: "kiki draw a frog for me"}
+    reply: {tool: {name: generate_image, args: {prompt: "a frog on a lily pad"}}, text: "one frog coming up"}
+  - expect: {run: done, followup: {status: done, attachments: 1}}
+  - expect: {sql: "SELECT round(cost_usd::numeric, 2)::text FROM agent_image_jobs ORDER BY id DESC LIMIT 1", equals: "0.04"}
+  # Every kind of spend has its own row; the drawing is the only one this large.
+  - slash: {as: alex, in: general, command: stats}
+  - expect: {response_contains: "drawings"}
+  - expect: {response_contains: "emoji"}
+  - expect: {response_contains: "$0.04"}
+  # Per person, a drawing's cost goes to whoever asked for it.
+  - slash: {as: alex, in: general, command: users}
+  - expect: {response_contains: "$0.04"}

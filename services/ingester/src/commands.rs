@@ -80,7 +80,28 @@ const MAX_USER_ROWS: usize = 20;
 /// interaction token that answers it lasts 15 minutes.
 const DESCRIBE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// How per-person cost is attributed.
-const COST_NOTE: &str = "Cost: replies split across the messages that triggered them, plus Decide; topic summaries excluded";
+const COST_NOTE: &str = "Cost: replies and their drawings split across the messages that triggered them, plus Decide; topic summaries excluded";
+/// What `/kiki stats`' cost rows cover: every purpose Grafana's Kiki / Cost
+/// dashboard shows (`kiki_llm_cost_usd_total`), grouped by what the database records.
+const COSTS_NOTE: &str = "Replies include their searches, images read and web fees; drawings their \
+reference images and failure notes; emoji, descriptions. Only on Grafana (not stored): failed \
+replies, emoji embeddings, backfills.";
+
+/// A server's LLM spend in one time window, by what it was for (USD).
+#[derive(Debug, Default, FromRow, PartialEq)]
+struct Costs {
+    replies: f64,
+    drawings: f64,
+    decide: f64,
+    topics: f64,
+    emoji: f64,
+}
+
+impl Costs {
+    fn total(&self) -> f64 {
+        self.replies + self.drawings + self.decide + self.topics + self.emoji
+    }
+}
 
 /// One person's activity in one time window.
 #[derive(FromRow)]
@@ -526,14 +547,11 @@ impl Commands {
             via_active: i64,
             via_none: i64,
             routed: i64,
-            chat_cost: f64,
-            decide_cost: f64,
         }
         #[derive(FromRow)]
         struct Now {
             pending: i64,
             running: i64,
-            topic_cost: f64,
         }
         let windows: Vec<Window> = sqlx::query_as(
             r#"
@@ -541,12 +559,9 @@ impl Commands {
                                         (1, now() - interval '7 days'),
                                         (2, '-infinity'::timestamptz)),
             conv AS (SELECT id, created_at FROM conversations WHERE guild_id = $1),
-            runs AS (SELECT r.status, r.latency_ms, r.cost_usd,
-                            coalesce(r.finished_at, r.created_at) AS at
+            runs AS (SELECT r.status, r.latency_ms, coalesce(r.finished_at, r.created_at) AS at
                      FROM agent_runs r JOIN conv ON conv.id = r.conversation_id),
-            -- Decide cost is stored on every message of a pool; `newest` counts it once.
-            cls AS (SELECT c.check_hit, c.outcome, c.jev_cost_usd, c.classified_at AS at,
-                           c.message_id = c.pool_id AS newest
+            cls AS (SELECT c.check_hit, c.outcome, c.classified_at AS at
                     FROM classifications c JOIN messages m ON m.id = c.message_id
                     WHERE m.guild_id = $1),
             tagged AS (SELECT cm.tagged_at AS at
@@ -566,10 +581,7 @@ impl Commands {
                 (SELECT count(*) FROM cls WHERE check_hit = 'active_conversation' AND at > w.since)
                     AS via_active,
                 (SELECT count(*) FROM cls WHERE check_hit = 'none' AND at > w.since) AS via_none,
-                (SELECT count(*) FROM cls WHERE outcome <> 'no' AND at > w.since) AS routed,
-                (SELECT coalesce(sum(cost_usd), 0) FROM runs WHERE at > w.since) AS chat_cost,
-                (SELECT coalesce(sum(jev_cost_usd), 0) FROM cls WHERE newest AND at > w.since)
-                    AS decide_cost
+                (SELECT count(*) FROM cls WHERE outcome <> 'no' AND at > w.since) AS routed
             FROM w ORDER BY w.n
             "#,
         )
@@ -580,9 +592,7 @@ impl Commands {
             r#"
             SELECT
                 count(*) FILTER (WHERE r.status = 'pending') AS pending,
-                count(*) FILTER (WHERE r.status IN ('running', 'delivering')) AS running,
-                (SELECT coalesce(sum(topic_cost_usd), 0) FROM conversations WHERE guild_id = $1)
-                    AS topic_cost
+                count(*) FILTER (WHERE r.status IN ('running', 'delivering')) AS running
             FROM agent_runs r JOIN conversations c ON c.id = r.conversation_id
             WHERE c.guild_id = $1 AND r.status IN ('pending', 'running', 'delivering')
             "#,
@@ -590,6 +600,7 @@ impl Commands {
         .bind(guild_id)
         .fetch_one(&self.db)
         .await?;
+        let costs = guild_costs(&self.db, guild_id).await?;
 
         let row = |label: &str, cell: &dyn Fn(&Window) -> String| -> Vec<String> {
             std::iter::once(label.to_owned())
@@ -612,38 +623,11 @@ impl Commands {
             row("No match", &|w| w.via_none.to_string()),
             row("Routed", &|w| w.routed.to_string()),
         ];
-        // Topic summaries aren't timestamped, so their cost only has an all-time total.
-        let topic_cell = |i: usize| {
-            if i == 2 {
-                usd(current.topic_cost)
-            } else {
-                "–".to_owned()
-            }
-        };
-        let mut cost = vec![
-            row("Chat", &|w| usd(w.chat_cost)),
-            row("Decide", &|w| usd(w.decide_cost)),
-        ];
-        cost.push(
-            std::iter::once("Topics".to_owned())
-                .chain((0..windows.len()).map(topic_cell))
-                .collect(),
-        );
-        cost.push(
-            std::iter::once("Total".to_owned())
-                .chain(windows.iter().enumerate().map(|(i, w)| {
-                    let topics = if i == 2 { current.topic_cost } else { 0.0 };
-                    usd(w.chat_cost + w.decide_cost + topics)
-                }))
-                .collect(),
-        );
-
         let description = format!(
-            "**Activity**\n{}**Routing** · messages by the first check they matched\n{}**Cost** · USD\n{}\
-             Topic summaries have no timestamp, so their cost counts toward All only.",
+            "**Activity**\n{}**Routing** · messages by the first check they matched\n{}**Cost** · USD\n{}{COSTS_NOTE}",
             table(&WINDOW_COLUMNS, &activity),
             table(&WINDOW_COLUMNS, &routing),
-            table(&WINDOW_COLUMNS, &cost),
+            table(&WINDOW_COLUMNS, &cost_rows(&costs)),
         );
         Ok(EmbedBuilder::new()
             .color(COLOR)
@@ -1085,6 +1069,15 @@ impl Commands {
                 JOIN mine m ON m.id = t.id
                 WHERE r.cost_usd IS NOT NULL
                 UNION ALL
+                -- Its drawings' cost, split the same way.
+                SELECT m.author_id, coalesce(j.finished_at, j.created_at), 0, 0, NULL,
+                       j.cost_usd / cardinality(r.trigger_message_ids)
+                FROM agent_image_jobs j
+                JOIN agent_runs r ON r.id = j.run_id
+                CROSS JOIN unnest(r.trigger_message_ids) t(id)
+                JOIN mine m ON m.id = t.id
+                WHERE j.cost_usd IS NOT NULL
+                UNION ALL
                 -- Decide cost is stored on every message of a pool (one person's);
                 -- count it once, on the newest.
                 SELECT m.author_id, c.classified_at, 0, 0, NULL, c.jev_cost_usd
@@ -1110,6 +1103,63 @@ impl Commands {
         .fetch_all(&self.db)
         .await
     }
+}
+
+/// A server's spend for each of [`WINDOWS`], in order, from the costs the
+/// database records: replies (`agent_runs`: the chat model with web fees, plus the
+/// searches' embeddings and images read during the reply), drawings
+/// (`agent_image_jobs`: the image, its references' vision and any failure note),
+/// Decide (`classifications`), topic summaries (`topic_summaries`) and emoji
+/// descriptions (`guild_emojis`). All are OpenRouter's (or Jev's) billed cost.
+async fn guild_costs(db: &PgPool, guild_id: i64) -> sqlx::Result<Vec<Costs>> {
+    sqlx::query_as(
+        r#"
+        WITH w(n, since) AS (VALUES (0, now() - interval '24 hours'),
+                                    (1, now() - interval '7 days'),
+                                    (2, '-infinity'::timestamptz)),
+        conv AS (SELECT id FROM conversations WHERE guild_id = $1),
+        runs AS (SELECT r.id, r.cost_usd, coalesce(r.finished_at, r.created_at) AS at
+                 FROM agent_runs r JOIN conv ON conv.id = r.conversation_id),
+        drawings AS (SELECT j.cost_usd, coalesce(j.finished_at, j.created_at) AS at
+                     FROM agent_image_jobs j JOIN runs ON runs.id = j.run_id),
+        -- Decide cost is stored on every message of a pool; count it once, on the newest.
+        decide AS (SELECT c.jev_cost_usd AS cost_usd, c.classified_at AS at
+                   FROM classifications c JOIN messages m ON m.id = c.message_id
+                   WHERE m.guild_id = $1 AND c.message_id = c.pool_id),
+        topics AS (SELECT t.cost_usd, t.created_at AS at
+                   FROM topic_summaries t JOIN conv ON conv.id = t.conversation_id),
+        -- A redescribed emoji's cost adds up, counted when it was last described.
+        emoji AS (SELECT describe_cost_usd AS cost_usd, described_at AS at
+                  FROM guild_emojis WHERE guild_id = $1)
+        SELECT
+            (SELECT coalesce(sum(cost_usd), 0) FROM runs WHERE at > w.since) AS replies,
+            (SELECT coalesce(sum(cost_usd), 0) FROM drawings WHERE at > w.since) AS drawings,
+            (SELECT coalesce(sum(cost_usd), 0) FROM decide WHERE at > w.since) AS decide,
+            (SELECT coalesce(sum(cost_usd), 0) FROM topics WHERE at > w.since) AS topics,
+            (SELECT coalesce(sum(cost_usd), 0) FROM emoji WHERE at > w.since) AS emoji
+        FROM w ORDER BY w.n
+        "#,
+    )
+    .bind(guild_id)
+    .fetch_all(db)
+    .await
+}
+
+/// `/kiki stats`' cost table body: one row per kind of spend, then the total.
+fn cost_rows(windows: &[Costs]) -> Vec<Vec<String>> {
+    let row = |label: &str, cost: fn(&Costs) -> f64| -> Vec<String> {
+        std::iter::once(label.to_owned())
+            .chain(windows.iter().map(|w| usd(cost(w))))
+            .collect()
+    };
+    vec![
+        row("Replies", |c| c.replies),
+        row("Drawings", |c| c.drawings),
+        row("Decide", |c| c.decide),
+        row("Topics", |c| c.topics),
+        row("Emoji", |c| c.emoji),
+        row("Total", Costs::total),
+    ]
 }
 
 /// Describe batches until none are left, nothing progresses, or the deadline.
@@ -1569,6 +1619,74 @@ mod tests {
     use std::time::Duration;
 
     use super::{Align, definition, duration, seconds, table, truncate, usd};
+
+    #[tokio::test]
+    async fn guild_costs_cover_every_kind_of_spend_by_window() {
+        let Some(test) = crate::test_db::migrated("guild_costs_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        // Guild 9 is ours; guild 8's spend must not show. Costs are binary
+        // fractions, so sums are exact.
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES
+                (1, 9, 2, 100), (2, 8, 3, 100);
+            INSERT INTO messages (id, guild_id, channel_id, author_id, created_at, raw) VALUES
+                (10, 9, 2, 100, now(), '{}'), (11, 9, 2, 100, now(), '{}'), (20, 8, 3, 100, now(), '{}');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status, cost_usd, finished_at) VALUES
+                (1, 1, '{11}', 'done', 0.25, now() - interval '1 hour'),
+                (2, 1, '{11}', 'done', 0.5, now() - interval '3 days'),
+                (3, 1, '{11}', 'failed', NULL, now()),
+                (4, 2, '{20}', 'done', 64, now());
+            INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status, cost_usd, finished_at) VALUES
+                (1, 1, 11, '{}', 'done', 1, now() - interval '1 hour'),
+                (2, 1, 11, '{}', 'failed', 2, now() - interval '30 days'),
+                (4, 1, 20, '{}', 'done', 64, now());
+            -- Decide's cost is on every message of the pool (10, 11): counted once.
+            INSERT INTO classifications (message_id, pool_id, classified_at, check_hit, jev_cost_usd, outcome) VALUES
+                (10, 11, now() - interval '2 hours', 'none', 0.125, 'new'),
+                (11, 11, now() - interval '2 hours', 'none', 0.125, 'new'),
+                (20, 20, now(), 'none', 64, 'new');
+            INSERT INTO topic_summaries (job_id, conversation_id, cost_usd, created_at) VALUES
+                ('topic:1:10:12', 1, 0.0625, now() - interval '1 hour'),
+                ('topic:1:11:12', 1, 0.03125, now() - interval '10 days'),
+                ('topic:2:20:12', 2, 64, now());
+            INSERT INTO guild_emojis (id, guild_id, name, raw, describe_cost_usd, described_at) VALUES
+                (81, 9, 'froge', '{}', 0.015625, now() - interval '2 days'),
+                (82, 9, 'huh', '{}', NULL, NULL),
+                (83, 8, 'oop', '{}', 64, now());
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let costs = super::guild_costs(&db, 9).await.unwrap();
+        let cost = |replies, drawings, topics, emoji| super::Costs {
+            replies,
+            drawings,
+            decide: 0.125,
+            topics,
+            emoji,
+        };
+        assert_eq!(
+            costs,
+            [
+                cost(0.25, 1.0, 0.0625, 0.0),
+                cost(0.75, 1.0, 0.0625, 0.015625),
+                cost(0.75, 3.0, 0.09375, 0.015625),
+            ]
+        );
+        let rows = super::cost_rows(&costs);
+        let labels: Vec<_> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Replies", "Drawings", "Decide", "Topics", "Emoji", "Total"]
+        );
+        assert_eq!(rows[5], ["Total", "$1.44", "$1.95", "$3.98"]);
+        test.drop().await;
+    }
 
     #[test]
     fn formats_cost() {

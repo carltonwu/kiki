@@ -75,10 +75,11 @@ impl Agent {
             c.topic.as_deref().unwrap_or("(none yet)"),
             transcript.join("\n"),
         );
+        let job_id = topic_job_id(conversation_id, through, settings.topic_sample_messages);
         let completion = self
             .host
             .execute(&JobRequest {
-                id: topic_job_id(conversation_id, through, settings.topic_sample_messages),
+                id: job_id.clone(),
                 kind: "topic".into(),
                 scope: Scope::new(c.guild_id, c.channel_id, conversation_id),
                 model: self.config.topic_model.clone(),
@@ -88,11 +89,13 @@ impl Agent {
                 image_model: None,
             })
             .await?;
-        sqlx::query("UPDATE conversations SET topic_cost_usd = topic_cost_usd + $2 WHERE id = $1")
-            .bind(conversation_id)
-            .bind(completion.usage.cost.unwrap_or(0.0))
-            .execute(&self.db)
-            .await?;
+        record_cost(
+            &self.db,
+            &job_id,
+            conversation_id,
+            completion.usage.cost.unwrap_or(0.0),
+        )
+        .await?;
         let Some(topic) = clean_topic(&completion.text) else {
             anyhow::bail!("agent host returned an empty topic");
         };
@@ -122,6 +125,26 @@ impl Agent {
     }
 }
 
+/// Records a topic job's cost once: a retry the host answers from its saved
+/// result has the same job ID and wasn't billed again.
+async fn record_cost(
+    db: &sqlx::PgPool,
+    job_id: &str,
+    conversation_id: i64,
+    cost: f64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO topic_summaries (job_id, conversation_id, cost_usd) VALUES ($1, $2, $3) \
+         ON CONFLICT (job_id) DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(conversation_id)
+    .bind(cost)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 fn topic_job_id(conversation_id: i64, through: i64, sample: i64) -> String {
     format!("topic:{conversation_id}:{through}:{sample}")
 }
@@ -144,7 +167,30 @@ fn clean_topic(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_topic, topic_job_id};
+    use super::{clean_topic, record_cost, topic_job_id};
+
+    #[tokio::test]
+    async fn a_reused_job_result_is_not_counted_again() {
+        let Some(test) = crate::test_db::migrated("topic_cost_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        sqlx::query("INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 10, 20, 30)")
+            .execute(&db)
+            .await
+            .unwrap();
+        record_cost(&db, "topic:1:100:12", 1, 0.25).await.unwrap();
+        record_cost(&db, "topic:1:100:12", 1, 0.25).await.unwrap();
+        record_cost(&db, "topic:1:101:12", 1, 0.5).await.unwrap();
+        let total: f64 = sqlx::query_scalar(
+            "SELECT sum(cost_usd) FROM topic_summaries WHERE conversation_id = 1",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(total, 0.75);
+        test.drop().await;
+    }
 
     #[test]
     fn changed_sample_uses_a_distinct_durable_job() {
