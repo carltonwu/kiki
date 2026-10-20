@@ -4,8 +4,11 @@ Hybrid: full text plus pgvector, fused by reciprocal rank with a small recency
 vote. Everything is scoped to one guild: Kiki knows every channel she can read.
 """
 
+import asyncio
 import logging
+import math
 import re
+import time
 from datetime import datetime
 from typing import Literal
 
@@ -49,9 +52,30 @@ SHORTLIST = 200
 # scans keep walking the graph until the LIMIT is met; relaxed order is fine
 # because the shortlist is reranked.
 INDEX_SETTINGS = "SET hnsw.ef_search = 200; SET hnsw.iterative_scan = relaxed_order"
-# The search query's part of the tool deadline (agent/tools/messages.py
-# INDEX_WAIT_SECONDS). A cold HNSW cache made one take 5.7 s in production.
-STATEMENT_TIMEOUT = "3s"
+# Caps on a search's steps, each also cut to what's left of its deadline
+# (`Deadline`; the search_messages tool gives it 9 s of its 10). A cold HNSW
+# cache made one search query take 5.7 s in production.
+EMBED_SECONDS = 4  # the query embedding; past it, the search is lexical
+STATEMENT_SECONDS = 3  # the hybrid query; past it, a lexical one is tried
+LEXICAL_SECONDS = 1  # kept back for that lexical query
+CITE_SECONDS = 1  # kept back for citing the results (names, channels, links)
+
+
+class Deadline:
+    """One wall-clock deadline that a search's steps share. Local to search on
+    purpose: each use is `min(cap, deadline.left(keep=...))`, so it maps onto
+    a shared deadline helper (one that caps a step to the time left) if the
+    host gets one."""
+
+    def __init__(self, seconds: float):
+        self.at = time.monotonic() + seconds
+
+    def left(self, keep: float = 0) -> float:
+        """Seconds left, less `keep` held back for later steps (never below 0)."""
+        return max(0.0, self.at - time.monotonic() - keep)
+
+
+NO_DEADLINE = Deadline(math.inf)
 
 
 Semantic = Literal["full", "partial", "off"]
@@ -115,6 +139,22 @@ LIMIT %(limit)s
 """
 
 
+async def run_search(connection: AsyncConnection, params: dict, seconds: float) -> list | None:
+    """SEARCH under a server-side statement timeout; None if it ran out (or no
+    time was left to start it)."""
+    if seconds < 0.05:
+        return None
+    cursor = connection.cursor(row_factory=dict_row)
+    try:
+        async with connection.transaction():
+            await cursor.execute(f"SET LOCAL statement_timeout = '{int(seconds * 1000)}ms'")
+            await cursor.execute(INDEX_SETTINGS)
+            await cursor.execute(SEARCH, params)
+            return await cursor.fetchall()
+    except errors.QueryCanceled:
+        return None
+
+
 async def search(
     connection: AsyncConnection,
     embed: Embedder,
@@ -128,8 +168,11 @@ async def search(
     after: datetime | None = None,
     limit: int = 10,
     semantic: Semantic = "full",
+    deadline: Deadline = NO_DEADLINE,
 ) -> dict:
-    """`semantic` is the coverage of the guild's embeddings going in."""
+    """`semantic` is the coverage of the guild's embeddings going in. Each step
+    gets what's left of `deadline`: a slow embedding or hybrid query falls back
+    to a lexical search rather than running the caller out of time."""
     if not query.strip():
         raise ValueError("query must not be empty")
     authors = None
@@ -143,7 +186,11 @@ async def search(
         if not channels:
             return {"error": f"There's no channel named {channel!r} in this server."}
     try:
-        [vector] = await embed([query], query=True)
+        # A total, unlike the client's own timeouts (per connect, read, ...).
+        async with asyncio.timeout(
+            min(EMBED_SECONDS, deadline.left(keep=LEXICAL_SECONDS + CITE_SECONDS))
+        ):
+            [vector] = await embed([query], query=True)
     except Exception as error:  # noqa: BLE001 - lexical fallback without logging provider payloads
         logger.warning(
             "query embedding failed channel_id=%s conversation_id=%s error_type=%s; "
@@ -171,14 +218,25 @@ async def search(
         "recency": 0 if before or after else RECENCY_WEIGHT,
         "limit": max(1, min(limit, 10)),
     }
-    cursor = connection.cursor(row_factory=dict_row)
-    try:
-        async with connection.transaction():
-            await cursor.execute(f"SET LOCAL statement_timeout = '{STATEMENT_TIMEOUT}'")
-            await cursor.execute(INDEX_SETTINGS)
-            await cursor.execute(SEARCH, params)
-            rows = await cursor.fetchall()
-    except errors.QueryCanceled:
+    rows = None
+    if vector is not None:
+        rows = await run_search(
+            connection,
+            params,
+            min(STATEMENT_SECONDS, deadline.left(keep=LEXICAL_SECONDS + CITE_SECONDS)),
+        )
+        if rows is None:
+            logger.info(
+                "hybrid search timed out channel_id=%s conversation_id=%s; searching lexically",
+                scope.channel_id,
+                scope.conversation_id,
+            )
+            params["vector"], semantic = None, "off"
+    if rows is None:
+        rows = await run_search(
+            connection, params, min(STATEMENT_SECONDS, deadline.left(keep=CITE_SECONDS))
+        )
+    if rows is None:
         logger.info(
             "search timed out channel_id=%s conversation_id=%s semantic=%s",
             scope.channel_id,

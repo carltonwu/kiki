@@ -319,8 +319,13 @@ queries are an argument error returned to the model.
   saved vector takes its row out in the same statement. The host's query
   checks every condition again. Each reply drops stale rows (already embedded
   or no longer searchable) among the guild's 1,024 newest queued ones, so its
-  cost doesn't grow with a backlog. The searchability rule is repeated in the
-  migration's trigger function; `test_retrieval.py` checks that the two agree.
+  cost doesn't grow with a backlog. Stale rows past that window go as the
+  queue drains to them, or in `kiki-agent-host index`'s full sweep. Both
+  queries walk the queue first and look messages up by primary key (a
+  LATERAL subquery the planner can't reorder), whatever the statistics say;
+  `test_retrieval.py` checks the plan with 20k embedded messages and a drained
+  queue. The searchability rule is repeated in the migration's trigger
+  function; `test_retrieval.py` checks that the two agree.
 - **Ignoring and un-ignoring authors:** nothing reacts to a change in
   `ignored_authors`. A newly ignored author's queued messages are skipped and
   dropped. An un-ignored author's messages are never re-queued by a trigger:
@@ -344,9 +349,13 @@ queries are an argument error returned to the model.
     indexing, then searches what's already indexed and reports `"partial"`;
     if the run ends without a search, indexing is cancelled. Indexing errors,
     database ones included, also mean `"partial"`, never a failed reply. The
-    search's 10 s tool deadline splits as 2 s for indexing, 4 s for the query
-    embedding and 3 s for the SQL (a `statement_timeout`, on its own
-    connection); a timed-out query is an error the model sees. If 256 were found, the guild reports
+    search works to one 9 s deadline inside its 10 s tool deadline, and each
+    step gets at most its cap and never more than is left: the indexing wait
+    (2 s), connecting (2 s), the query embedding (4 s, a total; past it the
+    search is lexical), the hybrid query (3 s, a `statement_timeout` on the
+    search's own connection; past it a lexical query is tried), with 1 s held
+    back for that and 1 s for citing. Only when the lexical query also runs
+    out is the result an error the model sees. If 256 were found, the guild reports
     `"partial"`. A sleeping service does nothing; a reply can index pending
     messages from other channels in its guild.
   - History uses `kiki-agent-host index` (for example, through `railway ssh`).

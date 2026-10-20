@@ -468,16 +468,87 @@ async def test_a_search_does_not_wait_long_for_indexing(db, database_url, monkey
     assert await deps.indexing == "full"
 
 
-async def test_a_slow_search_query_is_an_error_for_kiki(db, monkeypatch):
-    # Within its 10 s tool deadline, behind the index wait and the query embedding.
+# Raises what a statement timeout raises when `semantic` is true: a timed-out
+# query without depending on timing.
+CANCEL_IF = """
+CREATE FUNCTION cancel_if(semantic boolean) RETURNS boolean LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+    IF semantic THEN
+        RAISE EXCEPTION 'canceling statement due to statement timeout'
+            USING ERRCODE = 'query_canceled';
+    END IF;
+    RETURN true;
+END
+$$
+"""
+
+
+async def test_a_timed_out_hybrid_search_falls_back_to_lexical(db, monkeypatch):
     await add(db, 96, "release plan")
-    monkeypatch.setattr(search_module, "STATEMENT_TIMEOUT", "50ms")
-    monkeypatch.setattr(search_module, "SEARCH", "SELECT pg_sleep(1) FROM (SELECT %(limit)s) x")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    await db.execute(CANCEL_IF)
+    timed_out = f"SELECT * FROM ({search_module.SEARCH}) s WHERE cancel_if(%(vector)s IS NOT NULL)"
+    monkeypatch.setattr(search_module, "SEARCH", timed_out)
+    result = await search(db, embedder(), SCOPE, "release plan")
+    assert result["semantic"] == "off"
+    assert [m["id"] for m in result["messages"]] == ["96"]
+    # SET LOCAL: the connection keeps no timeout.
+    cursor = await db.execute("SELECT current_setting('statement_timeout')")
+    assert (await cursor.fetchone())[0] == "0"
+
+
+async def test_a_search_that_times_out_both_ways_is_an_error_for_kiki(db, monkeypatch):
+    await add(db, 97, "release plan")
+    await db.execute(CANCEL_IF)
+    monkeypatch.setattr(search_module, "SEARCH", "SELECT cancel_if(true) FROM (SELECT %(limit)s) x")
     result = await search(db, embedder(), SCOPE, "release plan")
     assert result == {"error": "The search took too long. Try again, or narrow it down."}
-    # The connection is usable afterwards, without the timeout.
-    cursor = await db.execute("SELECT pg_sleep(0.1), current_setting('statement_timeout')")
-    assert (await cursor.fetchone())[1] == "0"
+
+
+async def test_a_search_fits_its_deadline_when_every_step_is_slow(db, database_url, monkeypatch):
+    """Seen in review: a 2 s index wait, a 1.5 s connect, a 3.8 s embedding and
+    2.9 s of SQL, each under its own cap, added up to the tool's bare timeout."""
+    await add(db, 98, "release plan")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    # Caps that add up to more than the deadline, so the deadline binds; the
+    # lexical query keeps 0.3 s, plenty on a loaded machine.
+    monkeypatch.setattr(message_tools, "SEARCH_SECONDS", 1.5)
+    monkeypatch.setattr(message_tools, "INDEX_WAIT_SECONDS", 0.5)
+    monkeypatch.setattr(message_tools, "CONNECT_SECONDS", 0.3)
+    monkeypatch.setattr(search_module, "EMBED_SECONDS", 0.8)
+    monkeypatch.setattr(search_module, "STATEMENT_SECONDS", 0.3)
+    monkeypatch.setattr(search_module, "LEXICAL_SECONDS", 0.4)
+    monkeypatch.setattr(search_module, "CITE_SECONDS", 0.2)
+    connect = db_module.connect
+
+    async def slow_connect(url, **kwargs):
+        await asyncio.sleep(0.15)
+        return await connect(url, **kwargs)
+
+    monkeypatch.setattr(db_module, "connect", slow_connect)
+
+    class SlowEmbeddings(FakeEmbeddings):
+        async def create(self, model, input):
+            await asyncio.sleep(10)
+
+    deps = SimpleNamespace(
+        connection=db,
+        embed=Embedder(SimpleNamespace(embeddings=SlowEmbeddings())),
+        scope=SCOPE,
+        roster=Roster(),
+        spent=Counter(),
+        job_id="reply:test",
+        indexing=asyncio.create_task(asyncio.sleep(10, "full")),
+        memory=MemorySession(database_url),
+    )
+    started = asyncio.get_running_loop().time()
+    result = await message_tools.search_messages(SimpleNamespace(deps=deps), "release plan")
+    # Its 1.5 s deadline, with room for a loaded machine; before, the tool's 10 s.
+    assert asyncio.get_running_loop().time() - started < 2.5
+    # Lexical results, not {"error": "Timed out."}.
+    assert result["semantic"] == "off"
+    assert [m["id"] for m in result["messages"]] == ["98"]
+    deps.indexing.cancel()
 
 
 async def test_database_errors_in_indexing_leave_search_partial(monkeypatch):
@@ -624,3 +695,59 @@ async def test_stale_rows_are_dropped_from_the_newest_of_the_guild_only(db, monk
     assert await index_pending(db, embedder(), guild_id=GUILD) == (0, None)
     # The guild's two newest went; the older one waits, the other guild's stays.
     assert await queued(db) == [130, 133]
+
+
+HISTORY = 20_000
+
+
+async def plan(db, query: str, params: dict) -> str:
+    cursor = await db.execute("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) " + query, params)
+    return "\n".join(row[0] for row in await cursor.fetchall())
+
+
+async def test_the_queue_drives_the_pending_queries_whatever_the_statistics(db):
+    """Seen in review: as a plain join, Postgres could walk every message and
+    every embedding before reading the (drained) queue."""
+    # The vector index isn't under test, and building it for 20k rows is slow.
+    await db.execute("DROP INDEX message_embeddings_hnsw_idx")
+    await db.execute(
+        "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
+        " created_at, raw)"
+        " SELECT i, %s, %s, 100, 'alex', 'message ' || i, now(), '{}'"
+        " FROM generate_series(1, %s) i",
+        (GUILD, CHANNEL, HISTORY),
+    )
+    await db.execute(
+        "INSERT INTO message_embeddings (message_id, embedding)"
+        " SELECT i, array_fill(0.01::real, ARRAY[1024])::halfvec FROM generate_series(1, %s) i",
+        (HISTORY,),
+    )
+    # Statistics from when everything was queued, then a drained queue.
+    await db.execute("ANALYZE messages, message_embeddings, message_embedding_queue")
+    await db.execute("DELETE FROM message_embedding_queue")
+    await add(db, HISTORY + 1, "release plan")
+
+    for query, params in [
+        (indexing.PENDING, {"guild": GUILD, "below": None, "limit": indexing.INDEX_LIMIT}),
+        (indexing.DROP_STALE, {"guild": GUILD, "window": indexing.STALE_WINDOW}),
+    ]:
+        shown = await plan(db, query, params)
+        assert "Scan Backward using message_embedding_queue_pkey" in shown, shown
+        assert "Seq Scan on messages" not in shown, shown
+        assert "Seq Scan on message_embeddings" not in shown, shown
+        assert "Index Scan Backward using messages_pkey" not in shown, shown
+        assert "Hash" not in shown and "Merge" not in shown, shown
+        # One queued row: one message looked up, once.
+        assert "on messages m (actual rows=1.00 loops=1)" in shown, shown
+    assert await index_pending(db, embedder(), guild_id=GUILD) == (1, None)
+
+
+async def test_the_cli_sweeps_stale_rows_past_the_reply_window(db, monkeypatch):
+    monkeypatch.setattr(indexing, "STALE_WINDOW", 1)
+    for id in (140, 141, 142):
+        await add(db, id, "pizza")
+    await db.execute("UPDATE messages SET author_id = 1358234666267578368")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    assert await queued(db) == [140, 141]
+    assert await indexing.sweep(db) == 2
+    assert await queued(db) == []
