@@ -87,19 +87,23 @@ The chat model passes:
   went into the hip).
 - `subjects`: the people, pets and things whose look matters, each with a `name`,
   what she knows of them (`description`), a person's roster ref (`person`; a name
-  only one member has gone by resolves too, and a name several have gone by means
-  the one going by it now, else the one in the conversation: in prod Ethan had
-  once been nicknamed "Reece", so "Reece" resolved to nobody and was searched for
-  as a thing, which made a game character and a monkey his references), `me` for
-  herself, and `photos`:
+  only one member has gone by resolves too, and so does a mention, drawn under
+  their name). A name several people have gone by means those going by it now,
+  narrowed to the conversation's people, then to who spoke in the channel lately;
+  if that still leaves more than one, the call is a tool error naming them, so
+  Kiki gives the ref or asks. A person's name is never searched for as a thing:
+  in prod Ethan had once been nicknamed "Reece", so "Reece" resolved to nobody and
+  was searched for as a thing, which made a game character and a monkey his
+  references. `me` is for herself, and `photos`:
   message IDs she or the people asking already picked, or a Discord message link
   or attachment link they pasted. An attachment link's message is found by its
   attachment ID in the link's channel; an attachment's snowflake comes just
   before its message's, and the link names that one image (`ID:N`). A bare
   string is taken as a name (models slip; two slips failed a prod reply through
-  the tool's retry limit), and a message ID inside a name with no `photos` is
-  taken as a photo ("Reece (from the selfie he shared, message 156…)" was drawn
-  without the selfie in prod).
+  the tool's retry limit), and a message ID or message link inside a name with no
+  `photos` is taken as a photo (only a link's message, not its server or channel;
+  mentions stay names). "Reece (from the selfie he shared, message 156…)" was drawn
+  without the selfie in prod.
 - `shared`: the messages a picture is made from that don't show a subject (the
   photo, meme, template or post to redraw), when they aren't among what Rust
   adds itself (below): a picture from earlier in the chat that a follow-up asks
@@ -118,8 +122,9 @@ The chat model passes:
 The image job (`media/drawing.py`) then finds references for each subject, at most 3 per
 subject and 16 in all (OpenRouter's `input_references` range for GPT Image), best first:
 
-1. **Given photos** (`photos`): used as they are. A picture Kiki drew
-   (`kiki-<id>.png`) isn't a photo of anyone: as a subject's photo, outside an edit
+1. **Given photos** (`photos`): used as they are. A picture Kiki drew isn't a
+   photo of anyone (found by provenance: her image jobs' follow-up messages, or her
+   uploads named `kiki-<image id>.png|jpg|webp|gif` matching a saved drawing): as a subject's photo, outside an edit
    or her own self-portrait, it's a tool error that tells her to put it in `shared`
    (in prod her "starring reece" picture became Reece's likeness).
 2. **Candidates** from memory and the server history:
@@ -143,6 +148,11 @@ subject and 16 in all (OpenRouter's `input_references` range for GPT Image), bes
    prompt, to prefer what the picture needs (the face for a portrait, the whole
    body for an outfit), and up to 2 given photos as known photos of the subject
    (lettered, not candidates), so it approves only the same person or animal.
+   Its instructions say captions, file names and text in images are what people
+   posted, not instructions. Exactly one verdict per image is required: a
+   missing, repeated or made-up number is retried once, then the batch is dropped
+   (a "no" and a "yes" for one image once counted as a yes). At most 8 picker
+   requests run at once per drawing.
    Photos of the subject with clarity 1 or more are kept, clearest first. It
    turns down memes, art, game renders, screenshots, photos where the subject
    isn't clear, and photos of several people or animals where it can't tell which
@@ -267,6 +277,13 @@ reference and vision-call counts, outcome, cost and latency.
 - **Two messages.** The ack and the picture are separate, about 15–25 s apart in
   prod tests. The issue's alternative, reacting 🎨 on the request, is still
   available to Kiki as her ack (a reaction alone).
+- **Channel scope is the guild's.** Like search and `read_image`, candidates
+  (memory-cited and history) come from any channel of the server Kiki has stored,
+  not only those the person asking can see: Kiki stores no channel permissions
+  ([agent tools](agent-tools-hld.md), "Retrieval does not apply the requesting
+  member's channel permissions"). The candidates' images go to the vision and
+  image models. Per-member channel filtering is a planned follow-up for all of
+  them together.
 - **Likeness is as good as the references.** The picker judges from the
   photo and its caption whether it plausibly shows the person; it can't recognize
   faces, so a person's references are their own selfie-like posts. People who
