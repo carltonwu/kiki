@@ -366,11 +366,15 @@ MAX_SUGGESTED = 10
 MAX_TIDIED_CHARS = 16_000
 # A cut emoji's place, until `tidy` closes the gap around it.
 CUT = "\x00"
+# REACT and SEPARATOR are only ever `fullmatch`ed against one line: searching
+# a whole text with either would retry at every position, which is quadratic.
 # A `react:` line as Rust's `delivery::plan` reads it (after a speaker label).
 # Whitespace can follow only the label, so a long blank line can't backtrack.
 REACT = re.compile(r"(\s*(?:(?:Kiki:|\*\*Kiki\*\*:|\[Kiki\]:?)\s*)?react:)(.*)", re.IGNORECASE)
 # A message boundary as `delivery::separator` reads it: `---`, or with a pause.
-SEPARATOR = re.compile(r"---(?:\s*-?[0-9]*\.?[0-9]+\s*(?:ms|s)?)?\s*")
+# Each part is unambiguous (no `[0-9]*\.?[0-9]+`, which backtracks quadratically
+# on a long run of digits); it accepts what the earlier form did.
+SEPARATOR = re.compile(r"---(?:\s*-?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:\s*(?:ms|s))?)?\s*")
 # Said when cutting left a reply with no message (it had one) or a reaction-only
 # answer with no reaction: a reply of a different kind than the model chose
 # (silence for a message, or a message for a reaction) would ignore what it meant

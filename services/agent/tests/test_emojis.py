@@ -787,3 +787,23 @@ def test_over_the_tidy_cap_emoji_are_still_cut():
     assert checked.stripped.endswith("word  end"), "cut, not tidied"
     only_bad = " ".join(["<:fake:1>"] * 2_000)
     assert emojis.check(only_bad, SERVER).stripped == "🙂"
+
+
+# Fifth review of PR #67 (Opus 5.5). Finding 2 (snapshot clocks) is Rust's.
+
+
+def test_separator_matching_stays_linear_and_unchanged():
+    """Finding 1: `---(?:\\s*-?[0-9]*\\.?[0-9]+…` backtracked quadratically, so
+    `"hi <:fake:1>\\n---" + "1" * 15900 + "x"` took 4.2 s in the event loop."""
+    import time
+
+    accepted = ["---", "--- 5", "---5.5s", "--- .5 ms", "--- -2s", "---5 ms  ", "--- 1500ms"]
+    rejected = ["---5.", "---.", "---5s5", "----", "--- later"]
+    assert all(emojis.SEPARATOR.fullmatch(t) for t in accepted)
+    assert not any(emojis.SEPARATOR.fullmatch(t) for t in rejected)
+    started = time.monotonic()
+    assert emojis.SEPARATOR.fullmatch("---" + "1" * 200_000 + "x") is None
+    assert emojis.SEPARATOR.fullmatch("--- " + " " * 100_000 + "1" + " " * 100_000 + "x") is None
+    checked = emojis.check("hi <:fake:1>\n---" + "1" * 15_900 + "x", SERVER)
+    assert checked.problems and checked.stripped.startswith("hi\n---1")
+    assert time.monotonic() - started < 2

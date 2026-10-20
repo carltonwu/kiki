@@ -5,6 +5,8 @@
 
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, types::Json};
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use tracing::{info, warn};
 
 /// How long a sync waits for another sync of its guild. One holds the lock for
@@ -63,8 +65,12 @@ pub async fn sync(
         .await?;
     let snapshot = snapshot_us;
     let stale: bool = sqlx::query_scalar(
+        // A stored snapshot over a minute in the future came from a clock that
+        // jumped ahead; ignoring it lets the row heal instead of blocking every
+        // sync until real time catches up.
         "SELECT EXISTS (SELECT 1 FROM guild_emoji_syncs \
-         WHERE guild_id = $1 AND snapshot_at > to_timestamp($2::double precision / 1e6))",
+         WHERE guild_id = $1 AND snapshot_at > to_timestamp($2::double precision / 1e6) \
+           AND snapshot_at <= clock_timestamp() + interval '1 minute')",
     )
     .bind(guild_id)
     .bind(snapshot)
@@ -169,13 +175,28 @@ pub async fn sync_logged(db: PgPool, guild_id: i64, emojis: Value, snapshot_us: 
     }
 }
 
-/// The time a list is read, for ordering syncs: microseconds, so two Gateway
-/// events can't tie. The process clock, which every sync of a guild uses (the
-/// Gateway and `/kiki emojis` run in the same ingester).
+/// The last [`now_us`] handed out.
+static LAST_US: AtomicI64 = AtomicI64::new(0);
+
+/// The time a list is read, for ordering syncs: microseconds on the process
+/// clock, which every sync of a guild uses (the Gateway and `/kiki emojis` run in
+/// the same ingester). Strictly increasing, even if the clock steps back: a
+/// later read must never look older, or its sync would be skipped as stale.
 pub fn now_us() -> i64 {
-    std::time::SystemTime::now()
+    let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as i64)
+        .map_or(0, |d| d.as_micros() as i64);
+    let previous = LAST_US
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(next_us(clock, last))
+        })
+        .expect("the update always returns Some");
+    next_us(clock, previous)
+}
+
+/// After `last`, at `clock` if the clock is past it.
+fn next_us(clock: i64, last: i64) -> i64 {
+    clock.max(last + 1)
 }
 
 /// The server's current emoji, by name.
@@ -389,6 +410,49 @@ mod tests {
         // Once the lock is free, the next event syncs as usual.
         sync_logged(db.clone(), GUILD, event, now_us()).await;
         assert_eq!(list(&db, GUILD).await.unwrap().len(), 1);
+        test.drop().await;
+    }
+
+    #[test]
+    fn snapshots_only_move_forward() {
+        // Review round 5 (a): a clock stepping back made later reads look older,
+        // so their syncs were skipped. Every read is later than the one before.
+        let reads: Vec<i64> = (0..10_000).map(|_| now_us()).collect();
+        assert!(reads.windows(2).all(|w| w[1] > w[0]));
+        // The clock steps back 5 s after a read at 1,000,000 µs: still after it.
+        assert_eq!(super::next_us(-4_000_000, 1_000_000), 1_000_001);
+        assert_eq!(super::next_us(1_000_000, 1_000_000), 1_000_001);
+        assert_eq!(super::next_us(2_000_000, 1_000_000), 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_from_a_clock_far_ahead_heals() {
+        // Review round 5 (b): a snapshot stored by a clock that jumped forward
+        // blocked every sync until real time caught up. Over a minute ahead, it's
+        // ignored; within a minute, it still orders syncs.
+        let Some(test) = crate::test_db::migrated("emojis_future_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let huh = [json!({"id": "11", "name": "huh"})];
+        let ahead = |interval: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(&format!(
+                    "INSERT INTO guild_emoji_syncs (guild_id, snapshot_at) \
+                     VALUES (1, clock_timestamp() + interval '{interval}') \
+                     ON CONFLICT (guild_id) DO UPDATE SET snapshot_at = EXCLUDED.snapshot_at"
+                ))
+                .execute(&db)
+                .await
+                .unwrap();
+            }
+        };
+        ahead("30 seconds").await;
+        assert_eq!(sync(&db, 1, &huh, now_us()).await.unwrap(), None);
+        ahead("1 hour").await;
+        assert!(sync(&db, 1, &huh, now_us()).await.unwrap().is_some());
+        assert_eq!(list(&db, 1).await.unwrap().len(), 1);
         test.drop().await;
     }
 
