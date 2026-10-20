@@ -15,6 +15,7 @@ from pydantic_ai.messages import BinaryImage, ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
 from pydantic_ai.usage import RequestUsage
 
+from kiki_agent_host import telemetry
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.agent.guard import Budget, guarded
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest
@@ -220,6 +221,22 @@ async def test_every_tool_outcome_is_counted(recorded):
     assert [s.attributes["kiki.tool.outcome"] for s in spans] == ["ok", "budget_exhausted"]
     [span] = recorded.finished("execute_tool recall")
     assert span.attributes["error.type"] == "RuntimeError"
+
+
+async def test_model_labels_are_capped_per_process(recorded):
+    models = [f"vendor/model-{i}" for i in range(telemetry.MAX_MODELS + 2)]
+    for model in [*models, models[0]]:
+        with telemetry.llm_call("reply", model) as call:
+            call.bill(0.01)
+    assert recorded.value("kiki.llm.calls", purpose="reply", model=models[0], result="ok") == 2
+    assert recorded.value("kiki.llm.calls", purpose="reply", model=models[15], result="ok") == 1
+    assert recorded.value("kiki.llm.calls", purpose="reply", model=models[16], result="ok") is None
+    assert recorded.value("kiki.llm.calls", purpose="reply", model="other", result="ok") == 2
+    # Spans keep the full ID.
+    assert recorded.finished("llm reply")[-2].attributes["gen_ai.request.model"] == models[-1]
+    with telemetry.image_attempt("vendor/late-image", str):
+        pass
+    assert recorded.value("kiki.images.attempts", model="other", result="drawn") == 1
 
 
 def test_with_export_off_recording_is_a_no_op_without_the_sdk():

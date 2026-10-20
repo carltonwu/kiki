@@ -159,6 +159,8 @@ Cost keeps the currency in its name: the annotation unit `{USD}` adds no suffix.
 In the agent host these are **live** for every purpose but `jev` (the ingester's).
 Each is recorded where the call is made, with the model actually called (the
 vision model, or the chat model standing in for it; the fallback image model).
+The host keeps the first 16 distinct model IDs per process as `model` labels
+(here and on `kiki.images.*`); later ones are `other`, while spans keep the ID.
 A reply or topic run is one call however many model requests it makes:
 `duration` is the whole run, its tools' time included, `cost_usd` its billed cost
 with OpenRouter's web fees, and `tokens` its requests' sum (the requests per run

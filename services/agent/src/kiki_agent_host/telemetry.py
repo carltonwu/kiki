@@ -52,9 +52,13 @@ JOB_PATHS = "/v1/"
 # Histogram buckets (docs/observability.md, "Cardinality rules").
 DURATION_BUCKETS = (0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
 COUNT_BUCKETS = (1, 2, 5, 10, 20, 50)
+# Distinct `model` label values per process. Admins configure any model, and
+# aliases resolve to new versioned IDs over time; later ones become "other".
+MAX_MODELS = 16
 
 _providers: tuple | None = None
 _recorder: "Recorder | None" = None
+_models: set[str] = set()
 _handler: logging.Handler | None = None
 _closing = False
 _flushing: asyncio.Task | None = None
@@ -427,6 +431,17 @@ class Call:
         self.input_tokens, self.output_tokens = input_tokens or 0, output_tokens or 0
 
 
+def model_label(model: str) -> str:
+    """`model` as a metric label: the first MAX_MODELS distinct IDs keep their
+    names, later ones are "other". Spans keep the full ID."""
+    if model in _models:
+        return model
+    if len(_models) < MAX_MODELS:
+        _models.add(model)  # recorded on the event loop only: no race
+        return model
+    return "other"
+
+
 def timed_out(error: BaseException) -> bool:
     # A job's deadline cancels its task; openai's and httpx's timeouts aren't
     # TimeoutErrors.
@@ -443,7 +458,7 @@ def llm_call(purpose: str, model: str, *, span: str = "") -> Iterator[Call]:
     if (recorder := _recorder) is None:
         yield call
         return
-    labels = {"purpose": purpose, "model": model}
+    labels = {"purpose": purpose, "model": model_label(model)}
     started = time.monotonic()
     with recorder.span(
         span or f"llm {purpose}", {"kiki.purpose": purpose, "gen_ai.request.model": model}
@@ -488,8 +503,9 @@ def image_attempt(
             raise
         finally:
             if (recorder := _recorder) is not None:
-                recorder.image_attempts.add(1, {"model": model, "result": result})
-                recorder.image_duration.record(time.monotonic() - started, {"model": model})
+                label = model_label(model)
+                recorder.image_attempts.add(1, {"model": label, "result": result})
+                recorder.image_duration.record(time.monotonic() - started, {"model": label})
                 if fallback:
                     recorder.image_fallback.add(
                         1, {"result": "drawn" if result == "drawn" else "failed"}

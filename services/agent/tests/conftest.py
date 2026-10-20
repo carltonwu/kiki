@@ -88,4 +88,5 @@ def recorded(monkeypatch):
     tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
     recorder = telemetry.Recorder(MeterProvider(metric_readers=[reader]), tracer_provider)
     monkeypatch.setattr(telemetry, "_recorder", recorder)
+    monkeypatch.setattr(telemetry, "_models", set())
     return Recorded(reader, spans)
