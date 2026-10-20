@@ -30,7 +30,7 @@ steps:
   - say: {as: alex, in: general, text: "@kiki we won the regional", reply: {text: "react: :TANNAH: :skull:"}}
   - expect: {run: done, reply: false, reaction: {emoji: "tannah:900000000000005003", present: true}}
   - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "<a:tannah:900000000000005003>"}
-  # Discord rejects an emoji Kiki can't use; the reply still goes out.
+  # An emoji that isn't the server's is checked out of the reply before Discord sees it; the reply still goes out.
   - say: {as: alex, in: general, text: "@kiki rate my outfit", reply: {text: "react: <:nope:123>\nten"}}
   - expect: {run: done, reply: true, text_contains: ten}
   - expect: {sql: "SELECT cardinality(reactions) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 0}

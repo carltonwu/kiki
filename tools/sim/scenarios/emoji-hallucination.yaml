@@ -1,0 +1,25 @@
+name: Kiki's emoji are checked against the server's before posting (invented ones retried, then cut; known names fixed)
+steps:
+  - slash: {as: alex, in: general, command: emojis, options: {resync: true}}
+  - expect: {response_contains: "3 new"}
+  # Production reply:401: an emoji she made up. The check sends it back and she
+  # picks a real one.
+  - say:
+      as: alex
+      in: general
+      text: "kiki rate my outfit"
+      reply: {text: "ten, and that's the L i deserved <:salute:1>", retry: "ten <:huh:900000000000005001>"}
+  - expect: {run: done, reply: true, text_contains: "ten <:huh:900000000000005001>", text_lacks: "salute"}
+  # Production reply:406: the same emoji without an ID, and a model that won't fix
+  # it. It's cut rather than posted as text, and the reply still goes out.
+  - say: {as: alex, in: general, text: "kiki was it merle", reply: {text: "third L, and this one's certified <:salute:>"}}
+  - expect: {run: done, reply: true, text_contains: "this one's certified", text_lacks: "salute"}
+  # A real name missing its ID, or an animated emoji written without its `a`, is
+  # fixed in place, with no retry.
+  - say: {as: alex, in: general, text: "kiki thoughts", reply: {text: "<:huh:> and <:tannah:900000000000005003>"}}
+  - expect: {run: done, reply: true, text_contains: "<:huh:900000000000005001> and <a:tannah:900000000000005003>"}
+  # A shortcode for an emoji the server doesn't have would be dropped as a
+  # reaction: it's cut, and the empty marker line isn't posted.
+  - say: {as: alex, in: general, text: "kiki we won", reply: {text: "react: :salute:\nlets go"}}
+  - expect: {run: done, reply: true, text_contains: "lets go", text_lacks: "react|salute"}
+  - expect: {sql: "SELECT cardinality(reactions) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 0}

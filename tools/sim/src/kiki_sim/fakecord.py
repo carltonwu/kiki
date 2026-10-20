@@ -100,6 +100,7 @@ class World:
         self.unexpected: list[dict] = []
         self.llm: list[dict] = []  # every OpenRouter request, with what we answered
         self.scripts: dict[str, list[dict]] = {"jev": [], "reply": []}
+        self.answered: dict = {}  # the reply script entry that answered last
         self.guild_creates = 0
         self.identifies = 0
         self.last_snowflake = 0
@@ -792,7 +793,16 @@ class Fakecord:
             trigger = trigger_line(prompt)
             record["trigger"] = trigger
             tool_results = [content_text(m.get("content")) for m in messages if m["role"] == "tool"]
-            if messages[-1]["role"] == "tool":
+            if "Fix the errors and try again." in prompt:
+                # The agent host's output check sent the answer back (pydantic-ai's
+                # retry prompt): the script's `retry` text, else the same answer.
+                record["retry"] = prompt
+                said = [
+                    content_text(m.get("content")) for m in messages if m["role"] == "assistant"
+                ]
+                text = w.answered.get("retry", said[-1] if said else "")
+                message = {"role": "assistant", "content": text}
+            elif messages[-1]["role"] == "tool":
                 entry = next((e for e in w.scripts["reply"] if e.get("pending")), {})
                 queue = entry.get("queue") or []
                 record["tool_results"] = tool_results
@@ -804,6 +814,7 @@ class Fakecord:
                 else:
                     # Last turn of a scripted tool call: answer from its result.
                     entry.pop("pending", None)
+                    w.answered = entry
                     ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
                     text = entry.get("text", "stub: found {ids}").format(
                         trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
@@ -833,6 +844,7 @@ class Fakecord:
                     message, usage = self.server_tools(body, entry, trigger)
                     record["web"] = usage["server_tool_use_details"]
                 elif entry:
+                    w.answered = entry
                     message = {
                         "role": "assistant",
                         "content": entry["text"].format(trigger=trigger, ids="", result=""),

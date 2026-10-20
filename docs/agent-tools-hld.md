@@ -455,6 +455,20 @@ queries are an argument error returned to the model.
   listed in every prompt became all she used. The run context names emoji she
   has used at least twice in the messages shown (text or reactions) and asks her
   to give them a rest.
+- **Checked before posting:** Discord only renders a custom emoji whose ID Kiki
+  can use. Anything else is posted as text, or silently left off as a reaction:
+  an invented `<:salute:1>` (Discord stores it as `:salute:`), a `<:huh:>` with
+  no ID, or a `:skull:` shortcode, which Discord never converts in a bot's
+  message. So the reply agent has an output validator (`tools.check_emojis`,
+  `chat/emojis.py` `check`). It compares every custom emoji and `:shortcode:`
+  outside code against the run's catalog, which is loaded once before indexing
+  starts. A known name is rewritten as Discord needs it: its real ID, the `a`
+  for an animated emoji, and its exact name. Anything else raises `ModelRetry`,
+  naming close matches. On the last attempt the emoji is cut instead, along
+  with any `react:` line left empty, so a bad emoji never costs the reply.
+  Before a server's first resync, written-out emoji can't be checked and pass.
+  The emoji tools are offered (a toolset `prepare`) only once the server has
+  emoji synced.
 
 ## Failures and retries
 
