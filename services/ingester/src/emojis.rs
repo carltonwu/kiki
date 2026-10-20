@@ -5,6 +5,11 @@
 
 use serde_json::Value;
 use sqlx::{FromRow, PgPool, types::Json};
+use tracing::{info, warn};
+
+/// How long a sync waits for another sync of its guild. One holds the lock for
+/// a single short statement; waiting longer means something is stuck.
+const LOCK_TIMEOUT: &str = if cfg!(test) { "300ms" } else { "10s" };
 
 /// What a sync changed.
 #[derive(Debug, Default, FromRow, PartialEq)]
@@ -34,9 +39,9 @@ impl Emoji {
 }
 
 /// Replaces the guild's emoji list with `emojis` (Discord's `GET
-/// guilds/{id}/emojis`, or a Gateway event's list), as read at `snapshot_ms`
-/// (the database clock, `now_ms`; `None` for now). Descriptions survive renames;
-/// emoji missing from the list are marked removed, not deleted.
+/// guilds/{id}/emojis`, or a Gateway event's list), as read at `snapshot_us`
+/// ([`now_us`] when the list was requested or the event arrived). Descriptions
+/// survive renames; emoji missing from the list are marked removed, not deleted.
 ///
 /// Syncs of one guild take turns (an advisory lock), and one whose snapshot is
 /// older than the last applied one is skipped (`None`): a resync's REST list,
@@ -46,27 +51,20 @@ pub async fn sync(
     db: &PgPool,
     guild_id: i64,
     emojis: &[Value],
-    snapshot_ms: Option<i64>,
+    snapshot_us: i64,
 ) -> sqlx::Result<Option<Synced>> {
     let mut tx = db.begin().await?;
-    // Another sync of this guild holds the lock for one short statement; waiting
-    // longer means something is stuck, so fail this sync instead of hanging.
-    sqlx::query("SET LOCAL lock_timeout = '10s'")
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"))
         .execute(&mut *tx)
         .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('guild_emojis:' || $1, 0))")
         .bind(guild_id.to_string())
         .execute(&mut *tx)
         .await?;
-    let snapshot: i64 = sqlx::query_scalar(
-        "SELECT coalesce($1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)",
-    )
-    .bind(snapshot_ms)
-    .fetch_one(&mut *tx)
-    .await?;
+    let snapshot = snapshot_us;
     let stale: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM guild_emoji_syncs \
-         WHERE guild_id = $1 AND snapshot_at > to_timestamp($2::double precision / 1000))",
+         WHERE guild_id = $1 AND snapshot_at > to_timestamp($2::double precision / 1e6))",
     )
     .bind(guild_id)
     .bind(snapshot)
@@ -124,7 +122,7 @@ pub async fn sync(
     .await?;
     sqlx::query(
         "INSERT INTO guild_emoji_syncs (guild_id, snapshot_at) \
-         VALUES ($1, to_timestamp($2::double precision / 1000)) \
+         VALUES ($1, to_timestamp($2::double precision / 1e6)) \
          ON CONFLICT (guild_id) DO UPDATE SET snapshot_at = EXCLUDED.snapshot_at, synced_at = now()",
     )
     .bind(guild_id)
@@ -145,11 +143,39 @@ pub async fn sync_listed(
     db: &PgPool,
     guild_id: i64,
     emojis: &Value,
+    snapshot_us: i64,
 ) -> sqlx::Result<Option<Synced>> {
     match emojis.as_array() {
-        Some(list) => sync(db, guild_id, list, None).await,
+        Some(list) => sync(db, guild_id, list, snapshot_us).await,
         None => Ok(None),
     }
+}
+
+/// [`sync_listed`] for the Gateway, which spawns it: best effort, so a failed
+/// sync (say, the lock timing out) is logged and never holds up catch-up or
+/// message ingestion. The next event or resync brings the list up to date.
+pub async fn sync_logged(db: PgPool, guild_id: i64, emojis: Value, snapshot_us: i64) {
+    match sync_listed(&db, guild_id, &emojis, snapshot_us).await {
+        Ok(Some(synced)) if synced.added + synced.renamed + synced.removed > 0 => info!(
+            guild_id,
+            total = synced.total,
+            added = synced.added,
+            renamed = synced.renamed,
+            removed = synced.removed,
+            "custom emoji synced from the Gateway"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!(guild_id, error = %e, "couldn't sync custom emoji from the Gateway"),
+    }
+}
+
+/// The time a list is read, for ordering syncs: microseconds, so two Gateway
+/// events can't tie. The process clock, which every sync of a guild uses (the
+/// Gateway and `/kiki emojis` run in the same ingester).
+pub fn now_us() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
 }
 
 /// The server's current emoji, by name.
@@ -205,7 +231,7 @@ pub async fn now_ms(db: &PgPool) -> sqlx::Result<i64> {
 mod tests {
     use serde_json::json;
 
-    use super::{Synced, list, named, sync, sync_listed};
+    use super::{Synced, list, named, now_us, sync, sync_listed, sync_logged};
 
     #[tokio::test]
     async fn sync_adds_renames_removes_and_keeps_descriptions() {
@@ -220,7 +246,7 @@ mod tests {
             &db,
             1,
             &[huh.clone(), oop.clone(), json!({"name": "no_id"})],
-            None,
+            now_us(),
         )
         .await
         .unwrap();
@@ -241,15 +267,20 @@ mod tests {
         .await
         .unwrap();
         // Another server's emoji is never touched.
-        sync(&db, 2, &[json!({"id": "21", "name": "theirs"})], None)
+        sync(&db, 2, &[json!({"id": "21", "name": "theirs"})], now_us())
             .await
             .unwrap();
 
         let renamed = json!({"id": "11", "name": "huh_what"});
-        let second = sync(&db, 1, &[renamed, json!({"id": "13", "name": "new"})], None)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = sync(
+            &db,
+            1,
+            &[renamed, json!({"id": "13", "name": "new"})],
+            now_us(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             second,
             Synced {
@@ -282,7 +313,7 @@ mod tests {
         assert_eq!(found["huh_what"].mention(), "<:huh_what:11>");
 
         // A removed emoji that comes back counts as added, with its description.
-        let third = sync(&db, 1, &[oop], None).await.unwrap().unwrap();
+        let third = sync(&db, 1, &[oop], now_us()).await.unwrap().unwrap();
         assert_eq!((third.added, third.removed), (1, 2));
         let [oop] = &list(&db, 1).await.unwrap()[..] else {
             panic!("expected one emoji");
@@ -302,13 +333,11 @@ mod tests {
         let fresh = json!({"id": "12", "name": "fresh"});
         // A resync reads Discord's list (both emoji) at t=1000; meanwhile a Gateway
         // update, read at t=2000, says fresh was deleted and is applied first.
-        let update = sync(&db, 1, std::slice::from_ref(&huh), Some(2000))
+        let update = sync(&db, 1, std::slice::from_ref(&huh), 2000)
             .await
             .unwrap();
         assert!(update.is_some());
-        let resync = sync(&db, 1, &[huh.clone(), fresh], Some(1000))
-            .await
-            .unwrap();
+        let resync = sync(&db, 1, &[huh.clone(), fresh], 1000).await.unwrap();
         assert_eq!(resync, None, "the older REST list is skipped");
         let names: Vec<String> = list(&db, 1)
             .await
@@ -318,7 +347,7 @@ mod tests {
             .collect();
         assert_eq!(names, ["huh"]);
         // Another guild's syncs are ordered on their own.
-        assert!(sync(&db, 2, &[], Some(1000)).await.unwrap().is_some());
+        assert!(sync(&db, 2, &[], 1000).await.unwrap().is_some());
         // A synced guild with no emoji is recorded as synced.
         let synced: i64 =
             sqlx::query_scalar("SELECT count(*) FROM guild_emoji_syncs WHERE guild_id = 2")
@@ -326,6 +355,34 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(synced, 1);
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn a_gateway_sync_that_cannot_lock_gives_up_quietly() {
+        // Review round 4: a failed sync returned early from GUILD_CREATE, before
+        // catch-up was scheduled. The Gateway now spawns `sync_logged`, which logs
+        // a failure (here, the lock held past its timeout) and returns.
+        let Some(test) = crate::test_db::migrated("emojis_lock_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let mut holder = db.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('guild_emojis:' || $1, 0))")
+            .bind("1")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let event = json!([{"id": "11", "name": "huh"}]);
+        sync_logged(db.clone(), 1, event.clone(), now_us()).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(sync(&db, 1, &[], now_us()).await.is_err(), "still locked");
+        assert!(list(&db, 1).await.unwrap().is_empty());
+        holder.rollback().await.unwrap();
+        // Once the lock is free, the next event syncs as usual.
+        sync_logged(db.clone(), 1, event, now_us()).await;
+        assert_eq!(list(&db, 1).await.unwrap().len(), 1);
         test.drop().await;
     }
 
@@ -343,12 +400,12 @@ mod tests {
                     .collect::<Vec<_>>()
             )
         };
-        let first = sync_listed(&db, 1, &event(&[("11", "huh"), ("12", "oop")]))
+        let first = sync_listed(&db, 1, &event(&[("11", "huh"), ("12", "oop")]), now_us())
             .await
             .unwrap();
         assert_eq!(first.map(|s| s.added), Some(2));
         // An emoji added and one deleted in Discord, as GUILD_EMOJIS_UPDATE sends them.
-        let update = sync_listed(&db, 1, &event(&[("11", "huh"), ("13", "fresh")]))
+        let update = sync_listed(&db, 1, &event(&[("11", "huh"), ("13", "fresh")]), now_us())
             .await
             .unwrap();
         assert_eq!(update.map(|s| (s.added, s.removed)), Some((1, 1)));
@@ -360,7 +417,10 @@ mod tests {
             .collect();
         assert_eq!(names, ["fresh", "huh"]);
         // A payload without a list (an unavailable guild) changes nothing.
-        assert_eq!(sync_listed(&db, 1, &json!(null)).await.unwrap(), None);
+        assert_eq!(
+            sync_listed(&db, 1, &json!(null), now_us()).await.unwrap(),
+            None
+        );
         assert_eq!(list(&db, 1).await.unwrap().len(), 2);
         test.drop().await;
     }

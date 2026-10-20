@@ -217,7 +217,7 @@ impl Listener {
                     store::delete_channel(&self.db, id).await?;
                 }
             }
-            "GUILD_EMOJIS_UPDATE" => self.sync_emojis(guild_id, &d["emojis"]).await?,
+            "GUILD_EMOJIS_UPDATE" => self.spawn_emoji_sync(guild_id, &d["emojis"]),
             "THREAD_LIST_SYNC" => {
                 let threads = d["threads"].as_array().cloned().unwrap_or_default();
                 store::upsert_channels(&self.db, guild_id, &threads).await?;
@@ -233,7 +233,6 @@ impl Listener {
                 let mut channels = d["channels"].as_array().cloned().unwrap_or_default();
                 channels.extend(d["threads"].as_array().cloned().unwrap_or_default());
                 store::upsert_channels(&self.db, guild_id, &channels).await?;
-                self.sync_emojis(guild_id, &d["emojis"]).await?;
                 info!(
                     guild_id,
                     name = d["name"].as_str(),
@@ -241,27 +240,25 @@ impl Listener {
                 );
                 let catch_up = self.catch_up.clone();
                 tokio::spawn(async move { catch_up.run_logged(Id::new(guild_id as u64)).await });
+                self.spawn_emoji_sync(guild_id, &d["emojis"]);
             }
             _ => {}
         }
         Ok(())
     }
 
-    /// The server's emoji list, from `GUILD_CREATE` or `GUILD_EMOJIS_UPDATE`.
-    async fn sync_emojis(&self, guild_id: i64, emojis: &Value) -> anyhow::Result<()> {
-        if let Some(synced) = emojis::sync_listed(&self.db, guild_id, emojis).await?
-            && synced.added + synced.renamed + synced.removed > 0
-        {
-            info!(
-                guild_id,
-                total = synced.total,
-                added = synced.added,
-                renamed = synced.renamed,
-                removed = synced.removed,
-                "custom emoji synced from the Gateway"
-            );
-        }
-        Ok(())
+    /// Syncs the server's emoji list from `GUILD_CREATE` or `GUILD_EMOJIS_UPDATE`
+    /// in the background, best effort: it never holds up catch-up or the next
+    /// event. Its snapshot is when the event arrived, so a sync that runs late
+    /// can't overwrite a newer one.
+    fn spawn_emoji_sync(&self, guild_id: i64, emojis: &Value) {
+        let snapshot_us = emojis::now_us();
+        tokio::spawn(emojis::sync_logged(
+            self.db.clone(),
+            guild_id,
+            emojis.clone(),
+            snapshot_us,
+        ));
     }
 
     /// A live message: the start of its trace, which routing continues.

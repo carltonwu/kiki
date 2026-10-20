@@ -436,12 +436,16 @@ queries are an argument error returned to the model.
   describe nothing: an event shouldn't spend on a vision model. `/kiki emojis
   resync:true` (Manage Server) replaces the list from `GET guilds/{id}/emojis` and
   describes the new ones; until then, new emoji are found by name only.
-  Descriptions survive renames, since an emoji's image never changes. Syncs of a
-  guild take turns (an advisory lock), and `guild_emoji_syncs` (migration 0032)
-  keeps the latest one's snapshot time. A sync whose list was read earlier is
-  skipped, so a resync's REST list, read before a Gateway update was applied,
-  can't bring a deleted emoji back. The table also tells a synced guild with no
-  emoji from one never synced.
+  Descriptions survive renames, since an emoji's image never changes. A Gateway
+  sync is spawned, best effort, after catch-up is scheduled: a failure is logged
+  and never delays catch-up or ingestion. Syncs of a guild take turns (an advisory
+  lock, waiting at most 10 s), and `guild_emoji_syncs` (migration 0032) keeps the
+  latest one's snapshot time: when its list was requested, or when its event
+  arrived (microseconds on the ingester's clock). A sync whose list was read
+  earlier is skipped, so a resync's REST list, read before a Gateway update was
+  applied, can't bring a deleted emoji back, and neither can a late-running
+  spawned sync. The table also tells a synced guild with no emoji from one never
+  synced.
 - **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
   until none are left (at most 10 minutes; the interaction token lasts 15). The host
   downloads each emoji as a 128 px PNG (the first frame if animated) and asks
@@ -476,7 +480,9 @@ queries are an argument error returned to the model.
   A markdown link's destination is skipped from `](` to its balanced closing
   parenthesis, and a bare URL up to whitespace or `<` (which a URL can't
   contain unescaped), so an emoji written right after a link is still checked.
-  Every scan is linear, so replies of any length are checked.
+  Every scan is linear, so replies of any length are checked. Over 16,000
+  characters, bad emoji are still cut, just without tidying around them, in case
+  some other path turns out quadratic.
   - A known name is rewritten as Discord needs it: its real ID, the `a` for an
     animated emoji, and its exact name.
   - The catalog is read again for every answer that writes emoji, so one the

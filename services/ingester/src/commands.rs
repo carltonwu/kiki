@@ -469,7 +469,7 @@ impl Commands {
         }
         let actor = require_manage_server(invocation, "resync emoji")?;
         // As of before the request: a Gateway update applied while it's in flight wins.
-        let snapshot_ms = emojis::now_ms(&self.db).await?;
+        let snapshot_us = emojis::now_us();
         let listed = get_json("guild emojis", || {
             self.http.emojis(Id::new(guild_id as u64))
         })
@@ -479,7 +479,7 @@ impl Commands {
         let listed = listed
             .as_array()
             .context("Discord's emoji list is not an array")?;
-        let synced = emojis::sync(&self.db, guild_id, listed, Some(snapshot_ms)).await?;
+        let synced = emojis::sync(&self.db, guild_id, listed, snapshot_us).await?;
         let mut summary = match &synced {
             Some(synced) => format!(
                 "Synced {} emoji from Discord: {} new, {} renamed, {} removed.",

@@ -754,4 +754,36 @@ def test_long_replies_are_checked_and_stay_fast():
     started = time.monotonic()
     checked = emojis.check(many, SERVER)
     assert time.monotonic() - started < 2
-    assert len(checked.problems) == 10_000 and checked.stripped == "ok"
+    # Over the tidy cap (round 4), so cut without closing the gaps.
+    assert len(checked.problems) == 10_000 and checked.stripped.strip() == "ok"
+
+
+# Fourth review of PR #67 (GPT-6.1-Sol). Finding 1 (Gateway emoji sync never
+# delays catch-up) is Rust's; finding 2:
+
+
+def test_closing_gaps_stays_linear_after_long_whitespace():
+    """Finding 2: `GAP.sub` took 0.9/3.6/14.4 s on `" " * n + "ok <:fake:1>"` at
+    10k/20k/40k characters, in the event loop. So did `REACT` on a long blank line."""
+    import time
+
+    started = time.monotonic()
+    assert emojis.close_gaps(" " * 200_000 + "ok \x00") == " " * 200_000 + "ok"
+    assert emojis.close_gaps("a \x00 , \x00 b") == "a b"
+    assert emojis.REACT.fullmatch(" " * 200_000 + "x") is None
+    # Under the cap, the whole check, tidy included.
+    text = " " * (emojis.MAX_TIDIED_CHARS - 100) + "ok <:fake:1>"
+    checked = emojis.check(text, SERVER)
+    assert checked.stripped == text.removesuffix(" <:fake:1>")
+    assert time.monotonic() - started < 2
+
+
+def test_over_the_tidy_cap_emoji_are_still_cut():
+    """The safety cap: a reply over 16k characters is checked, and its bad emoji
+    are cut, just without tidying around them."""
+    long = "word " * 4_000 + "<:fake:1> end"
+    checked = emojis.check(long, SERVER)
+    assert checked.problems and "<:fake:1>" not in checked.stripped
+    assert checked.stripped.endswith("word  end"), "cut, not tidied"
+    only_bad = " ".join(["<:fake:1>"] * 2_000)
+    assert emojis.check(only_bad, SERVER).stripped == "🙂"

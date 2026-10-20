@@ -361,11 +361,14 @@ MAX_ID_DIGITS = 20
 # Problems that get close-name suggestions and appear in a retry: the rest of a
 # reply full of bad emoji is still cut, without a fuzzy match per emoji.
 MAX_SUGGESTED = 10
+# Over this, a reply's bad emoji are still cut, but without `tidy`: a guard in
+# case some other path through it turns out quadratic (it runs in the event loop).
+MAX_TIDIED_CHARS = 16_000
 # A cut emoji's place, until `tidy` closes the gap around it.
 CUT = "\x00"
-GAP = re.compile(r"[ \t]*\x00(?:[ \t,]*\x00)*[ \t]*")
 # A `react:` line as Rust's `delivery::plan` reads it (after a speaker label).
-REACT = re.compile(r"(\s*(?:Kiki:|\*\*Kiki\*\*:|\[Kiki\]:?)?\s*react:)(.*)", re.IGNORECASE)
+# Whitespace can follow only the label, so a long blank line can't backtrack.
+REACT = re.compile(r"(\s*(?:(?:Kiki:|\*\*Kiki\*\*:|\[Kiki\]:?)\s*)?react:)(.*)", re.IGNORECASE)
 # A message boundary as `delivery::separator` reads it: `---`, or with a pause.
 SEPARATOR = re.compile(r"---(?:\s*-?[0-9]*\.?[0-9]+\s*(?:ms|s)?)?\s*")
 # Said when cutting left a reply with no message (it had one) or a reaction-only
@@ -506,6 +509,9 @@ def check(text: str, emojis: Catalog) -> Checked:
     result = "".join(kept)
     if not problems:
         return Checked(result, result, problems, fixed)
+    if len(text) > MAX_TIDIED_CHARS:
+        stripped = "".join(cut).replace(CUT, "")
+        return Checked(result, stripped if stripped.strip() else STAND_IN, problems, fixed)
     return Checked(result, tidy("".join(cut), had_message=has_message(text)), problems, fixed)
 
 
@@ -538,7 +544,7 @@ def tidy(text: str, *, had_message: bool) -> str:
         if CUT not in line:
             lines.append(line)
             continue
-        line = GAP.sub(join_gap, line)
+        line = close_gaps(line)
         if react := REACT.fullmatch(line):
             rest = re.sub(r"[\s,]+", " ", react[2]).strip()
             if not rest:
@@ -579,12 +585,40 @@ def without_empty_messages(lines: list[str]) -> list[str]:
     return out
 
 
-def join_gap(gap: re.Match) -> str:
+def close_gaps(line: str) -> str:
+    """Closes each gap cut emoji left in `line`: a run of `CUT` markers (with the
+    spaces and commas between them) and the spaces and tabs on either side.
+    Anchored on the markers and never rescanning text, so it's linear, unlike a
+    regex retried at every position of a long run of spaces."""
+    pieces, pos, n = [], 0, len(line)
+    at = line.find(CUT)
+    while at != -1:
+        start = at
+        while start > pos and line[start - 1] in " \t":
+            start -= 1
+        end = at + 1
+        while True:
+            k = end
+            while k < n and line[k] in " \t,":
+                k += 1
+            if k < n and line[k] == CUT:
+                end = k + 1
+                continue
+            break
+        while end < n and line[end] in " \t":
+            end += 1
+        before = line[start - 1] if start else ""
+        after = line[end] if end < n else ""
+        pieces += [line[pos:start], join_gap(before, after)]
+        pos = end
+        at = line.find(CUT, pos)
+    pieces.append(line[pos:])
+    return "".join(pieces)
+
+
+def join_gap(before: str, after: str) -> str:
     """One space between words the cut separated; none at the line's ends or
     before punctuation."""
-    line = gap.string
-    before = line[gap.start() - 1] if gap.start() else ""
-    after = line[gap.end()] if gap.end() < len(line) else ""
     if before and not before.isspace() and after and not after.isspace():
         return "" if after in ",.!?;:)" else " "
     return ""
