@@ -5,7 +5,10 @@
 //! environment. Railway injects `RAILWAY_PROJECT_ID` and
 //! `RAILWAY_ENVIRONMENT_ID` into every service.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, anyhow};
 use reqwest::{StatusCode, header};
@@ -22,6 +25,9 @@ const WINDOW_SECS: u64 = 300;
 const SAMPLE_RATE_SECS: u32 = 60;
 /// Railway reports sizes in decimal GB (samples are whole 4 KiB pages × 10⁻⁹).
 const BYTES_PER_GB: f64 = 1e9;
+/// Service names are fetched again this often, and whenever a sample names
+/// an unknown service, so a rename shows up without a restart.
+const NAMES_MAX_AGE: Duration = Duration::from_secs(3600);
 
 const METRICS: &str = r#"
 query Metrics($projectId: String!, $environmentId: String!, $startDate: DateTime!,
@@ -72,8 +78,9 @@ pub struct Railway {
     http: reqwest::Client,
     project_id: String,
     environment_id: String,
-    /// Service ID → name, refreshed when a sample names an unknown ID.
+    /// Service ID → name, and when it was fetched.
     names: HashMap<String, String>,
+    names_at: Option<Instant>,
 }
 
 impl Railway {
@@ -110,6 +117,7 @@ impl Railway {
             project_id,
             environment_id,
             names: HashMap::new(),
+            names_at: None,
         }))
     }
 
@@ -132,7 +140,8 @@ impl Railway {
             .iter()
             .filter_map(|s| s.tags.service_id.as_ref())
             .any(|id| !self.names.contains_key(id));
-        if unknown {
+        let stale = self.names_at.is_none_or(|at| at.elapsed() >= NAMES_MAX_AGE);
+        if unknown || stale {
             let services: ServicesData = self
                 .query(SERVICES, json!({ "projectId": self.project_id }))
                 .await?;
@@ -143,6 +152,7 @@ impl Railway {
                 .into_iter()
                 .map(|e| (e.node.id, e.node.name))
                 .collect();
+            self.names_at = Some(Instant::now());
         }
         Ok(latest(data, &self.names))
     }
@@ -378,6 +388,8 @@ mod tests {
 
     #[test]
     fn needs_the_token_and_railway_ids() {
+        // Building the client needs a crypto provider, as in main.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let env = |vars: &'static [(&'static str, &'static str)]| {
             move |name: &str| {
                 vars.iter()

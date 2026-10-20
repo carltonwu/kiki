@@ -238,11 +238,15 @@ snapshot; the instruments are observable, and their callbacks (run by the metric
 reader at export) only read the snapshot, never query. It starts once the
 instance holds the leader lock, so one instance reports, and stops on shutdown
 or when leadership ends. With export off it returns at once: no queries, no API
-calls. Each poll's Postgres queries run in a transaction with
-`statement_timeout = 3s` and `lock_timeout = 1s`, under a 15 s bound per source.
-A failing source is logged at warn at most every 10 minutes (with a count of
-the failures left out) and reports no samples, so its series go stale, until it
-recovers.
+calls. Each Postgres query runs in a transaction with `statement_timeout = 3s`
+and `lock_timeout = 1s`, under a 5 s bound for each queue query and 15 s for the
+server statistics and for Railway. Each queue query stands alone: one that fails
+or times out leaves the others' values. A failure is logged at warn at most
+every 10 minutes per query or source (with a count of the failures left out),
+and its series report no samples, so they go stale, until it recovers. The
+callbacks hold only a weak reference to the snapshot, and main awaits the
+stopped poller before releasing the leader lock, so the gauges go silent with
+leadership instead of repeating the last values.
 
 - **Postgres.** `kiki.pg.connections` counts client backends on the whole server
   (the connection limit is per server), excluding the poller's own.
@@ -253,8 +257,8 @@ recovers.
   values; they reset only with a stats reset, which Prometheus's `rate` and
   `increase` handle. `kiki.pg.cache.hit_ratio` is `blks_hit / (blks_hit +
   blks_read)` over the last poll interval, not since the stats reset (a lifetime
-  ratio barely moves); it is absent after the first poll, an interval without
-  reads, or a reset. Table size is `pg_total_relation_size` (indexes and TOAST
+  ratio barely moves); it is absent after the first poll, in an interval without
+  reads, and across a stats reset (a changed `pg_stat_database.stats_reset`). Table size is `pg_total_relation_size` (indexes and TOAST
   included). `table` ∈ `messages, message_embeddings, agent_host_images,
   agent_runs, conversations, classifications, agent_host_jobs`.
 - **Queues.** `agent_runs` is runs in `pending`, `drawings` is
@@ -262,7 +266,10 @@ recovers.
   `kiki.agent_runs.stuck` counts runs `running` or `delivering` whose
   `started_at` is over 10 minutes ago: a run's host requests give up after
   `AGENT_HOST_TIMEOUT_MS` (180 s, wake-up retries included) and delivery takes
-  seconds, so anything past 10 minutes is wedged. `kiki.conversations.open` is
+  seconds, so anything past 10 minutes is wedged. Migration 0026's partial
+  index `agent_runs_active_idx` (`started_at` where running or delivering) keeps
+  it an index-only scan of the few runs in flight (0.2 ms at 200k runs, against
+  a 28 MB heap scan without it). `kiki.conversations.open` is
   conversations with no `closed_at`.
 - **Embedding backlog.** Messages the agent host would embed (its pending query:
   people's undeleted, non-empty messages and link fixers' reposts, ignored
@@ -272,9 +279,8 @@ recovers.
   by `kiki-agent-host index`. The window is a snowflake-ID range on the primary
   key: on a 300k-message table (469 MB heap) the query read about 3 MB of
   `messages` and took 10 ms, against a 480 MB sequential scan (170 ms, and page
-  cache Railway bills as memory) for the unbounded count. The `stuck` count
-  scans `agent_runs`' heap (narrow rows: 6 MB at 40k runs; the request snapshot
-  is TOASTed); everything else reads a partial index.
+  cache Railway bills as memory) for the unbounded count. The other queue
+  queries read partial indexes.
 - **Railway** (optional). On when the ingester has `RAILWAY_METRICS_TOKEN`, a
   project token for its environment (Project Settings → Tokens). Railway injects
   `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID`. Each poll makes the
@@ -283,8 +289,8 @@ recovers.
   environment: `CPU_USAGE`, `MEMORY_USAGE_GB`, `NETWORK_RX_GB`, `NETWORK_TX_GB`
   and `DISK_USAGE_GB` over the last 5 minutes at `sampleRateSeconds: 60`,
   `groupBy: [SERVICE_ID]`, and keeps each service's newest sample. Service IDs
-  map to names through `project { services }`, fetched again whenever an
-  unknown ID appears. `service` is the Railway service the sample describes
+  map to names through `project { services }`, fetched again hourly and
+  whenever an unknown ID appears. `service` is the Railway service the sample describes
   (`ingester`, `agent`, `postgres`), not the exporter. Railway's GB are decimal
   (×10⁹ bytes). `kiki.railway.network` is not cumulative: it is the public
   network bytes moved in the sample's minute (private networking, such as

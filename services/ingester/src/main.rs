@@ -119,7 +119,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
             Err(e) => Err(e),
         },
     };
+    // Stop the poller (its gauges go silent with it) while still the leader.
     poller.abort();
+    let _ = poller.await;
     // Only now may the next instance connect to the Gateway.
     leader.release().await;
     leader_held.record(0, &[]);

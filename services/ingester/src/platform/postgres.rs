@@ -5,7 +5,13 @@
 //! server cancels a slow one, and a `lock_timeout`, so a size lookup never waits
 //! behind a migration's lock.
 
-use sqlx::{FromRow, PgPool, Postgres, Transaction};
+use std::time::Duration;
+
+use sqlx::{
+    FromRow, PgPool, Postgres, Transaction,
+    postgres::{PgArguments, PgRow},
+    query::QueryAs,
+};
 
 /// Tables whose size and dead tuples are reported: a fixed allowlist, so the
 /// `table` attribute stays bounded.
@@ -54,20 +60,27 @@ pub struct Server {
     pub blocks_read: u64,
     pub deadlocks: u64,
     pub temp_bytes: u64,
+    /// When the database's statistics were last reset (Unix seconds), if ever:
+    /// block-counter deltas are only meaningful while it stays the same.
+    pub stats_reset: Option<f64>,
     /// (table, total size in bytes, dead tuples), for the [`TABLES`] that exist.
     pub tables: Vec<(&'static str, u64, u64)>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, FromRow)]
+/// Each value is `None` when its query failed this poll.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Queues {
-    pub runs_pending: i64,
-    pub runs_oldest_secs: f64,
-    pub drawings_pending: i64,
-    pub drawings_oldest_secs: f64,
-    pub runs_stuck: i64,
-    pub conversations_open: i64,
-    pub embeddings_backlog: i64,
+    /// Pending agent runs, and the oldest one's age in seconds (0 if none).
+    pub runs: Option<(i64, f64)>,
+    /// Pending drawings, and the oldest one's age.
+    pub drawings: Option<(i64, f64)>,
+    pub runs_stuck: Option<i64>,
+    pub conversations_open: Option<i64>,
+    pub embeddings_backlog: Option<i64>,
 }
+
+/// Bounds each queue query, above its `statement_timeout`.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn begin(db: &PgPool) -> sqlx::Result<Transaction<'static, Postgres>> {
     let mut tx = db.begin().await?;
@@ -97,6 +110,7 @@ pub async fn server(db: &PgPool) -> sqlx::Result<Server> {
         blocks_read: i64,
         deadlocks: i64,
         temp_bytes: i64,
+        stats_reset: Option<f64>,
     }
     #[derive(FromRow)]
     struct Table {
@@ -135,7 +149,8 @@ pub async fn server(db: &PgPool) -> sqlx::Result<Server> {
             blks_hit AS blocks_hit,
             blks_read AS blocks_read,
             deadlocks::bigint AS deadlocks,
-            temp_bytes::bigint AS temp_bytes
+            temp_bytes::bigint AS temp_bytes,
+            extract(epoch FROM stats_reset)::float8 AS stats_reset
         FROM pg_stat_database WHERE datname = current_database()
         "#,
     )
@@ -176,6 +191,7 @@ pub async fn server(db: &PgPool) -> sqlx::Result<Server> {
         blocks_read: count(database.blocks_read),
         deadlocks: count(database.deadlocks),
         temp_bytes: count(database.temp_bytes),
+        stats_reset: database.stats_reset,
         tables: tables
             .into_iter()
             .filter_map(|t| {
@@ -186,52 +202,102 @@ pub async fn server(db: &PgPool) -> sqlx::Result<Server> {
     })
 }
 
-pub async fn queues(db: &PgPool) -> sqlx::Result<Queues> {
-    let mut tx = begin(db).await?;
-    // Every count reads a partial index or a short range, never a whole table,
-    // except `stuck`, which scans agent_runs' heap (narrow rows: the request
-    // snapshot is TOASTed).
-    //
-    // The backlog matches the host's pending query (chat/indexing.py and
-    // chat/scope.py: people's undeleted, non-empty messages, a link fixer's
-    // reposts included, ignored authors' excluded) over messages whose
-    // snowflake ID is newer than BACKLOG_DAYS: ID = (ms since 2015 << 22).
-    let queues: Queues = sqlx::query_as(
-        r#"
-        SELECT
-            (SELECT count(*) FROM agent_runs WHERE status = 'pending') AS runs_pending,
-            coalesce((SELECT extract(epoch FROM now() - min(created_at))
-                      FROM agent_runs WHERE status = 'pending'), 0)::float8 AS runs_oldest_secs,
-            (SELECT count(*) FROM agent_image_jobs WHERE status = 'pending') AS drawings_pending,
-            coalesce((SELECT extract(epoch FROM now() - min(created_at))
-                      FROM agent_image_jobs WHERE status = 'pending'), 0)::float8
-                AS drawings_oldest_secs,
-            (SELECT count(*) FROM agent_runs
-             WHERE status IN ('running', 'delivering')
-               AND started_at < now() - make_interval(secs => $1)) AS runs_stuck,
-            (SELECT count(*) FROM conversations WHERE closed_at IS NULL) AS conversations_open,
-            (SELECT count(*) FROM messages m
-             WHERE m.id >= ((extract(epoch FROM now() - make_interval(days => $2::int)) * 1000)::bigint
-                            - 1420070400000) << 22
-               AND m.deleted_at IS NULL
-               AND (NOT m.author_bot OR m.relayed_for IS NOT NULL)
-               AND (m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors))
-                    OR m.relayed_for IS NOT NULL)
-               AND btrim(coalesce(m.relayed_text, m.content)) <> ''
-               AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id))
-                AS embeddings_backlog
-        "#,
+/// Each query on its own, so a failing or slow one leaves the others' values.
+/// Returns the failures by query name.
+pub async fn queues(db: &PgPool) -> (Queues, Vec<(&'static str, anyhow::Error)>) {
+    let mut errors = Vec::new();
+    fn keep<T>(
+        errors: &mut Vec<(&'static str, anyhow::Error)>,
+        name: &'static str,
+        result: anyhow::Result<T>,
+    ) -> Option<T> {
+        result.map_err(|e| errors.push((name, e))).ok()
+    }
+    let runs = fetch::<(i64, f64)>(
+        db,
+        sqlx::query_as(
+            "SELECT count(*), coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 \
+             FROM agent_runs WHERE status = 'pending'",
+        ),
     )
-    .bind(STUCK_AFTER_SECS as f64)
-    .bind(BACKLOG_DAYS)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(Queues {
-        runs_oldest_secs: queues.runs_oldest_secs.max(0.0),
-        drawings_oldest_secs: queues.drawings_oldest_secs.max(0.0),
-        ..queues
+    .await;
+    let runs = keep(&mut errors, "agent_runs", runs);
+    let drawings = fetch::<(i64, f64)>(
+        db,
+        sqlx::query_as(
+            "SELECT count(*), coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 \
+             FROM agent_image_jobs WHERE status = 'pending'",
+        ),
+    )
+    .await;
+    let drawings = keep(&mut errors, "drawings", drawings);
+    // agent_runs_active_idx (migration 0026).
+    let stuck = fetch::<(i64,)>(
+        db,
+        sqlx::query_as(
+            "SELECT count(*) FROM agent_runs \
+             WHERE status IN ('running', 'delivering') \
+               AND started_at < now() - make_interval(secs => $1)",
+        )
+        .bind(STUCK_AFTER_SECS as f64),
+    )
+    .await;
+    let stuck = keep(&mut errors, "stuck", stuck);
+    let open = fetch::<(i64,)>(
+        db,
+        sqlx::query_as("SELECT count(*) FROM conversations WHERE closed_at IS NULL"),
+    )
+    .await;
+    let open = keep(&mut errors, "conversations", open);
+    // The host's pending query (chat/indexing.py and chat/scope.py: people's
+    // undeleted, non-empty messages, a link fixer's reposts included, ignored
+    // authors' excluded) over messages whose snowflake ID is newer than
+    // BACKLOG_DAYS: ID = (ms since 2015 << 22), a primary-key range.
+    let backlog = fetch::<(i64,)>(
+        db,
+        sqlx::query_as(
+            r#"
+            SELECT count(*) FROM messages m
+            WHERE m.id >= ((extract(epoch FROM now() - make_interval(days => $1::int)) * 1000)::bigint
+                           - 1420070400000) << 22
+              AND m.deleted_at IS NULL
+              AND (NOT m.author_bot OR m.relayed_for IS NOT NULL)
+              AND (m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors))
+                   OR m.relayed_for IS NOT NULL)
+              AND btrim(coalesce(m.relayed_text, m.content)) <> ''
+              AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
+            "#,
+        )
+        .bind(BACKLOG_DAYS),
+    )
+    .await;
+    let backlog = keep(&mut errors, "embeddings_backlog", backlog);
+    let queues = Queues {
+        runs: runs.map(|(n, age)| (n, age.max(0.0))),
+        drawings: drawings.map(|(n, age)| (n, age.max(0.0))),
+        runs_stuck: stuck.map(|(n,)| n),
+        conversations_open: open.map(|(n,)| n),
+        embeddings_backlog: backlog.map(|(n,)| n),
+    };
+    (queues, errors)
+}
+
+async fn fetch<T>(
+    db: &PgPool,
+    query: QueryAs<'static, Postgres, T, PgArguments>,
+) -> anyhow::Result<T>
+where
+    T: for<'r> FromRow<'r, PgRow> + Send + Unpin,
+{
+    let fetched: sqlx::Result<T> = tokio::time::timeout(QUERY_TIMEOUT, async {
+        let mut tx = begin(db).await?;
+        let row = query.fetch_one(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(row)
     })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out"))?;
+    Ok(fetched?)
 }
 
 #[cfg(test)]
@@ -270,7 +336,18 @@ mod tests {
             return;
         };
         let db = test.db.clone();
-        assert_eq!(queues(&db).await.unwrap(), Queues::default());
+        let (empty, errors) = queues(&db).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            empty,
+            Queues {
+                runs: Some((0, 0.0)),
+                drawings: Some((0, 0.0)),
+                runs_stuck: Some(0),
+                conversations_open: Some(0),
+                embeddings_backlog: Some(0),
+            }
+        );
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -312,15 +389,32 @@ mod tests {
         .await
         .unwrap();
 
-        let q = queues(&db).await.unwrap();
-        assert_eq!(q.runs_pending, 2);
-        assert!((85.0..120.0).contains(&q.runs_oldest_secs), "{q:?}");
-        assert_eq!(q.drawings_pending, 1);
-        assert!((25.0..60.0).contains(&q.drawings_oldest_secs), "{q:?}");
-        assert_eq!(q.runs_stuck, 2);
-        assert_eq!(q.conversations_open, 1);
+        let (q, errors) = queues(&db).await;
+        assert!(errors.is_empty(), "{errors:?}");
+        let (runs, runs_age) = q.runs.unwrap();
+        assert_eq!(runs, 2);
+        assert!((85.0..120.0).contains(&runs_age), "{q:?}");
+        let (drawings, drawings_age) = q.drawings.unwrap();
+        assert_eq!(drawings, 1);
+        assert!((25.0..60.0).contains(&drawings_age), "{q:?}");
+        assert_eq!(q.runs_stuck, Some(2));
+        assert_eq!(q.conversations_open, Some(1));
         // The plain pending message and the link fixer's repost.
-        assert_eq!(q.embeddings_backlog, 2);
+        assert_eq!(q.embeddings_backlog, Some(2));
+
+        // One failing query leaves the others' values.
+        sqlx::raw_sql("ALTER TABLE ignored_authors RENAME TO ignored_authors_gone")
+            .execute(&db)
+            .await
+            .unwrap();
+        let (q, errors) = queues(&db).await;
+        assert_eq!(
+            errors.iter().map(|e| e.0).collect::<Vec<_>>(),
+            ["embeddings_backlog"]
+        );
+        assert_eq!(q.embeddings_backlog, None);
+        assert_eq!(q.runs_stuck, Some(2));
+        assert_eq!(q.conversations_open, Some(1));
         test.drop().await;
     }
 }

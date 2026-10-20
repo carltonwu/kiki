@@ -13,7 +13,8 @@ mod postgres;
 mod railway;
 
 use std::{
-    sync::{Arc, Mutex},
+    collections::HashMap,
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -41,7 +42,7 @@ struct Snapshot {
     server: Option<Server>,
     /// Over the last poll interval, from `pg_stat_database`'s block counters.
     cache_hit_ratio: Option<f64>,
-    queues: Option<Queues>,
+    queues: Queues,
     railway: Vec<Usage>,
 }
 
@@ -65,7 +66,7 @@ pub async fn run(db: PgPool, mut shutdown: watch::Receiver<bool>) {
     info!(railway = railway.is_some(), "platform poller started");
 
     let mut server_warn = Throttle::default();
-    let mut queues_warn = Throttle::default();
+    let mut queue_warns: HashMap<&'static str, Throttle> = HashMap::new();
     let mut railway_warn = Throttle::default();
     let mut previous: Option<Server> = None;
     let mut ticks = tokio::time::interval(INTERVAL);
@@ -78,7 +79,7 @@ pub async fn run(db: PgPool, mut shutdown: watch::Receiver<bool>) {
         let poll = async {
             let (server, queues, usage) = tokio::join!(
                 bounded(postgres::server(&db)),
-                bounded(postgres::queues(&db)),
+                postgres::queues(&db),
                 poll_railway(&mut railway, &mut railway_warn),
             );
             (server, queues, usage)
@@ -87,8 +88,13 @@ pub async fn run(db: PgPool, mut shutdown: watch::Receiver<bool>) {
             polled = poll => polled,
             _ = shutdown.wait_for(|stop| *stop) => return,
         };
-        server_warn.check("postgres", server.as_ref().err());
-        queues_warn.check("queues", queues.as_ref().err());
+        let (queues, failed) = queues;
+        if let Err(e) = &server {
+            server_warn.warn("postgres", e);
+        }
+        for (query, e) in failed {
+            queue_warns.entry(query).or_default().warn(query, &e);
+        }
         let server = server.ok();
         let ratio = server
             .as_ref()
@@ -97,7 +103,7 @@ pub async fn run(db: PgPool, mut shutdown: watch::Receiver<bool>) {
         let mut snap = snapshot.lock().unwrap_or_else(|e| e.into_inner());
         snap.cache_hit_ratio = ratio;
         snap.server = server.clone();
-        snap.queues = queues.ok();
+        snap.queues = queues;
         snap.railway = usage;
         drop(snap);
         previous = server;
@@ -118,10 +124,7 @@ async fn poll_railway(railway: &mut Option<Railway>, throttle: &mut Throttle) ->
         .unwrap_or_default()
         .as_secs();
     match tokio::time::timeout(POLL_TIMEOUT, client.poll(now)).await {
-        Ok(Ok(usage)) => {
-            throttle.ok();
-            usage
-        }
+        Ok(Ok(usage)) => usage,
         Ok(Err(railway::Error::Unauthorized(message))) => {
             warn!(
                 error = message,
@@ -144,6 +147,9 @@ async fn poll_railway(railway: &mut Option<Railway>, throttle: &mut Throttle) ->
 /// Hits over all block reads since the previous poll; `None` without reads
 /// or across a stats reset.
 fn cache_hit_ratio(before: &Server, now: &Server) -> Option<f64> {
+    if before.stats_reset != now.stats_reset {
+        return None;
+    }
     let hit = now.blocks_hit.checked_sub(before.blocks_hit)?;
     let read = now.blocks_read.checked_sub(before.blocks_read)?;
     let total = hit + read;
@@ -173,18 +179,6 @@ impl Throttle {
         self.last = Some(Instant::now());
         self.suppressed = 0;
     }
-
-    fn check(&mut self, source: &str, error: Option<&anyhow::Error>) {
-        match error {
-            Some(e) => self.warn(source, e),
-            None => self.ok(),
-        }
-    }
-
-    fn ok(&mut self) {
-        // Keeps `last`, so a flapping source still warns at most every WARN_EVERY.
-        self.suppressed = 0;
-    }
 }
 
 /// The instruments, held while the poller runs.
@@ -192,16 +186,21 @@ type Instruments = Vec<Box<dyn std::any::Any + Send + Sync>>;
 
 fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
     let mut all: Instruments = Vec::new();
-    // Each callback locks the snapshot for a copy-free read and observes.
+    // Each callback reads the snapshot through a Weak: the SDK keeps callbacks
+    // after their instruments drop, so once the poller stops (and drops the
+    // snapshot) they observe nothing instead of repeating the last values.
     macro_rules! observe {
         ($kind:ident, $name:literal, $unit:literal, $description:literal, |$s:ident, $o:ident| $body:expr) => {{
-            let shared = snapshot.clone();
+            let shared: Weak<Mutex<Snapshot>> = Arc::downgrade(snapshot);
             all.push(Box::new(
                 meter
                     .$kind($name)
                     .with_unit($unit)
                     .with_description($description)
                     .with_callback(move |$o| {
+                        let Some(shared) = shared.upgrade() else {
+                            return;
+                        };
                         let $s = shared.lock().unwrap_or_else(|e| e.into_inner());
                         $body
                     })
@@ -317,22 +316,22 @@ fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
         }
     );
 
-    // Kiki's queues.
+    // Kiki's queues. Each query fails alone, so each value is checked.
+    fn queue(name: &'static str) -> [KeyValue; 1] {
+        [KeyValue::new("queue", name)]
+    }
+    let count = |n: i64| n.max(0) as u64;
     observe!(
         u64_observable_gauge,
         "kiki.queue.pending",
         "{item}",
         "Agent runs and drawings waiting to start",
         |s, o| {
-            if let Some(q) = &s.queues {
-                o.observe(
-                    q.runs_pending.max(0) as u64,
-                    &[KeyValue::new("queue", "agent_runs")],
-                );
-                o.observe(
-                    q.drawings_pending.max(0) as u64,
-                    &[KeyValue::new("queue", "drawings")],
-                );
+            if let Some((n, _)) = s.queues.runs {
+                o.observe(count(n), &queue("agent_runs"));
+            }
+            if let Some((n, _)) = s.queues.drawings {
+                o.observe(count(n), &queue("drawings"));
             }
         }
     );
@@ -342,12 +341,11 @@ fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
         "s",
         "Age of the oldest waiting item (0 if none)",
         |s, o| {
-            if let Some(q) = &s.queues {
-                o.observe(q.runs_oldest_secs, &[KeyValue::new("queue", "agent_runs")]);
-                o.observe(
-                    q.drawings_oldest_secs,
-                    &[KeyValue::new("queue", "drawings")],
-                );
+            if let Some((_, age)) = s.queues.runs {
+                o.observe(age, &queue("agent_runs"));
+            }
+            if let Some((_, age)) = s.queues.drawings {
+                o.observe(age, &queue("drawings"));
             }
         }
     );
@@ -356,10 +354,8 @@ fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
         "kiki.agent_runs.stuck",
         "{run}",
         "Runs running or delivering for over 10 minutes",
-        |s, o| {
-            if let Some(q) = &s.queues {
-                o.observe(q.runs_stuck.max(0) as u64, &[]);
-            }
+        |s, o| if let Some(n) = s.queues.runs_stuck {
+            o.observe(count(n), &[]);
         }
     );
     observe!(
@@ -367,10 +363,8 @@ fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
         "kiki.conversations.open",
         "{conversation}",
         "Conversations not yet closed",
-        |s, o| {
-            if let Some(q) = &s.queues {
-                o.observe(q.conversations_open.max(0) as u64, &[]);
-            }
+        |s, o| if let Some(n) = s.queues.conversations_open {
+            o.observe(count(n), &[]);
         }
     );
     observe!(
@@ -378,10 +372,8 @@ fn register(meter: &Meter, snapshot: &Shared) -> Instruments {
         "kiki.embeddings.backlog",
         "{message}",
         "Searchable messages from the last 7 days without an embedding",
-        |s, o| {
-            if let Some(q) = &s.queues {
-                o.observe(q.embeddings_backlog.max(0) as u64, &[]);
-            }
+        |s, o| if let Some(n) = s.queues.embeddings_backlog {
+            o.observe(count(n), &[]);
         }
     );
 
@@ -460,6 +452,12 @@ mod tests {
         assert_eq!(cache_hit_ratio(&at(100, 100), &at(100, 100)), None);
         // A stats reset: the counters went back.
         assert_eq!(cache_hit_ratio(&at(100, 100), &at(5, 1)), None);
+        // A reset followed by enough activity to pass the old counts.
+        let reset = Server {
+            stats_reset: Some(1.0),
+            ..at(500, 200)
+        };
+        assert_eq!(cache_hit_ratio(&at(100, 100), &reset), None);
     }
 
     #[test]
