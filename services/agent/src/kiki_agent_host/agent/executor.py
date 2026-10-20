@@ -315,7 +315,9 @@ class PydanticExecutor:
         drew_with = request.image_model
         try:
             async with await db.connect(self.database_url) as connection:
-                gather = drawing.Gatherer(connection, scope, vision, cdn_base(), self.transport)
+                gather = drawing.Gatherer(
+                    connection, scope, vision, cdn_base(), self.transport, purpose=plan.prompt
+                )
                 found, shared = await asyncio.gather(
                     asyncio.gather(*(gather.find(s) for s in plan.subjects)),
                     gather.shared(plan.shared),

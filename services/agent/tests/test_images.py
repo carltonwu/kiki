@@ -228,13 +228,49 @@ def test_compose_numbers_references_and_defaults_to_a_phone_photo():
     assert edited.endswith(drawing.EDIT) and "Reference image 1 is the photo to edit" in edited
 
 
-def test_verdicts_read_the_vision_check():
-    answer = (
-        "Image 1: a white dog on a couch => yes\nImage 2: a meme => no\n"
-        "**Image 3:** the dog, a selfie (yes) => **Yes**\nimage 4: blurry => maybe\n"
-        "Image 5: says yes on a sign => no"
-    )
-    assert drawing.verdicts(answer) == {1, 3}
+def test_attachments_that_look_like_photos_rank_first():
+    # Seen in prod: a 300x225 meme and phone screenshots ranked with selfies.
+    now = ((1561578462123266113 >> 22) + drawing.DISCORD_EPOCH_MS) + 1000
+    recent = 1561578462123266113
+
+    def rank(name, content_type, width, height, message_id=recent):
+        attachment = {"filename": name, "content_type": content_type}
+        attachment |= {"width": width, "height": height}
+        return drawing.likely(attachment, message_id, now)
+
+    camera = rank("IMG_8637.jpg", "image/jpeg", 2160, 2880)
+    screenshot = rank("Screenshot 2026-10-18.png", "image/png", 1179, 2556)
+    thumbnail = rank("image0.jpg", "image/jpeg", 300, 225)
+    pasted = rank("image.png", "image/png", 1200, 900)
+    years_old = rank("IMG_1.jpg", "image/jpeg", 2160, 2880, message_id=1 << 22)
+    drawn = rank("kiki-16.png", "image/png", 1024, 1024)
+    assert camera > years_old > thumbnail
+    assert camera > pasted > screenshot
+    assert drawn < -5
+
+
+def picks(judge):
+    """A vision model answering the reference picker: JSON verdicts for each
+    candidate image, `judge(label)` giving (subject, clarity) from its label."""
+
+    def respond(messages, info):
+        texts = [p for p in messages[-1].parts[0].content if isinstance(p, str)]
+        labels = [t for t in texts if t.startswith("Candidate image ")]
+        verdicts = []
+        for n, label in enumerate(labels, 1):
+            subject, clarity = judge(label)
+            verdicts.append(
+                {
+                    "image": n,
+                    "shows": label,
+                    "kind": "photo" if subject else "meme",
+                    "subject": subject,
+                    "clarity": clarity,
+                }
+            )
+        return ModelResponse(parts=[TextPart(json.dumps({"verdicts": verdicts}))])
+
+    return respond
 
 
 def test_links_expire_and_refresh_only_for_discord():
@@ -681,18 +717,11 @@ async def test_drawing_finds_checks_and_numbers_references(database_url):
     }
     checks = []
 
+    judged = picks(lambda label: ("meme" not in label and "avatar" not in label, 2))
+
     def chat(messages, info):
-        prompt = messages[-1].parts[0].content
-        texts = [p for p in prompt if isinstance(p, str)]
-        checks.append(texts)
-        if "draw Nougie" in texts[0]:
-            # Newest first: snow, meme, adopted. The meme is turned down.
-            return ModelResponse(
-                parts=[TextPart("Image 1: dog => yes\nImage 2: meme => no\nImage 3: dog => yes")]
-            )
-        return ModelResponse(
-            parts=[TextPart("Image 1: selfie => yes\nImage 2: cartoon avatar => no")]
-        )
+        checks.append([p for p in messages[-1].parts[0].content if isinstance(p, str)])
+        return judged(messages, info)
 
     model = FakeImageModel()
     run = executor(database_url, model, chat)
@@ -755,8 +784,7 @@ async def test_shared_images_come_last_and_given_photos_are_not_sent_twice(datab
         "/attachments/2/83/meme.png": PNG + b"meme",
     }
 
-    def chat(messages, info):
-        return ModelResponse(parts=[TextPart("Image 1: a man => yes")])
+    chat = picks(lambda label: (True, 3))
 
     model = FakeImageModel()
     run = executor(database_url, model, chat)
@@ -984,3 +1012,154 @@ def test_binary_keeps_only_types_the_image_model_takes():
     assert drawing.binary(PNG).media_type == "image/png"
     assert drawing.binary(b"GIF89a....") is None
     assert isinstance(BinaryContent(PNG, media_type="image/png"), BinaryContent)
+
+
+async def test_the_picker_takes_the_clearest_photos_of_several_candidates(database_url):
+    # Seen in prod: the first approved candidates were taken in search order, and
+    # a meme of a monkey and a game character were taken for Reece.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (100, 200, "me at the lake", [attachment(101, "IMG_1.jpg")]),
+        (102, 200, "me lol", [attachment(103, "IMG_2.jpg")]),
+        (104, 200, "my soup", [attachment(105, "IMG_3.jpg")]),
+        (106, 300, "user200 as a monkey", [attachment(107, "monkey.png", "image/png")]),
+    )
+    files = {
+        "/attachments/2/101/IMG_1.jpg": JPEG + b"lake",
+        "/attachments/2/103/IMG_2.jpg": JPEG + b"close",
+        "/attachments/2/105/IMG_3.jpg": JPEG + b"soup",
+        "/attachments/2/107/monkey.png": PNG + b"monkey",
+    }
+    clarity = {"lake": 1, "lol": 3}
+    prompts = []
+    judged = picks(
+        lambda label: next(((True, c) for k, c in clarity.items() if k in label), (False, 0))
+    )
+
+    def chat(messages, info):
+        prompts.append([p for p in messages[-1].parts[0].content if isinstance(p, str)])
+        return judged(messages, info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord(files, [])
+    job = image_job([Subject(name="user200", user_id="200")], prompt="a portrait")
+    result = await run.draw(job)
+    # The clear close-up first, then the blurry lake photo; soup and monkey are out.
+    assert [r.message_id for r in result.references] == ["102", "100"]
+    [texts] = prompts
+    assert sum(t.startswith("Candidate image ") for t in texts) == 4  # (no avatar served)
+    assert 'The picture to draw: "a portrait"' in texts[0]
+
+
+async def test_given_photos_anchor_the_picker_and_bad_answers_get_one_retry(database_url):
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (110, 300, "this is what reece looks like", [attachment(111, "reece.jpg")]),
+        (112, 300, "Reece at the beach", [attachment(113, "beach.jpg")]),
+    )
+    files = {
+        "/attachments/2/111/reece.jpg": JPEG + b"reece",
+        "/attachments/2/113/beach.jpg": JPEG + b"beach",
+    }
+    requests = []
+    judged = picks(lambda label: (True, 2))
+
+    def chat(messages, info):
+        requests.append(messages)
+        if len(messages) == 1:  # skips the only candidate: retried through ModelRetry
+            return ModelResponse(parts=[TextPart('{"verdicts": []}')])
+        return judged(messages[:1], info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord(files, [])
+    result = await run.draw(image_job([Subject(name="Reece", photos=["110"])]))
+    assert [r.message_id for r in result.references] == ["110", "112"]
+    assert len(requests) == 2  # the first answer had no verdict for image 1
+    texts = [p for p in requests[0][0].parts[0].content if isinstance(p, str)]
+    assert "Known photo A of Reece (not a candidate)" in texts
+    assert "the same one as in the known photos" in texts[0]
+    assert [t for t in texts if t.startswith("Candidate image ")] == [
+        'Candidate image 1; caption: "Reece at the beach"'
+    ]
+
+
+async def test_photos_cited_in_memory_are_candidates(database_url):
+    await reply_job(database_url)
+    await seed(database_url, (120, 300, "look at her go", [attachment(121, "IMG_9.jpg")]))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        cursor = await db.execute(
+            "INSERT INTO memory_subjects (guild_id, kind, name, name_norm)"
+            " VALUES (%s, 'thing', 'Piper', name_norm('Piper')) RETURNING id",
+            (GUILD,),
+        )
+        [subject] = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO memory_entries (doc_id, kind, text, sources, first_observed_at,"
+            " last_observed_at) SELECT id, 'fact', 'Piper is a merle dog', '{120}', now(), now()"
+            " FROM memory_docs WHERE subject_id = %s",
+            (subject,),
+        )
+    model = FakeImageModel()
+    run = executor(database_url, model, picks(lambda label: (True, 3)))
+    run.transport = discord({"/attachments/2/121/IMG_9.jpg": JPEG + b"piper"}, [])
+    result = await run.draw(image_job([Subject(name="Piper")], prompt="Piper in snow"))
+    # The caption doesn't name her: only her memory points at the photo.
+    assert [r.message_id for r in result.references] == ["120"]
+
+
+async def test_a_name_two_people_had_means_the_one_going_by_it(database_url):
+    # Seen in prod: Ethan had once been nicknamed "Reece", so "Reece" meant nobody
+    # and Reece was searched for as a thing.
+    await seed(database_url, (130, 200, "hi", []), (131, 400, "hey", []))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO user_names (guild_id, user_id, kind, name, name_norm, first_seen,"
+            " last_seen) VALUES (%s, 200, 'nick', 'Reece', 'reece', now(), now()),"
+            " (%s, 400, 'nick', 'Reece', 'reece', now(), now()) ON CONFLICT DO NOTHING",
+            (GUILD, GUILD),
+        )
+        await db.execute(
+            "INSERT INTO people (guild_id, user_id, username, nick, seen_at) VALUES"
+            " (%s, 200, 'user200', 'Ethan', now()), (%s, 400, 'rqc2', 'Reece', now())"
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET nick = excluded.nick",
+            (GUILD, GUILD),
+        )
+    args = {"prompt": "x", "subjects": [{"name": "Reece"}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.user_id) for s in queued.subjects] == [("Reece", "400")]
+
+
+async def test_a_message_id_in_a_name_is_a_photo_and_kikis_drawings_are_not(database_url):
+    # Seen in prod: "Reece (from the selfie he shared, message …)" with no photos,
+    # and Kiki's own picture of Reece given as his photo.
+    await seed(database_url, (1561574753435652146, 300, "me", [attachment(141, "me.jpg")]))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, author_bot,"
+            " content, created_at, raw) VALUES (142, %s, 2, 999, 'Kiki', true, 'starring reece',"
+            " now(), %s)",
+            (GUILD, Jsonb({"attachments": [attachment(143, "kiki-16.png", "image/png")]})),
+        )
+    name = "Reece (from the selfie he shared, message 1561574753435652146)"
+    args = {"prompt": "x", "subjects": [{"name": name}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.photos) for s in queued.subjects] == [("Reece", ["1561574753435652146"])]
+
+    results = []
+
+    def respond(messages, info):
+        if len(messages) == 1:
+            call = {"prompt": "x", "subjects": [{"name": "Reece", "photos": ["142"]}]}
+            return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+        results.append(messages[-1].parts[0].content)
+        return ModelResponse(parts=[TextPart("hm")])
+
+    result = await executor(database_url, FakeImageModel(), respond).execute(request("test/image"))
+    assert result.drawings == []
+    assert "142 is a picture you drew, not a photo of Reece" in results[0]["error"]

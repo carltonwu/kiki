@@ -24,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 
 MAX_IMAGES = 2  # pictures one reply may queue
+# A message ID (a snowflake) in a subject's name, and the clause around it.
+ID_IN_NAME = re.compile(r"\b([0-9]{17,20})\b")
+ID_IN_NAME_CLAUSE = re.compile(r"\s*[(\[][^)\]]*\b[0-9]{17,20}\b[^)\]]*[)\]]|\b[0-9]{17,20}\b")
 
 
 def listed(value: Any) -> Any:
@@ -59,6 +62,12 @@ class Pictured(BaseModel):
         if not isinstance(value, dict):
             return value
         value = {k: v for k, v in value.items() if v is not None}
+        # A message ID put in the name ("Reece (from the selfie he shared, message
+        # 1561574753435652146)", seen in prod with no photos) is a photo.
+        name = str(value.get("name") or "")
+        if not value.get("photos") and (ids := ID_IN_NAME.findall(name)):
+            value["photos"] = ids
+            value["name"] = ID_IN_NAME_CLAUSE.sub("", name).strip(" ,;:-") or name
         if isinstance(value.get("person"), int):
             value["person"] = f"u{value['person']}"
         if not str(value.get("name") or "").strip() and (value.get("me") or value.get("person")):
@@ -189,12 +198,21 @@ async def generate_image(
                 tries = [f"@{label['username']}"] if label and label["username"] else []
                 for who in [*tries, name]:
                     ids = await resolve_person(deps.connection, deps.scope, deps.roster, who)
+                    if len(ids) > 1:
+                        ids = await going_by(deps, ids, who)
                     if len(ids) == 1:
                         user_id = str(ids[0])
                         break
             photos = [await photo_message(deps, p.strip()) for p in s.photos if p.strip()]
             if missing := await without_images(deps, photos):
                 raise ValueError(f"No message with images among {missing} in this server")
+            if not (s.me or edit) and (drawn := await drawn_by_kiki(deps, photos)):
+                # Seen in prod: her own "starring reece" picture as Reece's photo, so
+                # the next one was drawn from a drawing and drifted further.
+                raise ValueError(
+                    f"{', '.join(drawn)} is a picture you drew, not a photo of {name}: put it "
+                    "in shared to redraw it, or leave photos empty to use real photos of them"
+                )
             pictured.append(
                 Subject(
                     name=name,
@@ -241,6 +259,38 @@ async def generate_image(
         }
 
     return await guarded(ctx, "generate_image", work, budget=None)
+
+
+async def going_by(deps: Deps, ids: list[int], name: str) -> list[int]:
+    """Of the people a name has meant, those who go by it now, else those in this
+    conversation. In prod Ethan had once been nicknamed "Reece", so "Reece" meant
+    nobody and Reece was searched for as a thing: a game character and a monkey
+    became his references."""
+    cursor = await deps.connection.execute(
+        "SELECT user_id FROM people WHERE guild_id = %s AND user_id = ANY(%s)"
+        " AND name_norm(%s) IN (name_norm(coalesce(nick, '')), name_norm(coalesce(global_name, '')),"
+        " name_norm(coalesce(username, '')))",
+        (deps.scope.guild_id, ids, name.removeprefix("@")),
+    )
+    now = [row[0] for row in await cursor.fetchall()]
+    if now:
+        return now
+    return [i for i in ids if i in deps.roster.speakers]
+
+
+async def drawn_by_kiki(deps: Deps, picks: list[str]) -> list[str]:
+    """The picks that are Kiki's own pictures (her `kiki-<id>.png` uploads)."""
+    ids = [int(m[1]) for p in picks if (m := PICK.match(p))]
+    if not ids:
+        return []
+    cursor = await deps.connection.execute(
+        "SELECT m.id::text FROM messages m WHERE m.guild_id = %s AND m.id = ANY(%s)"
+        " AND m.author_bot AND EXISTS (SELECT 1 FROM jsonb_array_elements("
+        " coalesce(m.raw->'attachments', '[]')) a WHERE a->>'filename' ~ '^kiki-[0-9]+\\.png$')",
+        (deps.scope.guild_id, ids),
+    )
+    drawn = {row[0] for row in await cursor.fetchall()}
+    return [p for p in picks if p.split(":")[0] in drawn]
 
 
 async def photo_message(deps: Deps, photo: str) -> str:

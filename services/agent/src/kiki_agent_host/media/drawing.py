@@ -8,11 +8,14 @@ the subject looks like, best first:
    attached images, then its linked post's photos from the site itself (all of a
    tweet's, where Discord's preview has one or none) or else Discord's previews,
    or only the Nth of them ("123:2");
-2. images in the server's history: for a thing, posts whose text names it; for a
-   person, their own posts that look like photos of them (captions like "me",
-   camera JPEGs rather than screenshots) and other people's posts naming them.
-   A vision model checks each candidate and keeps the clear ones;
-3. a person's Discord avatar, if the same check says it's a photo of them;
+2. candidates from Kiki's memory of it (the messages its entries cite) and the
+   server's history (for a thing, posts whose text names it; for a person, their
+   own posts with captions like "me", then other people's posts naming them),
+   ranked by what each attachment looks like (camera JPEG or screenshot, size,
+   shape, age), and a person's Discord avatar. The picker, a vision model with a
+   structured verdict per image, keeps the photos that clearly show it, clearest
+   first, judged against the given photos when there are some;
+3. (a person's avatar is one of those candidates);
 4. for Kiki herself, her earlier self-portraits.
 
 Images people shared with the request (`Drawing.shared`: attached to it, in a
@@ -28,37 +31,50 @@ the reply's own prompt, so the request never ends in silence.
 import asyncio
 import logging
 import re
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 from psycopg import AsyncConnection, OperationalError
 from psycopg.rows import dict_row
-from pydantic_ai import Agent
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, ModelRetry, PromptedOutput, RunContext
+from pydantic_ai.exceptions import AgentRunError
 from pydantic_ai.messages import BinaryContent, BinaryImage, ModelResponse, TextPart, UserContent
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
 from .. import telemetry
 from ..chat.attachments import images_in
-from ..chat.scope import HEARD, Scope
+from ..chat.scope import HEARD, PEOPLES, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
 from ..prompt import history
 from . import links
 from .fetch import allowed, client, download, refresh, sniff
-from .vision import ImageRefused, Vision, bill, billed_cost, look
+from .vision import Vision, bill, billed_cost
 
 logger = logging.getLogger(__name__)
 
 PER_SUBJECT = 3  # references per subject: enough for a likeness, room for several subjects
 SHARED_IMAGES = 4  # images shared with the request, after the subjects'
 GIVEN_PER_MESSAGE = 4  # images taken from one picked message, unless one is named
-CANDIDATE_MESSAGES = 10
-CANDIDATES = 8  # images shown to the vision check per subject
+# Messages searched per subject. In prod the first 10 by caption alone held no photo
+# of Carlton and one of Reece among food and cat pictures; the images are then ranked
+# by what their attachment says (camera photo or screenshot, size, shape, age).
+CANDIDATE_MESSAGES = 40
+CANDIDATES = 24  # images shown to the picker per subject, its avatar included
+PICK_BATCH = 12  # images per picker request; the batches run in parallel
+ANCHORS = 2  # given photos shown to the picker as what the subject looks like
 VERIFY_TIMEOUT_SECONDS = 30
-# One line per photo, without thinking (`look(think=False)`): a reasoning model
+# A short verdict per photo, without thinking (`think=False`): a reasoning model
 # spent over 2,000 tokens and 20 s on five photos, past the check's deadline.
-VERIFY_MAX_TOKENS = 1500
+VERIFY_MAX_TOKENS = 2000
+# One retry when the picker's answer doesn't match the candidates (a missing or
+# made-up image number): a second request, still inside the check's deadline.
+PICK_RETRIES = 1
+MIN_CLARITY = 1  # 0 is unusable; the clearest come first anyway
 NOTE_MAX_TOKENS = 400
 # GPT Image edits take PNG, JPEG and WebP.
 REFERENCE_TYPES = ("image/png", "image/jpeg", "image/webp")
@@ -92,35 +108,79 @@ EDIT = (
 
 VERIFY = """\
 You pick reference photos for an image generator. It will draw {name} ({what}), \
-and the photos you approve show it what {name} looks like.
+and the photos you approve show it what {name} looks like.{known}{purpose}
 
-For each candidate below, first look at what the image actually is, then decide \
-whether it clearly shows {name}. Captions help tell who is in a photo; they \
-never make a meme, artwork or screenshot into a photo.
+For each candidate image below, first look at what the image actually is, then \
+judge it:
+- kind: photo (a real camera photo), screenshot, meme, art (a drawing, render, \
+game or AI picture) or other. Captions help tell who is in a photo; they never \
+make a meme, artwork or screenshot into a photo.
+- subject: true only if {name} is clearly in it and you can tell which one is {name}.
+- clarity: 3 when {name} is the main subject, sharp, well lit and fully visible \
+(for a person, the face); 2 when clearly {name} but small, partly hidden, or with \
+others; 1 when blurry, dark or at an odd angle; 0 when unusable.
 {rules}
-Answer one line per candidate and nothing else, in this form, describing that \
-image itself:
-Image <number>: <what this image shows, in a few words> => <yes or no>"""
+Give one verdict for every candidate image, by its number."""
+
+KNOWN = """
+The known photos (lettered A, B) come first: they're of {name} for sure and \
+aren't candidates, so give them no verdict. A candidate is {name} only if it's \
+the same {kind} as in the known photos."""
+PURPOSE = """
+The picture to draw: "{prompt}". Among clear photos, prefer ones showing what it \
+needs (the face for a portrait, the whole body for an outfit)."""
 
 PERSON_RULES = """\
 - Candidates come from {name}'s own posts or posts that name them, with their \
-captions. Say yes for a real camera photo whose main person is plausibly {name}: \
-a selfie or a photo of the poster ("me", "me tonight"), or a caption naming them. \
+captions. A real camera photo whose main person is plausibly {name} is them: a \
+selfie or a photo of the poster ("me", "me tonight"), or a caption naming them. \
 If several photos show the same person, that consistency supports them; a photo \
-of someone who looks clearly different from the rest is no.
-- Say no for screenshots, memes, art, illustrations, other people, photos of \
-several people unless the caption says which one is {name}, and photos where the \
-face isn't visible.
-- The avatar is the picture they chose for their profile: yes only if it's a real \
-photo of the same person as their other approved photos (or, with none, plainly a \
+of someone who looks clearly different from the rest is not {name}.
+- Not {name}: screenshots, memes, art, other people, animals, food and things, \
+photos of several people unless the caption says which one is {name}, and photos \
+where the face isn't visible.
+- The avatar is the picture they chose for their profile: it's {name} only if it's \
+a real photo of the same person as their other photos (or, with none, plainly a \
 casual photo of an ordinary person rather than a celebrity, model or character)."""
 
 THING_RULES = """\
-- Candidates are posts whose captions name {name}. Say yes when {name} is clearly \
-visible: the main subject, in focus, not tiny or hidden.
-- Say no for screenshots, memes, drawings, photos where it isn't visible (a \
+- Candidates are posts whose captions name {name}. It's {name} when {name} is \
+clearly visible: the main subject, in focus, not tiny or hidden.
+- Not {name}: screenshots, memes, drawings, photos where it isn't visible (a \
 caption can name {name} while the photo shows something else), and photos of \
 several animals or things where you can't tell which one is {name}."""
+
+
+class Verdict(BaseModel):
+    """The picker's judgment of one candidate image."""
+
+    image: int = Field(description="The candidate's image number")
+    shows: str = Field(description="What the image itself shows, in a few words")
+    kind: Literal["photo", "screenshot", "meme", "art", "other"]
+    subject: bool = Field(description="Whether it clearly shows the subject")
+    clarity: int = Field(ge=0, le=3, description="0 (unusable) to 3 (the clearest)")
+
+
+class Picks(BaseModel):
+    """The picker's verdicts, one per candidate."""
+
+    verdicts: list[Verdict]
+
+
+# Prompted (JSON in the text) rather than a tool call: it works with any vision
+# model, including ones without tool calling or structured outputs.
+picker = Agent(output_type=PromptedOutput(Picks, name="reference_photos"), deps_type=int)
+
+
+@picker.output_validator
+def every_candidate(ctx: RunContext[int], picks: Picks) -> Picks:
+    """One verdict per candidate: a skipped or made-up number gets one retry."""
+    numbers = {v.image for v in picks.verdicts}
+    expected = set(range(1, ctx.deps + 1))
+    if not expected <= numbers or numbers - expected:
+        raise ModelRetry(f"Give exactly one verdict for each of images 1 to {ctx.deps}.")
+    return picks
+
 
 FAILURE_NOTE = """\
 (Not from the chat:) The picture you just said you'd make couldn't be made: \
@@ -142,6 +202,8 @@ class Candidate:
     caption: str = ""
     # The hosts it may come from: Discord's, or a link reader's for a post's photo.
     allow: Callable[[str], bool] = allowed
+    # How likely it shows the subject well, before anyone looks (`likely`).
+    rank: float = 0.0
 
 
 @dataclass
@@ -154,7 +216,7 @@ class Found:
 
 # Messages with image attachments that may show a thing: their text names it.
 THING_CANDIDATES = f"""
-SELECT m.id, m.author_id, m.content, m.raw FROM messages m
+SELECT m.id, m.author_id, m.content, m.raw, 0 AS rank FROM messages m
 WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
   AND jsonb_array_length(coalesce(m.raw->'attachments', '[]')) > 0
   AND m.content ~* %(pattern)s
@@ -162,21 +224,47 @@ ORDER BY m.id DESC LIMIT %(limit)s
 """
 
 # A person's likely photos of themselves first: their own posts with captions about
-# themselves ("me tonite" most of all), camera JPEGs (screenshots are PNGs), then
-# posts naming them.
+# themselves ("me tonite" most of all), then posts naming or mentioning them (in
+# prod mostly memes, so they come after even their own posts of food or cats). `rank` is that order; the images'
+# own signals are added in Python (`likely`).
+PERSON_RANK = """
+  (m.author_id = %(user)s)::int * 2
+  + (m.author_id = %(user)s AND m.content ~* %(first_person)s)::int * 2
+  + (m.author_id = %(user)s AND m.content ~* %(selfie)s)::int * 2
+  + (m.author_id <> %(user)s)::int
+"""
 PERSON_CANDIDATES = f"""
-SELECT m.id, m.author_id, m.content, m.raw FROM messages m
+SELECT m.id, m.author_id, m.content, m.raw, {PERSON_RANK} AS rank FROM messages m
 WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND NOT m.author_bot AND {HEARD}
   AND jsonb_array_length(coalesce(m.raw->'attachments', '[]')) > 0
   AND (m.author_id = %(user)s OR m.content LIKE %(mention)s OR m.content ~* %(pattern)s)
-ORDER BY (m.author_id = %(user)s)::int * 2
-         + (m.author_id = %(user)s AND m.content ~* %(first_person)s)::int * 2
-         + (m.author_id = %(user)s AND m.content ~* %(selfie)s)::int * 2
-         + coalesce(m.raw->'attachments'->0->>'content_type' = 'image/jpeg', false)::int * 2
-         + (m.author_id <> %(user)s)::int DESC,
-         m.id DESC
+ORDER BY rank DESC, m.id DESC
 LIMIT %(limit)s
 """
+
+# Messages Kiki's memory of the subject cites ("Piper is Austin's dog" citing his
+# photo of her), when they carry images: people pointed at them about the subject.
+MEMORY_CANDIDATES = f"""
+SELECT m.id, m.author_id, m.content, m.raw, 3 AS rank FROM messages m
+WHERE m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {PEOPLES}
+  AND jsonb_array_length(coalesce(m.raw->'attachments', '[]')) > 0
+  AND m.id IN (
+    SELECT unnest(e.sources) FROM memory_subjects s
+    JOIN memory_docs d ON d.subject_id = s.id
+    JOIN memory_entries e ON e.doc_id = d.id AND e.superseded_at IS NULL
+    WHERE s.guild_id = %(guild)s
+      AND (s.user_id = %(user)s OR (s.kind = 'thing' AND s.name_norm = name_norm(%(name)s))))
+ORDER BY m.id DESC LIMIT %(limit)s
+"""
+MEMORY_MESSAGES = 6
+
+# Kiki's own pictures (`kiki-<id>.png` from a bot): a drawing is never a likeness.
+KIKI_DRAWING = re.compile(r"^kiki-[0-9]+\.png$")
+# Camera files ("IMG_8637.jpg", "PXL_…", "DSC07881.jpg") and screenshots by name.
+CAMERA_NAME = re.compile(r"^(img|pxl|dsc|dscn|dcim|photo|mvimg)[_-]?\d", re.IGNORECASE)
+SCREENSHOT_NAME = re.compile(r"screen ?shot|screen_?recording|^image\d*\.png$", re.IGNORECASE)
+DISCORD_EPOCH_MS = 1420070400000
+YEAR_MS = 365 * 24 * 3600 * 1000
 FIRST_PERSON = r"\m(me|my|myself|i|im|i'm|selfie|us)\M"
 SELFIE = r"^\W*(me|selfie|my face|pic of me|it'?s me|us)\M"
 
@@ -227,6 +315,7 @@ def candidates_in(
     picture people mean."""
     found = []
     for m in rows:
+        attachments = {str(a.get("id")): a for a in (m["raw"] or {}).get("attachments") or []}
         for image in images_in(m["raw"] or {})[:per_message]:
             if image.id is None and not embeds:
                 continue
@@ -242,9 +331,41 @@ def candidates_in(
                     url=image.url,
                     media_type=image.media_type,
                     caption=(m["content"] or "").strip()[:200],
+                    rank=float(m.get("rank") or 0)
+                    + likely(attachments.get(image.id or "", {}), int(m["id"])),
                 )
             )
     return found
+
+
+def likely(attachment: dict, message_id: int, now_ms: float | None = None) -> float:
+    """How likely an attachment is a usable photo, from what Discord says of it: a
+    camera JPEG over a PNG screenshot, a real size over a thumbnail, a photo's shape
+    over a phone screen's, and recent over years old (people change). In prod, a
+    300x225 meme and a 1179x2556 screenshot ranked with selfies."""
+    score = 0.0
+    name = attachment.get("filename") or ""
+    content_type = (attachment.get("content_type") or "").split(";")[0].strip().lower()
+    if content_type in ("image/jpeg", "image/heic", "image/heif"):
+        score += 2
+    elif content_type == "image/gif":
+        score -= 3
+    if CAMERA_NAME.match(name):
+        score += 1
+    if SCREENSHOT_NAME.search(name):
+        score -= 2
+    width, height = attachment.get("width") or 0, attachment.get("height") or 0
+    if width and height:
+        if max(width, height) < 400:
+            score -= 2
+        if max(width, height) / min(width, height) > 2:  # a phone screen, a banner
+            score -= 2
+    if KIKI_DRAWING.match(name):
+        score -= 10
+    age_ms = (now_ms or time.time() * 1000) - ((message_id >> 22) + DISCORD_EPOCH_MS)
+    if age_ms > 3 * YEAR_MS:
+        score -= 1
+    return score
 
 
 class Gatherer:
@@ -257,12 +378,15 @@ class Gatherer:
         vision: Vision,
         cdn: str,
         transport: httpx.AsyncBaseTransport | None = None,
+        purpose: str = "",
     ):
         self.connection = connection
         self.scope = scope
         self.vision = vision
         self.cdn = cdn
         self.transport = transport
+        # The picture's prompt, so the picker prefers photos showing what it needs.
+        self.purpose = purpose
 
     async def rows(self, query: str, params: dict) -> list[dict]:
         cursor = self.connection.cursor(row_factory=dict_row)
@@ -295,7 +419,8 @@ class Gatherer:
         return [(c.reference, image) for c, image in fetched]
 
     async def subject(self, subject: Subject) -> Found:
-        """References for one subject, at most PER_SUBJECT."""
+        """References for one subject, at most PER_SUBJECT: the photos given, then
+        the best the picker finds in the history, judged against the given ones."""
         name = subject.name
         chosen: list[tuple[Reference, BinaryImage]] = []
         if subject.photos:
@@ -314,48 +439,59 @@ class Gatherer:
             candidates = [
                 c for c in await self.candidates(subject) if key(c.reference) not in given_keys
             ]
-            approved = await self.verify(subject, candidates)
+            known = [image for _, image in chosen[:ANCHORS]]
+            approved = await self.pick(subject, candidates, known)
             chosen += [(c.reference, image) for c, image in approved][: PER_SUBJECT - len(chosen)]
         for reference, _ in chosen:
             reference.subject = name
         return Found(subject, chosen[:PER_SUBJECT])
 
     async def candidates(self, subject: Subject) -> list[Candidate]:
-        if subject.user_id:
-            rows = await self.rows(
+        """Images that may show the subject, likeliest first (`likely`): messages
+        Kiki's memory of it cites, then the history's (a person's own photos and
+        posts naming them, a thing's posts naming it), at most CANDIDATES, with a
+        person's avatar last."""
+        user = int(subject.user_id) if subject.user_id else None
+        memory = await self.rows(
+            MEMORY_CANDIDATES, {"user": user, "name": subject.name, "limit": MEMORY_MESSAGES}
+        )
+        if user is not None:
+            history = await self.rows(
                 PERSON_CANDIDATES,
                 {
-                    "user": int(subject.user_id),
-                    "mention": f"%<@{subject.user_id}>%",
+                    "user": user,
+                    "mention": f"%<@{user}>%",
                     "pattern": word(subject.name),
                     "first_person": FIRST_PERSON,
                     "selfie": SELFIE,
                     "limit": CANDIDATE_MESSAGES,
                 },
             )
-            found = candidates_in(rows, per_message=2)[: CANDIDATES - 1]
-            for row in await self.rows(AVATAR, {"user": int(subject.user_id)}):
-                url = avatar_url(
-                    self.cdn,
-                    subject.user_id,
-                    row["user_hash"],
-                    self.scope.guild_id,
-                    row["member_hash"],
-                )
-                if url:
-                    found.append(
-                        Candidate(
-                            label="avatar",
-                            reference=Reference(subject="", avatar_of=subject.user_id),
-                            url=url,
-                            media_type="image/png",
-                        )
-                    )
+        else:
+            history = await self.rows(
+                THING_CANDIDATES, {"pattern": word(subject.name), "limit": CANDIDATE_MESSAGES}
+            )
+        seen = {r["id"] for r in memory}
+        rows = memory + [r for r in history if r["id"] not in seen]
+        # Stable: equal ranks keep the query's order (newest first).
+        found = sorted(candidates_in(rows, per_message=2), key=lambda c: -c.rank)
+        found = [c for c in found if c.rank > -5][: CANDIDATES - (user is not None)]
+        if user is None:
             return found
-        rows = await self.rows(
-            THING_CANDIDATES, {"pattern": word(subject.name), "limit": CANDIDATE_MESSAGES}
-        )
-        return candidates_in(rows, per_message=2)[:CANDIDATES]
+        for row in await self.rows(AVATAR, {"user": user}):
+            url = avatar_url(
+                self.cdn, subject.user_id, row["user_hash"], self.scope.guild_id, row["member_hash"]
+            )
+            if url:
+                found.append(
+                    Candidate(
+                        label="avatar",
+                        reference=Reference(subject="", avatar_of=subject.user_id),
+                        url=url,
+                        media_type="image/png",
+                    )
+                )
+        return found
 
     async def given(self, picks: list[str]) -> list[Candidate]:
         """The images of messages Kiki or the people asking picked, in the order
@@ -425,35 +561,102 @@ class Gatherer:
                 fetched.append((c, BinaryImage(result.data, media_type=result.media_type)))
         return fetched
 
-    async def verify(
-        self, subject: Subject, candidates: list[Candidate]
+    async def pick(
+        self, subject: Subject, candidates: list[Candidate], known: Sequence[BinaryImage] = ()
     ) -> list[tuple[Candidate, BinaryImage]]:
-        """The candidates a vision model says clearly show the subject, in order."""
+        """The candidates the picker (a vision model, with a structured answer) says
+        are photos clearly showing the subject, clearest first, then likeliest.
+        `known` are photos of it for sure, shown first so it approves only the same
+        person or thing. Batches of PICK_BATCH run in parallel."""
         usable = await self.fetch(candidates)
         if not usable:
             return []
+        started = time.monotonic()
+        batches = [usable[i : i + PICK_BATCH] for i in range(0, len(usable), PICK_BATCH)]
+        judged = await asyncio.gather(*(self.judge(subject, b, known) for b in batches))
+        approved = [
+            (clarity, offset + n, pair)
+            for offset, batch, verdicts in zip(
+                range(0, len(usable), PICK_BATCH), batches, judged, strict=True
+            )
+            for n, pair in enumerate(batch)
+            if (clarity := verdicts.get(n + 1, -1)) >= MIN_CLARITY
+        ]
+        approved.sort(key=lambda a: (-a[0], a[1]))
+        logger.info(
+            "references picked subject_kind=%s known=%d candidates=%d batches=%d approved=%d "
+            "latency_ms=%d",
+            "person" if subject.user_id else "thing",
+            len(known),
+            len(usable),
+            len(batches),
+            len(approved),
+            (time.monotonic() - started) * 1000,
+        )
+        return [pair for _, _, pair in approved]
+
+    async def judge(
+        self,
+        subject: Subject,
+        batch: list[tuple[Candidate, BinaryImage]],
+        known: Sequence[BinaryImage],
+    ) -> dict[int, int]:
+        """One picker request: the clarity of each image (numbered from 1) that is
+        a photo of the subject. Empty if the request fails: drawn without them."""
         what = subject.description or ("a person in the group" if subject.user_id else "")
         rules = (PERSON_RULES if subject.user_id else THING_RULES).format(name=subject.name)
+        purpose = (self.purpose or "").strip()
         prompt: list[UserContent] = [
-            VERIFY.format(name=subject.name, what=what or "as named", rules=rules)
+            VERIFY.format(
+                name=subject.name,
+                what=what or "as named",
+                rules=rules,
+                known=KNOWN.format(name=subject.name, kind="person" if subject.user_id else "one")
+                if known
+                else "",
+                purpose=PURPOSE.format(prompt=purpose[:400]) if purpose else "",
+            )
         ]
-        for n, (c, image) in enumerate(usable, 1):
-            label = f"Image {n}" + (" (their avatar)" if c.label == "avatar" else "")
+        for letter, image in zip("ABCDEFGH", known, strict=False):
+            prompt += [
+                f"Known photo {letter} of {subject.name} (not a candidate)",
+                BinaryContent(image.data, media_type=image.media_type),
+            ]
+        for n, (c, image) in enumerate(batch, 1):
+            label = f"Candidate image {n}" + (" (their avatar)" if c.label == "avatar" else "")
             if c.caption:
                 label += f'; caption: "{c.caption}"'
             prompt += [label, BinaryContent(image.data, media_type=image.media_type)]
+        self.vision.calls += 1
         try:
-            async with asyncio.timeout(VERIFY_TIMEOUT_SECONDS):
-                answer = await look(self.vision, prompt, max_tokens=VERIFY_MAX_TOKENS, think=False)
-        except (TimeoutError, ImageRefused) as error:
+            with telemetry.llm_call(self.vision.purpose, self.vision.name) as call:
+                async with asyncio.timeout(VERIFY_TIMEOUT_SECONDS):
+                    run = await picker.run(
+                        prompt,
+                        model=self.vision.model,
+                        deps=len(batch),
+                        model_settings={
+                            "max_tokens": VERIFY_MAX_TOKENS,
+                            "openrouter_usage": {"include": True},
+                            # A quick judgment, not a reasoned one; the same
+                            # photos get the same verdicts.
+                            "openrouter_reasoning": {"enabled": False},
+                            "temperature": 0,
+                        },
+                        retries={"output": PICK_RETRIES},
+                        usage_limits=UsageLimits(request_limit=1 + PICK_RETRIES),
+                    )
+                    bill(call, run)
+        except (TimeoutError, AgentRunError) as error:  # ModelAPIError is one
             logger.warning(
-                "reference check failed subject_kind=%s error_type=%s",
+                "reference check failed subject_kind=%s candidates=%d error_type=%s",
                 "person" if subject.user_id else "thing",
+                len(batch),
                 type(error).__name__,
             )
-            return []
-        approved = verdicts(answer)
-        return [pair for n, pair in enumerate(usable, 1) if n in approved]
+            return {}
+        self.vision.cost += billed_cost(run) or 0.0
+        return {v.image: v.clarity for v in run.output.verdicts if v.subject and v.kind == "photo"}
 
 
 def key(reference: Reference) -> tuple:
@@ -478,11 +681,6 @@ def trim(groups: list[list], limit: int) -> list[list]:
                 kept[i] += 1
                 total += 1
     return [group[:n] for group, n in zip(groups, kept, strict=True)]
-
-
-def verdicts(answer: str) -> set[int]:
-    """The image numbers the vision check approved ("Image 3: a selfie => yes")."""
-    return {int(m[1]) for m in re.finditer(r"(?im)^\W*image\s+(\d+)\b[^\n]*?=>\W*yes\b", answer)}
 
 
 def binary(data: bytes) -> BinaryImage | None:

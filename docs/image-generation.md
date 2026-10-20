@@ -14,7 +14,7 @@ Rust: reply job (+ image_model) ─▶ host: chat model calls generate_image(pro
    │                                 └─ only queues it: result { text: Kiki's ack, drawings: [...] }
    ├─▶ agent_image_jobs rows (pending), then the ack is posted (or her reaction)
    └─▶ per drawing, its own task: POST /v1/images { id: image:<run>:<n>, drawing, … }
-          host: references per subject ─▶ vision check ─▶ final prompt ─▶ OpenRouter image model
+          host: candidates per subject ─▶ vision picker ─▶ final prompt ─▶ OpenRouter image model
                 ─▶ agent_host_images row (+ prompt, references, cost, latency)
        ◀── { image, caption } or { error, failure_note }
        └─▶ follow-up message replying to the request: the image and Kiki's caption,
@@ -87,13 +87,19 @@ The chat model passes:
   went into the hip).
 - `subjects`: the people, pets and things whose look matters, each with a `name`,
   what she knows of them (`description`), a person's roster ref (`person`; a name
-  only one member has gone by resolves too), `me` for herself, and `photos`:
+  only one member has gone by resolves too, and a name several have gone by means
+  the one going by it now, else the one in the conversation: in prod Ethan had
+  once been nicknamed "Reece", so "Reece" resolved to nobody and was searched for
+  as a thing, which made a game character and a monkey his references), `me` for
+  herself, and `photos`:
   message IDs she or the people asking already picked, or a Discord message link
   or attachment link they pasted. An attachment link's message is found by its
   attachment ID in the link's channel; an attachment's snowflake comes just
   before its message's, and the link names that one image (`ID:N`). A bare
   string is taken as a name (models slip; two slips failed a prod reply through
-  the tool's retry limit).
+  the tool's retry limit), and a message ID inside a name with no `photos` is
+  taken as a photo ("Reece (from the selfie he shared, message 156…)" was drawn
+  without the selfie in prod).
 - `shared`: the messages a picture is made from that don't show a subject (the
   photo, meme, template or post to redraw), when they aren't among what Rust
   adds itself (below): a picture from earlier in the chat that a follow-up asks
@@ -112,21 +118,38 @@ The chat model passes:
 The image job (`media/drawing.py`) then finds references for each subject, at most 3 per
 subject and 16 in all (OpenRouter's `input_references` range for GPT Image), best first:
 
-1. **Given photos** (`photos`): used as they are.
-2. **Server history**, checked by the vision model (`OPENROUTER_VISION_MODEL`):
-   - a thing or pet: posts with images whose text names it ("Nougie got adopted
+1. **Given photos** (`photos`): used as they are. A picture Kiki drew
+   (`kiki-<id>.png`) isn't a photo of anyone: as a subject's photo, outside an edit
+   or her own self-portrait, it's a tool error that tells her to put it in `shared`
+   (in prod her "starring reece" picture became Reece's likeness).
+2. **Candidates** from memory and the server history:
+   - messages with images that Kiki's memory of the subject cites (its live
+     entries' sources), first;
+   - a thing or pet: up to 40 posts whose text names it ("Nougie got adopted
      today!"), newest first;
-   - a person: their own posts first, ranked by captions about themselves ("me
-     tonite", "my face rn"), camera JPEGs over PNG screenshots, then posts naming
-     or mentioning them; plus their avatar (server avatar if set).
-   Up to 8 candidates go to one vision call that describes each image and then
-   answers yes or no ("Image 4: selfie of a young man in a car => yes"). It turns
-   down memes, art, screenshots, photos where the subject isn't clear, and photos
-   of several people or animals where it can't tell which is the subject. The
-   check runs with the model's reasoning off: over 8 photos a reasoning model took
-   longer than the check's 30 s deadline.
-3. **Avatar** for a person, through the same check (it must be a real photo of the
-   same person).
+   - a person: up to 40 of their own posts, ranked by captions about themselves
+     ("me tonite", "my face rn"), then posts naming or mentioning them; plus their
+     avatar (server avatar if set).
+   Each post gives up to 2 images, re-ranked by what Discord says of each
+   attachment (`likely`): camera JPEGs (`IMG_…`, `PXL_…`) over PNG screenshots,
+   real sizes over thumbnails (under 400 px), a photo's shape over a phone
+   screen's (taller than 2:1), and over 3 years old last. The best 24 go on.
+3. **The picker** (`Gatherer.pick`), a Pydantic AI agent on the vision model
+   (`OPENROUTER_VISION_MODEL`), looks at them in parallel batches of 12 with their
+   captions, and gives a structured verdict per image (`PromptedOutput(Picks)`:
+   what it shows, `kind` photo/screenshot/meme/art/other, whether it clearly shows
+   the subject, and `clarity` 0-3). An output validator checks there's one verdict
+   per image and sends a `ModelRetry` once if not. It also sees the drawing's
+   prompt, to prefer what the picture needs (the face for a portrait, the whole
+   body for an outfit), and up to 2 given photos as known photos of the subject
+   (lettered, not candidates), so it approves only the same person or animal.
+   Photos of the subject with clarity 1 or more are kept, clearest first. It
+   turns down memes, art, game renders, screenshots, photos where the subject
+   isn't clear, and photos of several people or animals where it can't tell which
+   is the subject. It runs with the model's reasoning off and a 30 s deadline per
+   batch: over 8 photos a reasoning model took longer than that. Prompted output
+   (JSON in the text) works with any vision model, even without tool calling.
+   The avatar is judged with the rest (it must be a real photo of the same person).
 4. **Kiki herself**: her earlier pictures saved with a `me` subject, so her look
    stays consistent once she has drawn herself.
 
@@ -208,8 +231,12 @@ and the live API. GPT Image models get `quality: medium`.
   no drawing guidance in the prompt.
 - 2 pictures per reply. The image call has 75 s; the whole image job runs inside the
   host's job timeout (`AGENT_HOST_JOB_TIMEOUT_SECS`, 120 s in prod) and Rust's host
-  deadline (`AGENT_HOST_TIMEOUT_MS`, 180 s). The reference check has 30 s; past it,
-  that subject is drawn without references.
+  deadline (`AGENT_HOST_TIMEOUT_MS`, 180 s). Each picker batch has 30 s; past it,
+  that batch's candidates are dropped (the subject is drawn from the others, or
+  from its description). Measured on prod data with DeepSeek V4.1 Flash: about
+  2-4 s to search, 7-17 s to pick from 24 candidates in two batches, $0.001-0.003
+  per subject. That runs after the ack, while the conversation carries on; the
+  old single check of 8 took 2-7 s and about $0.0001-0.005.
 - PNG/JPEG/WebP/GIF results up to 8 MiB, typed by their bytes (`media/fetch.py` `sniff`).
 
 ## Observability
@@ -240,7 +267,7 @@ reference and vision-call counts, outcome, cost and latency.
 - **Two messages.** The ack and the picture are separate, about 15–25 s apart in
   prod tests. The issue's alternative, reacting 🎨 on the request, is still
   available to Kiki as her ack (a reaction alone).
-- **Likeness is as good as the references.** The vision check judges from the
+- **Likeness is as good as the references.** The picker judges from the
   photo and its caption whether it plausibly shows the person; it can't recognize
   faces, so a person's references are their own selfie-like posts. People who
   never post photos of themselves get an avatar (if it's a real photo) or a
@@ -259,13 +286,18 @@ reference and vision-call counts, outcome, cost and latency.
 Python unit tests cover the OpenRouter request (references in order as data URLs,
 the 16 cap), queuing (the ack is the model's own text; lenient arguments; bad refs
 and photos as tool errors), reference gathering against a mock Discord (ranking,
-expired-link refresh, the vision verdicts, avatars, self-portraits), the final
+expired-link refresh, attachment ranking, the picker's clearest-first choice, its
+anchors and its retry on a bad answer, memory-cited photos, avatars,
+self-portraits, ambiguous names, IDs in names, Kiki's drawings refused as
+photos), the final
 prompt, saved metadata, and failure notes. Rust tests cover the image job contract
 and retries. `tools/sim/scenarios/generate-image.yaml` drives it end to end:
 fakecord's `/v1/images` stub records the reference images it got (it rejects links:
 references must be inline bytes), its CDN serves avatars and expires old links until
 `/attachments/refresh-urls` re-signs them, its chat stub answers the reference
-check (memes and screenshots are no) and writes the failure note. The scenario
+picker with JSON verdicts (memes and screenshots are out, a "clear" photo ranks
+first) and writes the failure note. `reference-picking.yaml` checks that the
+clearest photo leads, ahead of a newer blurry one, and the meme is left out. The scenario
 checks two different acks pass through verbatim, the follow-up replies to the
 request with the caption and image, the references and prompt the image model got,
 the stored metadata, a refusal followed by Kiki's note (not the fallback), and a

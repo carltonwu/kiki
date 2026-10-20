@@ -745,13 +745,25 @@ class Fakecord:
                 emoji = next((e for e in w.emojis.values() if e["name"] == name), {})
                 text = emoji.get("description") or f"stub description of :{name}:"
             elif "You pick reference photos" in prompt:
-                # The drawing step's reference check: memes and screenshots are out.
+                # The drawing step's reference picker (JSON verdicts, one per
+                # candidate after any known photos): memes and screenshots are out,
+                # and a "clear" photo is clearer than the rest.
                 record["kind"] = "check"
-                text = "\n".join(
-                    f"Image {n}: {label} => "
-                    + ("no" if re.search(r"meme|screenshot", label, re.I) else "yes")
-                    for n, label in enumerate((png_label(p) or "an image" for p in pictures), 1)
-                )
+                known = len(re.findall(r"Known photo [A-Z] of", prompt))
+                verdicts = []
+                for n, picture in enumerate(pictures[known:], 1):
+                    label = png_label(picture) or "an image"
+                    out = re.search(r"meme|screenshot", label, re.I)
+                    verdicts.append(
+                        {
+                            "image": n,
+                            "shows": label,
+                            "kind": "meme" if out else "photo",
+                            "subject": not out,
+                            "clarity": 0 if out else (3 if "clear" in label else 2),
+                        }
+                    )
+                text = json.dumps({"verdicts": verdicts})
             else:
                 text = describe(pictures, body.get("model"))
             message = {"role": "assistant", "content": text}
