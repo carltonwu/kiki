@@ -1,5 +1,8 @@
 """Message embeddings: computed lazily for the searched scope, or all at once by
-`kiki-agent-host index`."""
+`kiki-agent-host index`.
+
+Pending messages are the ones in `message_embedding_queue`, which triggers keep
+(migration 0029): finding them reads the queue, not every message."""
 
 import asyncio
 import logging
@@ -16,25 +19,85 @@ logger = logging.getLogger(__name__)
 
 INDEX_LIMIT = 256
 
+# What makes a message searchable, for messages aliased `m`.
+SEARCHABLE = f"m.deleted_at IS NULL AND {PEOPLES} AND btrim({TEXT}) <> ''"
 
+# Both queries walk the queue newest first and look each row's message up by
+# primary key, whatever the statistics say. Written as a plain join, Postgres
+# may reorder it (seen in review, after the queue drained and before autovacuum
+# refreshed its statistics) into the scan the queue exists to avoid: every
+# message, anti-joined with every embedding. A LATERAL subquery with LIMIT 1
+# can't be pulled up into the join, so the queue drives a nested loop and the
+# outer LIMIT stops it.
+#
+# Every condition is checked again: a queued row that no longer qualifies is
+# skipped (and dropped by DROP_STALE), never embedded.
 PENDING = f"""
-SELECT m.id, {TEXT} AS content, md5(m.content) AS hash FROM messages m
-WHERE (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
-  AND (%(below)s::bigint IS NULL OR m.id < %(below)s)
-  AND m.deleted_at IS NULL AND {PEOPLES} AND btrim({TEXT}) <> ''
-  AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
-ORDER BY m.id DESC LIMIT %(limit)s
+SELECT p.id, p.content, p.hash
+FROM message_embedding_queue q
+CROSS JOIN LATERAL (
+    SELECT m.id, {TEXT} AS content, md5(m.content) AS hash FROM messages m
+    WHERE m.id = q.message_id
+      AND (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
+      AND {SEARCHABLE}
+      AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
+    LIMIT 1
+) p
+WHERE (%(below)s::bigint IS NULL OR q.message_id < %(below)s)
+ORDER BY q.message_id DESC LIMIT %(limit)s
 """
 
+# Rows nothing will embed: already embedded (by another run, or by a host from
+# before the queue during a deploy) or no longer searchable (an author ignored
+# since). A reply looks only at the guild's newest `window` queued rows, the
+# ones PENDING reads next, so its cost doesn't grow with a backlog. Stale rows
+# further down go as the queue drains to them, or in `kiki-agent-host index`'s
+# full sweep (window NULL: LIMIT NULL is no limit). `= ANY (ARRAY(...))` deletes
+# by primary key; `IN (...)` could hash the whole queue.
+DROP_STALE = f"""
+DELETE FROM message_embedding_queue
+WHERE message_id = ANY (ARRAY(
+    SELECT newest.message_id FROM (
+        SELECT q.message_id, s.stale
+        FROM message_embedding_queue q
+        CROSS JOIN LATERAL (
+            SELECT NOT ({SEARCHABLE})
+                   OR EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
+                   AS stale
+            FROM messages m
+            WHERE m.id = q.message_id AND (%(guild)s::bigint IS NULL OR m.guild_id = %(guild)s)
+            LIMIT 1
+        ) s
+        ORDER BY q.message_id DESC LIMIT %(window)s
+    ) newest
+    WHERE newest.stale
+))
+"""
+STALE_WINDOW = 4 * INDEX_LIMIT
 
 # Writes only if the text is unchanged; FOR SHARE waits out a concurrent edit,
-# whose trigger would otherwise miss this row.
+# whose trigger would otherwise miss this row. A saved message leaves the
+# queue in the same statement; an edit after it re-queues it (its trigger).
 SAVE = """
-INSERT INTO message_embeddings (message_id, embedding)
-SELECT m.id, v.embedding
-FROM unnest(%s::bigint[], %s::text[], %s::halfvec[]) AS v(id, hash, embedding)
-JOIN messages m ON m.id = v.id AND md5(m.content) = v.hash AND m.deleted_at IS NULL
-FOR SHARE OF m
+WITH saved AS (
+    INSERT INTO message_embeddings (message_id, embedding)
+    SELECT m.id, v.embedding
+    FROM unnest(%s::bigint[], %s::text[], %s::halfvec[]) AS v(id, hash, embedding)
+    JOIN messages m ON m.id = v.id AND md5(m.content) = v.hash AND m.deleted_at IS NULL
+    FOR SHARE OF m
+    ON CONFLICT (message_id) DO NOTHING
+    RETURNING message_id
+)
+DELETE FROM message_embedding_queue q USING saved WHERE q.message_id = saved.message_id
+"""
+
+# `kiki-agent-host index` only: queues every searchable message without a
+# vector. It reads every message, which is why replies don't do it.
+ENQUEUE_ALL = f"""
+INSERT INTO message_embedding_queue (message_id)
+SELECT m.id FROM messages m
+WHERE {SEARCHABLE}
+  AND NOT EXISTS (SELECT 1 FROM message_embeddings e WHERE e.message_id = m.id)
 ON CONFLICT (message_id) DO NOTHING
 """
 
@@ -52,6 +115,8 @@ async def index_pending(
     Returns how many were found and, if that filled the limit, the lowest ID
     seen: more may be pending below it.
     """
+    if below is None:
+        await connection.execute(DROP_STALE, {"guild": guild_id, "window": STALE_WINDOW})
     cursor = await connection.execute(PENDING, {"guild": guild_id, "below": below, "limit": limit})
     rows = await cursor.fetchall()
     batches = [rows[i : i + EMBED_BATCH] for i in range(0, len(rows), EMBED_BATCH)]
@@ -61,10 +126,22 @@ async def index_pending(
     return len(rows), (rows[-1][0] if len(rows) == limit else None)
 
 
+async def sweep(connection: AsyncConnection) -> int:
+    """Drops every stale queue row, in every guild: the full version of what each
+    reply does for its guild's newest rows. Returns how many."""
+    cursor = await connection.execute(DROP_STALE, {"guild": None, "window": None})
+    logger.info("dropped %d stale queue rows", cursor.rowcount)
+    return cursor.rowcount
+
+
 async def index_all(database_url: str, api_key: str) -> None:
-    """`kiki-agent-host index`: embeds every pending message, then exits."""
+    """`kiki-agent-host index`: sweeps every stale row out of the queue, queues
+    and embeds every pending message, then exits."""
     embed, below, total = Embedder(openrouter_client(api_key)), None, 0
     async with await db.connect(database_url) as connection:
+        await sweep(connection)
+        cursor = await connection.execute(ENQUEUE_ALL)
+        logger.info("queued %d messages missing from the queue", cursor.rowcount)
         while True:
             found, below = await index_pending(connection, embed, below=below)
             total += found

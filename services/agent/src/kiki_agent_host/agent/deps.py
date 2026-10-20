@@ -18,7 +18,7 @@ from ..openrouter.embeddings import Embedder
 @dataclass
 class MemorySession:
     """One run's memory state. Its own connection: memory transactions must not
-    interleave with background indexing on the run's shared one. The lock covers
+    interleave with other tools on the run's shared one. The lock covers
     parallel tool calls."""
 
     database_url: str

@@ -309,11 +309,32 @@ queries are an argument error returned to the model.
 
 ## Embeddings
 
-- **Pending** means a non-bot, non-empty, undeleted message with no row in
-  `message_embeddings`. There's no queue.
+- **Pending** means a searchable (non-bot or relayed, non-empty, undeleted, not
+  ignored) message with no row in `message_embeddings`. Pending messages are
+  listed in `message_embedding_queue` (migration 0029): replies read the queue,
+  not every message. Before it, finding pending messages walked all 236k
+  messages from the newest down, 5 to 7 s per reply in production, and
+  searches timed out behind it.
+- **Queue:** an `AFTER INSERT` trigger queues a new searchable message. A
+  saved vector takes its row out in the same statement. The host's query
+  checks every condition again. Each reply drops stale rows (already embedded
+  or no longer searchable) among the guild's 1,024 newest queued ones, so its
+  cost doesn't grow with a backlog. Stale rows past that window go as the
+  queue drains to them, or in `kiki-agent-host index`'s full sweep. Both
+  queries walk the queue first and look messages up by primary key (a
+  LATERAL subquery the planner can't reorder), whatever the statistics say;
+  `test_retrieval.py` checks the plan with 20k embedded messages and a drained
+  queue. The searchability rule is repeated in the migration's trigger
+  function; `test_retrieval.py` checks that the two agree.
+- **Ignoring and un-ignoring authors:** nothing reacts to a change in
+  `ignored_authors`. A newly ignored author's queued messages are skipped and
+  dropped. An un-ignored author's messages are never re-queued by a trigger:
+  **run `kiki-agent-host index` after removing someone from
+  `ignored_authors`.**
 - **Staleness:** an `AFTER UPDATE OF content, deleted_at` trigger deletes the
-  vector. That covers every Rust write path (live update and REST upsert), so
-  Rust has no indexing code.
+  vector and queues the message again, or takes it out of the queue if it's
+  deleted or empty. That covers every Rust write path (live update and REST
+  upsert), so Rust has no indexing code.
 - **Write:** an `INSERT … SELECT … FOR SHARE` saves only when `md5(content)`
   still matches the embedded text. A concurrent edit is waited out and then
   rejected.
@@ -323,12 +344,27 @@ queries are an argument error returned to the model.
 - **When indexing happens:**
   - When a reply job starts, the guild's 256 newest pending messages are
     embedded in the background, in batches of 64, while the model reads the
-    prompt. The first search waits for this to finish; if the run ends without
-    a search, indexing is cancelled. If 256 were found, the guild reports
+    prompt, on a connection of its own (saving vectors means HNSW inserts,
+    which took up to 11 s on a cold cache). A search waits up to 2 s for
+    indexing, then searches what's already indexed and reports `"partial"`;
+    if the run ends without a search, indexing is cancelled. Indexing errors,
+    database ones included, also mean `"partial"`, never a failed reply. The
+    search works to one 9 s deadline inside its 10 s tool deadline, and each
+    step gets at most its cap and never more than is left: the indexing wait
+    (2 s), connecting (2 s), the query embedding (4 s, a total; past it the
+    search is lexical), the hybrid query (3 s, a `statement_timeout` on the
+    search's own connection; past it a lexical query is tried), with 1 s held
+    back for that and 1 s for citing. Only when the lexical query also runs
+    out is the result an error the model sees. Resolving `person` and `channel`
+    (1 s) and citing (what is left) are bounded too; if citing runs out, the
+    results come back with the names at hand and channel IDs, marked
+    `"enriched": false`. If 256 were found, the guild reports
     `"partial"`. A sleeping service does nothing; a reply can index pending
     messages from other channels in its guild.
   - History uses `kiki-agent-host index` (for example, through `railway ssh`).
-    It walks all pending messages newest first with a keyset cursor, logs
+    It first queues every searchable message without a vector (the one full
+    scan, so it also repairs the queue after a change to `ignored_authors`),
+    then walks the queue newest first with a keyset cursor, logs
     progress and cost, and exits. Rerun it any time.
 - **Cost:** about 25 tokens per message, so roughly $0.25 per million messages.
   Storage, about 2 GB per million, is the larger cost. A reply's embedding cost
