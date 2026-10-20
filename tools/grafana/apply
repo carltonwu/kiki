@@ -426,7 +426,7 @@ def main() -> int:
             print(f"Folder {folder_title!r}: created")
         elif folder.get("title") != folder_title:
             grafana.call("PUT", f"/api/folders/{folder_uid}", {"title": folder_title, "overwrite": True})
-            print(f"Folder {folder_title!r}: renamed from {folder.get('title')!r}")
+            print(grafana.redact(f"Folder {folder_title!r}: renamed from {folder.get('title')!r}"))
         else:
             print(f"Folder {folder_title!r}: exists")
     except Refused as e:
@@ -448,7 +448,7 @@ def main() -> int:
         )
         if ds:
             chosen[kind] = ds
-            print(f"Datasource ${{{kind}}}: {ds['name']} (uid {ds['uid']})")
+            print(grafana.redact(f"Datasource ${{{kind}}}: {ds['name']} (uid {ds['uid']})"))
 
     failed = False
     for path, model in dashboards:
