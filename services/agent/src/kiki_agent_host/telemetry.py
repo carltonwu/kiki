@@ -10,7 +10,8 @@ job, and the span and log batches send only when they hold something.
 
 So each wake is a new process whose counters start again, and Prometheus's
 increase() ignores a series' first sample: a counter's attribute set first
-exports a zero, and its real value a flush later (`Baselines`).
+exports a zero, and its real value once that has landed (`Baselines`,
+`MetricFlush`).
 
 The host's own metrics and spans are recorded through the functions at the end
 (`llm_call`, `tool_call`, ...): with export off each is a None check, and the SDK
@@ -134,9 +135,8 @@ def configure() -> bool:
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(timeout=timeout)))
     # An infinite interval starts no export thread; flush() collects instead.
     # Cumulative temporality (the exporter's default) suits Grafana's Mimir.
-    reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(timeout=timeout), export_interval_millis=math.inf
-    )
+    exporter = Acknowledged(OTLPMetricExporter(timeout=timeout))
+    reader = PeriodicExportingMetricReader(exporter, export_interval_millis=math.inf)
     # Series spent on nothing we read: request and response size histograms, and
     # database client metrics (made only if the database semconv is opted into).
     drop = [
@@ -172,8 +172,9 @@ def configure() -> bool:
     # (InRequestOnly), and errors' messages.
     PsycopgInstrumentor().instrument(tracer_provider=InRequestOnly.Provider(tracer_provider))
     _closing = False
-    _providers = (tracer_provider, meter_provider, logger_provider)
     _recorder = Recorder(meter_provider, tracer_provider)
+    metric_flush = MetricFlush(meter_provider, exporter, _recorder.baselines)
+    _providers = (tracer_provider, metric_flush, logger_provider)
     logger.info("OpenTelemetry export on service=%s", resource_attributes()["service.name"])
     return True
 
@@ -218,16 +219,7 @@ async def _flush_until_caught_up() -> None:
     global _flush_again
     while True:
         _flush_again = False
-        # Taken before the flush collects, so these keys' zeros go out in it.
-        recorder = _recorder
-        zeroed = recorder.baselines.pending() if recorder is not None else frozenset()
         await _on_daemon_thread(_force_flush)
-        if zeroed:
-            recorder.baselines.release(zeroed)
-            # Their real values go once more, later than the zeros. Shutting down,
-            # shutdown()'s own second flush sends them.
-            await asyncio.sleep(POINT_GAP_SECONDS)
-            _flush_again = True
         if not _flush_again or _closing:
             return
 
@@ -261,28 +253,12 @@ def shutdown() -> None:
     _closing = True
     if _providers is None:
         return
-    providers, _providers = _providers, None
-    recorder, _recorder = _recorder, None
-    # As in a job's flush: the zeros of keys new since the last one go out
-    # first, then their values. Taken before the meter provider's flush collects.
-    zeroed = recorder.baselines.pending()
-
-    def release() -> bool:
-        # Flushed again even if a job's flush released them first: it may have
-        # done so after this flush collected.
-        recorder.baselines.release(zeroed)
-        return bool(zeroed)
-
+    providers, _providers, _recorder = _providers, None, None
     if _handler is not None:
         logging.getLogger().removeHandler(_handler)
     deadline = time.monotonic() + SHUTDOWN_SECONDS
     threads = [
-        threading.Thread(
-            target=_stop,
-            args=(provider, release),
-            name="OtelShutdown",
-            daemon=True,
-        )
+        threading.Thread(target=_stop, args=(provider,), name="OtelShutdown", daemon=True)
         for provider in providers
     ]
     for thread in threads:
@@ -293,13 +269,10 @@ def shutdown() -> None:
         logger.warning("telemetry shutdown timed out after %ds", SHUTDOWN_SECONDS)
 
 
-def _stop(provider, release: Callable[[], bool]) -> None:
+def _stop(provider) -> None:
     try:
         # Metrics have no export thread: only a flush sends the last collection.
         provider.force_flush(FLUSH_TIMEOUT_MILLIS)
-        if isinstance(provider, metrics.MeterProvider) and release():
-            time.sleep(POINT_GAP_SECONDS)
-            provider.force_flush(FLUSH_TIMEOUT_MILLIS)
         provider.shutdown()
     except Exception:  # exiting anyway
         logger.warning("telemetry shutdown failed", exc_info=True)
@@ -362,14 +335,12 @@ class Baselines:
     the first job after every wake would go uncounted.
 
     A counter's new attribute set (a key) is added 0 at once and its values held
-    back: `pending()` keys, taken before a flush, are released after it, then
-    flushed again. Only a flush with new keys flushes twice; nothing ever exports
-    between jobs. Histograms can't be baselined (no SDK measurement makes a point
-    with a count of 0): their first observation per attribute set per process
-    goes uncounted by increase().
+    back until `MetricFlush` has sent the zero. Histograms can't be baselined (no
+    SDK measurement makes a point with a count of 0): their first observation
+    per attribute set per process goes uncounted by increase().
 
-    Recording is on the event loop, but shutdown() releases on its own thread:
-    the lock covers both."""
+    Recording is on the event loop, releasing on a flush thread: the lock covers
+    both."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -395,14 +366,69 @@ class Baselines:
             return frozenset(self._pending)
 
     def release(self, keys: frozenset) -> None:
-        """Adds the held-back values of `keys` once a flush has sent their zeros.
-        Idempotent: a job's flush and shutdown() may both release a key."""
+        """Adds the held-back values of `keys`, whose zeros an export has sent."""
         with self._lock:
             for key in keys:
                 if (held := self._pending.pop(key, None)) is not None:
                     counter, attributes, amount = held
                     counter.add(amount, attributes)
             self._exported.update(keys)
+
+
+class Acknowledged:
+    """A metric exporter that keeps whether its last export landed: the reader
+    discards the result, and a zero must land before its value is released."""
+
+    def __init__(self, exporter) -> None:
+        self.exporter = exporter
+        self.succeeded = False
+
+    def export(self, metrics_data, timeout_millis: float = 10_000, **kwargs):
+        from opentelemetry.sdk.metrics.export import MetricExportResult
+
+        self.succeeded = False
+        result = self.exporter.export(metrics_data, timeout_millis=timeout_millis, **kwargs)
+        self.succeeded = result is MetricExportResult.SUCCESS
+        return result
+
+    def __getattr__(self, name: str):
+        return getattr(self.exporter, name)
+
+
+class MetricFlush:
+    """The meter provider, flushed through the counters' baselines. Every metric
+    flush, a job's or shutdown()'s, comes here, one at a time.
+
+    A flush sends what was recorded, new series' zeros included. Once that
+    export has landed, it waits POINT_GAP_SECONDS, releases those series' held
+    back values and sends them, so only a flush with new series exports twice.
+    Nothing else collects meanwhile, so a value's point is always the gap or
+    more after its zero's. If the export fails, the values stay held back and
+    the next flush sends the zeros again. The lock is held across exports: the
+    reader runs one export at a time anyway."""
+
+    def __init__(self, provider, exporter: Acknowledged, baselines: "Baselines") -> None:
+        self.provider = provider
+        self.exporter = exporter
+        self.baselines = baselines
+        self._lock = threading.Lock()
+
+    def force_flush(self, timeout_millis: float) -> None:
+        with self._lock:
+            # Taken before collecting: these keys' zeros are in this export.
+            zeroed = self.baselines.pending()
+            if self._export(timeout_millis) and zeroed:
+                time.sleep(POINT_GAP_SECONDS)
+                self.baselines.release(zeroed)
+                self._export(timeout_millis)
+
+    def _export(self, timeout_millis: float) -> bool:
+        self.exporter.succeeded = False
+        self.provider.force_flush(timeout_millis)
+        return self.exporter.succeeded
+
+    def shutdown(self) -> None:
+        self.provider.shutdown()
 
 
 class Counter:

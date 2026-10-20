@@ -68,6 +68,7 @@ def test_http_client_and_exporter_logs_are_never_exported():
 # Runs in a subprocess (providers are process-wide) with a local OTLP receiver
 # that records every request; RECEIVED holds (path, headers), METRICS each
 # metrics export's points, and EXPORTING is set once the first has arrived.
+# FAIL_METRICS lists metrics exports (by index) to turn away, as FAILED does.
 RECEIVER = """
 import asyncio, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -77,6 +78,8 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
 
 RECEIVED = []
 METRICS = []
+FAIL_METRICS = os.environ.get("FAIL_METRICS", "").split(",")
+FAILED = set()
 EXPORTING = threading.Event()
 
 def points(body):
@@ -97,18 +100,22 @@ def points(body):
 class Receiver(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        status = 200
         if self.path == "/v1/metrics":
+            if str(len(METRICS)) in FAIL_METRICS:
+                FAILED.add(len(METRICS))
+                status = 400  # not retried
             METRICS.append(points(body))
-        self.reply()
+        self.reply(status)
 
     def do_GET(self):
         self.reply()
 
-    def reply(self):
+    def reply(self, status=200):
         RECEIVED.append((self.path, dict(self.headers)))
         EXPORTING.set()
         time.sleep(float(os.environ.get("RECEIVER_DELAY", "0")))
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -180,6 +187,11 @@ def job(tool="recall"):
     with telemetry.tool_call(tool):
         pass
     telemetry.web_calls(1, 0)
+
+def landed(key):
+    # The series' points that were accepted, in time order.
+    found = [m[key] for i, m in enumerate(METRICS) if i not in FAILED and key in m]
+    return [value for value, _ in sorted(found, key=lambda point: point[1])]
 """
 
 
@@ -234,6 +246,73 @@ for key, total in ((COST, 0.08), (TOOL, 1), (SEARCH, 1), (WEB, 2)):
     assert seen[0] == 0 and seen[-1] == total, (key, seen)
 """,
         RECEIVER_DELAY="0.2",
+    )
+
+
+def test_values_wait_until_their_zero_has_landed():
+    """A failed export of the zeros keeps the values held back: sent first, a
+    value would be the series' first sample, uncounted."""
+    run(
+        JOB
+        + """
+job()
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 1 and METRICS[0][COST][0] == 0, METRICS  # turned away
+
+job()  # the same series: held back with the first job's values
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 3, METRICS
+assert landed(COST) == [0, 0.08] and landed(TOOL) == [0, 2], METRICS
+""",
+        FAIL_METRICS="0",
+    )
+
+
+def test_a_value_export_that_fails_goes_with_the_next_flush():
+    run(
+        JOB
+        + """
+job()
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 2 and METRICS[1][COST][0] == 0.04, METRICS  # turned away
+
+job()
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 3, METRICS
+assert landed(COST) == [0, 0.08] and landed(TOOL) == [0, 2], METRICS
+""",
+        FAIL_METRICS="1",
+    )
+
+
+def test_shutdown_during_a_flush_keeps_the_gap_after_the_zeros():
+    """Shutdown starting the moment a job's flush releases values: its own flush
+    waits, so nothing collects a value within the gap after its zero."""
+    run(
+        JOB
+        + """
+release = telemetry.Baselines.release
+stopping = []
+
+def release_then_shut_down(self, keys):
+    release(self, keys)
+    stopping.append(threading.Thread(target=telemetry.shutdown))
+    stopping[0].start()
+    time.sleep(0.05)  # time enough for shutdown to try a flush
+
+telemetry.Baselines.release = release_then_shut_down
+job()
+asyncio.run(telemetry.flush())
+stopping[0].join()
+for key in (COST, TOOL, WEB):
+    found = (m[key] for i, m in enumerate(METRICS) if i not in FAILED and key in m)
+    points = sorted(found, key=lambda point: point[1])
+    assert points[0][0] == 0, (key, points)
+    zero = max(time for value, time in points if value == 0)
+    first = min(time for value, time in points if value)
+    assert first - zero >= 5_000_000, (key, points)
+assert landed(COST)[-1] == 0.04, METRICS
+"""
     )
 
 
@@ -304,7 +383,7 @@ from opentelemetry import trace
 
 with trace.get_tracer("test").start_as_current_span("job"):
     logging.getLogger("kiki_agent_host.test").warning("a job")
-    telemetry.meter().create_counter("kiki.test").add(1)
+    telemetry.job_answered("reply", "completed")  # a new series: zero, then value
 started = time.monotonic()
 telemetry.shutdown()
 elapsed = time.monotonic() - started
@@ -326,6 +405,7 @@ async def main():
     tracer = trace.get_tracer("test")
     for _ in range(200):
         tracer.start_span("queued").end()
+    telemetry.job_answered("reply", "completed")  # a new series: zero, then value
     telemetry.flush_soon()
     # The flush is now waiting on the receiver.
     assert await asyncio.to_thread(EXPORTING.wait, 10)
