@@ -46,7 +46,7 @@ from pydantic_ai.messages import BinaryContent, BinaryImage, ModelResponse, Text
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
-from .. import telemetry
+from .. import deadline, telemetry
 from ..chat.attachments import images_in
 from ..chat.scope import HEARD, PEOPLES, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
@@ -76,6 +76,9 @@ VERIFY_TIMEOUT_SECONDS = 30
 # much of the job's 120 s, so the image call keeps its 75 s. In review, 6 subjects
 # of 24 candidates made 12 batches, two waves of 27 s: 124 s with the image.
 REFERENCES_SECONDS = 35
+# What the stage leaves of the job for the image call and the failure note: the
+# executor's MIN_IMAGE_SECONDS (20) and NOTE_TIMEOUT_SECONDS (15).
+IMAGE_KEEP_SECONDS = 35
 MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
 STAGE_GRACE = 5  # past the deadline, for downloads in flight; then the stage is cut
 # A short verdict per photo, without thinking (`think=False`): a reasoning model
@@ -419,7 +422,6 @@ class Gatherer:
         self.picking = asyncio.Semaphore(PICKS_AT_ONCE)
         # The whole reference stage's deadline (loop time), queue waits included,
         # so the image call keeps its time in the job's; None for no deadline.
-        # `time_left` and `within` match deadline.py's (#69), to switch to it.
         if seconds is not None and (job := job_time_left()) is not None:
             seconds = min(seconds, max(0.0, job))
         self.deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
@@ -762,13 +764,11 @@ class Gatherer:
 
 
 def job_time_left() -> float | None:
-    """The job's own time left, where the host sets a job deadline (#69's
-    `deadline.time_left`), else None: the stage's own seconds then apply."""
-    try:
-        from .. import deadline  # optional until #69 lands
-    except ImportError:
-        return None
-    return deadline.time_left()
+    """The job's own time left for the reference stage, where the host sets a job
+    deadline (`deadline.time_left`), less what the image call and Kiki's note need
+    after it (`IMAGE_KEEP_SECONDS`); else None: the stage's own seconds apply."""
+    left = deadline.time_left()
+    return None if left is None else left - IMAGE_KEEP_SECONDS
 
 
 def key(reference: Reference) -> tuple:

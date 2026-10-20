@@ -8,7 +8,8 @@
         "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
-        }
+        },
+        "timeout": 45
       },
       "text": "ok",
       "tools": [
@@ -693,7 +694,8 @@
         "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
-        }
+        },
+        "timeout": 45
       },
       "text": "ok",
       "tools": [
@@ -1513,7 +1515,8 @@
         "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
-        }
+        },
+        "timeout": 45
       },
       "text": "ok",
       "tools": []

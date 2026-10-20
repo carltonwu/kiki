@@ -27,6 +27,9 @@ from .jobs import RequestConflict, run_image_job, run_job
 
 logger = logging.getLogger(__name__)
 
+# Past a job's deadline, for connecting, the session lock and saving the result.
+JOB_GRACE_SECONDS = 5
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -78,8 +81,12 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="agent host is busy") from None
         started = time.monotonic()
         try:
-            async with asyncio.timeout(settings.job_timeout_seconds):
-                result = await run(settings.database_url, request, executor)
+            # The job's own deadline is in `durable`, which saves a timeout as the
+            # job's result. This one only bounds the database work around it.
+            async with asyncio.timeout(settings.job_timeout_seconds + JOB_GRACE_SECONDS):
+                result = await run(
+                    settings.database_url, request, executor, timeout=settings.job_timeout_seconds
+                )
             logger.debug(
                 "job response job_id=%s kind=%s channel_id=%s conversation_id=%s status=%s "
                 "latency_ms=%d rss_mb=%d",

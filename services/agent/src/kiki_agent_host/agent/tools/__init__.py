@@ -13,6 +13,7 @@ from pydantic_ai_harness import Skills
 
 from ...chat import emojis as emoji_catalog
 from ..deps import Deps
+from ..guard import out_of_lookup_time, time_for_another_turn
 from . import drawing, emojis, links, memory, messages, reading
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,13 @@ class LastRequestAnswers(AbstractCapability[Deps]):
     ones capabilities add (Skills' `load_capability`). A function tool call there
     would need one more request, and the limit would then fail the whole reply.
     OpenRouter's web search and fetch stay on: they run inside the request, so
-    they don't need another."""
+    they don't need another. The same once the run is out of time for lookups
+    (`guard`): a tool would only be turned away, at the cost of a request."""
 
     async def before_model_request(
         self, ctx: RunContext[Deps], request_context: ModelRequestContext
     ) -> ModelRequestContext:
-        if ctx.usage.requests + 1 < ctx.deps.request_limit:
+        if ctx.usage.requests + 1 < ctx.deps.request_limit and not out_of_lookup_time():
             return request_context
         parameters = replace(request_context.model_request_parameters, function_tools=[])
         return replace(request_context, model_request_parameters=parameters)
@@ -70,7 +72,8 @@ async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
     animated emoji, or a `:name:` shortcode. Each answer that writes emoji is
     checked against the catalog as it is now (`current_catalog`). An unusable
     emoji gets a retry while the run has an output retry and a model request
-    left. Otherwise it's cut (`emojis.check`'s `stripped`), keeping the reply's
+    left, and the time for one more turn (`guard.time_for_another_turn`). Otherwise
+    it's cut (`emojis.check`'s `stripped`), keeping the reply's
     kind: a message stays a message and a reaction stays a reaction, so a cut
     never turns into silence the server may not allow. A retry costs at least
     one more request, more if the model searches first, and `LastRequestAnswers`
@@ -86,7 +89,7 @@ async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
             logger.info("reply emoji fixed job_id=%s fixed=%d", deps.job_id, checked.fixed)
         return checked.text
     requests_left = deps.request_limit - ctx.usage.requests
-    if not ctx.last_attempt and requests_left > 0:
+    if not ctx.last_attempt and requests_left > 0 and time_for_another_turn():
         logger.info(
             "reply emoji rejected job_id=%s problems=%d fixed=%d attempt=%d requests_left=%d",
             deps.job_id,

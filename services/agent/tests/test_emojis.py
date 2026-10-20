@@ -11,11 +11,13 @@ from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCall
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host.agent import executor as agent_executor
+from kiki_agent_host.agent import guard
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.api.app import create_app
 from kiki_agent_host.chat import emojis
 from kiki_agent_host.config import Settings
 from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult, JobRequest
+from kiki_agent_host.deadline import run_deadline
 from kiki_agent_host.media import fetch
 from kiki_agent_host.openrouter.embeddings import Embedder
 
@@ -881,3 +883,37 @@ async def test_the_emoji_check_runs_on_the_fallbacks_answer(database_url, db, mo
     # The fallback's emoji was rejected with a retry, and the retry fixed it.
     assert text == "ten <:huh:11>"
     assert [name for name, _ in attempts] == ["thinking", "unthinking", "thinking"]
+
+
+# PR #69: the run deadline. A validator retry and a tool call each cost a request,
+# so neither is spent once the run can't afford it.
+
+
+async def test_a_bad_emoji_is_cut_not_retried_without_time_for_another_turn(
+    database_url, db, monkeypatch
+):
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(guard, "ANSWER_RESERVE_SECONDS", 200)
+    Executor, seen = scripted("ten <:salute:1>", "ten <:huh:11>")
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    with run_deadline(100):  # less than a whole last turn
+        result = await executor.execute(reply_request())
+    assert result.text == "ten"
+    assert len(seen) == 1, "no retry request"
+
+
+async def test_no_tools_are_offered_once_the_run_is_out_of_lookup_time(
+    database_url, db, monkeypatch
+):
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(guard, "ANSWER_RESERVE_SECONDS", 200)
+    with run_deadline(100):
+        text, offered = await run_turns(database_url, "ten")
+    assert text == "ten"
+    assert offered == [[]]
+    # With time, they are.
+    monkeypatch.setattr(guard, "ANSWER_RESERVE_SECONDS", 45)
+    with run_deadline(100):
+        _, offered = await run_turns(database_url, "ten")
+    assert "search_emojis" in offered[0]

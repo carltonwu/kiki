@@ -168,19 +168,112 @@ async def test_image_jobs_are_durable_so_a_retry_does_not_draw_again(database_ur
         assert (await http.post("/v1/images", json=changed, headers=HEADERS)).status_code == 409
 
 
-async def test_timeout_releases_lock_and_same_job_can_be_recovered(database_url):
-    class HangingExecutor:
+async def test_a_job_past_its_deadline_fails_for_good_and_releases_its_lock(database_url):
+    """A timeout is the job's result: a retry of the same ID (Rust retries while its
+    own deadline lasts) gets it instead of running the whole job again."""
+
+    class HangingExecutor(FakeExecutor):
         async def execute(self, request):
+            self.calls += 1
             await asyncio.Event().wait()
 
+    hanging = HangingExecutor()
     settings = Settings(database_url, TOKEN, job_timeout_seconds=0.2)
-    async with client(create_app(settings, HangingExecutor())) as http:
-        assert (await http.post("/v1/jobs", json=job(), headers=HEADERS)).status_code == 503
+    async with client(create_app(settings, hanging)) as http:
+        first = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert first.status_code == 200
+        assert first.json()["status"] == "failed"
+        assert first.json()["error"] == "timed out"
     executor = FakeExecutor()
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        again = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert again.json()["error"] == "timed out"
+    assert hanging.calls == 1 and executor.calls == 0
+    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+        cursor = await connection.execute(
+            "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (job()["id"],)
+        )
+        assert (await cursor.fetchone())[0]
+
+
+async def test_the_work_is_cancelled_at_its_deadline_and_the_timeout_saved_after(database_url):
+    """The work stops 10 s before the job's deadline, leaving that for saving."""
+    cancelled = asyncio.Event()
+
+    class Slow(FakeExecutor):
+        async def execute(self, request):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+    settings = Settings(database_url, TOKEN, job_timeout_seconds=10.5)
+    started = asyncio.get_running_loop().time()
+    async with client(create_app(settings, Slow())) as http:
+        response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+    assert response.json()["error"] == "timed out"
+    assert cancelled.is_set()
+    assert asyncio.get_running_loop().time() - started < 3  # at 0.5 s, not 10.5
+
+
+async def test_a_step_timing_out_with_job_time_left_is_retried(database_url):
+    """A model request cut at its own cap (waiting out a 429's Retry-After, say)
+    isn't the job running out: the host answers 503 and the retry runs it again."""
+
+    class StepTimesOut(FakeExecutor):
+        async def execute(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError
+            return JobResult(text="second time lucky", model=request.model)
+
+    executor = StepTimesOut()
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        first = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert first.status_code == 503
+        second = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert second.json()["result"]["text"] == "second time lucky"
+    assert executor.calls == 2
+
+
+async def test_a_resumed_job_gets_only_what_is_left_of_its_deadline(database_url):
+    """A job interrupted mid-run (a deploy, a dropped connection) runs again on
+    retry, but its deadline counts from its first attempt."""
+    seen = []
+
+    class Timed(FakeExecutor):
+        async def execute(self, request):
+            from kiki_agent_host.deadline import time_left
+
+            seen.append(time_left())
+            return await super().execute(request)
+
+    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+        payload = JobRequest.model_validate(job()).model_dump(mode="json", exclude_none=True)
+        await connection.execute(
+            "INSERT INTO agent_host_jobs (id, request, status, created_at) "
+            "VALUES (%s, %s, 'running', now() - interval '60 seconds')",
+            ("reply:42", Jsonb(payload)),
+        )
+    executor = Timed()
     async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
         response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
         assert response.json()["status"] == "completed"
-        assert executor.calls == 1
+    # 120 s from 60 s ago, less the margin kept to save the result.
+    [left] = seen
+    assert 40 < left <= 50
+
+    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+        await connection.execute(
+            "INSERT INTO agent_host_jobs (id, request, status, created_at) "
+            "VALUES (%s, %s, 'running', now() - interval '10 minutes')",
+            ("reply:43", Jsonb({**payload, "id": "reply:43"})),
+        )
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        late = await http.post("/v1/jobs", json=job("reply:43"), headers=HEADERS)
+        assert late.json()["error"] == "timed out"
+    assert executor.calls == 1
 
 
 async def test_capacity_is_bounded(database_url, recorded):

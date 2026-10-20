@@ -627,7 +627,10 @@ class Fakecord:
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
-            return web.json_response(self.chat(body))
+            answer = self.chat(body)
+            if delay := self.world.llm[-1].get("delay_s"):
+                await asyncio.sleep(delay)
+            return web.json_response(answer)
         if request.method == "POST" and path == "v1/embeddings":
             return web.json_response(embeddings(body))
         self.world.unexpected.append({"method": request.method, "path": f"openrouter/{path}"})
@@ -851,6 +854,9 @@ class Fakecord:
                     message = {"role": "assistant", "content": text}
             else:
                 entry = self.overthinks(trigger, body) or self.take("reply", trigger)
+                if entry and entry.get("delay_s"):
+                    # A slow model: the first request of the reply waits this long.
+                    record["delay_s"] = float(entry["delay_s"])
                 tools = (entry or {}).get("tools") or (
                     [entry["tool"]] if entry and entry.get("tool") else []
                 )

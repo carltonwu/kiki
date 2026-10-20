@@ -1,0 +1,16 @@
+name: a slow reply skips its lookups and still answers before the job deadline
+# The host's job deadline is 60 s here, so the run's own is 50 s, and a tool must
+# leave 45 s for the answer. With a quick model the search runs; when the first
+# request takes 6 s, the search is turned away and Kiki answers with what she has
+# instead of running into the job timeout.
+host_env: {AGENT_HOST_JOB_TIMEOUT_SECS: "60"}
+steps:
+  - say: {as: alex, in: general, text: "kiki who shipped the release?"}
+    reply: {tool: {name: search_messages, args: {query: "release shipped"}}, text: "found {ids}"}
+  - expect: {run: done, reply: true, tool_called: search_messages, tool_result_contains: ["shipped the release"]}
+  - say: {as: alex, in: general, text: "kiki anything about budgets?"}
+    reply:
+      delay_s: 6
+      tool: {name: search_messages, args: {query: "budget meeting"}}
+      text: "stub answer: {result}"
+  - expect: {run: done, reply: true, tool_result_contains: ["Out of time for lookups"], text_contains: "Out of time"}
