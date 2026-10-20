@@ -3,6 +3,7 @@
 provider failures to `ImageRefused`, the one image error whose message is safe
 to show the chat model, and adds billed cost."""
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -12,7 +13,7 @@ from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, UserCont
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
-from .. import telemetry
+from .. import deadline, telemetry
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,15 @@ class ImageRefused(ValueError):
 NOT_SEEN = " Say you couldn't see it rather than guessing what it shows."
 
 
+# What a thinking request leaves of its deadline (read_image's, say) for the same
+# request without thinking. Thinking requests that ran out of room took about
+# 10 s, but one in prod took 41 s and ran into read_image's 45 s (reply:461 on
+# 10-20), so the retry never happened.
+UNTHINKING_SECONDS = 12
+# With less than this left, thinking isn't tried: the answer without it is.
+MIN_THINKING_SECONDS = 6
+
+
 class _OutOfRoom(Exception):
     """The model spent its whole `max_tokens` thinking and wrote nothing."""
 
@@ -67,19 +77,42 @@ async def look(
     `think=False` turns off a reasoning model's thinking, for quick yes/no checks:
     over several photos it can take longer than the answer is worth.
     `max_tokens` is the answer's room; thinking gets `REASONING_TOKENS` more. If
-    the thinking still uses it all, it's asked once more without thinking."""
+    the thinking still uses it all, or would run into what it leaves of the
+    deadline (`deadline.time_left`) for the retry (UNTHINKING_SECONDS, or half of
+    a deadline under twice that), it's asked once more without thinking. With
+    under MIN_THINKING_SECONDS left, it's asked without thinking at once."""
     out_of_room = ImageRefused("The image model ran out of room before answering." + NOT_SEEN)
+    left = deadline.time_left()
+    keep = think and left is not None
+    if keep and left < MIN_THINKING_SECONDS:
+        logger.info("vision skips thinking model=%s left_s=%.1f", vision.name, left)
+        return await _look_again(vision, prompt, max_tokens, instructions, out_of_room)
+    # Thinking leaves the retry UNTHINKING_SECONDS, or half of a shorter deadline
+    # (a tool left 12-24 s by downloads or the run's answer reserve).
+    thinking = None
+    if keep:
+        thinking = left - UNTHINKING_SECONDS if left > 2 * UNTHINKING_SECONDS else left / 2
     try:
-        return await _look(vision, prompt, max_tokens, instructions, think)
+        async with asyncio.timeout(thinking):
+            return await _look(vision, prompt, max_tokens, instructions, think)
     except _OutOfRoom:
         if not think:
             raise out_of_room from None
-    # The read_image deadline (45 s) leaves room for this: these fail in about 10 s.
+    except TimeoutError:
+        if not keep:
+            raise
+        logger.warning("vision thinking cut short model=%s; asking without thinking", vision.name)
+        return await _look_again(vision, prompt, max_tokens, instructions, out_of_room)
     logger.warning(
         "vision thinking ran out model=%s max_tokens=%d; asking without thinking",
         vision.name,
         max_tokens + REASONING_TOKENS,
     )
+    return await _look_again(vision, prompt, max_tokens, instructions, out_of_room)
+
+
+async def _look_again(vision, prompt, max_tokens, instructions, out_of_room) -> str:
+    """The same request without thinking."""
     try:
         return await _look(vision, prompt, max_tokens, instructions, think=False)
     except _OutOfRoom:

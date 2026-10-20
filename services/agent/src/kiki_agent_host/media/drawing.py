@@ -46,7 +46,7 @@ from pydantic_ai.messages import BinaryContent, BinaryImage, ModelResponse, Text
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
-from .. import telemetry
+from .. import deadline, telemetry
 from ..chat.attachments import images_in
 from ..chat.scope import HEARD, PEOPLES, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
@@ -73,11 +73,22 @@ PICKS_AT_ONCE = 8
 ANCHORS = 2  # given photos shown to the picker as what the subject looks like
 VERIFY_TIMEOUT_SECONDS = 30
 # The whole reference stage (search, downloads, picker queue and calls) gets this
-# much of the job's 120 s, so the image call keeps its 75 s. In review, 6 subjects
-# of 24 candidates made 12 batches, two waves of 27 s: 124 s with the image.
-REFERENCES_SECONDS = 35
-MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
+# much of the job's work time (110 s of its 120). After it and STAGE_GRACE, an
+# image attempt gets min(75, 110 - 30 - the note's 15) = 65 s; prod's attempts
+# took 16-19 s, a blocked one and its fallback 59 s together. One wave of picker
+# batches (up to PICKS_AT_ONCE, 4+ subjects) took 5-17 s on prod data, so 25 s
+# fits one with room; a second wave (5+ subjects; 27 s each in review) is cut.
+REFERENCES_SECONDS = 25
 STAGE_GRACE = 5  # past the deadline, for downloads in flight; then the stage is cut
+# Scheduling and cancelling the stage's tasks take a little past its deadline
+# and grace (12 ms in review), which exact sums don't allow for.
+STAGE_HEADROOM = 3
+# What the stage, its grace included, leaves of the job for an image attempt and
+# the failure note: the executor's MIN_IMAGE_SECONDS (20) and NOTE_TIMEOUT_SECONDS
+# (15), STAGE_GRACE and STAGE_HEADROOM. Less and the attempt would be skipped
+# (a resumed job).
+IMAGE_KEEP_SECONDS = 20 + 15 + STAGE_GRACE + STAGE_HEADROOM
+MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
 # A short verdict per photo, without thinking (`think=False`): a reasoning model
 # spent over 2,000 tokens and 20 s on five photos, past the check's deadline.
 VERIFY_MAX_TOKENS = 2000
@@ -419,7 +430,6 @@ class Gatherer:
         self.picking = asyncio.Semaphore(PICKS_AT_ONCE)
         # The whole reference stage's deadline (loop time), queue waits included,
         # so the image call keeps its time in the job's; None for no deadline.
-        # `time_left` and `within` match deadline.py's (#69), to switch to it.
         if seconds is not None and (job := job_time_left()) is not None:
             seconds = min(seconds, max(0.0, job))
         self.deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
@@ -441,14 +451,19 @@ class Gatherer:
     ) -> tuple[list[Found], list[tuple[Reference, BinaryImage]]]:
         """Every subject's references and the shared images, in parallel. Past the
         stage's deadline (and STAGE_GRACE for downloads in flight), what's done is
-        kept and the rest is drawn without: the image call keeps its time."""
+        kept and the rest is drawn without: the image call keeps its time. With
+        no time at all (a job resumed late), there's no stage, and no grace: that
+        would come out of the image call's time."""
+        left = self.time_left()
+        if left is not None and left <= 0:
+            logger.warning("no time for references subjects=%d", len(plan.subjects))
+            return [Found(subject, []) for subject in plan.subjects], []
         subjects = [asyncio.ensure_future(self.find(s)) for s in plan.subjects]
         shared = asyncio.ensure_future(self.shared(plan.shared))
         tasks = [*subjects, shared]
-        left = self.time_left()
         try:
             done, late = await asyncio.wait(
-                tasks, timeout=None if left is None else max(0.0, left) + STAGE_GRACE
+                tasks, timeout=None if left is None else left + STAGE_GRACE
             )
         finally:
             # Also when this is cancelled (the job's deadline, a shutdown):
@@ -762,13 +777,11 @@ class Gatherer:
 
 
 def job_time_left() -> float | None:
-    """The job's own time left, where the host sets a job deadline (#69's
-    `deadline.time_left`), else None: the stage's own seconds then apply."""
-    try:
-        from .. import deadline  # optional until #69 lands
-    except ImportError:
-        return None
-    return deadline.time_left()
+    """The job's own time left for the reference stage, where the host sets a job
+    deadline (`deadline.time_left`), less what the image call and Kiki's note need
+    after it (`IMAGE_KEEP_SECONDS`); else None: the stage's own seconds apply."""
+    left = deadline.time_left()
+    return None if left is None else left - IMAGE_KEEP_SECONDS
 
 
 def key(reference: Reference) -> tuple:

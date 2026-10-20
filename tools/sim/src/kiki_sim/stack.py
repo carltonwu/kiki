@@ -398,7 +398,7 @@ class Config:
             }
         return service_env(values | telemetry_env() | self.env | overrides)
 
-    def host_env(self) -> dict[str, str]:
+    def host_env(self, overrides: dict[str, str] | None = None) -> dict[str, str]:
         values = {
             "DATABASE_URL": database_url(),
             "PORT": str(self.ports.host),
@@ -428,7 +428,7 @@ class Config:
                 "OPENROUTER_VISION_MODEL": "sim/vision",
                 "OPENROUTER_IMAGE_FALLBACK_MODEL": "sim/image-fallback",
             }
-        return service_env(values | telemetry_env())
+        return service_env(values | telemetry_env() | (overrides or {}))
 
 
 # --- processes ---------------------------------------------------------------
@@ -604,8 +604,14 @@ def up(config: Config) -> None:
     reset(config)
 
 
-def reset(config: Config, env: dict[str, str] | None = None, fixture: Path | None = None) -> None:
-    """A fresh database and guild, then both services, waiting until ready."""
+def reset(
+    config: Config,
+    env: dict[str, str] | None = None,
+    fixture: Path | None = None,
+    host_env: dict[str, str] | None = None,
+) -> None:
+    """A fresh database and guild, then both services, waiting until ready.
+    `env` overrides the ingester's settings, `host_env` the agent host's."""
     stop("ingester", "agent")
     recreate_database()
     control("reset", {"fixture": str(fixture or config.fixture)})
@@ -624,7 +630,7 @@ def reset(config: Config, env: dict[str, str] | None = None, fixture: Path | Non
             "--locked",
             "kiki-agent-host",
         ],
-        config.host_env(),
+        config.host_env(host_env),
     )
     since = log_size("ingester")
     start("ingester", [str(config.ingester)], config.ingester_env(env or {}))

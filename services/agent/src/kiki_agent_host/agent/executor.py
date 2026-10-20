@@ -39,6 +39,7 @@ from ..contracts import (
     Reference,
     Usage,
 )
+from ..deadline import time_left, within
 from ..executor import TransientError
 from ..media import drawing, generation
 from ..media.vision import (
@@ -70,9 +71,23 @@ MAX_MODEL_REQUESTS = 10
 # a total). A search also bounds its query embedding by its own deadline
 # (chat/search.py EMBED_SECONDS).
 EMBEDDING_TIMEOUT_SECONDS = 4
-# Image models are slow, more so with references; with the reference check this
-# stays inside the host's job timeout (AGENT_HOST_JOB_TIMEOUT_SECS, 120 s).
+# Image models are slow, more so with references. An attempt also gets no more
+# than the drawing has left (see `draw`).
 IMAGE_TIMEOUT_SECONDS = 75
+# One chat model request, the SDK's own retries included. The SDK's default is
+# 600 s per read with two retries, far past the job timeout; replies' slowest
+# requests in prod took about 30 s (a reasoning model at its token limit).
+# Cancelling one closes the connection, but OpenRouter doesn't stop a
+# non-streaming request with it: the provider may finish, and bill, it anyway.
+MODEL_REQUEST_TIMEOUT_SECONDS = 45
+# What a thinking request leaves of the run for the same request without
+# thinking, when it thinks until its limit (`Metered(keep=)`).
+UNTHINKING_SECONDS = 12
+# A drawing keeps this long for Kiki's note about a failure, and gives up on the
+# note past it (Rust then posts its stock notice).
+NOTE_TIMEOUT_SECONDS = 15
+# Below this an image attempt (the fallback model's, say) isn't started.
+MIN_IMAGE_SECONDS = 20
 
 topic_agent = Agent()
 
@@ -102,22 +117,66 @@ def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> None:
     )
 
 
+class CutShort(Exception):
+    """A request `Metered` stopped to leave its `keep` for the request after it.
+    A `FallbackModel` falls back on it (`fallback_on`), to the model that request
+    is kept for."""
+
+
 class Metered(WrapperModel):
     """A run's model, billing each response to the run's telemetry call as it
     arrives, with its web searches and fetches: a run that fails later (a usage
     limit, a tool, the provider) still paid for the requests before.
-    `max_tokens`, if set, replaces the run's for this model's requests."""
+    `max_tokens`, if set, replaces the run's for this model's requests.
 
-    def __init__(self, wrapped: Model, call: telemetry.Call, *, max_tokens: int | None = None):
+    Each request gets `MODEL_REQUEST_TIMEOUT_SECONDS` in all, no more than the run
+    has left, less `keep`: the time a request after it needs, as the request
+    without thinking that may follow a thinking one. With a `keep`, any timeout
+    raises `CutShort`, so the thinking model always falls back to its twin first
+    rather than failing the job. A request cut short without one is retried by
+    Rust like a provider error while the job has time (`api/jobs.py`). Either is
+    logged: OpenRouter may still bill a request given up on."""
+
+    def __init__(
+        self,
+        wrapped: Model,
+        call: telemetry.Call,
+        *,
+        max_tokens: int | None = None,
+        keep: float = 0,
+        job_id: str = "-",
+    ):
         super().__init__(wrapped)
         self.call = call
         self.max_tokens = max_tokens
+        self.keep = keep
+        self.job_id = job_id
 
     # Runs don't stream, so request_stream isn't metered.
     async def request(self, messages, model_settings, model_request_parameters) -> ModelResponse:
         if self.max_tokens is not None:
             model_settings = {**(model_settings or {}), "max_tokens": self.max_tokens}
-        response = await super().request(messages, model_settings, model_request_parameters)
+        # Bounded in all, not just per read: the run deadline cuts it shorter.
+        left = time_left()
+        cap = timeout = within(MODEL_REQUEST_TIMEOUT_SECONDS)
+        if left is not None and self.keep:
+            # Never below a fraction of the time left: a request still gets a go.
+            timeout = max(min(cap, left - self.keep), min(cap, left / 3))
+        try:
+            async with asyncio.timeout(timeout):
+                response = await super().request(messages, model_settings, model_request_parameters)
+        except TimeoutError:
+            logger.warning(
+                "model request timed out job_id=%s model=%s timeout_s=%.1f left_s=%s%s",
+                self.job_id,
+                self.model_name,
+                timeout,
+                "-" if left is None else int(left),
+                "; falling back" if self.keep else "",
+            )
+            if self.keep:
+                raise CutShort from None
+            raise
         usage = response.usage
         self.call.bill(response_cost(response), usage.input_tokens, usage.output_tokens)
         web = web_use([response])
@@ -179,7 +238,9 @@ class PydanticExecutor:
     async def thinks(self, name: str) -> bool:
         return catalog.reasons(name)  # the copy at hand: replies don't wait on it
 
-    async def chat_model(self, name: str, billed: telemetry.Call, max_tokens: int) -> Model:
+    async def chat_model(
+        self, name: str, billed: telemetry.Call, max_tokens: int, job_id: str = "-"
+    ) -> Model:
         """A run's model, each response billed to `billed`, with `max_tokens`
         (`reply_max_tokens`) per request. A model that thinks does so inside
         `max_tokens`, so it gets `REASONING_TOKENS` more; if its thinking still
@@ -187,11 +248,19 @@ class PydanticExecutor:
         after two read_images), the same request goes again with thinking off and
         the plain cap, so the run keeps its tool results instead of failing."""
         if not await self.thinks(name):
-            return Metered(self.model(name), billed, max_tokens=max_tokens)
+            return Metered(self.model(name), billed, max_tokens=max_tokens, job_id=job_id)
+        # The thinking request leaves the one without thinking its time
+        # (UNTHINKING_SECONDS), and is dropped for it when that cuts it short.
         return FallbackModel(
-            Metered(self.model(name), billed, max_tokens=max_tokens + REASONING_TOKENS),
-            Metered(self.unthinking(name), billed, max_tokens=max_tokens),
-            fallback_on=out_of_room,
+            Metered(
+                self.model(name),
+                billed,
+                max_tokens=max_tokens + REASONING_TOKENS,
+                keep=UNTHINKING_SECONDS,
+                job_id=job_id,
+            ),
+            Metered(self.unthinking(name), billed, max_tokens=max_tokens, job_id=job_id),
+            fallback_on=(out_of_room, CutShort),
         )
 
     def image_model(self, name: str) -> ImageGenerationModel:
@@ -206,11 +275,15 @@ class PydanticExecutor:
         # its tools' calls are their own (guard.py).
         billed = telemetry.Call()
         options = {
-            "model": await self.chat_model(request.model, billed, request.max_output_tokens),
+            "model": await self.chat_model(
+                request.model, billed, request.max_output_tokens, request.id
+            ),
             "message_history": earlier,
             "model_settings": {
                 "max_tokens": request.max_output_tokens,  # each model sets its own
                 "openrouter_usage": {"include": True},
+                # Per read and attempt in the SDK; Metered bounds the whole request.
+                "timeout": MODEL_REQUEST_TIMEOUT_SECONDS,
             },
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
         }
@@ -336,9 +409,22 @@ class PydanticExecutor:
                 plan, found, shared, max_references=reference_limit(model)
             )
             rescue = model != request.image_model
+            # What the drawing has left, keeping time for Kiki's note if it fails.
+            left = time_left()
+            timeout = IMAGE_TIMEOUT_SECONDS
+            if left is not None:
+                timeout = min(timeout, left - NOTE_TIMEOUT_SECONDS)
+                if timeout < MIN_IMAGE_SECONDS:
+                    logger.info(
+                        "no time left to draw job_id=%s model=%s left_s=%d",
+                        request.id,
+                        model,
+                        left,
+                    )
+                    raise TimeoutError
             try:
                 with telemetry.image_attempt(model, attempt_result, fallback=rescue) as attempt:
-                    async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
+                    async with asyncio.timeout(timeout):
                         data, mime_type, cost = await generation.generate(
                             self.image_model(model),
                             prompt,
@@ -348,7 +434,10 @@ class PydanticExecutor:
                         )
                 return data, mime_type, cost, model, prompt, references
             except generation.SafetyRefused:
-                if fallback is None:
+                left = time_left()
+                if fallback is None or (
+                    left is not None and left - NOTE_TIMEOUT_SECONDS < MIN_IMAGE_SECONDS
+                ):
                     raise
                 logger.info(
                     "drawing blocked, trying the fallback job_id=%s model=%s fallback=%s",
@@ -413,7 +502,9 @@ class PydanticExecutor:
                         e.status_code,
                         e.code,
                     )
-                except (APIError, TimeoutError) as e:
+                except TimeoutError:
+                    error, reason = "failed", "the image model took too long"
+                except APIError as e:
                     error, reason = "failed", f"the image model failed ({type(e).__name__})"
                 latency_ms = int((time.monotonic() - started) * 1000)
                 if error is None:
@@ -433,13 +524,7 @@ class PydanticExecutor:
                         mime_type=mime_type,
                     )
                 else:
-                    note, note_cost = await drawing.failure_note(
-                        connection,
-                        self.model(request.chat_model),
-                        request.reply_job,
-                        request.ack,
-                        reason,
-                    )
+                    note, note_cost = await self.failure_note(connection, request, reason)
         except OperationalError as e:
             raise TransientError(type(e).__name__) from e
         cost = image_cost + vision.cost + note_cost
@@ -467,6 +552,24 @@ class PydanticExecutor:
             error=error,
             failure_note=note,
         )
+
+    async def failure_note(
+        self, connection, request: ImageJobRequest, reason: str
+    ) -> tuple[str, float]:
+        """Kiki's note about a failed drawing, or "" (Rust's stock notice) when it
+        can't be written in the time left."""
+        try:
+            async with asyncio.timeout(within(NOTE_TIMEOUT_SECONDS)):
+                return await drawing.failure_note(
+                    connection,
+                    self.model(request.chat_model),
+                    request.reply_job,
+                    request.ack,
+                    reason,
+                )
+        except TimeoutError:
+            logger.warning("failure note timed out reply_job=%s", request.reply_job)
+            return "", 0.0
 
     async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:
         """Describes one batch of the guild's undescribed emoji with a vision model."""

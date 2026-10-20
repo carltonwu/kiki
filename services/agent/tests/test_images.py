@@ -1508,6 +1508,19 @@ async def test_the_stage_never_outlasts_the_jobs_own_deadline(monkeypatch):
     assert 34.5 < drawing.Gatherer(None, None, None, "", seconds=35).time_left() <= 35
 
 
+async def test_the_stage_keeps_the_image_calls_time_in_the_jobs_deadline():
+    # The real job deadline (deadline.py), as `durable` sets it: 50 s left, of
+    # which the image call and the note keep IMAGE_KEEP_SECONDS.
+    from kiki_agent_host.deadline import run_deadline
+
+    with run_deadline(50):
+        gather = drawing.Gatherer(None, None, None, "", seconds=35)
+        assert 50 - drawing.IMAGE_KEEP_SECONDS - 0.5 < gather.time_left() <= 15
+    with run_deadline(20):  # less than the image needs: no stage at all
+        assert drawing.Gatherer(None, None, None, "", seconds=35).time_left() <= 0
+    assert 34.5 < drawing.Gatherer(None, None, None, "", seconds=35).time_left() <= 35
+
+
 async def test_a_paid_picker_response_is_billed_when_its_retry_fails(
     database_url, monkeypatch, recorded
 ):

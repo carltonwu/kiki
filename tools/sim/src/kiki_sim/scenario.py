@@ -3,6 +3,7 @@
     name: what this checks
     live: false            # true: also runs with --live; only: runs only with --live
     env: {JEV_MIN_CONFIDENCE: "0.3"}   # ingester settings for this scenario
+    host_env: {AGENT_HOST_JOB_TIMEOUT_SECS: "40"}   # ... and the agent host's
     script: {jev: [...], reply: [...]} # stub answers, matched by text
     steps:
       - say: {as: alex, in: general, text: "kiki hi", id: hi}   # send, then wait
@@ -34,7 +35,8 @@ the stub vision model describes an image as its label, the drawing step's
 reference check turns down labels saying meme or screenshot, and an `expired`
 link only downloads after Discord's refresh), and the sugar
 `jev: {choice, confidence}` and `reply: {text | tool | tools | web}` to script the
-stub's answer to exactly this message. In tool arguments, `{image_message}` is the
+stub's answer to exactly this message (`delay_s` makes its first request that slow).
+In tool arguments, `{image_message}` is the
 message ID from the trigger's image marker, else the newest one in the conversation.
 `tools` is a sequence of calls; an argument `"{entry_id}"` (or `"{entry_ids:N}"`)
 takes memory entry IDs from the previous call's result, and `"{cursor}"` its
@@ -517,7 +519,12 @@ def run_file(path: Path, config: stack.Config, live: bool) -> Result:
         return result
     started = time.monotonic()
     fixture = stack.SIM / "fixtures" / f"{spec['fixture']}.yaml" if spec.get("fixture") else None
-    stack.reset(config, {str(k): str(v) for k, v in (spec.get("env") or {}).items()}, fixture)
+    stack.reset(
+        config,
+        {str(k): str(v) for k, v in (spec.get("env") or {}).items()},
+        fixture,
+        {str(k): str(v) for k, v in (spec.get("host_env") or {}).items()},
+    )
     run = Run(spec, config)
     try:
         run.execute()

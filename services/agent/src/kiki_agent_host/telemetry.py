@@ -698,7 +698,7 @@ def image_attempt(
 def tool_call(tool: str) -> Iterator[Call]:
     """One tool call as kiki.tools.* and a span. The caller sets the outcome; an
     exception makes it an error (cancelled: only a span). One turned away
-    (budget_exhausted) never ran, so it has no duration."""
+    (budget_exhausted, out_of_time) never ran, so it has no duration."""
     call = Call()
     if (recorder := _recorder) is None:
         yield call
@@ -713,7 +713,7 @@ def tool_call(tool: str) -> Iterator[Call]:
         finally:
             if call.outcome != CANCELLED:
                 recorder.tool_calls.add(1, {"tool": tool, "outcome": call.outcome})
-            if call.outcome not in (CANCELLED, "budget_exhausted"):
+            if call.outcome not in (CANCELLED, "budget_exhausted", "out_of_time"):
                 recorder.tool_duration.record(time.monotonic() - started, {"tool": tool})
             call.span.set_attribute("kiki.tool.outcome", call.outcome)
 
