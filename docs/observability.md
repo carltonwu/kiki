@@ -267,28 +267,94 @@ emoji-description endpoint is not a job.
 
 | Metric | Type | Unit | Attributes | Prometheus |
 |---|---|---|---|---|
-| `kiki.railway.cpu` | gauge | `{vCPU}` | `service` | `kiki_railway_cpu` |
-| `kiki.railway.memory` | gauge | `By` | `service` | `kiki_railway_memory_bytes` |
-| `kiki.railway.network` | gauge | `By` | `service`, `direction=rx\|tx` | `kiki_railway_network_bytes` |
-| `kiki.railway.disk` | gauge | `By` | `service` | `kiki_railway_disk_bytes` |
-| `kiki.pg.connections` | gauge | `{connection}` | `state` (`pg_stat_activity` states) | `kiki_pg_connections` |
-| `kiki.pg.database.size` | gauge | `By` | | `kiki_pg_database_size_bytes` |
-| `kiki.pg.table.size` | gauge | `By` | `table` (allowlist) | `kiki_pg_table_size_bytes` |
-| `kiki.pg.transactions` | counter | `{transaction}` | `result=commit\|rollback` | `kiki_pg_transactions_total` |
-| `kiki.pg.cache.hit_ratio` | gauge | `1` | | `kiki_pg_cache_hit_ratio` |
-| `kiki.pg.deadlocks` | counter | `{deadlock}` | | `kiki_pg_deadlocks_total` |
-| `kiki.pg.temp.written` | counter | `By` | | `kiki_pg_temp_written_bytes_total` |
-| `kiki.pg.oldest_transaction.age` | gauge | `s` | | `kiki_pg_oldest_transaction_age_seconds` |
-| `kiki.pg.dead_tuples` | gauge | `{tuple}` | `table` (allowlist) | `kiki_pg_dead_tuples` |
-| `kiki.queue.pending` | gauge | `{item}` | `queue=agent_runs\|drawings` | `kiki_queue_pending` |
-| `kiki.queue.oldest_pending.age` | gauge | `s` | `queue` | `kiki_queue_oldest_pending_age_seconds` |
-| `kiki.agent_runs.stuck` | gauge | `{run}` | | `kiki_agent_runs_stuck` |
-| `kiki.conversations.open` | gauge | `{conversation}` | | `kiki_conversations_open` |
-| `kiki.embeddings.backlog` | gauge | `{message}` | | `kiki_embeddings_backlog` |
+| `kiki.railway.cpu` | gauge | `{vCPU}` | `service` | `kiki_railway_cpu` — **live** |
+| `kiki.railway.memory` | gauge | `By` | `service` | `kiki_railway_memory_bytes` — **live** |
+| `kiki.railway.network` | gauge | `By` | `service`, `direction=rx\|tx` | `kiki_railway_network_bytes` — **live** |
+| `kiki.railway.disk` | gauge | `By` | `service` | `kiki_railway_disk_bytes` — **live** |
+| `kiki.pg.connections` | gauge | `{connection}` | `state=active\|idle\|idle_in_transaction\|idle_in_transaction_aborted\|other` | `kiki_pg_connections` — **live** |
+| `kiki.pg.database.size` | gauge | `By` | | `kiki_pg_database_size_bytes` — **live** |
+| `kiki.pg.table.size` | gauge | `By` | `table` (allowlist) | `kiki_pg_table_size_bytes` — **live** |
+| `kiki.pg.transactions` | counter | `{transaction}` | `result=commit\|rollback` | `kiki_pg_transactions_total` — **live** |
+| `kiki.pg.cache.hit_ratio` | gauge | `1` | | `kiki_pg_cache_hit_ratio` — **live** |
+| `kiki.pg.deadlocks` | counter | `{deadlock}` | | `kiki_pg_deadlocks_total` — **live** |
+| `kiki.pg.temp.written` | counter | `By` | | `kiki_pg_temp_written_bytes_total` — **live** |
+| `kiki.pg.oldest_transaction.age` | gauge | `s` | | `kiki_pg_oldest_transaction_age_seconds` — **live** |
+| `kiki.pg.dead_tuples` | gauge | `{tuple}` | `table` (allowlist) | `kiki_pg_dead_tuples` — **live** |
+| `kiki.queue.pending` | gauge | `{item}` | `queue=agent_runs\|drawings` | `kiki_queue_pending` — **live** |
+| `kiki.queue.oldest_pending.age` | gauge | `s` | `queue` | `kiki_queue_oldest_pending_age_seconds` — **live** |
+| `kiki.agent_runs.stuck` | gauge | `{run}` | | `kiki_agent_runs_stuck` — **live** |
+| `kiki.conversations.open` | gauge | `{conversation}` | | `kiki_conversations_open` — **live** |
+| `kiki.embeddings.backlog` | gauge | `{message}` | | `kiki_embeddings_backlog` — **live** |
 
-`service` here is the Railway service the sample describes (`ingester`, `agent`,
-`postgres`), not the exporter. `kiki.pg.transactions`, `kiki.pg.deadlocks` and
-`kiki.pg.temp.written` mirror Postgres's cumulative `pg_stat_database` counters
-(observable counters). `kiki.railway.network` is what Railway's metrics API
-reports for the sample window; the poller PR states whether that is cumulative.
-The poller runs only on the leader so one instance reports it.
+Code: `services/ingester/src/platform/`. One task polls every 60 s into a
+snapshot; the instruments are observable, and their callbacks (run by the metric
+reader at export) only read the snapshot, never query. It starts once the
+instance holds the leader lock, so one instance reports, and stops on shutdown
+or when leadership ends. With export off it returns at once: no queries, no API
+calls. Each Postgres query runs in a transaction with `statement_timeout = 3s`
+and `lock_timeout = 1s`, under a 5 s bound for each queue query and 15 s for the
+server statistics and for Railway. Each queue query stands alone: one that fails
+or times out leaves the others' values. A failure is logged at warn at most
+every 10 minutes per query or source (with a count of the failures left out),
+and its series report no samples, so they go stale, until it recovers. The
+callbacks hold only a weak reference to the snapshot, and main awaits the
+stopped poller before releasing the leader lock, so the gauges go silent with
+leadership instead of repeating the last values.
+
+- **Postgres.** `kiki.pg.connections` counts client backends on the whole server
+  (the connection limit is per server), excluding the poller's own.
+  `kiki.pg.oldest_transaction.age` is the oldest open transaction of any client
+  (0 if none). Database size, `pg_stat_database` and the table rows are for the
+  current database. `kiki.pg.transactions`, `kiki.pg.deadlocks` and
+  `kiki.pg.temp.written` are observable counters with Postgres's raw cumulative
+  values; they reset only with a stats reset, which Prometheus's `rate` and
+  `increase` handle. `kiki.pg.cache.hit_ratio` is `blks_hit / (blks_hit +
+  blks_read)` over the last poll interval, not since the stats reset (a lifetime
+  ratio barely moves); it is absent after the first poll, in an interval without
+  reads, and across a stats reset (a changed `pg_stat_database.stats_reset`). Table size is `pg_total_relation_size` (indexes and TOAST
+  included). `table` ∈ `messages, message_embeddings, agent_host_images,
+  agent_runs, conversations, classifications, agent_host_jobs`.
+- **Queues.** `agent_runs` is runs in `pending`, `drawings` is
+  `agent_image_jobs` in `pending`; the oldest age is 0 when the queue is empty.
+  `kiki.agent_runs.stuck` counts runs `running` or `delivering` whose
+  `started_at` is over 10 minutes ago: a run's host requests give up after
+  `AGENT_HOST_TIMEOUT_MS` (180 s, wake-up retries included) and delivery takes
+  seconds, so anything past 10 minutes is wedged. Migration 0026's partial
+  index `agent_runs_active_idx` (`started_at` where running or delivering) keeps
+  it an index-only scan of the few runs in flight (0.2 ms at 200k runs, against
+  a 28 MB heap scan without it). `kiki.conversations.open` is
+  conversations with no `closed_at`.
+- **Embedding backlog.** Messages the agent host would embed (its pending query:
+  people's undeleted, non-empty messages and link fixers' reposts, ignored
+  authors excluded) with no `message_embeddings` row, **among messages from the
+  last 7 days**. Indexing is newest first (each reply embeds its guild's 256
+  newest pending messages), so a backlog builds there; older history is filled
+  by `kiki-agent-host index`. The window is a snowflake-ID range on the primary
+  key: on a 300k-message table (469 MB heap) the query read about 3 MB of
+  `messages` and took 10 ms, against a 480 MB sequential scan (170 ms, and page
+  cache Railway bills as memory) for the unbounded count. The other queue
+  queries read partial indexes.
+- **Railway** (optional). On when the ingester has `RAILWAY_METRICS_TOKEN`, a
+  project token for its environment (Project Settings → Tokens). Railway injects
+  `RAILWAY_PROJECT_ID` and `RAILWAY_ENVIRONMENT_ID`. Each poll makes the
+  `metrics` query of Railway's public GraphQL API
+  (`backboard.railway.com/graphql/v2`, header `Project-Access-Token`) for the
+  environment: `CPU_USAGE`, `MEMORY_USAGE_GB`, `NETWORK_RX_GB`, `NETWORK_TX_GB`
+  and `DISK_USAGE_GB` over the last 5 minutes at `sampleRateSeconds: 60`,
+  `groupBy: [SERVICE_ID]`, and keeps each service's newest sample. Service IDs
+  map to names through `project { services }`, fetched again hourly and
+  whenever an unknown ID appears. `service` is the Railway service the sample describes
+  (`ingester`, `agent`, `postgres`), not the exporter. Railway's GB are decimal
+  (×10⁹ bytes). `kiki.railway.network` is not cumulative: it is the public
+  network bytes moved in the sample's minute (private networking, such as
+  Postgres traffic, isn't counted). `kiki.railway.disk` is volume usage (0 for a
+  service without a volume). A refused token (`Not Authorized`, or HTTP 401/403)
+  logs one warning and turns the Railway part off until restart. Not yet
+  confirmed with a real project token: the query and response shape match the
+  schema and the dashboard's own metrics, but whether Railway lets a project
+  token (not an account token) read `metrics` is untested.
+
+Series: 33 without Railway (connections 5, tables 7 × 2, transactions 2,
+deadlocks, temp bytes, size, ratio, oldest transaction, queues 4, stuck, open,
+backlog) plus 15 with it
+(3 services × cpu, memory and disk, and × 2 network directions): 48.

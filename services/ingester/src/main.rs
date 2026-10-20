@@ -18,6 +18,7 @@ mod health;
 mod jev;
 mod leader;
 mod metrics;
+mod platform;
 mod rest;
 mod router;
 mod store;
@@ -102,6 +103,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .build();
     leader_held.record(1, &[]);
 
+    // Leader only, so one instance reports the platform's metrics.
+    let poller = tokio::spawn(platform::run(pool.clone(), shutdown_rx.clone()));
     let mut ingest = tokio::spawn(ingest(
         pool,
         discord,
@@ -118,6 +121,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
             Err(e) => Err(e),
         },
     };
+    // Stop the poller (its gauges go silent with it) while still the leader.
+    poller.abort();
+    let _ = poller.await;
     // Only now may the next instance connect to the Gateway.
     leader.release().await;
     leader_held.record(0, &[]);

@@ -95,6 +95,9 @@ export default defineRailway(() => {
       AGENT_HOST_URL: preserve(),
       AGENT_HOST_TOKEN: "${{shared.AGENT_HOST_TOKEN}}",
       DISCORD_GUILD_IDS: "1358240830887952575,348273727298863104",
+      // Secret, optional: a project token for this environment, so the platform
+      // poller can report the services' Railway CPU, memory, network and disk.
+      RAILWAY_METRICS_TOKEN: preserve(),
       ...telemetry,
       OTEL_SERVICE_NAME: "ingester",
     },
