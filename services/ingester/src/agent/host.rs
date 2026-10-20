@@ -5,12 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use reqwest::{Response, StatusCode, Url, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, field::Empty, info_span, warn};
 
 use super::people::PersonRef;
 use crate::{
     chat::{Message, Usage},
     config::AgentConfig,
+    metrics,
 };
 
 pub(crate) struct Host {
@@ -234,11 +235,14 @@ impl Host {
         tokio::time::timeout(self.timeout, async {
             let mut delay = Duration::from_secs(1);
             loop {
-                if let Ok(response) = self.attempt(&self.emoji_endpoint, request).await? {
-                    return response
-                        .json()
-                        .await
-                        .context("parsing agent host emoji response");
+                match self.attempt(&self.emoji_endpoint, request).await? {
+                    Ok(response) => {
+                        return response
+                            .json()
+                            .await
+                            .context("parsing agent host emoji response");
+                    }
+                    Err((reason, _)) => metrics::host_retry(reason),
                 }
                 debug!(
                     guild_id = request.guild_id,
@@ -253,19 +257,49 @@ impl Host {
         .context("agent host deadline exceeded (including wake-up retries)")?
     }
 
-    /// One POST: the response, why to retry while the host wakes up or is busy
-    /// (reason and HTTP status, for logs), or an error retrying won't fix.
+    /// Which endpoint `url` is, for `kiki.agent_host.requests`.
+    fn endpoint_name(&self, url: &Url) -> &'static str {
+        if *url == self.image_endpoint {
+            "images"
+        } else if *url == self.emoji_endpoint {
+            "emojis"
+        } else {
+            "jobs"
+        }
+    }
+
+    /// One POST, in a span of its own: the response, why to retry while the host
+    /// wakes up or is busy (reason and HTTP status, for logs), or an error
+    /// retrying won't fix.
     async fn attempt(
         &self,
         url: &Url,
         body: &impl Serialize,
     ) -> anyhow::Result<Result<Response, (&'static str, Option<u16>)>> {
-        let mut request = self.http.post(url.clone()).json(body);
-        // The agent host continues the current trace (the run's span).
-        for (name, value) in crate::telemetry::trace_headers() {
-            request = request.header(name, value);
+        let endpoint = self.endpoint_name(url);
+        let span = info_span!(
+            "agent_host_request",
+            otel.kind = "client",
+            endpoint,
+            url.path = url.path(),
+            http.response.status_code = Empty,
+        );
+        let sent = async {
+            let mut request = self.http.post(url.clone()).json(body);
+            // The agent host continues the current trace (this span, in the run's).
+            for (name, value) in crate::telemetry::trace_headers() {
+                request = request.header(name, value);
+            }
+            request.send().await
         }
-        match request.send().await {
+        .instrument(span.clone())
+        .await;
+        let status = sent.as_ref().ok().map(|r| r.status().as_u16());
+        metrics::host_request(endpoint, status);
+        if let Some(status) = status {
+            span.record("http.response.status_code", status);
+        }
+        match sent {
             Err(error) if error.is_timeout() => Ok(Err(("timeout", None))),
             Err(error) if error.is_connect() || error.is_request() => Ok(Err(("connection", None))),
             Err(error) => Err(error).context("calling agent host"),
@@ -316,6 +350,7 @@ impl Host {
                     }
                 }
             };
+            metrics::host_retry(reason);
             if reason != "running" && !warned {
                 warn!(
                     job_id = id,

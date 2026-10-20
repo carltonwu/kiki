@@ -29,10 +29,20 @@ use std::{
 use anyhow::bail;
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::{sync::watch, task::JoinSet};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use twilight_http::Client;
 
-use crate::{chat::Usage, config::AgentConfig};
+use crate::{
+    chat::Usage,
+    config::AgentConfig,
+    metrics::{self, RunStatus},
+    telemetry,
+};
+
+/// A run's kind (see [`metrics::run_kind`]), from its first trigger message's
+/// classification. SQL over an `agent_runs` row aliased `r`.
+const RUN_KIND: &str = "(SELECT c.check_hit FROM classifications c \
+                         WHERE c.message_id = r.trigger_message_ids[1])";
 
 const NOTIFY_CHANNEL: &str = "agent_run_queued";
 /// Pending runs are also checked this often, in case a notification was lost
@@ -54,6 +64,9 @@ pub struct Agent {
 
 struct Claim {
     run_id: i64,
+    kind: &'static str,
+    /// The `traceparent` stored when the run was queued.
+    trace_context: Option<String>,
     conversation_id: i64,
     channel_id: i64,
     /// Trigger messages of every claimed run, oldest first.
@@ -104,13 +117,16 @@ impl Agent {
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         // Delivery is not safely retryable after a crash. Host execution can
         // reuse a saved result through its stable job ID.
-        let interrupted = sqlx::query(
-            "UPDATE agent_runs SET status = 'failed', error = 'interrupted', finished_at = now() \
-             WHERE status = 'delivering'",
-        )
-        .execute(&self.db)
-        .await?
-        .rows_affected();
+        let interrupted: Vec<Option<String>> = sqlx::query_scalar(&format!(
+            "UPDATE agent_runs r SET status = 'failed', error = 'interrupted', finished_at = now() \
+             WHERE status = 'delivering' RETURNING {RUN_KIND}"
+        ))
+        .fetch_all(&self.db)
+        .await?;
+        for kind in &interrupted {
+            metrics::run_finished(metrics::run_kind(kind.as_deref()), RunStatus::Interrupted);
+        }
+        let interrupted = interrupted.len();
         if interrupted > 0 {
             warn!(
                 runs = interrupted,
@@ -163,6 +179,7 @@ impl Agent {
                     if let Some(conversation_id) = workers.by_task.remove(&id) {
                         workers.busy.remove(&conversation_id);
                     }
+                    metrics::workers_active(workers.tasks.len());
                     // A run queued while that conversation was busy was skipped.
                     self.dispatch(&mut workers).await;
                 }
@@ -209,7 +226,18 @@ impl Agent {
     async fn serve(self: Arc<Self>, conversation_id: i64) {
         loop {
             match self.claim(conversation_id).await {
-                Ok(Some(claim)) => self.answer(claim).await,
+                Ok(Some(claim)) => {
+                    // Continues the trace of the classification that queued it.
+                    let span = info_span!(
+                        "agent_run",
+                        run_id = claim.run_id,
+                        conversation_id = claim.conversation_id,
+                        channel_id = claim.channel_id,
+                        kind = claim.kind,
+                    );
+                    telemetry::continue_trace(&span, claim.trace_context.as_deref());
+                    self.answer(claim).instrument(span).await
+                }
                 Ok(None) => return,
                 Err(e) => {
                     warn!(
@@ -225,20 +253,36 @@ impl Agent {
 
     async fn claim(&self, conversation_id: i64) -> anyhow::Result<Option<Claim>> {
         let mut tx = self.db.begin().await?;
-        let runs: Vec<(i64, Vec<i64>, i64, Option<serde_json::Value>)> = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let runs: Vec<(
+            i64,
+            Vec<i64>,
+            i64,
+            Option<serde_json::Value>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(&format!(
             r#"
-            SELECT id, trigger_message_ids, (extract(epoch FROM created_at) * 1000)::bigint, host_request
-            FROM agent_runs WHERE conversation_id = $1 AND status = 'pending'
+            SELECT id, trigger_message_ids, (extract(epoch FROM created_at) * 1000)::bigint, host_request,
+                   {RUN_KIND}, trace_context
+            FROM agent_runs r WHERE conversation_id = $1 AND status = 'pending'
             ORDER BY id FOR UPDATE SKIP LOCKED
-            "#,
-        )
+            "#
+        ))
         .bind(conversation_id)
         .fetch_all(&mut *tx)
         .await?;
-        let Some((run_id, _, created_at_ms, host_request)) = runs.last() else {
+        let Some((run_id, _, created_at_ms, host_request, kind, trace_context)) = runs.last()
+        else {
             return Ok(None);
         };
-        let (run_id, created_at_ms, host_request) = (*run_id, *created_at_ms, host_request.clone());
+        let (run_id, created_at_ms, host_request, kind, trace_context) = (
+            *run_id,
+            *created_at_ms,
+            host_request.clone(),
+            metrics::run_kind(kind.as_deref()),
+            trace_context.clone(),
+        );
         let channel_id: i64 =
             sqlx::query_scalar("SELECT channel_id FROM conversations WHERE id = $1")
                 .bind(conversation_id)
@@ -256,9 +300,12 @@ impl Agent {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        for (_, _, _, _, kind, _) in &runs[..runs.len() - 1] {
+            metrics::run_finished(metrics::run_kind(kind.as_deref()), RunStatus::Superseded);
+        }
 
         let mut trigger_message_ids: Vec<i64> =
-            runs.into_iter().flat_map(|(_, ids, _, _)| ids).collect();
+            runs.into_iter().flat_map(|(_, ids, ..)| ids).collect();
         trigger_message_ids.sort_unstable();
         trigger_message_ids.dedup();
         debug!(
@@ -271,6 +318,8 @@ impl Agent {
         );
         Ok(Some(Claim {
             run_id,
+            kind,
+            trace_context,
             conversation_id,
             channel_id,
             trigger_message_ids,
@@ -279,20 +328,19 @@ impl Agent {
         }))
     }
 
-    #[tracing::instrument(
-        name = "agent_run",
-        skip_all,
-        fields(
-            run_id = claim.run_id,
-            conversation_id = claim.conversation_id,
-            channel_id = claim.channel_id
-        )
-    )]
+    /// Runs in the `agent_run` span (see [`Self::serve`]).
     async fn answer(self: &Arc<Self>, claim: Claim) {
         let started = Instant::now();
         let mut record = RunRecord::default();
         let result = self.reply(&claim, &mut record).await;
         let latency_ms = started.elapsed().as_millis() as i32;
+        let status = match &result {
+            Ok(()) => RunStatus::Done,
+            Err(e) if e.is::<Expired>() => RunStatus::Expired,
+            Err(_) => RunStatus::Failed,
+        };
+        metrics::run_finished(claim.kind, status);
+        metrics::run_duration(claim.kind, started.elapsed());
 
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
         match &error {
@@ -352,7 +400,7 @@ impl Agent {
             (crate::router::unix_millis() - claim.created_at_ms).max(0) as u64,
         );
         if age > self.config.run_max_age {
-            bail!("expired: queued {}s ago", age.as_secs());
+            return Err(Expired(age).into());
         }
         let Some(context) = self
             .context(claim.conversation_id, &claim.trigger_message_ids)
@@ -442,6 +490,7 @@ impl Agent {
             &plan.messages,
             &images,
             context.settings.chat_reply_reference,
+            metrics::Send::Reply,
             record,
         )
         .await
@@ -497,8 +546,21 @@ impl Workers {
             .tasks
             .spawn(async move { agent.serve(conversation_id).await });
         self.by_task.insert(handle.id(), conversation_id);
+        metrics::workers_active(self.tasks.len());
     }
 }
+
+/// A run queued too long ago to answer (`AGENT_RUN_MAX_AGE_SECS`).
+#[derive(Debug)]
+struct Expired(Duration);
+
+impl std::fmt::Display for Expired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "expired: queued {}s ago", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for Expired {}
 
 fn clean_reply(text: &str) -> String {
     fix_custom_emoji(strip_speaker(text.trim()).trim())

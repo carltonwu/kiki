@@ -4,21 +4,26 @@
 //! twilight-gateway runs the protocol (identify, heartbeats, resume, reconnects);
 //! dispatch payloads are handled as raw JSON so `raw` stores exactly what Discord sent.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::bail;
 use futures_util::StreamExt;
 use serde_json::Value;
 use sqlx::PgPool;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use twilight_gateway::{CloseFrame, ConfigBuilder, Intents, Message, Shard, ShardId};
-use twilight_model::id::Id;
+use twilight_model::{id::Id, util::Timestamp};
 
 use crate::{
     catch_up::{CatchUp, snowflake},
     commands::Commands,
-    store,
+    metrics::{self, Author, Reconnect},
+    store, telemetry,
 };
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -27,6 +32,8 @@ pub struct Listener {
     pub db: PgPool,
     pub catch_up: Arc<CatchUp>,
     pub guild_ids: HashSet<i64>,
+    /// Kiki's own messages count as `author=kiki`.
+    pub bot_user_id: i64,
     pub commands: Arc<Commands>,
     /// A fake Gateway for local testing; `None` is Discord's.
     pub gateway_url: Option<String>,
@@ -47,6 +54,9 @@ impl Listener {
         let mut shard = Shard::with_config(ShardId::ONE, config.build());
         info!("connecting to the Discord Gateway");
 
+        // Set by a reconnect request or invalid session, which the shard
+        // answers by closing the connection.
+        let mut dropping = None;
         loop {
             let item = tokio::select! {
                 item = shard.next() => item,
@@ -55,9 +65,19 @@ impl Listener {
             match item {
                 // The shard reconnects (resuming when it can) on its own.
                 Some(Ok(Message::Close(frame))) => {
-                    info!(?frame, "Gateway connection closed; reconnecting")
+                    let reason = close_reason(dropping.take(), frame.as_ref().map(|f| f.code));
+                    metrics::gateway_reconnect(reason);
+                    info!(
+                        ?frame,
+                        reason = reason.as_str(),
+                        "Gateway connection closed; reconnecting"
+                    )
                 }
-                Some(Ok(Message::Text(text))) => self.handle(&text).await,
+                Some(Ok(Message::Text(text))) => {
+                    if let Some(reason) = self.handle(&text).await {
+                        dropping = Some(reason);
+                    }
+                }
                 Some(Err(e)) => warn!(error = %e, "Gateway receive error"),
                 None => bail!(
                     "Gateway closed the connection for good: check DISCORD_BOT_TOKEN and that \
@@ -71,7 +91,9 @@ impl Listener {
             while let Some(item) = shard.next().await {
                 match item {
                     Ok(Message::Close(_)) => break,
-                    Ok(Message::Text(text)) => self.handle(&text).await,
+                    Ok(Message::Text(text)) => {
+                        self.handle(&text).await;
+                    }
                     Err(_) => {}
                 }
             }
@@ -83,19 +105,27 @@ impl Listener {
         Ok(())
     }
 
-    async fn handle(&self, text: &str) {
+    /// Stores a dispatch. Returns why the shard is about to drop the connection,
+    /// if the payload is Discord telling it to.
+    async fn handle(&self, text: &str) -> Option<Reconnect> {
         let payload: Value = match serde_json::from_str(text) {
             Ok(v) => v,
-            Err(e) => return warn!(error = %e, "unparseable Gateway payload"),
+            Err(e) => {
+                warn!(error = %e, "unparseable Gateway payload");
+                return None;
+            }
         };
         // Only dispatches (op 0) carry events; the shard handles every other opcode.
-        if payload["op"].as_u64() != Some(0) {
-            return;
+        match payload["op"].as_u64() {
+            Some(0) => {}
+            Some(7) => return Some(Reconnect::Requested),
+            Some(9) => return Some(Reconnect::InvalidSession),
+            _ => return None,
         }
-        let Some(event) = payload["t"].as_str() else {
-            return;
-        };
+        let event = payload["t"].as_str()?;
+        metrics::gateway_event(event);
         if let Err(e) = self.dispatch(event, &payload["d"]).await {
+            metrics::gateway_store_error();
             warn!(
                 event,
                 guild_id = payload["d"]["guild_id"].as_str(),
@@ -106,6 +136,7 @@ impl Listener {
                 "failed to store Gateway event"
             );
         }
+        None
     }
 
     async fn dispatch(&self, event: &str, d: &Value) -> anyhow::Result<()> {
@@ -146,12 +177,14 @@ impl Listener {
         match event {
             "INTERACTION_CREATE" => self.commands.spawn_handle(d.clone()),
             "MESSAGE_CREATE" => {
-                store::upsert_messages(&self.db, guild_id, std::slice::from_ref(d)).await?;
-                if let (Some(channel), Some(id)) =
-                    (snowflake(&d["channel_id"]), snowflake(&d["id"]))
-                {
-                    store::bump_last_message(&self.db, channel, id).await?;
-                }
+                let span = info_span!(
+                    "message_create",
+                    guild_id,
+                    channel_id = d["channel_id"].as_str(),
+                    message_id = d["id"].as_str(),
+                    author_id = d["author"]["id"].as_str(),
+                );
+                self.store_message(guild_id, d).instrument(span).await?;
             }
             "MESSAGE_UPDATE" => {
                 // Unknown message (sent while we were offline): store it if the
@@ -209,5 +242,72 @@ impl Listener {
             _ => {}
         }
         Ok(())
+    }
+
+    /// A live message: the start of its trace, which routing continues.
+    async fn store_message(&self, guild_id: i64, d: &Value) -> anyhow::Result<()> {
+        if let Some(lag) = lag(d, SystemTime::now()) {
+            metrics::gateway_lag(lag);
+        }
+        metrics::message_ingested(match snowflake(&d["author"]["id"]) {
+            Some(id) if id == self.bot_user_id => Author::Kiki,
+            _ if d["author"]["bot"].as_bool() == Some(true) => Author::Bot,
+            _ => Author::Human,
+        });
+        let id = snowflake(&d["id"]);
+        // Before the insert, whose notification the router may handle at once.
+        if let Some(id) = id {
+            telemetry::remember_message(id);
+        }
+        store::upsert_messages(&self.db, guild_id, std::slice::from_ref(d)).await?;
+        if let (Some(channel), Some(id)) = (snowflake(&d["channel_id"]), id) {
+            store::bump_last_message(&self.db, channel, id).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Why a closed connection dropped: what Discord said before, else its close code.
+fn close_reason(said: Option<Reconnect>, code: Option<u16>) -> Reconnect {
+    match (said, code) {
+        (Some(reason), _) => reason,
+        (None, None | Some(1006)) => Reconnect::Transport,
+        (None, Some(_)) => Reconnect::Closed,
+    }
+}
+
+/// How long after Discord created the message it arrived.
+fn lag(d: &Value, now: SystemTime) -> Option<Duration> {
+    let created = Timestamp::parse(d["timestamp"].as_str()?).ok()?.as_micros();
+    let now = now.duration_since(UNIX_EPOCH).ok()?.as_micros() as i64;
+    Some(Duration::from_micros(
+        now.saturating_sub(created).max(0) as u64
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_reasons() {
+        let requested = Some(Reconnect::Requested);
+        assert_eq!(close_reason(requested, Some(4000)), Reconnect::Requested);
+        assert_eq!(close_reason(None, Some(1006)), Reconnect::Transport);
+        assert_eq!(close_reason(None, None), Reconnect::Transport);
+        assert_eq!(close_reason(None, Some(4009)), Reconnect::Closed);
+    }
+
+    #[test]
+    fn lag_is_receipt_minus_the_message_timestamp() {
+        let d = serde_json::json!({"timestamp": "2026-10-19T12:00:00.000000+00:00"});
+        let sent = UNIX_EPOCH + Duration::from_secs(1_792_411_200);
+        assert_eq!(
+            lag(&d, sent + Duration::from_millis(1500)),
+            Some(Duration::from_millis(1500))
+        );
+        // Clock skew never makes it negative.
+        assert_eq!(lag(&d, sent - Duration::from_secs(1)), Some(Duration::ZERO));
+        assert_eq!(lag(&serde_json::json!({}), sent), None);
     }
 }

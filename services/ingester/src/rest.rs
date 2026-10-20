@@ -71,6 +71,7 @@ where
             delay_ms = delay.as_millis() as u64,
             "Discord request failed; retrying"
         );
+        crate::metrics::rest_retry(reason);
         tokio::time::sleep(delay).await;
     }
 }

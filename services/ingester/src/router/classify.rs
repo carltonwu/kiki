@@ -14,10 +14,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 use sqlx::FromRow;
-use tracing::{debug, info, warn};
+use tracing::{Span, debug, field::Empty, info, warn};
 
 use super::{Pool, PoolKey, Router, unix_millis};
-use crate::conversation;
+use crate::{conversation, metrics, telemetry};
 
 const INSTRUCTIONS: &str = "Kiki is an AI member of this Discord server, a close friend group where \
 banter, teasing and roasting are normal. Based on new_messages, is their author talking to Kiki: \
@@ -199,6 +199,16 @@ impl Router {
             (check, outcome)
         };
 
+        let span = Span::current();
+        span.record("check", check.as_str());
+        span.record(
+            "outcome",
+            match outcome {
+                Outcome::Continue { .. } => "continue",
+                Outcome::New { .. } => "new",
+                Outcome::No => "no",
+            },
+        );
         self.tag(key, pool, &messages, check, outcome, &jev, classified_at)
             .await
     }
@@ -695,8 +705,14 @@ impl Router {
     }
 
     /// Records the classification of every pooled message and, when routed, tags
-    /// them into their conversation and queues the agent. One transaction.
+    /// them into their conversation and queues the agent. One transaction. The
+    /// run stores this span's trace context, so the agent continues the trace.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "tag",
+        skip_all,
+        fields(conversation_id = Empty, run_id = Empty, evicted = Empty)
+    )]
     async fn tag(
         &self,
         key: PoolKey,
@@ -709,6 +725,7 @@ impl Router {
     ) -> anyhow::Result<()> {
         let ids: Vec<i64> = messages.iter().map(|m| m.id).collect();
         let pool_id = *ids.last().expect("pool is not empty");
+        let span = Span::current();
         let mut tx = self.db.begin().await?;
         if !matches!(outcome, Outcome::No) {
             conversation::lock_pool(&mut tx).await?;
@@ -759,13 +776,17 @@ impl Router {
             .bind(via)
             .execute(&mut *tx)
             .await?;
-            run_id = Some(sqlx::query_scalar(
-                "INSERT INTO agent_runs (conversation_id, trigger_message_ids) VALUES ($1, $2) RETURNING id",
-            )
-            .bind(conversation_id)
-            .bind(&ids)
-            .fetch_one(&mut *tx)
-            .await?);
+            run_id = Some(
+                sqlx::query_scalar(
+                    "INSERT INTO agent_runs (conversation_id, trigger_message_ids, trace_context) \
+                 VALUES ($1, $2, $3) RETURNING id",
+                )
+                .bind(conversation_id)
+                .bind(&ids)
+                .bind(telemetry::traceparent())
+                .fetch_one(&mut *tx)
+                .await?,
+            );
         }
 
         let classified_secs = classified_at
@@ -796,6 +817,19 @@ impl Router {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+
+        metrics::classification(check.as_str(), outcome_name);
+        if outcome_name == "new" {
+            metrics::conversation_started();
+        }
+        metrics::conversations_closed("evicted", evicted.iter().map(|&(_, n)| n));
+        if run_id.is_some() {
+            metrics::run_queued(metrics::run_kind(Some(check.as_str())));
+        }
+        let evicted: Vec<i64> = evicted.into_iter().map(|(id, _)| id).collect();
+        span.record("conversation_id", conversation_id);
+        span.record("run_id", run_id);
+        span.record("evicted", evicted.len());
         // Shown until the agent replies (it removes the reaction then). Explicit
         // triggers (check 1) were already reacted to when they were stored.
         if pool.settings.status_reactions
