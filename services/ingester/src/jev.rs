@@ -3,11 +3,14 @@
 //! as TypeSafe's own API.
 //! https://openrouter.ai/docs/cookbook/evaluate-and-optimize/jev-classification
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use tracing::{Instrument, Span, field::Empty, info_span};
+
+use crate::metrics::{self, LlmResult};
 
 pub struct Jev {
     http: reqwest::Client,
@@ -57,7 +60,48 @@ impl Jev {
         })
     }
 
+    /// Asks Jev, recording the call (`kiki.llm.*`, purpose `jev`) and a span.
     pub async fn choose(
+        &self,
+        state: Value,
+        instructions: &str,
+        criteria: Map<String, Value>,
+    ) -> anyhow::Result<Choice> {
+        let span = info_span!(
+            "jev",
+            otel.kind = "client",
+            model = self.model,
+            choice = Empty,
+            confidence = Empty,
+            result = Empty,
+        );
+        async {
+            let started = Instant::now();
+            let choice = self.request(state, instructions, criteria).await;
+            let result = match &choice {
+                Ok(_) => LlmResult::Ok,
+                Err(e) if timed_out(e) => LlmResult::Timeout,
+                Err(_) => LlmResult::Error,
+            };
+            let (model, cost) = match &choice {
+                Ok(c) => (c.model.as_deref().unwrap_or(&self.model), c.cost),
+                Err(_) => (self.model.as_str(), None),
+            };
+            metrics::llm_call("jev", model, result, started.elapsed(), cost);
+            let span = Span::current();
+            span.record("result", format!("{result:?}").to_lowercase());
+            if let Ok(c) = &choice {
+                metrics::jev_confidence(c.confidence);
+                span.record("choice", c.choice.as_str());
+                span.record("confidence", c.confidence);
+            }
+            choice
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn request(
         &self,
         state: Value,
         instructions: &str,
@@ -99,4 +143,11 @@ impl Jev {
             cost: response.usage.and_then(|u| u.cost),
         })
     }
+}
+
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| {
+        e.downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+    })
 }

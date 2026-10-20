@@ -98,20 +98,23 @@ pub async fn lock_pool(tx: &mut sqlx::PgConnection) -> sqlx::Result<()> {
     Ok(())
 }
 
+/// A conversation just closed: its ID and message count.
+pub type Closed = (i64, i32);
+
 /// Closes the least recently active open conversations beyond `max`. Call with
 /// [`lock_pool`] held.
 pub async fn evict_beyond(
     tx: &mut sqlx::PgConnection,
     guild_id: i64,
     max: i64,
-) -> sqlx::Result<Vec<i64>> {
-    sqlx::query_scalar(
+) -> sqlx::Result<Vec<Closed>> {
+    sqlx::query_as(
         r#"
         UPDATE conversations SET closed_at = now(), closed_reason = 'evicted'
         WHERE guild_id = $2 AND closed_at IS NULL AND id NOT IN (
             SELECT id FROM conversations WHERE guild_id = $2 AND closed_at IS NULL
             ORDER BY last_active_at DESC, id DESC LIMIT $1)
-        RETURNING id
+        RETURNING id, message_count
         "#,
     )
     .bind(max)
@@ -121,10 +124,10 @@ pub async fn evict_beyond(
 }
 
 /// Closes every open conversation of the guild. Call with [`lock_pool`] held.
-pub async fn clear(tx: &mut sqlx::PgConnection, guild_id: i64) -> sqlx::Result<Vec<i64>> {
-    sqlx::query_scalar(
+pub async fn clear(tx: &mut sqlx::PgConnection, guild_id: i64) -> sqlx::Result<Vec<Closed>> {
+    sqlx::query_as(
         "UPDATE conversations SET closed_at = now(), closed_reason = 'cleared' \
-         WHERE guild_id = $1 AND closed_at IS NULL RETURNING id",
+         WHERE guild_id = $1 AND closed_at IS NULL RETURNING id, message_count",
     )
     .bind(guild_id)
     .fetch_all(tx)

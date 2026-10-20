@@ -55,6 +55,8 @@ impl CatchUp {
         }
     }
 
+    /// One span per run (not per page or channel).
+    #[tracing::instrument(name = "catch_up", skip_all, fields(guild_id = guild_id.get()))]
     pub async fn run(&self, guild_id: Id<GuildMarker>) -> anyhow::Result<()> {
         let Some(lock) = self.running.get(&guild_id) else {
             bail!("guild {guild_id} is not enabled");
