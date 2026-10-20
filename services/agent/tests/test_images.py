@@ -1374,11 +1374,13 @@ async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
 ):
     # Review of #66: 6 subjects of 24 candidates make 12 picker batches, two waves
     # through 8 slots; each wave within its own 30 s still took 2 x 27 s, and with
-    # the image's 70 s the job passed the host's 120 s. Scaled down 30x here.
-    monkeypatch.setattr(drawing, "REFERENCES_SECONDS", 1.0)
-    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 0.9)
+    # the image's 70 s the job passed the host's 120 s. Scaled down 10x here, with a
+    # second wave far slower than the stage allows, so the outcome doesn't hang on
+    # how fast the machine seeds and downloads (CI ate a 1 s stage doing so).
+    monkeypatch.setattr(drawing, "REFERENCES_SECONDS", 3.0)
+    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 6.0)
     monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.05)
-    monkeypatch.setattr(drawing, "STAGE_GRACE", 0.2)
+    monkeypatch.setattr(drawing, "STAGE_GRACE", 0.5)
     await reply_job(database_url)
     rows, files = [], {}
     for d in range(6):
@@ -1394,7 +1396,8 @@ async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
 
     async def slow(messages, info):
         started.append(asyncio.get_running_loop().time())
-        await asyncio.sleep(0.8)  # 24 s at full scale
+        # The first wave (8 slots) answers in 1 s; the second would take 5 s.
+        await asyncio.sleep(1.0 if len(started) <= drawing.PICKS_AT_ONCE else 5.0)
         return judged(messages, info)
 
     model = FakeImageModel()
@@ -1405,10 +1408,9 @@ async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
     result = await run.draw(job)
     elapsed = asyncio.get_running_loop().time() - began
     # One deadline for the stage, queue waits included: the second wave gets what's
-    # left of it rather than its own 0.9 s. Without the fix it's 1.6 s or more; the
-    # bound leaves room for a loaded machine (the stage is cut at 1.0 + 0.2 s).
-    assert elapsed < 1.45
-    assert len(started) >= 8  # the first wave, at least, ran
+    # left of it, not its own 6 s (6 s or more without the fix; cut at 3 + 0.5 s).
+    assert elapsed < 4.5
+    assert len(started) >= drawing.PICKS_AT_ONCE  # the first wave ran
     assert result.error is None and len(model.prompts) == 1
     # What the first wave judged is kept: at least 4 subjects have their 3.
     counts = [sum(r.subject == f"Dog{d}" for r in result.references) for d in range(6)]
