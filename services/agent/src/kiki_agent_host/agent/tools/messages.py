@@ -7,7 +7,6 @@ import logging
 from datetime import datetime
 from typing import Annotated
 
-from psycopg import OperationalError
 from pydantic import BeforeValidator
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FunctionToolset
@@ -16,11 +15,21 @@ from ... import db
 from ...chat.counting import GroupBy, count
 from ...chat.history import channel_history as read_history
 from ...chat.indexing import index_pending
-from ...chat.search import Semantic, message_context, search
+from ...chat.search import Deadline, Semantic, message_context, search
 from ..deps import Deps
 from ..guard import guarded
 
 logger = logging.getLogger(__name__)
+
+# search_messages works to one deadline, a second inside the tool's 10 s
+# (guard.TOOL_TIMEOUT_SECONDS), so it answers with what it has instead of
+# being cut off. Each step gets at most its cap and never more than is left:
+# waiting for the reply's indexing (then it searches what's indexed, reported
+# as "partial"), connecting, then search's own steps (chat/search.py: the
+# query embedding, the hybrid query, a lexical fallback and citing).
+SEARCH_SECONDS = 9
+INDEX_WAIT_SECONDS = 2
+CONNECT_SECONDS = 2
 
 
 # Some models fill every optional argument, sending "" for a time they mean to leave
@@ -58,23 +67,36 @@ async def search_messages(
 
     async def work():
         deps = ctx.deps
+        deadline = Deadline(SEARCH_SECONDS)
         if deps.indexing is None:
             deps.indexing = asyncio.create_task(index_guild(deps))
-        # Shielded: a search timing out must not cancel indexing for the next one.
-        semantic = await asyncio.shield(deps.indexing)
-        return await search(
-            deps.connection,
-            deps.embed,
-            deps.scope,
-            query,
-            person=person,
-            channel=channel,
-            roster=deps.roster,
-            before=before,
-            after=after,
-            limit=limit,
-            semantic=semantic,
-        )
+        # Shielded: a search giving up on it must not cancel indexing for the next one.
+        try:
+            semantic = await asyncio.wait_for(
+                asyncio.shield(deps.indexing), min(INDEX_WAIT_SECONDS, deadline.left())
+            )
+        except TimeoutError:
+            semantic = "partial"
+        # Its own connection: the search's statement timeout lives in a
+        # transaction, which mustn't interleave with other tools on the run's one.
+        wait = min(CONNECT_SECONDS, deadline.left())
+        async with asyncio.timeout(wait):
+            connection = await db.connect(deps.memory.database_url, timeout=wait)
+        async with connection:
+            return await search(
+                connection,
+                deps.embed,
+                deps.scope,
+                query,
+                person=person,
+                channel=channel,
+                roster=deps.roster,
+                before=before,
+                after=after,
+                limit=limit,
+                semantic=semantic,
+                deadline=deadline,
+            )
 
     return await guarded(ctx, "search_messages", work)
 
@@ -184,7 +206,7 @@ async def count_messages(
 
     async def work():
         # Its own connection: the count's statement timeout lives in a transaction,
-        # which mustn't interleave with indexing on the run's shared one.
+        # which mustn't interleave with other tools on the run's shared one.
         async with await db.connect(ctx.deps.memory.database_url) as connection:
             return await count(
                 connection,
@@ -205,9 +227,13 @@ async def count_messages(
 
 async def index_guild(deps: Deps) -> Semantic:
     try:
-        found, more = await index_pending(deps.connection, deps.embed, guild_id=deps.scope.guild_id)
-    except OperationalError:
-        raise
+        # Its own connection: saving vectors can take seconds (each is an HNSW
+        # insert), and the run's other tools mustn't queue behind it.
+        async with await db.connect(deps.memory.database_url) as connection:
+            found, more = await index_pending(connection, deps.embed, guild_id=deps.scope.guild_id)
+    # Database errors too (a connect timeout, too many clients, a cancelled or
+    # deadlocked statement): they only affect indexing's own connection, so the
+    # reply goes on with what's already indexed.
     except Exception as error:  # noqa: BLE001 - preserve search without logging provider payloads
         logger.warning(
             "indexing failed job_id=%s guild_id=%s error_type=%s; using partial index",

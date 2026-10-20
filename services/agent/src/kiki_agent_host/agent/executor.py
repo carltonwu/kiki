@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
 MAX_MODEL_REQUESTS = 10  # room for memory tools: a failed write, a split and a retry
-EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadline
+# The client's timeout for each embedding call (per connect, read, ..., so not
+# a total). A search also bounds its query embedding by its own deadline
+# (chat/search.py EMBED_SECONDS).
+EMBEDDING_TIMEOUT_SECONDS = 4
 # Image models are slow, more so with references; with the reference check this
 # stays inside the host's job timeout (AGENT_HOST_JOB_TIMEOUT_SECS, 120 s).
 IMAGE_TIMEOUT_SECONDS = 75

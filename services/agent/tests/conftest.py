@@ -24,9 +24,30 @@ COMMIT;
 """
 
 
+async def apply_migrations(database_url: str, *, before: str | None = None) -> None:
+    """Applies the Rust migrations in order, those named before `before` only if given."""
+    async with await AsyncConnection.connect(database_url, autocommit=True) as setup:
+        for migration in sorted(MIGRATIONS.glob("*.sql")):
+            if before is not None and migration.name >= before:
+                return
+            await setup.execute(migration.read_text())
+
+
+@pytest.fixture
+async def empty_database_url():
+    """An isolated schema with no migrations applied (pgvector stays in public)."""
+    async for url in schema(migrate=False):
+        yield url
+
+
 @pytest.fixture
 async def database_url():
     """An isolated schema with every Rust migration applied (pgvector stays in public)."""
+    async for url in schema(migrate=True):
+        yield url
+
+
+async def schema(*, migrate: bool):
     base = os.getenv("TEST_DATABASE_URL")
     if not base:
         pytest.skip("set TEST_DATABASE_URL for Postgres integration tests")
@@ -36,9 +57,8 @@ async def database_url():
         await connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         scoped = make_conninfo(base, options=f"-csearch_path={schema},public")
         try:
-            async with await AsyncConnection.connect(scoped, autocommit=True) as setup:
-                for migration in sorted(MIGRATIONS.glob("*.sql")):
-                    await setup.execute(migration.read_text())
+            if migrate:
+                await apply_migrations(scoped)
             yield scoped
         finally:
             await connection.execute(
