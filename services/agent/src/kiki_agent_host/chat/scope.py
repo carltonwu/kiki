@@ -128,8 +128,8 @@ NOT_A_FAILURE_NOTE = (
     r" OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in"
     r" https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one,"
     r" try again\?\)$')"
-    r" OR m.id = ANY (ARRAY(SELECT unnest(n.reply_message_ids) FROM agent_runs n"
-    r" WHERE n.failure_note))))"
+    r" OR m.id IN (SELECT x FROM agent_runs n, unnest(n.reply_message_ids) AS x"
+    r" WHERE n.failure_note AND x IS NOT NULL)))"
 )
 HEARD = f"({AUTHORS_HEARD} AND {NOT_A_FAILURE_NOTE})"
 # People's messages Kiki reads: no bots', but a link fixer's reposts of theirs.

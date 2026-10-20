@@ -73,7 +73,7 @@ async def test_a_reply_that_only_thinks_goes_again_without_thinking(database_url
         thinking_settings.append(info.model_settings)
         if not any(isinstance(m, ModelResponse) for m in messages):
             return ModelResponse(
-                parts=[ToolCallPart("find_emoji", {"name": "huh"}, tool_call_id="1")],
+                parts=[ToolCallPart("recall", {"subject": "u1"}, tool_call_id="1")],
                 provider_details={"cost": 0.001},
             )
         return thought_only()
@@ -91,7 +91,7 @@ async def test_a_reply_that_only_thinks_goes_again_without_thinking(database_url
     assert [s["max_tokens"] for s in unthinking_settings] == [100]
     # The same request went again: the tool's result is still there, not rerun.
     returns = [p for m in unthinking_messages[0] for p in m.parts if isinstance(p, ToolReturnPart)]
-    assert [r.tool_name for r in returns] == ["find_emoji"]
+    assert [r.tool_name for r in returns] == ["recall"]
     # The response thrown away was still paid for.
     assert result.usage.cost == pytest.approx(0.0045)
 
@@ -113,7 +113,7 @@ async def test_a_tool_call_that_ends_at_the_limit_is_acted_on(database_url):
         returns = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
         if returns:
             return ModelResponse(parts=[TextPart("done")])
-        call = ToolCallPart("find_emoji", {"name": "huh"}, tool_call_id="1")
+        call = ToolCallPart("recall", {"subject": "u1"}, tool_call_id="1")
         return ModelResponse(parts=[ThinkingPart("hmm"), call], finish_reason="length")
 
     def unthinking(messages, info: AgentInfo) -> ModelResponse:

@@ -52,11 +52,11 @@ pub(crate) const FAILURE_NOTE: &str = "(couldn't answer that one, try again?)";
 /// is exactly `FAILURE_NOTE`, or `FAILURE_NOTE` under the redirect header
 /// (`discord::redirect_header`), which also covers a note whose send response
 /// was lost or a crash before it was recorded; or one a `failure_note` run
-/// recorded (by provenance: one InitPlan over a partial index). Only bots'
+/// recorded (by provenance: a hashed subplan over a partial index). Only bots'
 /// rows get any of it, the text equality first. The one false positive: Kiki
 /// writing exactly that sentence herself. `chat/scope.py` has the same for the
 /// host's tools (test_history.py checks they match).
-pub(crate) const NOT_A_FAILURE_NOTE: &str = r"NOT (m.author_bot AND m.relayed_for IS NULL AND (m.content = '(couldn''t answer that one, try again?)' OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one, try again\?\)$') OR m.id = ANY (ARRAY(SELECT unnest(n.reply_message_ids) FROM agent_runs n WHERE n.failure_note))))";
+pub(crate) const NOT_A_FAILURE_NOTE: &str = r"NOT (m.author_bot AND m.relayed_for IS NULL AND (m.content = '(couldn''t answer that one, try again?)' OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one, try again\?\)$') OR m.id IN (SELECT x FROM agent_runs n, unnest(n.reply_message_ids) AS x WHERE n.failure_note AND x IS NOT NULL)))";
 /// Pending runs are also checked this often, in case a notification was lost
 /// while the listener reconnected.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
