@@ -429,10 +429,23 @@ queries are an argument error returned to the model.
   `removed_at`: they're excluded from search, but `find_emoji` still explains one
   written out in an old message. A trigger drops the embedding when the name or
   description changes.
-- **Sync (Rust):** `/kiki emojis resync:true` (Manage Server) replaces the list from
-  `GET guilds/{id}/emojis`. There's no Gateway sync yet (it would need the
-  `GUILD_EXPRESSIONS` intent); admins resync after adding emoji. Descriptions survive
-  renames, since an emoji's image never changes.
+- **Sync (Rust):** the Gateway keeps the list current. `GUILD_CREATE`, after every
+  new session, carries the whole list, and `GUILD_EMOJIS_UPDATE` (the
+  non-privileged `GUILD_EMOJIS_AND_STICKERS` intent) sends it again whenever an emoji
+  is added, renamed or deleted. Both replace the list (`emojis::sync_listed`) but
+  describe nothing: an event shouldn't spend on a vision model. `/kiki emojis
+  resync:true` (Manage Server) replaces the list from `GET guilds/{id}/emojis` and
+  describes the new ones; until then, new emoji are found by name only.
+  Descriptions survive renames, since an emoji's image never changes. A Gateway
+  sync is spawned, best effort, after catch-up is scheduled: a failure is logged
+  and never delays catch-up or ingestion. Syncs of a guild take turns (an advisory
+  lock, waiting at most 10 s), and `guild_emoji_syncs` (migration 0032) keeps the
+  latest one's snapshot time: when its list was requested, or when its event
+  arrived (microseconds on the ingester's clock). A sync whose list was read
+  earlier is skipped, so a resync's REST list, read before a Gateway update was
+  applied, can't bring a deleted emoji back, and neither can a late-running
+  spawned sync. The table also tells a synced guild with no emoji from one never
+  synced.
 - **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
   until none are left (at most 10 minutes; the interaction token lasts 15). The host
   downloads each emoji as a 128 px PNG (the first frame if animated) and asks
@@ -455,6 +468,38 @@ queries are an argument error returned to the model.
   listed in every prompt became all she used. The run context names emoji she
   has used at least twice in the messages shown (text or reactions) and asks her
   to give them a rest.
+- **Checked before posting:** Discord only renders a custom emoji whose ID Kiki
+  can use. Anything else is posted as text, or silently left off as a reaction:
+  an invented `<:salute:1>` (Discord stores it as `:salute:`), a `<:huh:>` with
+  no ID, or a `:skull:` shortcode, which Discord never converts in a bot's
+  message. So the reply agent has an output validator (`tools.check_emojis`,
+  `chat/emojis.py` `check`). It compares every custom emoji and `:shortcode:`
+  (run together too, like `:a::b:`) against the catalog as it is when each
+  answer arrives. It skips code (CommonMark fences and backtick runs, with
+  escapes; `chat/markdown.py`), links and quotes, which aren't Kiki's own words.
+  A markdown link's destination is skipped from `](` to its balanced closing
+  parenthesis, and a bare URL up to whitespace or `<` (which a URL can't
+  contain unescaped), so an emoji written right after a link is still checked.
+  Every scan is linear, so replies of any length are checked. Over 16,000
+  characters, bad emoji are still cut, just without tidying around them, in case
+  some other path turns out quadratic.
+  - A known name is rewritten as Discord needs it: its real ID, the `a` for an
+    animated emoji, and its exact name.
+  - The catalog is read again for every answer that writes emoji, so one the
+    Gateway added or deleted mid-run counts.
+  - An unusable emoji raises `ModelRetry`, naming close matches, while the run has
+    an output retry and a model request left. A retry costs at least one request,
+    more if the model searches first. `LastRequestAnswers` sends no function tools
+    on the last request the limit allows (OpenRouter's web search and fetch stay
+    on; they run within the request), so a retry can't push the run over it.
+  - Otherwise the emoji is cut. Only the gap is tidied, so code stays verbatim. A
+    `react:` line keeps its good emoji and drops leftover commas, a line left empty
+    is dropped, and so is a `---` separator with no message left on one side.
+    The reply keeps its kind: a message left with nothing to say becomes 🙂, and a
+    reaction-only answer left with no reaction reacts 🙂. Silence instead would
+    ignore a server's `chat_allow_silence` and a direct question.
+  - Until a server's list is first synced, written-out emoji can't be checked and
+    pass. The emoji tools are offered (a toolset `prepare`) only when it has some.
 
 ## Failures and retries
 

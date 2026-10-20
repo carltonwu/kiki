@@ -1,0 +1,48 @@
+name: Kiki's emoji are checked against the server's before posting (invented ones retried, then cut; known names fixed)
+steps:
+  # The Gateway's GUILD_CREATE synced the server's emoji: no resync needed to check them.
+  - expect: {sql: "SELECT count(*) FROM guild_emojis WHERE removed_at IS NULL", equals: 3}
+  # Production reply:401: an emoji she made up. The check sends it back and she
+  # picks a real one.
+  - say:
+      as: alex
+      in: general
+      text: "kiki rate my outfit"
+      reply: {text: "ten, and that's the L i deserved <:salute:1>", retry: "ten <:huh:900000000000005001>"}
+  - expect: {run: done, reply: true, text_contains: "ten <:huh:900000000000005001>", text_lacks: "salute"}
+  # Production reply:406: the same emoji without an ID, and a model that won't fix
+  # it. It's cut rather than posted as text, and the reply still goes out.
+  - say: {as: alex, in: general, text: "kiki was it merle", reply: {text: "third L, and this one's certified <:salute:>"}}
+  - expect: {run: done, reply: true, text_contains: "this one's certified", text_lacks: "salute"}
+  # A real name missing its ID, or an animated emoji written without its `a`, is
+  # fixed in place, with no retry.
+  - say: {as: alex, in: general, text: "kiki thoughts", reply: {text: "<:huh:> and <:tannah:900000000000005003>"}}
+  - expect: {run: done, reply: true, text_contains: "<:huh:900000000000005001> and <a:tannah:900000000000005003>"}
+  # A shortcode for an emoji the server doesn't have would be dropped as a
+  # reaction: it's cut, and the empty marker line isn't posted.
+  - say: {as: alex, in: general, text: "kiki we won", reply: {text: "react: :salute:\nlets go"}}
+  - expect: {run: done, reply: true, text_contains: "lets go", text_lacks: "react|salute"}
+  - expect: {sql: "SELECT cardinality(reactions) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 0}
+  # A reply of nothing but bad emoji (here split across two messages) stays a
+  # message, not that text and not silence, even where silence isn't allowed.
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "false"}}
+  - say: {as: alex, in: general, text: "kiki salute me", reply: {text: "<:salute:1>\n---\n<:salute:1>"}}
+  - expect: {run: done, reply: true, text_contains: "🙂", text_lacks: "salute|---"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "true"}}
+  # Review findings 3 and 7: links and quotes stay as written, and a react line
+  # keeps its good emoji without leftover separators.
+  - say:
+      as: alex
+      in: general
+      text: "kiki what was that link"
+      reply: {text: "react: :salute:, 💀\n> you said :salute:\nit's https://example.com/:huh:/docs"}
+  - expect: {run: done, reply: true, text_contains: ["> you said :salute:", "https://example.com/:huh:/docs"], text_lacks: "react"}
+  - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "💀"}
+  # Review finding 6: an emoji added in Discord is usable at once (GUILD_EMOJIS_UPDATE),
+  # and one deleted there is cut.
+  - add_emoji: {name: fresh, id: 900000000000005005}
+  - say: {as: alex, in: general, text: "kiki new emoji", reply: {text: "love it <:fresh:900000000000005005>"}}
+  - expect: {run: done, reply: true, text_contains: "love it <:fresh:900000000000005005>"}
+  - remove_emoji: huh
+  - say: {as: alex, in: general, text: "kiki huh", reply: {text: "same <:huh:900000000000005001>"}}
+  - expect: {run: done, reply: true, text_contains: "same", text_lacks: "huh"}

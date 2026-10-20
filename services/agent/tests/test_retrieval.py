@@ -324,6 +324,10 @@ class ToolsOnlyModel(TestModel):
 
 async def test_executor_runs_tools_and_reports_usage(database_url, db):
     await add(db, 80, "we shipped the release")
+    # The emoji tools are offered once the server has emoji synced.
+    await db.execute(
+        "INSERT INTO guild_emojis (id, guild_id, name, raw) VALUES (11, 1, 'huh', '{}')"
+    )
 
     class TestExecutor(PydanticExecutor):
         web_tools = ()  # TestModel can't run OpenRouter's server tools (see test_web.py)

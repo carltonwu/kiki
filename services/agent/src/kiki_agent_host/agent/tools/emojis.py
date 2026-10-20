@@ -1,6 +1,7 @@
 """Custom emoji tools: find the server's emoji by meaning or by name."""
 
 from pydantic_ai import RunContext
+from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
 from ...chat import emojis
@@ -11,7 +12,9 @@ from ..guard import guarded
 async def search_emojis(ctx: RunContext[Deps], query: str, limit: int = 5) -> dict:
     """Find this server's custom emoji by mood, reaction or what they show.
 
-    To use one, write its `emoji` exactly as returned, like <:name:id>.
+    To use one, write its `emoji` exactly as returned, like <:name:id>. Only these
+    results, find_emoji's and the emoji shown in the chat exist here: never write a
+    custom emoji from memory.
 
     Args:
         query: The feeling, reaction or subject, like "confused" or "laughing so hard".
@@ -29,6 +32,8 @@ async def search_emojis(ctx: RunContext[Deps], query: str, limit: int = 5) -> di
 async def find_emoji(ctx: RunContext[Deps], name: str) -> dict:
     """Look up this server's custom emoji by name, or explain one someone used.
 
+    A name it doesn't find isn't an emoji here, so don't write it.
+
     Args:
         name: An emoji name like huh or :huh:, or an emoji as it appears in a
             message, like <:huh:1085017182301339648>.
@@ -40,4 +45,12 @@ async def find_emoji(ctx: RunContext[Deps], name: str) -> dict:
     return await guarded(ctx, "find_emoji", work)
 
 
-toolset = FunctionToolset([search_emojis, find_emoji])
+async def only_with_emojis(
+    ctx: RunContext[Deps], tools: list[ToolDefinition]
+) -> list[ToolDefinition]:
+    """Offers the tools only when the server has emoji synced (`/kiki emojis
+    resync:true`). Otherwise they can only come back empty."""
+    return tools if ctx.deps.emojis.by_id else []
+
+
+toolset = FunctionToolset([search_emojis, find_emoji]).prepared(only_with_emojis)

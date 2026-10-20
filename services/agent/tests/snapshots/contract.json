@@ -426,7 +426,7 @@
           "strict": null
         },
         {
-          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>.",
+          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>. Only these\nresults, find_emoji's and the emoji shown in the chat exist here: never write a\ncustom emoji from memory.",
           "kind": "function",
           "name": "search_emojis",
           "parameters": {
@@ -450,7 +450,7 @@
           "strict": null
         },
         {
-          "description": "Look up this server's custom emoji by name, or explain one someone used.",
+          "description": "Look up this server's custom emoji by name, or explain one someone used.\n\nA name it doesn't find isn't an emoji here, so don't write it.",
           "kind": "function",
           "name": "find_emoji",
           "parameters": {
@@ -1111,7 +1111,7 @@
           "strict": null
         },
         {
-          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>.",
+          "description": "Find this server's custom emoji by mood, reaction or what they show.\n\nTo use one, write its `emoji` exactly as returned, like <:name:id>. Only these\nresults, find_emoji's and the emoji shown in the chat exist here: never write a\ncustom emoji from memory.",
           "kind": "function",
           "name": "search_emojis",
           "parameters": {
@@ -1135,7 +1135,7 @@
           "strict": null
         },
         {
-          "description": "Look up this server's custom emoji by name, or explain one someone used.",
+          "description": "Look up this server's custom emoji by name, or explain one someone used.\n\nA name it doesn't find isn't an emoji here, so don't write it.",
           "kind": "function",
           "name": "find_emoji",
           "parameters": {

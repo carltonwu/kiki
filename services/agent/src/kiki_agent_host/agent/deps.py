@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from psycopg import AsyncConnection
 
 from .. import db
+from ..chat.emojis import Catalog
 from ..chat.scope import Roster, Scope
 from ..chat.search import Semantic
 from ..contracts import Drawing
@@ -48,9 +49,14 @@ class Deps:
     vision: Vision
     memory: MemorySession
     job_id: str = ""
+    # The run's model request limit (UsageLimits), for tools that plan around it.
+    request_limit: int = 10
     # The server's image model, when it has drawing on; drawings run after the reply.
     image_model: str | None = None
     # Calls made per budget (`guard.Budget.name`).
     spent: Counter[str] = field(default_factory=Counter)
     indexing: asyncio.Task[Semantic] | None = None
     drawings: list[Drawing] = field(default_factory=list)
+    # The server's custom emoji, loaded once per run: the reply's emoji are checked
+    # against them (`tools.check_emojis`).
+    emojis: Catalog = field(default_factory=lambda: Catalog({}, {}))

@@ -49,7 +49,8 @@ from .web import MAX_WEB_STEPS, WEB_TOOLS, web_use
 logger = logging.getLogger(__name__)
 os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
 
-MAX_MODEL_REQUESTS = 10  # room for memory tools: a failed write, a split and a retry
+# Room for memory tools (a failed write, a split and a retry) and the emoji check's retry.
+MAX_MODEL_REQUESTS = 10
 # The client's timeout for each embedding call (per connect, read, ..., so not
 # a total). A search also bounds its query embedding by its own deadline
 # (chat/search.py EMBED_SECONDS).
@@ -186,7 +187,10 @@ class PydanticExecutor:
                         job_id=request.id,
                         image_model=request.image_model,
                         memory=MemorySession(self.database_url),
+                        request_limit=MAX_MODEL_REQUESTS,
                     )
+                    # The emoji tools' prepare reads it; the reply's check reads it again.
+                    deps.emojis = await emojis.catalog(connection, scope.guild_id)
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))

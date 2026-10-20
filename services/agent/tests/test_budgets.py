@@ -6,6 +6,7 @@ import asyncio
 from collections import Counter
 from types import SimpleNamespace
 
+from psycopg import AsyncConnection
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -46,6 +47,11 @@ async def test_lookups_and_memory_run_out_separately(database_url):
         def model(self, name):
             return FunctionModel(respond)
 
+    # The emoji tools are offered once the server has emoji synced.
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO guild_emojis (id, guild_id, name, raw) VALUES (11, 1, 'huh', '{}')"
+        )
     executor = TestExecutor(database_url, "unused-key")
     executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
     request = JobRequest.model_validate(

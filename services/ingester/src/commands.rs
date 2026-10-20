@@ -468,6 +468,8 @@ impl Commands {
             return Ok(emojis_embed(&list, None));
         }
         let actor = require_manage_server(invocation, "resync emoji")?;
+        // As of before the request: a Gateway update applied while it's in flight wins.
+        let snapshot_us = emojis::now_us();
         let listed = get_json("guild emojis", || {
             self.http.emojis(Id::new(guild_id as u64))
         })
@@ -477,11 +479,16 @@ impl Commands {
         let listed = listed
             .as_array()
             .context("Discord's emoji list is not an array")?;
-        let synced = emojis::sync(&self.db, guild_id, listed).await?;
-        let mut summary = format!(
-            "Synced {} emoji from Discord: {} new, {} renamed, {} removed.",
-            synced.total, synced.added, synced.renamed, synced.removed
-        );
+        let synced = emojis::sync(&self.db, guild_id, listed, snapshot_us).await?;
+        let mut summary = match &synced {
+            Some(synced) => format!(
+                "Synced {} emoji from Discord: {} new, {} renamed, {} removed.",
+                synced.total, synced.added, synced.renamed, synced.removed
+            ),
+            None => {
+                "Discord sent a newer emoji list while this one was read; kept that one.".to_owned()
+            }
+        };
         let mut described = EmojisDescribed::default();
         match &self.settings.describer {
             None => summary.push_str(" Describing them needs the agent host (`AGENT_HOST_URL`)."),

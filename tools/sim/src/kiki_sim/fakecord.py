@@ -28,6 +28,7 @@ log = logging.getLogger("fakecord")
 DISCORD_EPOCH_MS = 1420070400000
 EMBEDDING_DIMENSIONS = 1024
 ADMINISTRATOR = 1 << 3
+GUILD_EMOJIS_AND_STICKERS = 1 << 3  # Gateway intent: GUILD_EMOJIS_UPDATE
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
 STUB_IMAGE_MODELS = ["sim/image"]
@@ -100,6 +101,7 @@ class World:
         self.unexpected: list[dict] = []
         self.llm: list[dict] = []  # every OpenRouter request, with what we answered
         self.scripts: dict[str, list[dict]] = {"jev": [], "reply": []}
+        self.answered: dict = {}  # the reply script entry that answered last
         self.guild_creates = 0
         self.identifies = 0
         self.last_snowflake = 0
@@ -332,6 +334,7 @@ class Fakecord:
         self.world = World(fixture, self.media_base())
         self.sockets: set[web.WebSocketResponse] = set()
         self.identified: set[web.WebSocketResponse] = set()
+        self.intents: dict[web.WebSocketResponse, int] = {}  # each session's, from identify
         self.sequence = 0
         self.sessions = itertools.count(1)
 
@@ -354,6 +357,7 @@ class Fakecord:
                 if op == 1:
                     await ws.send_json({"op": 11})
                 elif op == 2:
+                    self.intents[ws] = int((payload.get("d") or {}).get("intents") or 0)
                     await self.identify(ws)
                 elif op == 6:
                     # No real resumes: re-identify, which also re-runs catch-up.
@@ -361,6 +365,7 @@ class Fakecord:
         finally:
             self.sockets.discard(ws)
             self.identified.discard(ws)
+            self.intents.pop(ws, None)
         return ws
 
     async def identify(self, ws: web.WebSocketResponse) -> None:
@@ -393,6 +398,7 @@ class Fakecord:
                 "threads": threads,
                 "roles": self.roles(),
                 "members": [],
+                "emojis": w.emoji_payloads(),
             },
         )
         w.guild_creates += 1
@@ -401,12 +407,24 @@ class Fakecord:
         self.sequence += 1
         await ws.send_json({"op": 0, "t": event, "s": self.sequence, "d": data})
 
-    async def dispatch(self, event: str, data: dict) -> None:
+    async def dispatch(self, event: str, data: dict, *, intent: int = 0) -> None:
+        """Sends an event to every session, or only to those whose identify asked
+        for `intent` (a Gateway intent bit)."""
         for ws in list(self.identified):
+            if intent and not self.intents.get(ws, 0) & intent:
+                continue
             try:
                 await self.send(ws, event, data)
             except ConnectionError:
                 self.identified.discard(ws)
+
+    async def emojis_updated(self) -> None:
+        w = self.world
+        await self.dispatch(
+            "GUILD_EMOJIS_UPDATE",
+            {"guild_id": w.guild["id"], "emojis": w.emoji_payloads()},
+            intent=GUILD_EMOJIS_AND_STICKERS,
+        )
 
     def roles(self) -> list[dict]:
         w = self.world
@@ -792,7 +810,16 @@ class Fakecord:
             trigger = trigger_line(prompt)
             record["trigger"] = trigger
             tool_results = [content_text(m.get("content")) for m in messages if m["role"] == "tool"]
-            if messages[-1]["role"] == "tool":
+            if "Fix the errors and try again." in prompt:
+                # The agent host's output check sent the answer back (pydantic-ai's
+                # retry prompt): the script's `retry` text, else the same answer.
+                record["retry"] = prompt
+                said = [
+                    content_text(m.get("content")) for m in messages if m["role"] == "assistant"
+                ]
+                text = w.answered.get("retry", said[-1] if said else "")
+                message = {"role": "assistant", "content": text}
+            elif messages[-1]["role"] == "tool":
                 entry = next((e for e in w.scripts["reply"] if e.get("pending")), {})
                 queue = entry.get("queue") or []
                 record["tool_results"] = tool_results
@@ -804,6 +831,7 @@ class Fakecord:
                 else:
                     # Last turn of a scripted tool call: answer from its result.
                     entry.pop("pending", None)
+                    w.answered = entry
                     ids = re.findall(r'"id":\s*"(\d+)"', tool_results[-1])
                     text = entry.get("text", "stub: found {ids}").format(
                         trigger=trigger, ids=" ".join(ids), result=tool_results[-1][:500]
@@ -833,6 +861,7 @@ class Fakecord:
                     message, usage = self.server_tools(body, entry, trigger)
                     record["web"] = usage["server_tool_use_details"]
                 elif entry:
+                    w.answered = entry
                     message = {
                         "role": "assistant",
                         "content": entry["text"].format(trigger=trigger, ids="", result=""),
@@ -1000,10 +1029,13 @@ class Fakecord:
             await self.dispatch("MESSAGE_UPDATE", message)
             return web.json_response(message)
         if route == "POST emojis":
-            # A server admin adds an emoji (no Gateway event: Kiki resyncs by command).
-            return web.json_response(w.add_emoji(body["name"], body))
+            # A server admin adds an emoji: GUILD_EMOJIS_UPDATE with the whole list.
+            emoji = w.add_emoji(body["name"], body)
+            await self.emojis_updated()
+            return web.json_response(emoji)
         if m := re.fullmatch(r"DELETE emojis/(\w+)", route):
             w.emojis = {k: e for k, e in w.emojis.items() if e["name"] != m[1]}
+            await self.emojis_updated()
             return web.json_response({"ok": True})
         if route == "POST interactions":
             return web.json_response(await self.interaction(body))

@@ -22,7 +22,7 @@
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
-      - remove_emoji: bruh                  # in fakecord; Kiki notices on resync
+      - remove_emoji: bruh                  # in fakecord, with GUILD_EMOJIS_UPDATE
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
@@ -337,11 +337,18 @@ class Run:
                 self.fail(step, f"{label}: Decide state contains {needle!r}")
 
     def expect_sql(self, step: int, args: dict) -> None:
-        """Escape hatch: `{sql: "SELECT …", equals: value}` (first column, first row)."""
-        with stack.connect() as db:
-            row = db.execute(args["sql"]).fetchone()
-        value = row[0] if row else None
-        if str(value) != str(args.get("equals")):
+        """Escape hatch: `{sql: "SELECT …", equals: value}` (first column, first row),
+        eventually: what Gateway events write lands a moment after the step."""
+        value = None
+
+        def matches() -> bool:
+            nonlocal value
+            with stack.connect() as db:
+                row = db.execute(args["sql"]).fetchone()
+            value = row[0] if row else None
+            return str(value) == str(args.get("equals"))
+
+        if not poll(matches, EVENTUALLY_S):
             self.fail(step, f"{args['sql']!r} is {value!r}, expected {args.get('equals')!r}")
 
     def expect_llm(self, step: int, args: dict, o: Observation, label: str) -> None:
