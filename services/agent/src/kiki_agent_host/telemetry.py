@@ -8,6 +8,10 @@ Railway sleeps this service once it has sent nothing for 10 minutes, so nothing
 exports on a timer: metrics leave only on flush(), which the API runs after each
 job, and the span and log batches send only when they hold something.
 
+So each wake is a new process whose counters start again, and Prometheus's
+increase() ignores a series' first sample: a counter's attribute set first
+exports a zero, and its real value a flush later (`Baselines`).
+
 The host's own metrics and spans are recorded through the functions at the end
 (`llm_call`, `tool_call`, ...): with export off each is a None check, and the SDK
 is never imported.
@@ -58,6 +62,9 @@ COUNT_BUCKETS = (1, 2, 5, 10)
 # Distinct `model` label values per process. Admins configure any model, and
 # aliases resolve to new versioned IDs over time; later ones become "other".
 MAX_MODELS = 16
+# Between a new series' zero and its first real value: Mimir keeps samples by
+# the millisecond, and two at one would be one.
+POINT_GAP_SECONDS = 0.01
 
 _providers: tuple | None = None
 _recorder: "Recorder | None" = None
@@ -211,7 +218,16 @@ async def _flush_until_caught_up() -> None:
     global _flush_again
     while True:
         _flush_again = False
+        # Taken before the flush collects, so these keys' zeros go out in it.
+        recorder = _recorder
+        zeroed = recorder.baselines.pending() if recorder is not None else frozenset()
         await _on_daemon_thread(_force_flush)
+        if zeroed:
+            recorder.baselines.release(zeroed)
+            # Their real values go once more, later than the zeros. Shutting down,
+            # shutdown()'s own second flush sends them.
+            await asyncio.sleep(POINT_GAP_SECONDS)
+            _flush_again = True
         if not _flush_again or _closing:
             return
 
@@ -245,12 +261,28 @@ def shutdown() -> None:
     _closing = True
     if _providers is None:
         return
-    providers, _providers, _recorder = _providers, None, None
+    providers, _providers = _providers, None
+    recorder, _recorder = _recorder, None
+    # As in a job's flush: the zeros of keys new since the last one go out
+    # first, then their values. Taken before the meter provider's flush collects.
+    zeroed = recorder.baselines.pending()
+
+    def release() -> bool:
+        # Flushed again even if a job's flush released them first: it may have
+        # done so after this flush collected.
+        recorder.baselines.release(zeroed)
+        return bool(zeroed)
+
     if _handler is not None:
         logging.getLogger().removeHandler(_handler)
     deadline = time.monotonic() + SHUTDOWN_SECONDS
     threads = [
-        threading.Thread(target=_stop, args=(provider,), name="OtelShutdown", daemon=True)
+        threading.Thread(
+            target=_stop,
+            args=(provider, release),
+            name="OtelShutdown",
+            daemon=True,
+        )
         for provider in providers
     ]
     for thread in threads:
@@ -261,10 +293,13 @@ def shutdown() -> None:
         logger.warning("telemetry shutdown timed out after %ds", SHUTDOWN_SECONDS)
 
 
-def _stop(provider) -> None:
+def _stop(provider, release: Callable[[], bool]) -> None:
     try:
         # Metrics have no export thread: only a flush sends the last collection.
         provider.force_flush(FLUSH_TIMEOUT_MILLIS)
+        if isinstance(provider, metrics.MeterProvider) and release():
+            time.sleep(POINT_GAP_SECONDS)
+            provider.force_flush(FLUSH_TIMEOUT_MILLIS)
         provider.shutdown()
     except Exception:  # exiting anyway
         logger.warning("telemetry shutdown failed", exc_info=True)
@@ -320,6 +355,67 @@ class FlushAfterJobs:
                 flush_soon()
 
 
+class Baselines:
+    """Zero baselines for the host's counters. An attribute set's first point in
+    a process would hold its first job's value, and increase() and rate() ignore
+    a series' first sample (Grafana Cloud doesn't ingest created timestamps), so
+    the first job after every wake would go uncounted.
+
+    A counter's new attribute set (a key) is added 0 at once and its values held
+    back: `pending()` keys, taken before a flush, are released after it, then
+    flushed again. Only a flush with new keys flushes twice; nothing ever exports
+    between jobs. Histograms can't be baselined (no SDK measurement makes a point
+    with a count of 0): their first observation per attribute set per process
+    goes uncounted by increase().
+
+    Recording is on the event loop, but shutdown() releases on its own thread:
+    the lock covers both."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Keys whose zero has gone out in a flush: their values go straight in.
+        self._exported: set = set()
+        # Keys given their zero and the total held back since.
+        self._pending: dict = {}
+
+    def add(self, counter, amount: float, attributes: Mapping[str, str]) -> None:
+        key = (counter.name, frozenset(attributes.items()))
+        with self._lock:
+            if key in self._exported:
+                counter.add(amount, attributes)
+            elif key in self._pending:
+                self._pending[key][2] += amount
+            else:
+                counter.add(0, attributes)
+                self._pending[key] = [counter, attributes, amount]
+
+    def pending(self) -> frozenset:
+        """Keys whose zeros a flush started now sends."""
+        with self._lock:
+            return frozenset(self._pending)
+
+    def release(self, keys: frozenset) -> None:
+        """Adds the held-back values of `keys` once a flush has sent their zeros.
+        Idempotent: a job's flush and shutdown() may both release a key."""
+        with self._lock:
+            for key in keys:
+                if (held := self._pending.pop(key, None)) is not None:
+                    counter, attributes, amount = held
+                    counter.add(amount, attributes)
+            self._exported.update(keys)
+
+
+class Counter:
+    """A counter recorded through `Baselines`."""
+
+    def __init__(self, counter, baselines: Baselines) -> None:
+        self.counter = counter
+        self.baselines = baselines
+
+    def add(self, amount: float, attributes: Mapping[str, str] | None = None) -> None:
+        self.baselines.add(self.counter, amount, attributes or {})
+
+
 class Recorder:
     """The host's instruments (docs/observability.md, "Metric catalog") and its
     tracer. Made only once export is on."""
@@ -336,7 +432,12 @@ class Recorder:
                 explicit_bucket_boundaries_advisory=buckets,
             )
 
-        counter = meter.create_counter
+        self.baselines = Baselines()
+
+        def counter(name: str, unit: str, description: str) -> Counter:
+            created = meter.create_counter(name, unit=unit, description=description)
+            return Counter(created, self.baselines)
+
         self.jobs = counter("kiki.agent.jobs", unit="{job}", description="Job requests answered")
         self.job_duration = histogram("kiki.agent.job.duration", "s", "Time running a job")
         self.jobs_rejected = counter(

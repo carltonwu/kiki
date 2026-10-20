@@ -49,11 +49,14 @@ async def database_url():
 class Recorded:
     """What the host recorded while export was on, in memory."""
 
-    def __init__(self, reader, spans):
-        self.reader, self.spans = reader, spans
+    def __init__(self, reader, spans, recorder):
+        self.reader, self.spans, self.recorder = reader, spans, recorder
 
     def value(self, name: str, **attributes) -> float | None:
-        """A counter's value, or a histogram's count, for exactly `attributes`."""
+        """A counter's value, or a histogram's count, for exactly `attributes`,
+        once a flush would have released counters' held-back values."""
+        baselines = self.recorder.baselines
+        baselines.release(baselines.pending())
         data = self.reader.get_metrics_data()  # None before anything is recorded
         found = [
             point
@@ -90,4 +93,4 @@ def recorded(monkeypatch):
     recorder = telemetry.Recorder(MeterProvider(metric_readers=[reader]), tracer_provider)
     monkeypatch.setattr(telemetry, "_recorder", recorder)
     monkeypatch.setattr(telemetry, "_models", set())
-    return Recorded(reader, spans)
+    return Recorded(reader, spans, recorder)

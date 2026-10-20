@@ -66,18 +66,39 @@ def test_http_client_and_exporter_logs_are_never_exported():
 
 
 # Runs in a subprocess (providers are process-wide) with a local OTLP receiver
-# that records every request; RECEIVED holds (path, headers), and EXPORTING is
-# set once the first has arrived.
+# that records every request; RECEIVED holds (path, headers), METRICS each
+# metrics export's points, and EXPORTING is set once the first has arrived.
 RECEIVER = """
 import asyncio, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
+    ExportMetricsServiceRequest,
+)
 
 RECEIVED = []
+METRICS = []
 EXPORTING = threading.Event()
+
+def points(body):
+    # {(name, attributes): (value, time)} for an export's sums.
+    request = ExportMetricsServiceRequest.FromString(body)
+    return {
+        (metric.name, frozenset((a.key, a.value.string_value) for a in point.attributes)): (
+            point.as_double or point.as_int,
+            point.time_unix_nano,
+        )
+        for resource in request.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.HasField("sum")
+        for point in metric.sum.data_points
+    }
 
 class Receiver(BaseHTTPRequestHandler):
     def do_POST(self):
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        if self.path == "/v1/metrics":
+            METRICS.append(points(body))
         self.reply()
 
     def do_GET(self):
@@ -143,6 +164,91 @@ assert len(RECEIVED) == 3, RECEIVED
 """,
         OTEL_BSP_SCHEDULE_DELAY="100",
         OTEL_BLRP_SCHEDULE_DELAY="100",
+    )
+
+
+# Shared by the baseline tests: a job billing one image call and one tool call,
+# and the counter series it makes.
+JOB = """
+COST = ("kiki.llm.cost_usd", frozenset({"purpose": "image", "model": "test/image"}.items()))
+TOOL = ("kiki.tools.calls", frozenset({"tool": "recall", "outcome": "ok"}.items()))
+WEB = ("kiki.web.calls", frozenset({"kind": "search"}.items()))
+
+def job(tool="recall"):
+    with telemetry.llm_call("image", "test/image") as call:
+        call.bill(0.04, 100, 0)
+    with telemetry.tool_call(tool):
+        pass
+    telemetry.web_calls(1, 0)
+"""
+
+
+def test_a_new_counter_series_exports_zero_then_its_value():
+    """increase() ignores a series' first sample, and every wake starts a process:
+    without a zero first, the first job after each wake would go uncounted."""
+    run(
+        JOB
+        + """
+job()
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 2, METRICS
+zeros, values = METRICS
+for key in (COST, TOOL, WEB):
+    assert zeros[key][0] == 0, (key, zeros)
+    # Mimir keeps milliseconds: two points at one would collapse.
+    assert values[key][1] - zeros[key][1] >= 5_000_000, (zeros[key], values[key])
+assert values[COST][0] == 0.04 and values[TOOL][0] == 1 and values[WEB][0] == 1, values
+
+# The same series again: one export, the value added straight away.
+job()
+asyncio.run(telemetry.flush())
+assert len(METRICS) == 3, METRICS
+assert METRICS[2][COST][0] == 0.08 and METRICS[2][TOOL][0] == 2, METRICS[2]
+
+# Then nothing while idle.
+time.sleep(1.5)
+assert len(METRICS) == 3, METRICS
+"""
+    )
+
+
+def test_a_series_new_while_a_flush_runs_still_starts_at_zero():
+    """A job ending while another's flush is exporting: its new series' values
+    wait for a flush that has sent their zeros, never the one in flight."""
+    run(
+        JOB
+        + """
+async def main():
+    job()
+    first = telemetry.flush_soon()
+    assert await asyncio.to_thread(EXPORTING.wait, 10)
+    job(tool="search_messages")  # a new series, and more for ones held back
+    telemetry.flush_soon()
+    await telemetry.flush()
+    assert first.done()
+
+asyncio.run(main())
+SEARCH = ("kiki.tools.calls", frozenset({"tool": "search_messages", "outcome": "ok"}.items()))
+for key, total in ((COST, 0.08), (TOOL, 1), (SEARCH, 1), (WEB, 2)):
+    seen = [export[key][0] for export in METRICS if key in export]
+    assert seen[0] == 0 and seen[-1] == total, (key, seen)
+""",
+        RECEIVER_DELAY="0.2",
+    )
+
+
+def test_shutdown_sends_zeros_then_values_recorded_outside_a_job():
+    """`kiki-agent-host index` records with no job flush: shutdown's is its only one."""
+    run(
+        JOB
+        + """
+job()
+telemetry.shutdown()
+assert len(METRICS) == 2, METRICS
+assert METRICS[0][COST][0] == 0 and METRICS[1][COST][0] == 0.04, METRICS
+assert METRICS[0][TOOL][0] == 0 and METRICS[1][TOOL][0] == 1, METRICS
+assert METRICS[1][COST][1] > METRICS[0][COST][1], METRICS
+"""
     )
 
 
