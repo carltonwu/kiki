@@ -24,6 +24,14 @@ MAX_REFERENCES = 16
 OPENAI_QUALITY = "medium"
 
 
+class NoImage(UnexpectedModelBehavior):
+    """A response with no usable image, which was still billed `cost`."""
+
+    def __init__(self, cost: float):
+        super().__init__("OpenRouter returned no image", body=None)
+        self.cost = cost
+
+
 class OpenRouterImageModel(ImageGenerationModel):
     """OpenRouter's `POST /api/v1/images` (GPT Image, Gemini, FLUX, …), with the chat key.
 
@@ -95,7 +103,7 @@ class OpenRouterImageModel(ImageGenerationModel):
                 generated.append(GeneratedImage(BinaryImage(data, media_type=media_type)))
         cost = float((payload.get("usage") or {}).get("cost") or 0)
         if not generated:
-            raise UnexpectedModelBehavior("OpenRouter returned no image", body=None)
+            raise NoImage(cost)
         return ImageGenerationResult(
             generated,
             prompt=prompt,

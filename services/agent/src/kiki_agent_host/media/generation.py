@@ -10,6 +10,7 @@ from pydantic_ai.images import ImageGenerationModel, ImageGenerationSettings
 from pydantic_ai.messages import BinaryImage
 
 from .. import telemetry
+from ..openrouter.images import NoImage
 from .fetch import sniff
 from .vision import ImageRefused
 
@@ -52,7 +53,9 @@ async def generate(
             f"The image model's safety filter blocked this picture{about}. Asking again "
             "won't get it through; only a tamer version of the idea could be drawn."
         ) from None
-    except UnexpectedModelBehavior:
+    except UnexpectedModelBehavior as e:
+        if isinstance(e, NoImage) and attempt is not None:
+            attempt.bill(e.cost)  # paid for all the same
         raise ImageRefused("No image was generated.") from None
     image = result.image
     cost = float((result.provider_details or {}).get("cost") or 0)

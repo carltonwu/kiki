@@ -67,6 +67,7 @@ class Metered(WrapperModel):
         super().__init__(wrapped)
         self.call = call
 
+    # Runs don't stream, so request_stream isn't metered.
     async def request(self, *args, **kwargs) -> ModelResponse:
         response = await super().request(*args, **kwargs)
         usage = response.usage

@@ -8,7 +8,9 @@ import sys
 from collections import Counter
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import AsyncOpenAI
 from pydantic_ai.exceptions import ContentFilterError, UsageLimitExceeded
 from pydantic_ai.images import GeneratedImage, ImageGenerationResult, TestImageGenerationModel
 from pydantic_ai.messages import BinaryImage, ModelResponse, TextPart, ToolCallPart
@@ -23,6 +25,7 @@ from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest
 from kiki_agent_host.media import generation
 from kiki_agent_host.media.vision import ImageRefused, Vision, look
 from kiki_agent_host.openrouter.embeddings import EMBEDDING_MODEL, Embedder
+from kiki_agent_host.openrouter.images import OpenRouterImageModel
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
 PRIMARY, FALLBACK = "openai/gpt-image-2.5-flare", "qwen/qwen-image-2.1-turbo"
@@ -204,6 +207,25 @@ async def test_an_image_refused_after_it_arrived_was_still_paid_for(recorded):
     image = {"purpose": "image", "model": PRIMARY}
     assert recorded.value("kiki.llm.calls", **image, result="error") == 1
     assert recorded.value("kiki.llm.cost_usd", **image) == 0.04
+
+
+async def test_a_paid_response_with_no_image_in_it_still_counts_its_cost(recorded):
+    def handler(request):
+        data = [{"b64_json": "not base64!"}]
+        return httpx.Response(200, json={"created": 1, "data": data, "usage": {"cost": 0.04}})
+
+    client = AsyncOpenAI(
+        base_url="https://openrouter.test/api/v1",
+        api_key="test-key",
+        max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    run = executor()
+    run.image_models = {PRIMARY: OpenRouterImageModel(PRIMARY, client)}
+    with pytest.raises(ImageRefused):
+        await run.generate(image_job(), [], [])
+    assert recorded.value("kiki.images.attempts", model=PRIMARY, result="refused") == 1
+    assert recorded.value("kiki.llm.cost_usd", purpose="image", model=PRIMARY) == 0.04
 
 
 async def test_every_tool_outcome_is_counted(recorded):
