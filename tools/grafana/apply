@@ -44,6 +44,11 @@ VAR_REF = re.compile(r"^\$\{?(\w+)\}?$")
 PARAM = re.compile(r"\$\{(\w+)\}")
 NO_DATA = {"NoData", "Alerting", "OK", "KeepLast"}
 EXEC_ERR = {"Error", "Alerting", "OK", "KeepLast"}
+# increase() over a range selector not followed by Mimir's `anchored` modifier.
+# Plain increase() extrapolates, which reads the agent host's sparse series at up
+# to about 2x (docs/observability.md, zero baselines).
+UNANCHORED = re.compile(r"\bincrease\([^\[\]]*\[[^\]]+\](?!\s*anchored\b)")
+UNANCHORED_HINT = "increase() without `anchored` extrapolates; write increase(…[w] anchored)"
 
 
 class Refused(Exception):
@@ -149,6 +154,8 @@ def check_dashboard(model: dict) -> list[str]:
                 errors.append(f"{title}: query {target.get('refId')} is empty")
             elif query.count("(") != query.count(")") or query.count("{") != query.count("}"):
                 errors.append(f"{title}: query {target.get('refId')} has unbalanced brackets")
+            elif target.get("expr") and UNANCHORED.search(target["expr"]):
+                errors.append(f"{title}: query {target.get('refId')}: {UNANCHORED_HINT}")
     return errors
 
 
@@ -232,6 +239,8 @@ def check_rule(rule: dict) -> list[str]:
         elif VAR_REF.match(ds) and VAR_REF.match(ds).group(1) in DS_TYPES:
             if not model.get("expr"):
                 errors.append(f"{query.get('refId')}: empty expr")
+            elif UNANCHORED.search(model["expr"]):
+                errors.append(f"{query.get('refId')}: {UNANCHORED_HINT}")
             if not isinstance(query.get("relativeTimeRange", {}).get("from"), int):
                 errors.append(f"{query.get('refId')}: relativeTimeRange.from must be seconds")
         else:

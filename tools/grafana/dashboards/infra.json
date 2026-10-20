@@ -83,7 +83,7 @@
     },
     {
       "type": "timeseries",
-      "title": "CPU",
+      "title": "CPU (vCPU)",
       "description": "vCPU used per Railway service (newest 1-minute sample).",
       "datasource": {
         "type": "prometheus",
@@ -151,8 +151,7 @@
               }
             ]
           },
-          "mappings": [],
-          "decimals": 2
+          "mappings": []
         },
         "overrides": []
       },
@@ -279,7 +278,7 @@
     {
       "type": "timeseries",
       "title": "Network (public)",
-      "description": "Public network bytes per minute-sample per service: received above zero, sent below. Private networking (Postgres traffic) isn't counted.",
+      "description": "Public network throughput per service, the bytes Railway reports for each 1-minute sample divided by 60 (average bytes per second over that minute): received above zero, sent below. Private networking (Postgres traffic) isn't counted.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -291,7 +290,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "max by (service) (kiki_railway_network_bytes{job=\"kiki/ingester\", direction=\"rx\"})",
+          "expr": "max by (service) (kiki_railway_network_bytes{job=\"kiki/ingester\", direction=\"rx\"}) / 60",
           "legendFormat": "{{service}} rx",
           "editorMode": "code",
           "instant": false,
@@ -303,7 +302,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "-max by (service) (kiki_railway_network_bytes{job=\"kiki/ingester\", direction=\"tx\"})",
+          "expr": "-max by (service) (kiki_railway_network_bytes{job=\"kiki/ingester\", direction=\"tx\"}) / 60",
           "legendFormat": "{{service}} tx",
           "editorMode": "code",
           "instant": false,
@@ -312,7 +311,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "bytes",
+          "unit": "Bps",
           "color": {
             "mode": "palette-classic"
           },
@@ -580,7 +579,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "last_over_time(kiki_pg_cache_hit_ratio{job=\"kiki/ingester\"}[10m])",
+          "expr": "max(last_over_time(kiki_pg_cache_hit_ratio{job=\"kiki/ingester\"}[10m]))",
           "legendFormat": "hit ratio",
           "editorMode": "code",
           "instant": false,
@@ -715,7 +714,7 @@
     },
     {
       "type": "stat",
-      "title": "Deadlocks (selected range)",
+      "title": "Deadlocks (range)",
       "description": "Deadlocks detected in the selected range.",
       "datasource": {
         "type": "prometheus",
@@ -728,7 +727,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_pg_deadlocks_total{job=\"kiki/ingester\"}[$__range]))",
+          "expr": "sum(increase(kiki_pg_deadlocks_total{job=\"kiki/ingester\"}[$__range] anchored))",
           "legendFormat": "deadlocks",
           "editorMode": "code",
           "instant": true,
@@ -755,7 +754,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -1165,7 +1165,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_pg_deadlocks_total{job=\"kiki/ingester\"}[$__rate_interval]))",
+          "expr": "sum(increase(kiki_pg_deadlocks_total{job=\"kiki/ingester\"}[$__rate_interval] anchored))",
           "legendFormat": "deadlocks",
           "editorMode": "code",
           "instant": false,
@@ -1350,7 +1350,7 @@
       "options": {
         "legend": {
           "showLegend": true,
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
           "calcs": [
             "lastNotNull"
@@ -1367,7 +1367,7 @@
         "x": 0,
         "y": 27,
         "w": 8,
-        "h": 8
+        "h": 11
       }
     },
     {
@@ -1440,15 +1440,14 @@
               }
             ]
           },
-          "mappings": [],
-          "decimals": 0
+          "mappings": []
         },
         "overrides": []
       },
       "options": {
         "legend": {
           "showLegend": true,
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
           "calcs": [
             "lastNotNull"
@@ -1465,7 +1464,7 @@
         "x": 8,
         "y": 27,
         "w": 8,
-        "h": 8
+        "h": 11
       }
     },
     {
@@ -1593,7 +1592,7 @@
         "x": 16,
         "y": 27,
         "w": 8,
-        "h": 8
+        "h": 11
       }
     },
     {
@@ -1603,7 +1602,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 35,
+        "y": 38,
         "w": 24,
         "h": 1
       },
@@ -1740,7 +1739,7 @@
       "id": 20,
       "gridPos": {
         "x": 0,
-        "y": 36,
+        "y": 39,
         "w": 8,
         "h": 7
       }
@@ -1839,7 +1838,7 @@
       "id": 21,
       "gridPos": {
         "x": 8,
-        "y": 36,
+        "y": 39,
         "w": 8,
         "h": 7
       }
@@ -1935,7 +1934,7 @@
       "id": 22,
       "gridPos": {
         "x": 16,
-        "y": 36,
+        "y": 39,
         "w": 8,
         "h": 7
       }

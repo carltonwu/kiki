@@ -190,6 +190,31 @@ class Files(unittest.TestCase):
         self.assertEqual(errors + alert_errors, [])
         self.assertTrue(groups and groups[0]["rules"])
 
+    def test_increase_must_be_anchored(self):
+        def panel(expr):
+            return {
+                "uid": "u",
+                "title": "t",
+                "schemaVersion": 41,
+                "templating": {"list": [{"name": "prom", "type": "datasource", "query": "prometheus"}]},
+                "panels": [
+                    {
+                        "id": 1,
+                        "type": "stat",
+                        "title": "p",
+                        "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+                        "datasource": {"uid": "${prom}"},
+                        "targets": [{"refId": "A", "datasource": {"uid": "${prom}"}, "expr": expr}],
+                    }
+                ],
+            }
+
+        self.assertEqual(apply.check_dashboard(panel("sum(increase(x_total[$__range] anchored))")), [])
+        self.assertEqual(apply.check_dashboard(panel("sum(rate(x_total[$__rate_interval]))")), [])
+        errors = apply.check_dashboard(panel("sum(increase(x_total{a=\"b\"}[1h])) / sum(increase(y[1h] anchored))"))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("anchored", errors[0])
+
     def test_param_override(self):
         groups, errors = apply.load_alerts({"daily_llm_spend_usd": "12.5"})
         self.assertEqual(errors, [])

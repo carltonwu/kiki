@@ -78,6 +78,7 @@ from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
 
 RECEIVED = []
 METRICS = []
+BOUNDS = {}  # histogram name -> its exported bucket bounds
 FAIL_METRICS = os.environ.get("FAIL_METRICS", "").split(",")
 FAILED = set()
 EXPORTING = threading.Event()
@@ -97,6 +98,17 @@ def points(body):
         for point in metric.sum.data_points
     }
 
+def bounds(body):
+    request = ExportMetricsServiceRequest.FromString(body)
+    return {
+        metric.name: list(point.explicit_bounds)
+        for resource in request.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.HasField("histogram")
+        for point in metric.histogram.data_points
+    }
+
 class Receiver(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
@@ -106,6 +118,7 @@ class Receiver(BaseHTTPRequestHandler):
                 FAILED.add(len(METRICS))
                 status = 400  # not retried
             METRICS.append(points(body))
+            BOUNDS.update(bounds(body))
         self.reply(status)
 
     def do_GET(self):
@@ -171,6 +184,26 @@ assert len(RECEIVED) == 3, RECEIVED
 """,
         OTEL_BSP_SCHEDULE_DELAY="100",
         OTEL_BLRP_SCHEDULE_DELAY="100",
+    )
+
+
+def test_http_server_duration_uses_the_agent_hosts_duration_buckets():
+    """Semconv's buckets end at 10 s and a job request takes tens of seconds, so
+    every p95 of FastAPI's request duration read as 10 s."""
+    run(
+        """
+from opentelemetry import metrics
+
+# As the FastAPI instrumentation makes it, with semconv's advisory buckets.
+duration = metrics.get_meter("opentelemetry.instrumentation.fastapi").create_histogram(
+    "http.server.request.duration",
+    unit="s",
+    explicit_bucket_boundaries_advisory=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+)
+duration.record(20, {"http.route": "/v1/jobs"})
+asyncio.run(telemetry.flush())
+assert BOUNDS["http.server.request.duration"] == list(telemetry.DURATION_BUCKETS), BOUNDS
+"""
     )
 
 

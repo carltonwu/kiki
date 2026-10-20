@@ -61,20 +61,22 @@ agent host (Python) ─OTLP────┘
     the counters (`kiki_agent_jobs_total`, `kiki_llm_calls_total`,
     `kiki_llm_cost_usd_total`, `kiki_llm_tokens_total`), not histogram counts;
     use the histograms for distributions.
-  - **`increase()` on these series is an operational estimate**, not a total.
-    It extrapolates toward the window's edges, and the few samples a sleepy
-    series has make that coarse: a window holding only a wake's zero and one
-    value reads about 1.5× that value, and up to about 2.1× when the window
-    ends just short of the extrapolation threshold (1.1× the gap between the
-    samples); four samples read about 1.17×. The excess shrinks as the range
-    holds more samples. Before baselines such a window read 0. Exact billing
-    totals come from the database: `agent_runs.cost_usd`,
-    `classifications.jev_cost_usd`, `topic_summaries.cost_usd`,
-    `agent_image_jobs.cost_usd` and `emoji_description_costs.cost_usd`, which
-    `/kiki stats` sums per server. They miss three costs the metrics count: a
-    reply run that fails (the host reports no result,
-    so `agent_runs.cost_usd` stays NULL, though its requests were billed),
-    emoji embeddings and `kiki-agent-host index` backfills.
+  - **Dashboards and alerts read counters with `increase(…[w] anchored)`**,
+    Mimir's (and Prometheus 3's experimental) extended range selector: the
+    difference between the window's last sample and the last one before the
+    window (within the 5 min lookback), resets counted, with no extrapolation.
+    Plain `increase()` extrapolates toward the window's edges, and the few
+    samples a sleepy series has make that coarse: a window holding only a
+    wake's zero and one value read about 1.5× that value, up to about 2.1×, and
+    counts came out fractional. With `anchored` and the baselines a window's
+    total is what was recorded in it. It is still not a billing total: an
+    ingester series' first sample after a restart isn't counted, a window that
+    starts in a gap of more than 5 min between a series' samples misses the
+    increase across that gap, and a partly rejected export (below) loses its
+    series' first job. Exact billing totals come from the database, which
+    `/kiki stats` sums per server; it misses a few costs the metrics count
+    (see Cost categories). If Grafana Cloud ever turns the modifier off, these queries
+    fail with a parse error; dropping ` anchored` brings back the estimates.
   - **A partly rejected export counts as acknowledged.** The SDK's OTLP
     exporter reports success on HTTP 200 without looking at
     `partial_success.rejected_data_points`. If Mimir rejected a zero but
@@ -130,8 +132,13 @@ Resource attributes: `service.name`, `service.namespace=kiki`, `service.version`
 (`RAILWAY_ENVIRONMENT_NAME`, else `local`), `service.instance.id` (the service
 name: each runs as a single instance, and a random per-process or per-replica ID
 would start new series on every restart, deploy and wake of the agent host). In Grafana Cloud
-metrics carry `job="kiki/<service>"` and `instance=<service.instance.id>`; the
-other resource attributes are on `target_info`.
+metrics carry `job="kiki/<service>"` and `instance=<service.instance.id>`, and
+Grafana Cloud also promotes `service_name`, `service_namespace`,
+`service_instance_id`, `service_version` and `deployment_environment_name` to
+labels on every series (all resource attributes are on `target_info` too). So a
+deploy starts new series under the new `service_version` (the old ones go
+stale): queries always aggregate (`sum`, `max`, `sum by (le, …)`), never read a
+bare series, or a deploy would show as two lines or two stat values.
 
 ## Seeing it locally
 
@@ -183,25 +190,69 @@ overrides the choice.
 | Kiki / Cost (`kiki-cost`) | Spend, average per day, monthly projection (selected range and last 7 days), spend by purpose for the range, cost by purpose and by model and tokens (rolling 1 h), purpose × model table, calls by result |
 | Kiki / Agent host (`kiki-agent`) | Jobs by kind × outcome, rejections, job duration, model requests per run, agent LLM calls and duration, image attempts model × result, fallback, tool calls tool × outcome and duration, web calls, FastAPI requests |
 | Kiki / Infra (`kiki-infra`) | Railway CPU, memory, network, disk per service; Postgres size, cache hit ratio, oldest transaction, deadlocks, connections, transactions, temp bytes, table sizes, dead tuples; queues, stuck runs, embedding backlog |
-| Kiki / Logs and traces (`kiki-logs`) | Log volume, ingester and agent host logs (level and text filters; the agent's lines parsed with `logfmt`), Tempo tables: recent agent runs, slow runs, traces with errors |
+| Kiki / Logs and traces (`kiki-logs`) | Log volume, ingester and agent host logs (level and text filters; the agent's lines parsed with `logfmt`), Tempo tables: recent and slow (> 20 s) `agent_run` spans (span rows with the run's own duration, since a trace also holds its drawing and Tempo's search can list a trace's root as "not yet received" while its spans arrive), traces with errors |
 
 Query notes:
 
 - The agent host's series are sparse (see Architecture), so panels fed by it
   (the Agent host and Cost dashboards, LLM errors on Overview) never use instant
-  values or short windows: their time series are rolling 1 h counts (`increase(…[1h])`
+  values or short windows: their time series are rolling 1 h counts (`increase(…[1h] anchored)`
   at each point, labelled "rolling 1 h"), and totals are one `increase()` over the
   selected range (`$__range`), never a sum of short-window increases.
-  `increase()` needs two samples of a series in its window, so a 15 min window
-  often held one and returned nothing. Even an hour misses a series' very first
-  job, which is its first sample, until the agent host exports a zero baseline
-  for each new series (a follow-up change); then the first job after a wake counts.
+- Every `increase()` is `anchored` (see Architecture, zero baselines), so totals
+  are exact sums of what was recorded and counts are whole numbers; `rate()` over
+  the ingester's regular samples keeps `$__rate_interval`. A test in
+  `tools/grafana` fails on an `increase()` without it.
+- Counter panels whose series are absent until the first event (rejections,
+  retries, reactions, web calls, send errors) show 0 rather than "No data", and
+  quantiles of a histogram with no counted observation (its only one was the
+  series' first, see Histograms aren't baselined) show "–" instead of NaN.
 - Grafana ends a range query on a multiple of its step, so a panel with a 1 h
   step never shows the current hour. Panels step at least every 15 min for that
   reason, and the 7-day spend chart is a rolling 24 h sum (what the alert reads)
   rather than daily bars.
 - The agent host's duration histograms have coarse buckets (0.5, 2.5, 10, 30,
   120 s), so their quantiles are interpolated within them.
+
+### Cost categories
+
+Every cost panel (Cost dashboard, Overview's spend, the daily spend alert) reads
+one counter, `kiki_llm_cost_usd_total` (OpenRouter's billed `usage.cost`, web
+fees included), over both services (`job=~"kiki/.+"`), split only by `purpose`
+and `model`. Totals are `sum(increase(kiki_llm_cost_usd_total{job=~"kiki/.+"}[$__range] anchored))`;
+per category, `sum by (purpose) (…)`. Everything billed counts, whatever became
+of it. The `purpose` values, and where the same money lands in the database
+that `/kiki stats` sums per server (its rows Replies, Drawings, Decide, Topics,
+Emoji):
+
+| `purpose` | Model call | Database column (`/kiki stats` row) |
+|---|---|---|
+| `reply` | the reply run's own model requests | `agent_runs.cost_usd` (Replies), together with the run's `vision` and `embedding` |
+| `vision` | `read_image`, during a reply or a drawing; not emoji (that's `emoji`) | `agent_runs.cost_usd` (Replies) or `agent_image_jobs.cost_usd` (Drawings) |
+| `embedding` | indexing messages during a reply; emoji descriptions; `index` backfills | `agent_runs.cost_usd` (Replies) during a reply; nowhere for emoji descriptions or `index` |
+| `image` | image model attempts, fallback included | `agent_image_jobs.cost_usd` (Drawings), with the drawing's `vision` and `failure_note` |
+| `failure_note` | the note posted when a drawing fails | `agent_image_jobs.cost_usd` (Drawings) |
+| `jev` | Jev's decide call (ingester) | `classifications.jev_cost_usd` (Decide; stored on every message of the pool, counted once) |
+| `topic` | topic summary runs | `topic_summaries.cost_usd` (Topics): one timestamped row per job, written by a trigger when the host saves the job's result. `conversations.topic_cost_usd` is no longer written. |
+| `emoji` | describing custom emoji | `emoji_description_costs.cost_usd` (Emoji): a timestamped row per paid description |
+
+So a `/kiki stats` row is a sum of purposes: Replies ≈ `reply` + the reply
+share of `vision` and `embedding`; Drawings ≈ `image` + `failure_note` + the
+drawing share of `vision`; Decide = `jev`, Topics = `topic`, Emoji = `emoji`.
+Metrics can't split `vision` and `embedding` between replies and drawings.
+
+Only Grafana counts:
+
+- **failed reply runs**: the host reports no result, so `agent_runs.cost_usd`
+  stays NULL, though the requests made before the failure were billed;
+- **emoji embeddings**: the descriptions' embeddings (`purpose="embedding"`,
+  from `chat/emojis.py`) aren't in `emoji_description_costs`;
+- **`kiki-agent-host index` backfills** (`purpose="embedding"`), which no job
+  records.
+
+The database is the billing total; Grafana differs by those and by the
+first-sample limits above (an ingester series' first sample after a restart,
+a window starting in a gap of more than 5 min between samples).
 
 Alert rules (`tools/grafana/alerts/kiki.json`, group `kiki`, evaluated every
 minute). Parameters are the file's `params`, overridable with `--param`:
@@ -265,7 +316,9 @@ is one more.
     `1, 2, 5, 10` (a run makes at most 10).
 - Instrumentation-made metrics are kept to what we read: the agent host keeps
   FastAPI's `http.server.request.duration` and `http.server.active_requests`
-  (three routes) and drops the body-size histograms; httpx client metrics are off
+  (three routes), the duration in the agent host's duration buckets rather
+  than semconv's (which end at 10 s, below a job request's tens of seconds, so
+  every p95 read 10 s), and drops the body-size histograms; httpx client metrics are off
   (read_link's hosts are unbounded). The ingester makes none.
 - A new metric's series estimate (attribute values multiplied, times buckets + 2
   for histograms) goes in its PR description.

@@ -205,7 +205,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (reason) (increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (reason) (increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "reconnect: {{reason}}",
           "editorMode": "code",
           "instant": false,
@@ -217,7 +217,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_gateway_store_errors_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum(increase(kiki_gateway_store_errors_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "store errors",
           "editorMode": "code",
           "instant": false,
@@ -273,7 +273,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -314,7 +315,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_gateway_lag_seconds_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_gateway_lag_seconds_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p50",
           "editorMode": "code",
           "instant": false,
@@ -326,7 +327,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_gateway_lag_seconds_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_gateway_lag_seconds_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p95",
           "editorMode": "code",
           "instant": false,
@@ -612,7 +613,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (check, outcome) (increase(kiki_router_classifications_total{job=\"kiki/ingester\"}[$__range]))",
+          "expr": "sum by (check, outcome) (increase(kiki_router_classifications_total{job=\"kiki/ingester\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -727,7 +728,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (le) (increase(kiki_jev_confidence_bucket{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (le) (increase(kiki_jev_confidence_bucket{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{le}}",
           "editorMode": "code",
           "instant": false,
@@ -812,7 +813,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval] anchored)))",
           "legendFormat": "p50",
           "editorMode": "code",
           "instant": false,
@@ -824,7 +825,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval] anchored)))",
           "legendFormat": "p95",
           "editorMode": "code",
           "instant": false,
@@ -931,7 +932,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval]))",
+          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval] anchored))",
           "legendFormat": "calls {{result}}",
           "editorMode": "code",
           "instant": false,
@@ -943,7 +944,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval]))",
+          "expr": "sum(increase(kiki_llm_cost_usd_total{job=\"kiki/ingester\", purpose=\"jev\"}[$__interval] anchored))",
           "legendFormat": "cost",
           "editorMode": "code",
           "instant": false,
@@ -1082,7 +1083,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (status) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (status) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{status}}",
           "editorMode": "code",
           "instant": false,
@@ -1255,7 +1256,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_agent_runs_queued_total{job=\"kiki/ingester\"}[$__range]))",
+          "expr": "sum by (kind) (increase(kiki_agent_runs_queued_total{job=\"kiki/ingester\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1268,7 +1269,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=\"done\"}[$__range]))",
+          "expr": "sum by (kind) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=\"done\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1281,7 +1282,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired|interrupted\"}[$__range]))",
+          "expr": "sum by (kind) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired|interrupted\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1388,7 +1389,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p50",
           "editorMode": "code",
           "instant": false,
@@ -1400,7 +1401,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p95",
           "editorMode": "code",
           "instant": false,
@@ -1412,7 +1413,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_run_duration_seconds_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "{{kind}} p95",
           "editorMode": "code",
           "instant": false,
@@ -1539,7 +1540,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (endpoint, status) (increase(kiki_agent_host_requests_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (endpoint, status) (increase(kiki_agent_host_requests_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{endpoint}} {{status}}",
           "editorMode": "code",
           "instant": false,
@@ -1643,7 +1644,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (reason) (increase(kiki_agent_host_retries_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (reason) (increase(kiki_agent_host_retries_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{reason}}",
           "editorMode": "code",
           "instant": false,
@@ -1699,7 +1700,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -1752,7 +1754,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (outcome) (increase(kiki_drawings_finished_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (outcome) (increase(kiki_drawings_finished_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "drawings {{outcome}}",
           "editorMode": "code",
           "instant": false,
@@ -1898,7 +1900,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_conversations_started_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum(increase(kiki_conversations_started_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "started",
           "editorMode": "code",
           "instant": false,
@@ -1910,7 +1912,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (reason) (increase(kiki_conversations_closed_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (reason) (increase(kiki_conversations_closed_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "closed {{reason}}",
           "editorMode": "code",
           "instant": false,
@@ -2024,7 +2026,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_conversation_messages_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (increase(kiki_conversation_messages_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p50",
           "editorMode": "code",
           "instant": false,
@@ -2036,7 +2038,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_conversation_messages_bucket{job=\"kiki/ingester\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_conversation_messages_bucket{job=\"kiki/ingester\"}[$__interval] anchored)))",
           "legendFormat": "p95",
           "editorMode": "code",
           "instant": false,
@@ -2146,7 +2148,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_discord_messages_sent_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (kind) (increase(kiki_discord_messages_sent_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "sent {{kind}}",
           "editorMode": "code",
           "instant": false,
@@ -2158,7 +2160,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (kind) (increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "error {{kind}}",
           "editorMode": "code",
           "instant": false,
@@ -2271,7 +2273,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_discord_reactions_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (result) (increase(kiki_discord_reactions_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": false,
@@ -2327,7 +2329,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": [
           {
@@ -2399,7 +2402,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (reason) (increase(kiki_discord_rest_retries_total{job=\"kiki/ingester\"}[$__interval]))",
+          "expr": "sum by (reason) (increase(kiki_discord_rest_retries_total{job=\"kiki/ingester\"}[$__interval] anchored))",
           "legendFormat": "{{reason}}",
           "editorMode": "code",
           "instant": false,
@@ -2455,7 +2458,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
