@@ -355,7 +355,10 @@ queries are an argument error returned to the model.
     search is lexical), the hybrid query (3 s, a `statement_timeout` on the
     search's own connection; past it a lexical query is tried), with 1 s held
     back for that and 1 s for citing. Only when the lexical query also runs
-    out is the result an error the model sees. If 256 were found, the guild reports
+    out is the result an error the model sees. Resolving `person` and `channel`
+    (1 s) and citing (what is left) are bounded too; if citing runs out, the
+    results come back with the names at hand and channel IDs, marked
+    `"enriched": false`. If 256 were found, the guild reports
     `"partial"`. A sleeping service does nothing; a reply can index pending
     messages from other channels in its guild.
   - History uses `kiki-agent-host index` (for example, through `railway ssh`).
