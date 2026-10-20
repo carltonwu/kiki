@@ -221,6 +221,7 @@ async def test_semantic_search_can_use_the_vector_index(db):
         "channels": None,
         "conversation": CONVERSATION,
         "authors": None,
+        "own": None,
         "before": None,
         "after": None,
         "query": "deploy",
@@ -353,6 +354,7 @@ async def test_executor_runs_tools_and_reports_usage(database_url, db):
     # Memory tools are covered in test_memory; placeholder arguments only get errors.
     assert set(json.loads(result.text)) - set(memory_tools.toolset.tools) == {
         "search_messages",
+        "find_quotes",
         "get_message_context",
         "channel_history",
         "count_messages",

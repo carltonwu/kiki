@@ -34,7 +34,7 @@
           "strict": null
         },
         {
-          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
+          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.\n\nTo quote someone, copy the hit's `text` word for word and link its `url`; if\nnothing matches, say so rather than reconstructing what they might have said.\nFor quotes people saved with a quote bot, use find_quotes.",
           "kind": "function",
           "name": "search_messages",
           "parameters": {
@@ -93,7 +93,7 @@
                   }
                 ],
                 "default": null,
-                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so."
+                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so.\n\"you\" searches your own past messages (what you said)."
               },
               "query": {
                 "description": "What to look for, in natural language or keywords.",
@@ -103,6 +103,59 @@
             "required": [
               "query"
             ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Find this server's saved quotes: messages people saved with a quote bot\n(the `.quote` replies and \"Quote #N\" cards in a channel like #quotes).\n\nUse it for someone's quotes (\"X's best quotes\", \"the quote where...\"), not\nsearch_messages: the quotes are inside the bots' posts, which search skips.\nEach is the saved message itself, with who said it, when and its link, and\nits whole text, so quote it word for word. `total` is how many match.",
+          "kind": "function",
+          "name": "find_quotes",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The previous result's `cursor`, to read on (with the same other\narguments)."
+              },
+              "limit": {
+                "default": 25,
+                "description": "Maximum quotes, up to 50; a page of long ones holds fewer.",
+                "type": "integer"
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only quotes of this person: a ref like u2 (best), an @username, or\na name they've gone by."
+              },
+              "query": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Rank by meaning and keywords. Leave it out to list them newest first."
+              }
+            },
             "type": "object"
           },
           "strict": null
@@ -666,7 +719,7 @@
           "strict": null
         },
         {
-          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.",
+          "description": "Search the message history of every channel in this server (by meaning and by keywords).\n\nRecent matches rank slightly higher unless `before`/`after` is given. Older\nmessages already shown to you in this conversation are not returned.\n\nTo quote someone, copy the hit's `text` word for word and link its `url`; if\nnothing matches, say so rather than reconstructing what they might have said.\nFor quotes people saved with a quote bot, use find_quotes.",
           "kind": "function",
           "name": "search_messages",
           "parameters": {
@@ -725,7 +778,7 @@
                   }
                 ],
                 "default": null,
-                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so."
+                "description": "Only messages written by this person: a ref like u2 (best), an\n@username, or a name they've gone by. Names match exactly, so \"Chris\"\nwon't find \"Chrissy\"; if several people share the name, results say so.\n\"you\" searches your own past messages (what you said)."
               },
               "query": {
                 "description": "What to look for, in natural language or keywords.",
@@ -735,6 +788,59 @@
             "required": [
               "query"
             ],
+            "type": "object"
+          },
+          "strict": null
+        },
+        {
+          "description": "Find this server's saved quotes: messages people saved with a quote bot\n(the `.quote` replies and \"Quote #N\" cards in a channel like #quotes).\n\nUse it for someone's quotes (\"X's best quotes\", \"the quote where...\"), not\nsearch_messages: the quotes are inside the bots' posts, which search skips.\nEach is the saved message itself, with who said it, when and its link, and\nits whole text, so quote it word for word. `total` is how many match.",
+          "kind": "function",
+          "name": "find_quotes",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "cursor": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "The previous result's `cursor`, to read on (with the same other\narguments)."
+              },
+              "limit": {
+                "default": 25,
+                "description": "Maximum quotes, up to 50; a page of long ones holds fewer.",
+                "type": "integer"
+              },
+              "person": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Only quotes of this person: a ref like u2 (best), an @username, or\na name they've gone by."
+              },
+              "query": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "description": "Rank by meaning and keywords. Leave it out to list them newest first."
+              }
+            },
             "type": "object"
           },
           "strict": null

@@ -27,7 +27,9 @@
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in
 that channel), `age_s`, `embeds` (link previews, delivered like Discord's unfurler as a
-follow-up MESSAGE_UPDATE), `attachments` (`[{filename, label?, content_type?, expired?}]`;
+follow-up MESSAGE_UPDATE), `components` (a bot's Components V2 card, sent with
+the message; in both, `{guild}`, `{channel:NAME}` and `{id:STEP}` become IDs, for
+a quote bot's link to a message), `attachments` (`[{filename, label?, content_type?, expired?}]`;
 the stub vision model describes an image as its label, the drawing step's
 reference check turns down labels saying meme or screenshot, and an `expired`
 link only downloads after Discord's refresh), and the sugar
@@ -93,8 +95,9 @@ class Run:
         body = {"as": args["as"], "in": args["in"], "text": str(args["text"])}
         if "age_s" in args:
             body["age_s"] = args["age_s"]
-        if "embeds" in args:
-            body["embeds"] = args["embeds"]
+        for key in ("embeds", "components"):
+            if key in args:
+                body[key] = self.placeholders(args[key])
         if "attachments" in args:
             body["attachments"] = args["attachments"]
         if reply_to := args.get("reply_to"):
@@ -119,6 +122,22 @@ class Run:
         if wait:
             self.observed[message["id"]] = observe(message, self.config, env=self.env)
         return message
+
+    def placeholders(self, value):
+        """`{guild}`, `{channel:NAME}` and `{id:STEP}` (a step's message ID) in a
+        message's embeds or components, for links between messages."""
+        state = stack.control("state")
+
+        def fill(match: re.Match) -> str:
+            kind, _, name = match[1].partition(":")
+            if kind == "guild":
+                return state["guild"]["id"]
+            if kind == "channel":
+                return state["channels"][name]
+            return self.named[name]["id"]
+
+        text = re.sub(r"\{(guild|channel:[\w-]+|id:[\w-]+)\}", fill, json.dumps(value))
+        return json.loads(text)
 
     def resolve_reply(self, target: str, channel: str) -> str:
         if target in self.named:
