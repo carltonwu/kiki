@@ -6,6 +6,8 @@ import os
 import sys
 from datetime import UTC, datetime
 
+from opentelemetry import trace
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -15,6 +17,10 @@ class JsonFormatter(logging.Formatter):
             "target": record.name,
             "message": record.getMessage(),
         }
+        span = trace.get_current_span().get_span_context()
+        if span.is_valid:  # only with telemetry export on
+            event["trace_id"] = format(span.trace_id, "032x")
+            event["span_id"] = format(span.span_id, "016x")
         if record.exc_info:
             event["exception"] = self.formatException(record.exc_info)
         return json.dumps(event, ensure_ascii=False)
@@ -32,3 +38,6 @@ def configure_logging() -> None:
     if level != "DEBUG":
         logging.getLogger("httpx").setLevel(logging.WARNING)
         logging.getLogger("httpcore").setLevel(logging.WARNING)
+        # The OpenAI SDK's client. Security: its INFO lines put full signed Discord
+        # URLs on stdout (Railway's logs).
+        logging.getLogger("httpx2").setLevel(logging.WARNING)

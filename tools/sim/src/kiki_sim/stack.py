@@ -287,6 +287,21 @@ def service_env(values: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def telemetry_env() -> dict[str, str]:
+    """OTLP export to a local collector (e.g. grafana/otel-lgtm), only when
+    `KIKI_SIM_OTEL_ENDPOINT` is set at `up`. Off by default."""
+    endpoint = os.getenv("KIKI_SIM_OTEL_ENDPOINT")
+    if not endpoint:
+        return {}
+    if urlparse(endpoint).hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise SimError(f"KIKI_SIM_OTEL_ENDPOINT must be on localhost, not {endpoint}")
+    return {
+        "OTEL_EXPORTER_OTLP_ENDPOINT": endpoint,
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+        "RAILWAY_ENVIRONMENT_NAME": "sim",  # deployment.environment.name
+    }
+
+
 def live_keys() -> dict[str, str]:
     """Only the OpenRouter keys, from the environment or the repo's dotenv file."""
     wanted = LIVE_KEYS + LIVE_OPTIONAL
@@ -381,7 +396,7 @@ class Config:
                 "OPENROUTER_CHAT_MODEL": "sim/chat",
                 "OPENROUTER_IMAGE_MODEL": "sim/image",
             }
-        return service_env(values | self.env | overrides)
+        return service_env(values | telemetry_env() | self.env | overrides)
 
     def host_env(self) -> dict[str, str]:
         values = {
@@ -413,7 +428,7 @@ class Config:
                 "OPENROUTER_VISION_MODEL": "sim/vision",
                 "OPENROUTER_IMAGE_FALLBACK_MODEL": "sim/image-fallback",
             }
-        return service_env(values)
+        return service_env(values | telemetry_env())
 
 
 # --- processes ---------------------------------------------------------------

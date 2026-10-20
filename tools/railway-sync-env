@@ -5,11 +5,14 @@
     tools/railway-sync-env --apply    # set changed variables, then redeploy
 
 Secret values (tokens, keys, URLs with credentials) are never printed. Variables
-that only make sense locally (database URLs, ports, simulator overrides) are
-skipped. Run from the repo root with the Railway project linked.
+that only make sense locally (database URLs, ports, simulator overrides, local
+OTEL_* settings) are skipped. GRAFANA_CLOUD_ID and GRAFANA_APP_TOKEN aren't synced
+themselves: they become both services' OTEL_EXPORTER_OTLP_HEADERS. Run from the
+repo root with the Railway project linked.
 """
 
 import argparse
+import base64
 import json
 import re
 import subprocess
@@ -67,7 +70,19 @@ LOCAL_ONLY = {
     "PORT",
     "TEST_DATABASE_URL",
 }
-SECRET = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|DATABASE_URL")
+# Grafana Cloud credentials (docs/observability.md). The endpoint itself is in
+# .railway/railway.ts; GRAFANA_CLOUD_INGESTION_URL is only for reference.
+GRAFANA = {"GRAFANA_APP_TOKEN", "GRAFANA_CLOUD_ID", "GRAFANA_CLOUD_INGESTION_URL"}
+SECRET = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|DATABASE_URL|HEADERS")
+
+
+def otlp_headers(local: dict[str, str]) -> str | None:
+    """The OTLP gateway's Basic auth, in OTEL_EXPORTER_OTLP_HEADERS form."""
+    instance, token = local.get("GRAFANA_CLOUD_ID"), local.get("GRAFANA_APP_TOKEN")
+    if not instance or not token:
+        return None
+    credentials = base64.b64encode(f"{instance}:{token}".encode()).decode()
+    return f"Authorization=Basic%20{credentials}"
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -113,9 +128,22 @@ def main() -> None:
     }
 
     changes: dict[str, dict[str, str]] = {"ingester": {}, "agent": {}}
+
+    def compare(service: str, key: str, value: str) -> None:
+        current = remote[service].get(key)
+        if current == value:
+            print(f"  same   {service}.{key}")
+            return
+        verb = "add" if current is None else "change"
+        print(f"  {verb:<6} {service}.{key} = {show(key, value)}")
+        changes[service][key] = value
+
     for key, value in sorted(local.items()):
-        if key in LOCAL_ONLY:
+        if key in LOCAL_ONLY or key.startswith("OTEL_"):
             print(f"  skip   {key} (local only)")
+            continue
+        if key in GRAFANA:
+            print(f"  skip   {key} (Grafana Cloud: synced as OTEL_EXPORTER_OTLP_HEADERS)")
             continue
         service = "agent" if key in AGENT else "ingester" if key in INGESTER else None
         if service is None:
@@ -124,13 +152,10 @@ def main() -> None:
         if value == "":
             print(f"  skip   {service}.{key} (empty locally)")
             continue
-        current = remote[service].get(key)
-        if current == value:
-            print(f"  same   {service}.{key}")
-            continue
-        verb = "add" if current is None else "change"
-        print(f"  {verb:<6} {service}.{key} = {show(key, value)}")
-        changes[service][key] = value
+        compare(service, key, value)
+    if headers := otlp_headers(local):
+        for service in ("ingester", "agent"):
+            compare(service, "OTEL_EXPORTER_OTLP_HEADERS", headers)
 
     if not args.apply:
         print("\nDry run. Re-run with --apply to set these and redeploy.")

@@ -260,7 +260,12 @@ impl Host {
         url: &Url,
         body: &impl Serialize,
     ) -> anyhow::Result<Result<Response, (&'static str, Option<u16>)>> {
-        match self.http.post(url.clone()).json(body).send().await {
+        let mut request = self.http.post(url.clone()).json(body);
+        // The agent host continues the current trace (the run's span).
+        for (name, value) in crate::telemetry::trace_headers() {
+            request = request.header(name, value);
+        }
+        match request.send().await {
             Err(error) if error.is_timeout() => Ok(Err(("timeout", None))),
             Err(error) if error.is_connect() || error.is_request() => Ok(Err(("connection", None))),
             Err(error) => Err(error).context("calling agent host"),

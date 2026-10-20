@@ -17,13 +17,14 @@ ALLOWED = {
     "config": [],
     "db": [],
     "logs": [],
+    "telemetry": [],  # observability: every part may record to it
     "contracts": [],
     "executor": ["contracts"],
     "prompt": ["contracts"],
-    "openrouter": ["openrouter", "config"],
-    "media.fetch": ["config"],
-    "chat": ["chat", "config", "db", "contracts", "openrouter", "media.fetch"],
-    "media": ["media", "chat", "config", "db", "contracts", "prompt", "openrouter"],
+    "openrouter": ["openrouter", "config", "telemetry"],
+    "media.fetch": ["config", "telemetry"],
+    "chat": ["chat", "config", "db", "contracts", "openrouter", "media.fetch", "telemetry"],
+    "media": ["media", "chat", "config", "db", "contracts", "prompt", "openrouter", "telemetry"],
     "agent": [
         "agent",
         "chat",
@@ -34,9 +35,10 @@ ALLOWED = {
         "contracts",
         "executor",
         "prompt",
+        "telemetry",
     ],
-    "api": ["api", "", "config", "contracts", "executor", "db"],
-    "__main__": ["logs"],
+    "api": ["api", "", "config", "contracts", "executor", "db", "telemetry"],
+    "__main__": ["logs", "telemetry"],
 }
 PLATFORM_WORDS = ("discord", "guild")
 

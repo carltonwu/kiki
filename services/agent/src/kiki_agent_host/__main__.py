@@ -5,6 +5,7 @@ import sys
 
 import uvicorn
 
+from . import telemetry
 from .logs import configure_logging
 
 
@@ -16,6 +17,14 @@ def main() -> None:
     except ImportError:
         pass
     configure_logging()
+    telemetry.configure()
+    try:
+        serve()
+    finally:
+        telemetry.shutdown()  # the server also shuts it down on SIGTERM
+
+
+def serve() -> None:
     if sys.argv[1:] == ["index"]:
         from .chat.indexing import index_all
 

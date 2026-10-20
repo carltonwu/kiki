@@ -7,6 +7,11 @@ requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.143.3",
     "httpx>=0.28.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1",
+    "opentelemetry-instrumentation-fastapi>=0.66b1",
+    "opentelemetry-instrumentation-httpx>=0.66b1",
+    "opentelemetry-instrumentation-logging>=0.66b1",
+    "opentelemetry-sdk>=1.45.1",
     "psycopg[binary]>=3.2",
     "pydantic-ai-harness[skills]==0.57.0",
     "pydantic-ai-slim[openrouter]==2.57.0",
