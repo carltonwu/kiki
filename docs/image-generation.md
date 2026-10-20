@@ -247,7 +247,11 @@ and the live API. GPT Image models get `quality: medium`.
   gets 30 s or what's left, whichever is less, and one that can't have 3 s isn't
   started. What was judged by then is kept; a batch past it is dropped (the
   subject is drawn from its other batches, or from its description), and 5 s
-  after it the stage is cut. In review, 6 subjects of 24 candidates made two waves
+  after it the stage is cut. Under a job deadline (#69's `deadline.py`, when the
+  host has it) the stage gets no more than the job has left. Cut or cancelled,
+  the stage cancels its searches, downloads and picker calls rather than leaving
+  them running. Each picker response is billed as it arrives (telemetry and the
+  drawing's cost), so one whose retry fails or times out is still counted. In review, 6 subjects of 24 candidates made two waves
   of 27 s batches: 124 s with the image, past the job's 120 s. Measured on prod data with DeepSeek V4.1 Flash: about
   2-4 s to search, 7-17 s to pick from 24 candidates in two batches, $0.001-0.003
   per subject. That runs after the ack, while the conversation carries on; the

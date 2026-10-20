@@ -53,7 +53,7 @@ from ..contracts import Drawing, JobRequest, Reference, Subject
 from ..prompt import history
 from . import links
 from .fetch import allowed, client, download, refresh, sniff
-from .vision import Vision, bill, billed_cost
+from .vision import Vision, bill, billed_cost, response_cost
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +420,8 @@ class Gatherer:
         # The whole reference stage's deadline (loop time), queue waits included,
         # so the image call keeps its time in the job's; None for no deadline.
         # `time_left` and `within` match deadline.py's (#69), to switch to it.
+        if seconds is not None and (job := job_time_left()) is not None:
+            seconds = min(seconds, max(0.0, job))
         self.deadline = None if seconds is None else asyncio.get_running_loop().time() + seconds
 
     def time_left(self) -> float | None:
@@ -442,13 +444,19 @@ class Gatherer:
         kept and the rest is drawn without: the image call keeps its time."""
         subjects = [asyncio.ensure_future(self.find(s)) for s in plan.subjects]
         shared = asyncio.ensure_future(self.shared(plan.shared))
+        tasks = [*subjects, shared]
         left = self.time_left()
-        done, late = await asyncio.wait(
-            [*subjects, shared], timeout=None if left is None else max(0.0, left) + STAGE_GRACE
-        )
-        for task in late:
-            task.cancel()
-        await asyncio.gather(*late, return_exceptions=True)
+        try:
+            done, late = await asyncio.wait(
+                tasks, timeout=None if left is None else max(0.0, left) + STAGE_GRACE
+            )
+        finally:
+            # Also when this is cancelled (the job's deadline, a shutdown):
+            # asyncio.wait leaves its tasks running, still calling and billing.
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            await asyncio.gather(*unfinished, return_exceptions=True)
         if late:
             logger.warning("references cut at the deadline late=%d", len(late))
         found = [
@@ -711,8 +719,9 @@ class Gatherer:
                 return {}
             self.vision.calls += 1
             with telemetry.llm_call(self.vision.purpose, self.vision.name) as call:
-                async with asyncio.timeout(timeout):
-                    run = await picker.run(
+                async with (
+                    asyncio.timeout(timeout),
+                    picker.iter(
                         prompt,
                         model=self.vision.model,
                         deps=len(batch),
@@ -726,8 +735,12 @@ class Gatherer:
                         },
                         retries={"output": PICK_RETRIES},
                         usage_limits=UsageLimits(request_limit=1 + PICK_RETRIES),
-                    )
-                    bill(call, run)
+                    ) as run,
+                ):
+                    async for node in run:
+                        if Agent.is_call_tools_node(node):  # a response, paid for
+                            self.charge(call, node.model_response)
+                    output = run.result.output
         except (TimeoutError, AgentRunError) as error:  # ModelAPIError is one
             logger.warning(
                 "reference check failed subject_kind=%s candidates=%d error_type=%s",
@@ -738,8 +751,24 @@ class Gatherer:
             return {}
         finally:
             self.picking.release()
-        self.vision.cost += billed_cost(run) or 0.0
-        return {v.image: v.clarity for v in run.output.verdicts if v.subject and v.kind == "photo"}
+        return {v.image: v.clarity for v in output.verdicts if v.subject and v.kind == "photo"}
+
+    def charge(self, call: telemetry.Call, response: ModelResponse) -> None:
+        """One picker response's cost, in telemetry and the drawing's vision cost,
+        as it arrives: a response whose retry then fails was still paid for."""
+        cost = response_cost(response) or 0.0
+        call.bill(cost, response.usage.input_tokens, response.usage.output_tokens)
+        self.vision.cost += cost
+
+
+def job_time_left() -> float | None:
+    """The job's own time left, where the host sets a job deadline (#69's
+    `deadline.time_left`), else None: the stage's own seconds then apply."""
+    try:
+        from .. import deadline  # optional until #69 lands
+    except ImportError:
+        return None
+    return deadline.time_left()
 
 
 def key(reference: Reference) -> tuple:

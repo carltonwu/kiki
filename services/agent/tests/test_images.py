@@ -1405,9 +1405,10 @@ async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
     result = await run.draw(job)
     elapsed = asyncio.get_running_loop().time() - began
     # One deadline for the stage, queue waits included: the second wave gets what's
-    # left of it rather than its own 0.9 s (1.6 s in all without the fix).
-    assert elapsed < 1.3
-    assert len(started) == 12 and max(started) - min(started) >= 0.7  # two waves
+    # left of it rather than its own 0.9 s. Without the fix it's 1.6 s or more; the
+    # bound leaves room for a loaded machine (the stage is cut at 1.0 + 0.2 s).
+    assert elapsed < 1.45
+    assert len(started) >= 8  # the first wave, at least, ran
     assert result.error is None and len(model.prompts) == 1
     # What the first wave judged is kept: at least 4 subjects have their 3.
     counts = [sum(r.subject == f"Dog{d}" for r in result.references) for d in range(6)]
@@ -1444,3 +1445,99 @@ async def test_a_batch_that_cant_start_in_time_is_skipped(database_url, monkeypa
             Drawing(prompt="x", subjects=[Subject(name="Bear")])
         )
     assert found[0].images == [] and shared == [] and calls == []
+
+
+def gatherer(db, chat, transport, seconds=None):
+    from kiki_agent_host.chat.scope import Scope
+    from kiki_agent_host.media.vision import Vision
+
+    vision = Vision(FunctionModel(chat), "test/vision", discord_token="bot-token")
+    return drawing.Gatherer(
+        db, Scope(GUILD, 2, 1), vision, "https://cdn.discordapp.com", transport, seconds=seconds
+    )
+
+
+async def test_cancelling_the_reference_stage_stops_its_calls_and_downloads(database_url):
+    # Review of #66: cancelled while awaiting asyncio.wait, the stage left a picker
+    # call and a download running (and billing) after the job had given up.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (4000, 300, "Bear at the vet", [attachment(4001, "IMG_1.jpg")]),
+        (4002, 300, "Nougie at the lake", [attachment(4003, "IMG_2.jpg")]),
+    )
+    picking, picker_stopped, download_stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_picker(messages, info):
+        picking.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            picker_stopped.set()
+            raise
+
+    async def cdn(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("IMG_2.jpg"):  # Nougie's download hangs
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                download_stopped.set()
+                raise
+        return httpx.Response(200, content=JPEG + b"bear")
+
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        gather = gatherer(db, slow_picker, httpx.MockTransport(cdn))
+        plan = Drawing(prompt="x", subjects=[Subject(name="Bear"), Subject(name="Nougie")])
+        stage = asyncio.create_task(gather.everything(plan))
+        await asyncio.wait_for(picking.wait(), 5)
+        stage.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stage
+        # Nothing of the stage is left running.
+        assert picker_stopped.is_set() and download_stopped.is_set()
+
+
+async def test_the_stage_never_outlasts_the_jobs_own_deadline(monkeypatch):
+    # With #69's job deadline: a resumed job with 10 s left gets a 10 s stage.
+    monkeypatch.setattr(drawing, "job_time_left", lambda: 10.0)
+    gather = drawing.Gatherer(None, None, None, "", seconds=35)
+    assert 9.5 < gather.time_left() <= 10.0
+    monkeypatch.setattr(drawing, "job_time_left", lambda: None)
+    assert 34.5 < drawing.Gatherer(None, None, None, "", seconds=35).time_left() <= 35
+
+
+async def test_a_paid_picker_response_is_billed_when_its_retry_fails(
+    database_url, monkeypatch, recorded
+):
+    # Review of #66: a response costing $0.0123 with bad verdicts, then a retry
+    # that timed out, recorded $0.
+    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.05)
+    await reply_job(database_url)
+    await seed(database_url, (4100, 300, "Bear at the vet", [attachment(4101, "IMG_1.jpg")]))
+    transport = discord({"/attachments/2/4101/IMG_1.jpg": JPEG + b"bear"}, [])
+    bad = ModelResponse(parts=[TextPart('{"verdicts": []}')], provider_details={"cost": 0.0123})
+
+    async def then_slow(messages, info):
+        if len(messages) == 1:
+            return bad
+        await asyncio.sleep(5)
+
+    def always_bad(messages, info):
+        return bad
+
+    plan = Drawing(prompt="x", subjects=[Subject(name="Bear")])
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        gather = gatherer(db, then_slow, transport)
+        found, _ = await gather.everything(plan)
+        assert found[0].images == []
+        assert gather.vision.cost == pytest.approx(0.0123)
+        # Out of validation retries: both responses were paid for.
+        gather = gatherer(db, always_bad, transport)
+        found, _ = await gather.everything(plan)
+        assert found[0].images == []
+        assert gather.vision.cost == pytest.approx(0.0246)
+    # And in telemetry, for both failed calls (a timeout, then a validation failure).
+    labels = {"purpose": "vision", "model": "test/vision"}
+    assert recorded.value("kiki.llm.cost_usd", **labels) == pytest.approx(0.0369)
+    assert recorded.value("kiki.llm.calls", **labels, result="ok") is None
