@@ -67,11 +67,7 @@ impl Listener {
                 Some(Ok(Message::Close(frame))) => {
                     let reason = close_reason(dropping.take(), frame.as_ref().map(|f| f.code));
                     metrics::gateway_reconnect(reason);
-                    info!(
-                        ?frame,
-                        reason = reason.as_str(),
-                        "Gateway connection closed; reconnecting"
-                    )
+                    info!(?frame, "Gateway connection closed; reconnecting")
                 }
                 Some(Ok(Message::Text(text))) => {
                     if let Some(reason) = self.handle(&text).await {

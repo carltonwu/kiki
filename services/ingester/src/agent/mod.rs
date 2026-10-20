@@ -65,8 +65,10 @@ pub struct Agent {
 struct Claim {
     run_id: i64,
     kind: &'static str,
-    /// The `traceparent` stored when the run was queued.
+    /// The `traceparent` stored when the run was queued, and those of the runs
+    /// it superseded (linked: their messages are answered here too).
     trace_context: Option<String>,
+    superseded_traces: Vec<String>,
     conversation_id: i64,
     channel_id: i64,
     /// Trigger messages of every claimed run, oldest first.
@@ -236,6 +238,9 @@ impl Agent {
                         kind = claim.kind,
                     );
                     telemetry::continue_trace(&span, claim.trace_context.as_deref());
+                    for traceparent in &claim.superseded_traces {
+                        telemetry::link_traceparent(&span, traceparent);
+                    }
                     self.answer(claim).instrument(span).await
                 }
                 Ok(None) => return,
@@ -300,8 +305,10 @@ impl Agent {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        for (_, _, _, _, kind, _) in &runs[..runs.len() - 1] {
+        let mut superseded_traces = Vec::new();
+        for (_, _, _, _, kind, trace) in &runs[..runs.len() - 1] {
             metrics::run_finished(metrics::run_kind(kind.as_deref()), RunStatus::Superseded);
+            superseded_traces.extend(trace.clone());
         }
 
         let mut trigger_message_ids: Vec<i64> =
@@ -320,6 +327,7 @@ impl Agent {
             run_id,
             kind,
             trace_context,
+            superseded_traces,
             conversation_id,
             channel_id,
             trigger_message_ids,
@@ -339,8 +347,6 @@ impl Agent {
             Err(e) if e.is::<Expired>() => RunStatus::Expired,
             Err(_) => RunStatus::Failed,
         };
-        metrics::run_finished(claim.kind, status);
-        metrics::run_duration(claim.kind, started.elapsed());
 
         let error = result.as_ref().err().map(|e| format!("{e:#}"));
         match &error {
@@ -369,11 +375,17 @@ impl Agent {
                 "agent run failed"
             ),
         }
-        if let Err(e) = self
+        // Counted once stored: a run left `delivering` counts as interrupted at
+        // the next startup instead.
+        match self
             .finish(&claim, &record, error.as_deref(), latency_ms)
             .await
         {
-            warn!(run_id = claim.run_id, error = %e, "couldn't record agent run");
+            Ok(()) => {
+                metrics::run_finished(claim.kind, status);
+                metrics::run_duration(claim.kind, started.elapsed());
+            }
+            Err(e) => warn!(run_id = claim.run_id, error = %e, "couldn't record agent run"),
         }
         // Keep the pending emoji where Kiki chose it as her reaction.
         let mut pending = claim.trigger_message_ids.clone();

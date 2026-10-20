@@ -161,6 +161,10 @@ token counts), and the agent host every other purpose, including the topic,
 drawing and emoji jobs the ingester asks it for (never counted again from their
 results). `model` is the model the provider reports (`~typesafe/jev-latest`),
 else the configured one; anything not shaped like a model ID is `other`.
+Admins choose models and aliases resolve to new versions, so `model` isn't an
+allowlist but capped per process: the first 16 distinct values keep their name,
+later ones are `other` (`metrics::Capped` in the ingester; the agent host does
+the same).
 
 ### Ingester
 
@@ -211,7 +215,8 @@ is Discord's message timestamp → receipt, for live `MESSAGE_CREATE`s.
 - Agent runs: `kind` is the routing check that queued the run (its first
   trigger message's `classifications.check_hit`; `other` when unknown).
   `expired` runs are older than `AGENT_RUN_MAX_AGE_SECS` (stored as `failed`);
-  `interrupted` ones were cut off mid-delivery and failed at startup.
+  `interrupted` ones were cut off mid-delivery and failed at startup. Runs and
+  drawings are counted once their final status is stored, so none counts twice.
   `duration` is claim → finished, so queueing is in `kiki.reply.latency` only.
 - Agent host: one `requests` sample per POST attempt; `retries` by why the job
   is asked again (`running`: the host is still on it).
@@ -233,7 +238,8 @@ Postgres notification, so the Gateway span's context is handed over in memory
 (bounded; the router runs in the same process). Runs and drawings are queued in
 Postgres: `agent_runs.trace_context` and `agent_image_jobs.trace_context` hold
 the queuing span's W3C `traceparent` (NULL when export is off), and the task that
-picks the row up starts its span as that span's child, so one trace runs from
+picks the row up starts its span as that span's child (and links the runs it
+superseded), so one trace runs from
 the message to Kiki's reply and her drawing. A missing or malformed value starts
 a new trace.
 

@@ -201,22 +201,22 @@ impl Agent {
                 run_id = job.run_id,
                 "drawing expired before it started"
             );
-            let _ = self
+            let expired = self
                 .finish_drawing(id, "failed", Some("expired"), None, None, None)
                 .await;
-            metrics::drawing_finished(Drawing::Expired);
+            if expired.is_ok() {
+                metrics::drawing_finished(Drawing::Expired);
+            }
             return;
         }
-        let (status, error) = match self.deliver_drawing(&job).await {
+        // `Ok`: deliver_drawing persisted the outcome itself.
+        let delivered = self.deliver_drawing(&job).await;
+        let persisted = delivered.is_ok();
+        let (status, error) = match delivered {
             Ok(None) => ("done", None),
             Ok(Some(reason)) => ("failed", Some(reason)),
             Err(e) => ("failed", Some(format!("{e:#}"))),
         };
-        metrics::drawing_finished(match error.as_deref() {
-            None => Drawing::Drawn,
-            Some("refused") => Drawing::Refused,
-            Some(_) => Drawing::Failed,
-        });
         match &error {
             None => info!(image_job_id = id, run_id = job.run_id, "drawing posted"),
             Some(error) => warn!(
@@ -226,8 +226,9 @@ impl Agent {
                 "drawing failed"
             ),
         }
+        let mut persisted = persisted;
         if status == "failed" {
-            let _ = sqlx::query(
+            let failed = sqlx::query(
                 "UPDATE agent_image_jobs SET status = 'failed', error = coalesce(error, $2), \
                  finished_at = coalesce(finished_at, now()) WHERE id = $1 AND status <> 'done'",
             )
@@ -235,6 +236,16 @@ impl Agent {
             .bind(&error)
             .execute(&self.db)
             .await;
+            persisted |= failed.is_ok_and(|r| r.rows_affected() > 0);
+        }
+        // Only a stored outcome counts: a row left `delivering` counts as
+        // interrupted at the next startup instead.
+        if persisted {
+            metrics::drawing_finished(match error.as_deref() {
+                None => Drawing::Drawn,
+                Some("refused") => Drawing::Refused,
+                Some(_) => Drawing::Failed,
+            });
         }
         // The pending emoji stays on the request until the picture is there when
         // Kiki didn't ack it.

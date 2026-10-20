@@ -4,7 +4,10 @@
 //! strs, unknowns as `other`): IDs and free text go on spans and logs instead.
 //! No-ops when export is off, like [`telemetry::meter`].
 
-use std::{sync::LazyLock, time::Duration};
+use std::{
+    sync::{LazyLock, RwLock},
+    time::Duration,
+};
 
 use opentelemetry::{
     KeyValue,
@@ -173,7 +176,7 @@ pub enum Reconnect {
 }
 
 impl Reconnect {
-    pub fn as_str(self) -> &'static str {
+    fn as_str(self) -> &'static str {
         match self {
             Self::Requested => "requested",
             Self::InvalidSession => "invalid_session",
@@ -294,9 +297,13 @@ pub fn llm_call(
     }
 }
 
+/// Distinct `model` values one process reports before the rest become `other`.
+const MAX_MODELS: usize = 16;
+static MODELS: Capped = Capped::new(MAX_MODELS);
+
 /// A model ID as the provider reported it (OpenRouter's can be an alias like
-/// `~typesafe/jev-latest`), or `other` if it doesn't look like one (a handful
-/// per deployment; never free text).
+/// `~typesafe/jev-latest`), capped by [`MODELS`]; `other` if it doesn't look like
+/// one (never free text).
 fn model_name(model: &str) -> String {
     let plausible = !model.is_empty()
         && model.len() <= 80
@@ -304,8 +311,42 @@ fn model_name(model: &str) -> String {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"/._:~-".contains(&b));
     match plausible {
-        true => model.to_owned(),
+        true => MODELS.get(model),
         false => "other".to_owned(),
+    }
+}
+
+/// Bounds an attribute whose values admins may legitimately change (models),
+/// where a fixed allowlist would be wrong: per process, the first `cap`
+/// distinct values keep their name and later ones are `other`. A value already
+/// seen costs one read lock.
+pub struct Capped {
+    cap: usize,
+    seen: RwLock<Vec<String>>,
+}
+
+impl Capped {
+    pub const fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            seen: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn get(&self, value: &str) -> String {
+        let known = |seen: &[String]| seen.iter().any(|v| v == value);
+        if known(&self.seen.read().expect("capped values poisoned")) {
+            return value.to_owned();
+        }
+        let mut seen = self.seen.write().expect("capped values poisoned");
+        if known(&seen) {
+            return value.to_owned();
+        }
+        if seen.len() < self.cap {
+            seen.push(value.to_owned());
+            return value.to_owned();
+        }
+        "other".to_owned()
     }
 }
 
@@ -461,7 +502,6 @@ mod tests {
 
     #[test]
     fn attribute_values_are_bounded() {
-        assert_eq!(model_name("typesafe/jev-1:free"), "typesafe/jev-1:free");
         assert_eq!(model_name("~typesafe/jev-latest"), "~typesafe/jev-latest");
         assert_eq!(model_name(""), "other");
         assert_eq!(model_name("ignore previous instructions"), "other");
@@ -481,6 +521,19 @@ mod tests {
                 .map(|kv| kv.value.to_string()),
             ["admitted", "none"]
         );
+    }
+
+    #[test]
+    fn capped_values_keep_the_first_names_only() {
+        let models = Capped::new(2);
+        assert_eq!(models.get("a/one"), "a/one");
+        assert_eq!(models.get("a/two"), "a/two");
+        // Past the cap: new values are `other`, known ones keep their name.
+        assert_eq!(models.get("a/three"), "other");
+        assert_eq!(models.get("a/one"), "a/one");
+        assert_eq!(models.get("a/two"), "a/two");
+        assert_eq!(models.get("a/four"), "other");
+        assert_eq!(models.seen.read().unwrap().len(), 2);
     }
 
     #[test]

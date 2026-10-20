@@ -127,6 +127,13 @@ pub fn set_parent(span: &tracing::Span, parent: &Context) {
     let _ = span.set_parent(parent.clone());
 }
 
+/// Links `span` to a stored [`traceparent`]; malformed ones are ignored.
+pub fn link_traceparent(span: &tracing::Span, traceparent: &str) {
+    if let Some(context) = extract(traceparent) {
+        link(span, &context);
+    }
+}
+
 /// Links `span` to stored contexts it also serves (superseded runs, a pool's
 /// earlier messages), without making them its parent.
 pub fn link(span: &tracing::Span, context: &Context) {
