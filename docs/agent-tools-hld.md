@@ -436,7 +436,12 @@ queries are an argument error returned to the model.
   describe nothing: an event shouldn't spend on a vision model. `/kiki emojis
   resync:true` (Manage Server) replaces the list from `GET guilds/{id}/emojis` and
   describes the new ones; until then, new emoji are found by name only.
-  Descriptions survive renames, since an emoji's image never changes.
+  Descriptions survive renames, since an emoji's image never changes. Syncs of a
+  guild take turns (an advisory lock), and `guild_emoji_syncs` (migration 0029)
+  keeps the latest one's snapshot time. A sync whose list was read earlier is
+  skipped, so a resync's REST list, read before a Gateway update was applied,
+  can't bring a deleted emoji back. The table also tells a synced guild with no
+  emoji from one never synced.
 - **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
   until none are left (at most 10 minutes; the interaction token lasts 15). The host
   downloads each emoji as a 128 px PNG (the first frame if animated) and asks
@@ -465,22 +470,30 @@ queries are an argument error returned to the model.
   no ID, or a `:skull:` shortcode, which Discord never converts in a bot's
   message. So the reply agent has an output validator (`tools.check_emojis`,
   `chat/emojis.py` `check`). It compares every custom emoji and `:shortcode:`
-  against the run's catalog. It skips code (CommonMark fences and backtick runs,
-  `chat/markdown.py`), links and quotes, which aren't Kiki's own words.
+  (run together too, like `:a::b:`) against the catalog as it is when each
+  answer arrives. It skips code (CommonMark fences and backtick runs, with
+  escapes; `chat/markdown.py`), links and quotes, which aren't Kiki's own words.
+  Links are skipped conservatively, from a markdown link's `](` or a URL to the
+  next whitespace, rather than parsed: no destination can be misread, and every
+  scan stays linear. Replies over 20,000 characters aren't checked.
   - A known name is rewritten as Discord needs it: its real ID, the `a` for an
     animated emoji, and its exact name.
-  - Before anything is rejected, the catalog is reloaded once, since the Gateway
-    may have synced a new emoji during the run.
+  - The catalog is read again for every answer that writes emoji, so one the
+    Gateway added or deleted mid-run counts. That read uses the memory session's
+    connection while indexing still holds the run's.
   - An unusable emoji raises `ModelRetry`, naming close matches, while the run has
     an output retry and a model request left. A retry costs at least one request,
-    more if the model searches first. `LastRequestAnswers` offers no tools on the
-    last request the limit allows, so a retry can never push the run over it.
+    more if the model searches first. `LastRequestAnswers` sends no function tools
+    on the last request the limit allows (OpenRouter's web search and fetch stay
+    on; they run within the request), so a retry can't push the run over it.
   - Otherwise the emoji is cut. Only the gap is tidied, so code stays verbatim. A
-    `react:` line keeps its good emoji and drops leftover commas, and a line left
-    empty is dropped. A reply of nothing but bad emoji becomes `NO_REPLY`
-    (silence; a server that disallows silence fails the run rather than post them).
-  - Before a server's emoji are first synced, written-out emoji can't be checked
-    and pass. The emoji tools are offered (a toolset `prepare`) only once some are.
+    `react:` line keeps its good emoji and drops leftover commas, a line left empty
+    is dropped, and so is a `---` separator with no message left on one side.
+    The reply keeps its kind: a message left with nothing to say becomes 🙂, and a
+    reaction-only answer left with no reaction reacts 🙂. Silence instead would
+    ignore a server's `chat_allow_silence` and a direct question.
+  - Until a server's list is first synced, written-out emoji can't be checked and
+    pass. The emoji tools are offered (a toolset `prepare`) only when it has some.
 
 ## Failures and retries
 

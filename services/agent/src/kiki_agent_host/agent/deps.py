@@ -60,4 +60,3 @@ class Deps:
     # The server's custom emoji, loaded once per run: the reply's emoji are checked
     # against them (`tools.check_emojis`).
     emojis: Catalog = field(default_factory=lambda: Catalog({}, {}))
-    emojis_reloaded: bool = False

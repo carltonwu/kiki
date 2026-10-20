@@ -17,9 +17,6 @@ from . import drawing, emojis, links, memory, messages, reading
 
 logger = logging.getLogger(__name__)
 
-# Kiki's answer when she sits out; the emoji check's answer when nothing valid is left.
-NO_REPLY = "NO_REPLY"
-
 TOOLSETS = [
     messages.toolset,
     reading.toolset,
@@ -32,10 +29,11 @@ TOOLSETS = [
 
 @dataclass
 class LastRequestAnswers(AbstractCapability[Deps]):
-    """No function tools on the last request the limit allows, including ones
-    capabilities add (Skills' `load_capability`). A tool call there would need one
-    more request, and the limit would then fail the whole reply. Without tools,
-    the model has to answer."""
+    """Sends no function tools on the last request the limit allows, including
+    ones capabilities add (Skills' `load_capability`). A function tool call there
+    would need one more request, and the limit would then fail the whole reply.
+    OpenRouter's web search and fetch stay on: they run inside the request, so
+    they don't need another."""
 
     async def before_model_request(
         self, ctx: RunContext[Deps], request_context: ModelRequestContext
@@ -57,26 +55,37 @@ reply_agent = Agent(
 )
 
 
+async def current_catalog(deps: Deps) -> emoji_catalog.Catalog:
+    """The server's emoji as of now. The Gateway may have added or deleted one
+    since the run started, and the emoji tools read the table too. Read on the
+    run's connection once indexing is done; until then, on the memory session's,
+    so it doesn't wait behind indexing."""
+    if deps.indexing is None or deps.indexing.done():
+        return await emoji_catalog.catalog(deps.connection, deps.scope.guild_id)
+    async with deps.memory.lock:
+        connection = await deps.memory.connect()
+        return await emoji_catalog.catalog(connection, deps.scope.guild_id)
+
+
 @reply_agent.output_validator
 async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
     """Kiki's emoji must be the server's own, written the way Discord renders them.
 
     A known name is fixed in place: a missing or wrong ID, a missing `a` for an
-    animated emoji, or a `:name:` shortcode. Before an emoji is called invalid,
-    the catalog is reloaded once, since the Gateway may have just synced one.
-    An unusable emoji gets a retry while the run has an output retry and a model
-    request left. Otherwise it's cut, because a reply with one bad emoji beats no
-    reply. A retry costs at least one more request: more if the model searches
-    first, and `LastRequestAnswers` keeps that within the limit.
+    animated emoji, or a `:name:` shortcode. Each answer that writes emoji is
+    checked against the catalog as it is now (`current_catalog`). An unusable
+    emoji gets a retry while the run has an output retry and a model request
+    left. Otherwise it's cut (`emojis.check`'s `stripped`), keeping the reply's
+    kind: a message stays a message and a reaction stays a reaction, so a cut
+    never turns into silence the server may not allow. A retry costs at least
+    one more request, more if the model searches first, and `LastRequestAnswers`
+    keeps that within the limit.
     """
-    if ctx.partial_output:
+    if ctx.partial_output or not emoji_catalog.has_emoji(text):
         return text
     deps = ctx.deps
+    deps.emojis = await current_catalog(deps)
     checked = emoji_catalog.check(text, deps.emojis)
-    if checked.problems and not deps.emojis_reloaded:
-        deps.emojis_reloaded = True
-        deps.emojis = await emoji_catalog.catalog(deps.connection, deps.scope.guild_id)
-        checked = emoji_catalog.check(text, deps.emojis)
     if not checked.problems:
         if checked.fixed:
             logger.info("reply emoji fixed job_id=%s fixed=%d", deps.job_id, checked.fixed)
@@ -91,23 +100,25 @@ async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
             ctx.retry,
             requests_left,
         )
+        if deps.emojis.by_name:
+            how = (
+                "Only use custom emoji your emoji tools returned or the chat shows, written "
+                "exactly like <:name:id>; never write one from memory. Call search_emojis to "
+                "find one by meaning, use a Unicode emoji character, or leave it out."
+            )
+        else:
+            how = "This server has no custom emoji: use a Unicode emoji character or leave it out."
         raise ModelRetry(
             "Your reply uses emoji Discord can't show, so they would be posted as text "
             "(or, as reactions, silently left out):\n- "
             + "\n- ".join(checked.problems)
-            + "\nOnly use custom emoji your emoji tools returned or the chat shows, "
-            "written exactly like <:name:id>; never write one from memory. Call "
-            "search_emojis to find one by meaning, use a Unicode emoji character, or "
-            "leave it out. Then write your whole reply again."
+            + f"\n{how} Then write your whole reply again."
         )
-    # Nothing valid left (a reply of only bad emoji): sitting out beats posting them.
-    # A server that disallows silence fails the run rather than posting them.
-    answer = checked.stripped if checked.stripped.strip() else NO_REPLY
     logger.warning(
-        "reply emoji cut job_id=%s problems=%d fixed=%d silent=%s",
+        "reply emoji cut job_id=%s problems=%d fixed=%d stand_in=%s",
         deps.job_id,
         len(checked.problems),
         checked.fixed,
-        answer == NO_REPLY,
+        emoji_catalog.STAND_IN in checked.stripped and emoji_catalog.STAND_IN not in text,
     )
-    return answer
+    return checked.stripped

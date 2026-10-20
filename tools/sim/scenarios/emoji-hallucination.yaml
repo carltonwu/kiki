@@ -23,9 +23,12 @@ steps:
   - say: {as: alex, in: general, text: "kiki we won", reply: {text: "react: :salute:\nlets go"}}
   - expect: {run: done, reply: true, text_contains: "lets go", text_lacks: "react|salute"}
   - expect: {sql: "SELECT cardinality(reactions) FROM agent_runs ORDER BY id DESC LIMIT 1", equals: 0}
-  # Review finding 2: a reply of nothing but a bad emoji is silence, not that text.
-  - say: {as: alex, in: general, text: "kiki salute me", reply: {text: "<:salute:1>"}}
-  - expect: {run: done, reply: false}
+  # A reply of nothing but bad emoji (here split across two messages) stays a
+  # message, not that text and not silence, even where silence isn't allowed.
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "false"}}
+  - say: {as: alex, in: general, text: "kiki salute me", reply: {text: "<:salute:1>\n---\n<:salute:1>"}}
+  - expect: {run: done, reply: true, text_contains: "🙂", text_lacks: "salute|---"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_allow_silence, value: "true"}}
   # Review findings 3 and 7: links and quotes stay as written, and a react line
   # keeps its good emoji without leftover separators.
   - say:

@@ -34,12 +34,45 @@ impl Emoji {
 }
 
 /// Replaces the guild's emoji list with `emojis` (Discord's `GET
-/// guilds/{id}/emojis`). Descriptions survive renames; emoji missing from the
-/// list are marked removed, not deleted.
-pub async fn sync(db: &PgPool, guild_id: i64, emojis: &[Value]) -> sqlx::Result<Synced> {
+/// guilds/{id}/emojis`, or a Gateway event's list), as read at `snapshot_ms`
+/// (the database clock, `now_ms`; `None` for now). Descriptions survive renames;
+/// emoji missing from the list are marked removed, not deleted.
+///
+/// Syncs of one guild take turns (an advisory lock), and one whose snapshot is
+/// older than the last applied one is skipped (`None`): a resync's REST list,
+/// read before a Gateway update was applied, would bring a deleted emoji back.
+/// Records the guild as synced (`guild_emoji_syncs`), even with no emoji.
+pub async fn sync(
+    db: &PgPool,
+    guild_id: i64,
+    emojis: &[Value],
+    snapshot_ms: Option<i64>,
+) -> sqlx::Result<Option<Synced>> {
+    let mut tx = db.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('guild_emojis:' || $1, 0))")
+        .bind(guild_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    let snapshot: i64 = sqlx::query_scalar(
+        "SELECT coalesce($1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint)",
+    )
+    .bind(snapshot_ms)
+    .fetch_one(&mut *tx)
+    .await?;
+    let stale: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM guild_emoji_syncs \
+         WHERE guild_id = $1 AND snapshot_at > to_timestamp($2::double precision / 1000))",
+    )
+    .bind(guild_id)
+    .bind(snapshot)
+    .fetch_one(&mut *tx)
+    .await?;
+    if stale {
+        return Ok(None);
+    }
     // Every CTE sees the table as it was before the statement, so `before`
     // is the previous state while `upserted` and `removed` write.
-    sqlx::query_as(
+    let synced: Synced = sqlx::query_as(
         r#"
         WITH incoming AS (
             SELECT DISTINCT ON ((e->>'id')::bigint)
@@ -82,23 +115,34 @@ pub async fn sync(db: &PgPool, guild_id: i64, emojis: &[Value]) -> sqlx::Result<
     )
     .bind(guild_id)
     .bind(Json(emojis))
-    .fetch_one(db)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO guild_emoji_syncs (guild_id, snapshot_at) \
+         VALUES ($1, to_timestamp($2::double precision / 1000)) \
+         ON CONFLICT (guild_id) DO UPDATE SET snapshot_at = EXCLUDED.snapshot_at, synced_at = now()",
+    )
+    .bind(guild_id)
+    .bind(snapshot)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(synced))
 }
 
 /// Syncs from a Gateway event's `emojis` (`GUILD_CREATE` after every new session,
 /// `GUILD_EMOJIS_UPDATE` when one is added, renamed or deleted), so Kiki's emoji
 /// check (the agent host's `check_emojis`) neither rejects a new emoji nor passes
 /// a deleted one. Descriptions are still `/kiki emojis resync:true`'s: an event
-/// shouldn't spend on a vision model. `None` when the payload has no list, which
-/// would otherwise mark every emoji removed.
+/// shouldn't spend on a vision model. `None` when the payload has no list (which
+/// would otherwise mark every emoji removed) or a newer list was already applied.
 pub async fn sync_listed(
     db: &PgPool,
     guild_id: i64,
     emojis: &Value,
 ) -> sqlx::Result<Option<Synced>> {
     match emojis.as_array() {
-        Some(list) => sync(db, guild_id, list).await.map(Some),
+        Some(list) => sync(db, guild_id, list, None).await,
         None => Ok(None),
     }
 }
@@ -171,17 +215,18 @@ mod tests {
             &db,
             1,
             &[huh.clone(), oop.clone(), json!({"name": "no_id"})],
+            None,
         )
         .await
         .unwrap();
         assert_eq!(
             first,
-            Synced {
+            Some(Synced {
                 total: 2,
                 added: 2,
                 renamed: 0,
                 removed: 0
-            }
+            })
         );
         sqlx::raw_sql(
             "UPDATE guild_emojis SET description = 'confused' WHERE id = 11; \
@@ -191,13 +236,14 @@ mod tests {
         .await
         .unwrap();
         // Another server's emoji is never touched.
-        sync(&db, 2, &[json!({"id": "21", "name": "theirs"})])
+        sync(&db, 2, &[json!({"id": "21", "name": "theirs"})], None)
             .await
             .unwrap();
 
         let renamed = json!({"id": "11", "name": "huh_what"});
-        let second = sync(&db, 1, &[renamed, json!({"id": "13", "name": "new"})])
+        let second = sync(&db, 1, &[renamed, json!({"id": "13", "name": "new"})], None)
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(
             second,
@@ -231,13 +277,50 @@ mod tests {
         assert_eq!(found["huh_what"].mention(), "<:huh_what:11>");
 
         // A removed emoji that comes back counts as added, with its description.
-        let third = sync(&db, 1, &[oop]).await.unwrap();
+        let third = sync(&db, 1, &[oop], None).await.unwrap().unwrap();
         assert_eq!((third.added, third.removed), (1, 2));
         let [oop] = &list(&db, 1).await.unwrap()[..] else {
             panic!("expected one emoji");
         };
         assert_eq!(oop.mention(), "<a:oop:12>");
 
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let Some(test) = crate::test_db::migrated("emojis_order_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let huh = json!({"id": "11", "name": "huh"});
+        let fresh = json!({"id": "12", "name": "fresh"});
+        // A resync reads Discord's list (both emoji) at t=1000; meanwhile a Gateway
+        // update, read at t=2000, says fresh was deleted and is applied first.
+        let update = sync(&db, 1, std::slice::from_ref(&huh), Some(2000))
+            .await
+            .unwrap();
+        assert!(update.is_some());
+        let resync = sync(&db, 1, &[huh.clone(), fresh], Some(1000))
+            .await
+            .unwrap();
+        assert_eq!(resync, None, "the older REST list is skipped");
+        let names: Vec<String> = list(&db, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["huh"]);
+        // Another guild's syncs are ordered on their own.
+        assert!(sync(&db, 2, &[], Some(1000)).await.unwrap().is_some());
+        // A synced guild with no emoji is recorded as synced.
+        let synced: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM guild_emoji_syncs WHERE guild_id = 2")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(synced, 1);
         test.drop().await;
     }
 

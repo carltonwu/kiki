@@ -83,6 +83,12 @@ async def add(db, id, name, description=None, *, guild=GUILD, removed=False, ava
             datetime.now(UTC) if removed else None,
         ),
     )
+    # As the Gateway or a resync records it: this server's list is known.
+    await db.execute(
+        "INSERT INTO guild_emoji_syncs (guild_id, snapshot_at) VALUES (%s, now())"
+        " ON CONFLICT DO NOTHING",
+        (guild,),
+    )
 
 
 async def database_now(db) -> datetime:
@@ -327,7 +333,7 @@ def catalog_of(*rows) -> emojis.Catalog:
     for row in full:
         if emojis.usable(row):
             by_name.setdefault(row["name"].lower(), []).append(row)
-    return emojis.Catalog({r["id"]: r for r in full}, by_name)
+    return emojis.Catalog({r["id"]: r for r in full}, by_name, synced=True)
 
 
 # Shaped like production's: two emoji named huh, an animated one, a removed one.
@@ -512,13 +518,21 @@ async def test_a_retry_that_searches_stays_within_the_request_limit(database_url
     assert "search_emojis" in offered[1] and offered[2] == []
 
 
-async def test_a_reply_of_only_bad_emoji_becomes_silence(database_url, db):
-    """Finding 2: stripping to nothing brought the invalid text back."""
+async def test_a_reply_of_only_bad_emoji_keeps_its_kind(database_url, db):
+    """Round 1, finding 2, and round 2, finding 1: stripping to nothing brought
+    the invalid text back, then became silence, which a server may disallow and
+    which ignores a direct question. A message stays a message, a reaction a
+    reaction."""
     await add(db, 11, "huh", "a confused face")
-    for only in ["<:salute:1>", "react: <:salute:1>", "react: :salute:, :nope:"]:
-        assert emojis.check(only, SERVER).stripped.strip() == "", only
+    for only, kept in [
+        ("<:salute:1>", "🙂"),
+        ("react: 😂\n<:salute:1>", "react: 😂\n🙂"),
+        ("react: <:salute:1>", "react: 🙂"),
+        ("react: :salute:, :nope:", "react: 🙂"),
+    ]:
+        assert emojis.check(only, SERVER).stripped == kept, only
         text, _ = await run_turns(database_url, only)
-        assert text == "NO_REPLY", only
+        assert text == kept, only
 
 
 def test_links_and_quotes_are_left_as_written():
@@ -585,3 +599,110 @@ def test_react_lines_lose_leftover_separators():
     }
     for text, stripped in cases.items():
         assert emojis.check(text, SERVER).stripped == stripped, text
+
+
+# Second review of PR #67 (GPT-6.1-Sol), one test per finding. Finding 1 is
+# test_a_reply_of_only_bad_emoji_keeps_its_kind; finding 2 is Rust's
+# an_older_snapshot_never_overwrites_a_newer_one (services/ingester/src/emojis.rs).
+
+
+async def test_the_catalog_is_current_for_every_answer(database_url, db):
+    """Finding 3: one reload, spent on a first bad answer, left an emoji added
+    later in the run rejected, and a deleted one accepted."""
+    await add(db, 11, "huh", "a confused face")
+
+    async def gateway_adds_one():
+        await add(db, 12, "fresh")
+        return "new one <:fresh:12>"
+
+    text, offered = await run_turns(database_url, "ten <:salute:1>", gateway_adds_one)
+    assert (text, len(offered)) == ("new one <:fresh:12>", 2)
+
+    async def gateway_deletes_one():
+        await db.execute("UPDATE guild_emojis SET removed_at = now() WHERE id = 11")
+        return "same <:huh:11>"
+
+    text, _ = await run_turns(database_url, gateway_deletes_one, "same")
+    assert text == "same"
+
+
+def test_shortcodes_run_together_are_each_checked():
+    """Finding 4: `:salute::salute:` skipped the check."""
+    checked = emojis.check("ok :salute::salute:", SERVER)
+    assert len(checked.problems) == 2 and checked.stripped == "ok"
+    assert emojis.check(":huh::dstrike:", SERVER).text == (
+        "<:huh:1085017182301339648><:dstrike:700413229767327835>"
+    )
+    # Not shortcodes: a C++ path, a time, a word with colons inside.
+    for text in ["call std::vector::push_back", "at 10:30:15", "re:zero:x"]:
+        assert emojis.check(text, SERVER).problems == [], text
+
+
+def test_link_destinations_are_never_parsed_into():
+    """Findings 5 and 9: the link regex stopped at the first `)` and scanned
+    quadratically. A destination is skipped up to the next whitespace instead."""
+    for text in [
+        "[quote](https://example.com/a_(b)/:salute:)",
+        "[q](https://example.com/a_(b)/:salute:) and more",
+        "[q](:salute:)",
+    ]:
+        checked = emojis.check(text, SERVER)
+        assert (checked.text, checked.problems) == (text, []), text
+    # The link's text is Kiki's own words, so it's still checked.
+    assert emojis.check("[:salute:](https://x.com)", SERVER).problems
+
+
+def test_scans_stay_linear_on_hostile_input():
+    """Finding 9: an unmatched `[` cost 2.8 s at 40k characters."""
+    import time
+
+    from kiki_agent_host.chat import markdown
+
+    for hostile in ["[" * 200_000, "[a](" * 50_000, "`a``b```c" * 20_000, "\\`" * 100_000]:
+        started = time.monotonic()
+        markdown.protected(hostile)
+        assert time.monotonic() - started < 2, hostile[:10]
+    # The check itself skips anything longer than a reply can be.
+    huge = "[" * (emojis.MAX_CHECKED_CHARS + 1) + " <:salute:1>"
+    assert emojis.check(huge, SERVER).problems == []
+
+
+def test_messages_left_empty_between_separators_are_dropped():
+    """Finding 6: `<:salute:1>\\n---\\n<:salute:1>` stripped to `---`, which Rust
+    rejects as a reply with no message."""
+    cases = {
+        "<:salute:1>\n---\n<:salute:1>": "🙂",
+        "ok\n---\n<:salute:1>": "ok",
+        "<:salute:1>\n--- 1.5s\nok": "ok",
+        "a\n---\n<:salute:1>\n---\nb": "a\n---\nb",
+        "react: 😂\n<:salute:1>\n---\nok": "react: 😂\nok",
+        "```\n---\n```\n<:salute:1>": "```\n---\n```",
+    }
+    for text, stripped in cases.items():
+        assert emojis.check(text, SERVER).stripped == stripped, text
+
+
+async def test_a_synced_server_with_no_emoji_rejects_invented_ones(database_url, db):
+    """Finding 7: no emoji looked the same as never synced, so every invented
+    emoji was accepted forever."""
+    synced_empty = emojis.Catalog({}, {}, synced=True)
+    assert emojis.check("hey <:froge:81>", synced_empty).problems
+    assert emojis.check("hey <:froge:81>", emojis.Catalog({}, {})).problems == []
+    await db.execute(
+        "INSERT INTO guild_emoji_syncs (guild_id, snapshot_at) VALUES (%s, now())", (GUILD,)
+    )
+    Executor, seen = scripted("hey <:froge:81>")
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    assert (await executor.execute(reply_request())).text == "hey"
+    retry = seen[1][0][-1].parts[0].model_response()
+    assert "This server has no custom emoji" in retry
+
+
+def test_escaped_backticks_are_literal():
+    """Finding 8: `\\`` was read as a code delimiter."""
+    assert emojis.check("not \\`code :salute: `", SERVER).problems
+    # Escaping the first of two leaves a one-backtick opener, closed by the last.
+    assert emojis.check("\\``code :salute: `", SERVER).problems == []
+    # Inside a span, backslashes are literal: this one doesn't escape the closer.
+    assert emojis.check("`a\\` :salute:", SERVER).problems

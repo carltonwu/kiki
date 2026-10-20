@@ -350,22 +350,38 @@ def epoch_ms(value: int) -> datetime:
 # bot's message. Code, links and quotes are left as written (`markdown.protected`).
 TOKEN = re.compile(
     r"(?P<custom><(?P<a>a?):(?P<name>\w*):(?P<id>[0-9]*):?>)"
-    r"|(?<![\w:<]):(?P<code>\w{2,32}):(?![\w:])"
+    # Shortcodes, alone or run together (`:a::b:`). The run is bounded by
+    # non-colons, so `std::vector::push` isn't one.
+    r"|(?<![\w:<])(?P<codes>(?::\w{2,32}:)+)(?![\w:])"
 )
+SHORTCODE = re.compile(r":(\w{2,32}):")
+# Longer replies aren't checked (Discord's messages are 2,000 characters; a reply
+# is a few). It bounds the scan, which runs in the event loop.
+MAX_CHECKED_CHARS = 20_000
 # A cut emoji's place, until `tidy` closes the gap around it.
 CUT = "\x00"
 GAP = re.compile(r"[ \t]*\x00(?:[ \t,]*\x00)*[ \t]*")
 # A `react:` line as Rust's `delivery::plan` reads it (after a speaker label).
 REACT = re.compile(r"(\s*(?:Kiki:|\*\*Kiki\*\*:|\[Kiki\]:?)?\s*react:)(.*)", re.IGNORECASE)
+# A message boundary as `delivery::separator` reads it: `---`, or with a pause.
+SEPARATOR = re.compile(r"---(?:\s*-?[0-9]*\.?[0-9]+\s*(?:ms|s)?)?\s*")
+# Said when cutting left a reply with no message (it had one) or a reaction-only
+# answer with no reaction: a reply of a different kind than the model chose
+# (silence for a message, or a message for a reaction) would ignore what it meant
+# and, for silence, the server's `chat_allow_silence`.
+STAND_IN = "🙂"
 
 
 @dataclass(frozen=True)
 class Catalog:
     """A server's emoji as `check` needs them: every row by ID (removed ones too,
-    to say why they fail), and the usable ones by lowercase name, lowest ID first."""
+    to say why they fail), the usable ones by lowercase name, lowest ID first,
+    and whether the server's list was ever synced (`guild_emoji_syncs`), which
+    tells a server with no emoji from one whose emoji are unknown."""
 
     by_id: dict[int, dict]
     by_name: dict[str, list[dict]]
+    synced: bool = False
 
     def named(self, name: str) -> dict | None:
         """The usable emoji with this name: the exact spelling first, as Rust's
@@ -396,19 +412,28 @@ async def catalog(connection: AsyncConnection, guild_id: int) -> Catalog:
         (guild_id,),
     )
     rows = await cursor.fetchall()
+    await cursor.execute(
+        "SELECT EXISTS (SELECT 1 FROM guild_emoji_syncs WHERE guild_id = %s) AS synced",
+        (guild_id,),
+    )
+    synced = (await cursor.fetchone())["synced"]
     by_name: dict[str, list[dict]] = {}
     for row in rows:
         if usable(row):
             by_name.setdefault(row["name"].lower(), []).append(row)
-    return Catalog({r["id"]: r for r in rows}, by_name)
+    return Catalog({r["id"]: r for r in rows}, by_name, synced)
+
+
+def has_emoji(text: str) -> bool:
+    """Whether `text` writes any emoji `check` would look at (protected or not)."""
+    return len(text) <= MAX_CHECKED_CHARS and TOKEN.search(text) is not None
 
 
 @dataclass
 class Checked:
     """`text` with fixable emoji written the way Discord needs them, `problems`
     naming each one that can't be fixed (for the model), and `stripped`: `text`
-    without those, and without a `react:` line or emoji-only line left empty.
-    `stripped` may be blank when the reply was nothing but bad emoji."""
+    without those, with what the cuts left empty dropped (see `tidy`)."""
 
     text: str
     stripped: str
@@ -419,14 +444,16 @@ class Checked:
 def check(text: str, emojis: Catalog) -> Checked:
     """Checks a reply's custom emoji and `:shortcodes:` against the server's
     catalog. A known name is rewritten as `<:name:id>` with its real ID and
-    animated flag. When the server has no emoji synced, written-out custom emoji
-    can't be checked and pass. Shortcodes never render either way."""
+    animated flag. Until the server's list is first synced, written-out custom
+    emoji can't be checked and pass. Shortcodes never render either way."""
+    if len(text) > MAX_CHECKED_CHARS:
+        return Checked(text, text)
     problems: list[str] = []
 
     def custom(match: re.Match) -> str | None:
         """The emoji as it should be written, or None when it can't be used."""
         token, name, digits = match["custom"], match["name"], match["id"]
-        if not emojis.by_id:
+        if not emojis.synced:
             return token
         row = emojis.by_id.get(int(digits)) if digits and int(digits) <= MAX_ID else None
         if row is not None and not usable(row):
@@ -439,8 +466,7 @@ def check(text: str, emojis: Catalog) -> Checked:
             return None
         return written(row)
 
-    def shortcode(match: re.Match) -> str | None:
-        token, name = match[0], match["code"]
+    def shortcode(token: str, name: str) -> str | None:
         if not re.search(r"[A-Za-z]", name):
             return token  # a time like 1:30:45
         if row := emojis.named(name):
@@ -449,28 +475,36 @@ def check(text: str, emojis: Catalog) -> Checked:
             f"{token} shows as plain text: Discord doesn't turn shortcodes into emoji in "
             "your messages, so write the emoji character itself (💀, not :skull:)"
         )
-        if emojis.by_id:
+        if emojis.synced:
             problem += f", and this server has no custom emoji named {name}"
         problems.append(problem)
         return None
 
     mask = markdown.protected(text)
     kept, cut, last, fixed = [], [], 0, 0
+
+    def emit(start: int, token: str, right: str | None) -> None:
+        nonlocal last, fixed
+        before = text[last:start]
+        kept.extend([before, token if right is None else right])
+        cut.extend([before, CUT if right is None else right])
+        fixed += right is not None and right != token
+        last = start + len(token)
+
     for match in TOKEN.finditer(text):
         if any(mask[match.start() : match.end()]):
             continue
-        right = custom(match) if match["custom"] else shortcode(match)
-        if right == match[0]:
+        if match["custom"]:
+            emit(match.start(), match[0], custom(match))
             continue
-        before = text[last : match.start()]
-        kept += [before, match[0] if right is None else right]
-        cut += [before, CUT if right is None else right]
-        fixed += right is not None
-        last = match.end()
+        for code in SHORTCODE.finditer(match["codes"]):
+            emit(match.start() + code.start(), code[0], shortcode(code[0], code[1]))
     kept.append(text[last:])
     cut.append(text[last:])
     result = "".join(kept)
-    return Checked(result, tidy("".join(cut)) if problems else result, problems, fixed)
+    if not problems:
+        return Checked(result, result, problems, fixed)
+    return Checked(result, tidy("".join(cut), had_message=has_message(text)), problems, fixed)
 
 
 def unknown(token: str, name: str, emojis: Catalog) -> str:
@@ -480,11 +514,22 @@ def unknown(token: str, name: str, emojis: Catalog) -> str:
     return problem
 
 
-def tidy(text: str) -> str:
+def has_message(text: str) -> bool:
+    """Whether Rust's `delivery::plan` would find a message in `text`: a line
+    that's neither blank, a `react:` line nor a `---` separator."""
+    return any(
+        line.strip() and not REACT.fullmatch(line) and not SEPARATOR.fullmatch(line.strip())
+        for line in text.split("\n")
+    )
+
+
+def tidy(text: str, *, had_message: bool) -> str:
     """Closes the gaps cut emoji left (`CUT`), touching only those lines and
     only around the cuts, so code elsewhere stays verbatim. A `react:` line
-    keeps its other emoji, single-spaced. Drops one left with none, which Rust
-    would post as text, and a line that held only cut emoji."""
+    keeps its other emoji, single-spaced, and is dropped when none are left
+    (Rust would post it as text); so is a line that held only cut emoji, and a
+    message left empty between `---` separators. A reply left with nothing of
+    the kind the model wrote gets `STAND_IN`."""
     lines = []
     for line in text.split("\n"):
         if CUT not in line:
@@ -499,7 +544,36 @@ def tidy(text: str) -> str:
         elif not line.strip():
             continue
         lines.append(line)
+    lines = without_empty_messages(lines)
+    reactions = [line for line in lines if REACT.fullmatch(line)]
+    if had_message and not has_message("\n".join(lines)):
+        lines.append(STAND_IN)
+    elif not had_message and not reactions and not has_message("\n".join(lines)):
+        lines.append(f"react: {STAND_IN}")
     return "\n".join(lines)
+
+
+def without_empty_messages(lines: list[str]) -> list[str]:
+    """Drops `---` separators that no longer separate two messages (one side is
+    empty), keeping every `react:` line. Separators in code are text."""
+    in_code = markdown.fence_lines("\n".join(lines))
+    parts: list[tuple[str | None, list[str]]] = [(None, [])]
+    for i, line in enumerate(lines):
+        if not in_code[i] and SEPARATOR.fullmatch(line.strip()):
+            parts.append((line, []))
+        else:
+            parts[-1][1].append(line)
+    out: list[str] = []
+    said = False
+    for separator, part in parts:
+        if has_message("\n".join(part)):
+            if said and separator is not None:
+                out.append(separator)
+            out.extend(part)
+            said = True
+        else:
+            out.extend(line for line in part if REACT.fullmatch(line))
+    return out
 
 
 def join_gap(gap: re.Match) -> str:
