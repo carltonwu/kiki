@@ -49,7 +49,7 @@ If the host job still fails, for this or any other reason, Rust marks the run
 delivering and posts `(couldn't answer that one, try again?)` in place of the
 reply (`Agent::post_failure_note`). The run is still recorded as failed; a crash
 after the send fails it at startup rather than posting the note again. The run is
-flagged `failure_note` (migration 0031) before the send, and every prompt
+flagged `failure_note` (migration 0033) before the send, and every prompt
 source leaves out the messages such a run posted: the conversation, what a
 message replies to, recent channel context, Jev's routing context and the
 host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). Kiki's own words are

@@ -123,7 +123,7 @@ async def test_pages_stop_before_flooding_the_context(db, monkeypatch):
 
 async def test_failure_notes_are_left_out_by_the_run_that_posted_them(db):
     """The ingester's "(couldn't answer that one, try again?)" isn't Kiki's words
-    (migration 0031): no tool reads it back. Her own reply with that text is hers."""
+    (migration 0033): no tool reads it back. Her own reply with that text is hers."""
     note = "(couldn't answer that one, try again?)"
     await add(db, 20, "help kiki where my meme at", minute=0)
     await add(db, 21, note, minute=1, bot=True)
