@@ -14,7 +14,7 @@ from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.api.app import create_app
 from kiki_agent_host.chat import emojis
 from kiki_agent_host.config import Settings
-from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult
+from kiki_agent_host.contracts import DescribeEmojisRequest, DescribeEmojisResult, JobRequest
 from kiki_agent_host.media import fetch
 from kiki_agent_host.openrouter.embeddings import Embedder
 
@@ -314,3 +314,135 @@ async def test_each_description_is_charged_when_it_is_made(db):
     assert await cursor.fetchall() == [(11, GUILD, 0.25), (11, GUILD, 0.125)]
     cursor = await db.execute("SELECT describe_cost_usd FROM guild_emojis WHERE id = 11")
     assert (await cursor.fetchone())[0] == 0.375
+
+
+def catalog_of(*rows) -> emojis.Catalog:
+    """A catalog from (id, name, animated, available, removed) rows."""
+    full = [
+        dict(zip(["id", "name", "animated", "available", "removed"], row, strict=True))
+        for row in rows
+    ]
+    by_name: dict[str, list[dict]] = {}
+    for row in full:
+        if emojis.usable(row):
+            by_name.setdefault(row["name"].lower(), []).append(row)
+    return emojis.Catalog({r["id"]: r for r in full}, by_name)
+
+
+# Shaped like production's: two emoji named huh, an animated one, a removed one.
+SERVER = catalog_of(
+    (700413229767327835, "dstrike", False, True, False),
+    (1085017182301339648, "huh", False, True, False),
+    (1136064129405305052, "huh", True, True, False),
+    (1444819174172922043, "gape_ape", True, True, False),
+    (13, "oop", False, True, True),
+    (14, "boosted", False, False, False),
+)
+
+
+def test_check_fixes_known_names_and_flags_invented_emoji():
+    # reply:401 and reply:406 (2026-10-20): an invented emoji, then the same one
+    # copied from how Discord stored it, without an ID.
+    for invented in ["the L i deserved <:salute:1>", "certified <:salute:>"]:
+        checked = emojis.check(invented, SERVER)
+        assert checked.problems and "no custom emoji named salute" in checked.problems[0]
+        assert "salute" not in checked.stripped
+    # reply:72 (2026-10-18): a real name without its ID is fixed, not rejected.
+    checked = emojis.check("Ethan's <:huh:> reply", SERVER)
+    assert (checked.text, checked.problems, checked.fixed) == (
+        "Ethan's <:huh:1085017182301339648> reply",
+        [],
+        1,
+    )
+    # A wrong animated flag or name for a real ID, and a shortcode that names one.
+    checked = emojis.check("<:gape_ape:1444819174172922043> <:DSTRIKE:700413229767327835:>", SERVER)
+    assert checked.text == "<a:gape_ape:1444819174172922043> <:dstrike:700413229767327835>"
+    assert emojis.check("react: :dstrike:", SERVER).text == "react: <:dstrike:700413229767327835>"
+    # Already right: untouched.
+    fine = "ok <:dstrike:700413229767327835> 💀 <a:huh:1136064129405305052>"
+    assert emojis.check(fine, SERVER) == emojis.Checked(fine, fine)
+
+
+def test_check_flags_shortcodes_removed_and_unavailable_emoji():
+    checked = emojis.check("lmao :skull:", SERVER)
+    assert "plain text" in checked.problems[0] and checked.stripped == "lmao"
+    removed = emojis.check("<:oop:13> <:boosted:14>", SERVER).problems
+    assert ["removed" in removed[0], "unavailable" in removed[1]] == [True, True]
+    # Close names help the model pick a real one.
+    assert "<:dstrike:700413229767327835>" in emojis.check("<:dstrik:5>", SERVER).problems[0]
+    # Times, ratios, code and URLs aren't emoji.
+    for text in ["meet at 1:30:45", "`:salute:`", "```\n<:salute:1>\n```", "https://x.com/a:b"]:
+        assert emojis.check(text, SERVER).problems == [], text
+
+
+def test_check_without_a_synced_catalog_passes_written_emoji():
+    nothing = emojis.Catalog({}, {})
+    assert emojis.check("<:froge:81>", nothing).problems == []
+    assert emojis.check(":froge:", nothing).problems  # never renders, synced or not
+
+
+def test_cutting_emoji_leaves_no_empty_react_line():
+    checked = emojis.check("react: <:salute:1>\nten\n---\nreact: 😂 :skull:\nbye", SERVER)
+    assert checked.stripped == "ten\n---\nreact: 😂\nbye"
+
+
+def reply_request(text="alex: rate my outfit"):
+    return JobRequest.model_validate(
+        {
+            "id": "reply:1",
+            "kind": "reply",
+            "scope": {"guild_id": str(GUILD), "channel_id": "2", "conversation_id": "1"},
+            "model": "test/model",
+            "messages": [
+                {"role": "system", "content": "You are Kiki."},
+                {"role": "user", "content": text},
+            ],
+            "max_output_tokens": 100,
+            "people": [],
+        }
+    )
+
+
+def scripted(*answers):
+    """A model that answers with `answers` in turn, recording what it was told."""
+    seen = []
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        seen.append((messages, [t.name for t in info.function_tools]))
+        return ModelResponse(parts=[TextPart(answers[min(len(seen), len(answers)) - 1])])
+
+    class TestExecutor(PydanticExecutor):
+        web_tools = ()
+
+        def model(self, name):
+            return FunctionModel(respond)
+
+    return TestExecutor, seen
+
+
+async def test_reply_with_an_invented_emoji_is_retried_then_cut(database_url, db):
+    await add(db, 11, "huh", "a confused face")
+    Executor, seen = scripted("ten <:salute:1>", "ten <:huh:11>")
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    result = await executor.execute(reply_request())
+    assert result.text == "ten <:huh:11>"
+    retry = seen[1][0][-1].parts[0]
+    assert "no custom emoji named salute" in retry.model_response()
+    assert {"search_emojis", "find_emoji"} <= set(seen[0][1])
+
+    # A model that won't fix it: the emoji is cut rather than losing the reply.
+    Executor, seen = scripted("ten <:salute:1>")
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    assert (await executor.execute(reply_request())).text == "ten"
+    assert len(seen) == 2
+
+
+async def test_emoji_tools_are_offered_only_once_emoji_are_synced(database_url):
+    Executor, seen = scripted("hey <:froge:81>")
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    # Nothing synced: no emoji tools, and written-out emoji can't be checked.
+    assert (await executor.execute(reply_request())).text == "hey <:froge:81>"
+    assert not {"search_emojis", "find_emoji"} & set(seen[0][1])

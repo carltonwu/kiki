@@ -187,6 +187,9 @@ class PydanticExecutor:
                         image_model=request.image_model,
                         memory=MemorySession(self.database_url),
                     )
+                    # Before indexing starts on this connection: the emoji tools'
+                    # prepare and the reply's check use it without waiting behind it.
+                    deps.emojis = await emojis.catalog(connection, scope.guild_id)
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))

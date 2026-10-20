@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from psycopg import AsyncConnection
 
 from .. import db
+from ..chat.emojis import Catalog
 from ..chat.scope import Roster, Scope
 from ..chat.search import Semantic
 from ..contracts import Drawing
@@ -54,3 +55,6 @@ class Deps:
     spent: Counter[str] = field(default_factory=Counter)
     indexing: asyncio.Task[Semantic] | None = None
     drawings: list[Drawing] = field(default_factory=list)
+    # The server's custom emoji, loaded once per run: the reply's emoji are checked
+    # against them (`tools.check_emojis`).
+    emojis: Catalog = field(default_factory=lambda: Catalog({}, {}))
