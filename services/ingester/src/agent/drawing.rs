@@ -14,13 +14,17 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::Context as _;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use super::{
     Agent, Claim, RunRecord,
     context::Context,
     delivery, discord,
     host::{self, ImageJobRequest, ImageRef},
+};
+use crate::{
+    metrics::{self, Drawing},
+    telemetry,
 };
 
 /// Posted when the host couldn't even write Kiki's own note (host down, or the
@@ -37,6 +41,8 @@ struct Job {
     request: ImageJobRequest,
     expired: bool,
     queued_ms: i64,
+    /// The `traceparent` of the run that queued it.
+    trace_context: Option<String>,
 }
 
 /// `drawing` with the images shared with the request that it doesn't use yet
@@ -109,13 +115,14 @@ impl Agent {
                 drawing: with_shared(drawing, &context.shared),
             };
             sqlx::query(
-                "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (run_id, position) DO NOTHING",
+                "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, trace_context) \
+                 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (run_id, position) DO NOTHING",
             )
             .bind(claim.run_id)
             .bind(n as i16 + 1)
             .bind(context.reply_to)
             .bind(serde_json::to_value(&request)?)
+            .bind(telemetry::traceparent())
             .execute(&self.db)
             .await?;
         }
@@ -152,12 +159,16 @@ impl Agent {
     /// At startup: a drawing cut off mid-send may have posted, so it fails; one
     /// cut off while drawing is drawn again (the host returns its saved image).
     pub(super) async fn recover_drawings(&self) -> sqlx::Result<()> {
-        sqlx::query(
+        let interrupted = sqlx::query(
             "UPDATE agent_image_jobs SET status = 'failed', error = 'interrupted', \
              finished_at = now() WHERE status = 'delivering'",
         )
         .execute(&self.db)
-        .await?;
+        .await?
+        .rows_affected();
+        for _ in 0..interrupted {
+            metrics::drawing_finished(Drawing::Interrupted);
+        }
         sqlx::query("UPDATE agent_image_jobs SET status = 'pending' WHERE status = 'drawing'")
             .execute(&self.db)
             .await?;
@@ -176,18 +187,32 @@ impl Agent {
                 );
             }
         };
+        // Continues the trace of the run that queued it.
+        let span = info_span!("drawing", image_job_id = id, run_id = job.run_id);
+        telemetry::continue_trace(&span, job.trace_context.as_deref());
+        self.draw_claimed(job).instrument(span).await;
+    }
+
+    async fn draw_claimed(&self, job: Job) {
+        let id = job.id;
         if job.expired {
             info!(
                 image_job_id = id,
                 run_id = job.run_id,
                 "drawing expired before it started"
             );
-            let _ = self
+            let expired = self
                 .finish_drawing(id, "failed", Some("expired"), None, None, None)
                 .await;
+            if expired.is_ok() {
+                metrics::drawing_finished(Drawing::Expired);
+            }
             return;
         }
-        let (status, error) = match self.deliver_drawing(&job).await {
+        // `Ok`: deliver_drawing persisted the outcome itself.
+        let delivered = self.deliver_drawing(&job).await;
+        let persisted = delivered.is_ok();
+        let (status, error) = match delivered {
             Ok(None) => ("done", None),
             Ok(Some(reason)) => ("failed", Some(reason)),
             Err(e) => ("failed", Some(format!("{e:#}"))),
@@ -201,8 +226,9 @@ impl Agent {
                 "drawing failed"
             ),
         }
+        let mut persisted = persisted;
         if status == "failed" {
-            let _ = sqlx::query(
+            let failed = sqlx::query(
                 "UPDATE agent_image_jobs SET status = 'failed', error = coalesce(error, $2), \
                  finished_at = coalesce(finished_at, now()) WHERE id = $1 AND status <> 'done'",
             )
@@ -210,6 +236,16 @@ impl Agent {
             .bind(&error)
             .execute(&self.db)
             .await;
+            persisted |= failed.is_ok_and(|r| r.rows_affected() > 0);
+        }
+        // Only a stored outcome counts: a row left `delivering` counts as
+        // interrupted at the next startup instead.
+        if persisted {
+            metrics::drawing_finished(match error.as_deref() {
+                None => Drawing::Drawn,
+                Some("refused") => Drawing::Refused,
+                Some(_) => Drawing::Failed,
+            });
         }
         // The pending emoji stays on the request until the picture is there when
         // Kiki didn't ack it.
@@ -226,16 +262,17 @@ impl Agent {
     }
 
     async fn claim_drawing(&self, id: i64) -> anyhow::Result<Option<Job>> {
-        let row: Option<(i64, i64, serde_json::Value, bool, i64)> = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let row: Option<(i64, i64, serde_json::Value, bool, i64, Option<String>)> = sqlx::query_as(
             "UPDATE agent_image_jobs SET status = 'drawing' WHERE id = $1 AND status = 'pending' \
              RETURNING run_id, reply_to_id, request, created_at < now() - make_interval(secs => $2), \
-                       (extract(epoch FROM created_at) * 1000)::bigint",
+                       (extract(epoch FROM created_at) * 1000)::bigint, trace_context",
         )
         .bind(id)
         .bind(MAX_AGE.as_secs_f64())
         .fetch_optional(&self.db)
         .await?;
-        let Some((run_id, reply_to, request, expired, queued_ms)) = row else {
+        let Some((run_id, reply_to, request, expired, queued_ms, trace_context)) = row else {
             return Ok(None);
         };
         Ok(Some(Job {
@@ -245,6 +282,7 @@ impl Agent {
             request: serde_json::from_value(request)?,
             expired,
             queued_ms,
+            trace_context,
         }))
     }
 
@@ -329,6 +367,7 @@ impl Agent {
             &messages,
             &attachments,
             true,
+            metrics::Send::Drawing,
             &mut record,
         )
         .await

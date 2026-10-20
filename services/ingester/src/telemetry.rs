@@ -6,10 +6,15 @@
 //! standard variables themselves (`OTEL_EXPORTER_OTLP_HEADERS`, percent-decoded,
 //! and the timeouts).
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use futures_util::future::join_all;
-use opentelemetry::{KeyValue, global, metrics::Meter, trace::TracerProvider as _};
+use opentelemetry::{
+    Context, KeyValue, global,
+    metrics::Meter,
+    propagation::TextMapPropagator,
+    trace::{TraceContextExt, TracerProvider as _},
+};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{LogExporter, MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::{
@@ -98,6 +103,78 @@ pub fn trace_headers() -> HashMap<String, String> {
     let context = tracing::Span::current().context();
     global::get_text_map_propagator(|propagator| propagator.inject_context(&context, &mut headers));
     headers
+}
+
+/// The current span's W3C `traceparent`, to store with work another task picks
+/// up from Postgres (`agent_runs.trace_context`, `agent_image_jobs.trace_context`).
+/// `None` when export is off or there's no span.
+pub fn traceparent() -> Option<String> {
+    let mut headers = HashMap::new();
+    TraceContextPropagator::new().inject_context(&tracing::Span::current().context(), &mut headers);
+    headers.remove("traceparent")
+}
+
+/// Makes `span` a child of a stored [`traceparent`]. Missing or malformed
+/// context leaves it as it was. Call before the span is first entered.
+pub fn continue_trace(span: &tracing::Span, traceparent: Option<&str>) {
+    if let Some(parent) = traceparent.and_then(extract) {
+        set_parent(span, &parent);
+    }
+}
+
+/// Makes `span` a child of `parent`. Call before the span is first entered.
+pub fn set_parent(span: &tracing::Span, parent: &Context) {
+    let _ = span.set_parent(parent.clone());
+}
+
+/// Links `span` to a stored [`traceparent`]; malformed ones are ignored.
+pub fn link_traceparent(span: &tracing::Span, traceparent: &str) {
+    if let Some(context) = extract(traceparent) {
+        link(span, &context);
+    }
+}
+
+/// Links `span` to stored contexts it also serves (superseded runs, a pool's
+/// earlier messages), without making them its parent.
+pub fn link(span: &tracing::Span, context: &Context) {
+    span.add_link(context.span().span_context().clone());
+}
+
+fn extract(traceparent: &str) -> Option<Context> {
+    let carrier = HashMap::from([("traceparent".to_owned(), traceparent.to_owned())]);
+    let context = TraceContextPropagator::new().extract(&carrier);
+    context.span().span_context().is_valid().then_some(context)
+}
+
+/// Each live message's Gateway span, until the router picks it up from the
+/// `message_inserted` notification, so classification continues its trace.
+/// Holds only valid contexts (none when export is off); bounded.
+static MESSAGE_TRACES: Mutex<Vec<(i64, Context)>> = Mutex::new(Vec::new());
+const MESSAGE_TRACES_MAX: usize = 1000;
+
+/// Remembers the current span as `message_id`'s.
+pub fn remember_message(message_id: i64) {
+    let context = tracing::Span::current().context();
+    if !context.span().span_context().is_valid() {
+        return;
+    }
+    remember(message_id, context);
+}
+
+fn remember(message_id: i64, context: Context) {
+    let mut traces = MESSAGE_TRACES.lock().expect("message traces poisoned");
+    // Notifications that never come (lost while the listener reconnected) age out.
+    if traces.len() >= MESSAGE_TRACES_MAX {
+        traces.drain(..MESSAGE_TRACES_MAX / 2);
+    }
+    traces.push((message_id, context));
+}
+
+/// The span [`remember_message`] stored for `message_id`, once.
+pub fn take_message(message_id: i64) -> Option<Context> {
+    let mut traces = MESSAGE_TRACES.lock().expect("message traces poisoned");
+    let i = traces.iter().rposition(|(id, _)| *id == message_id)?;
+    Some(traces.remove(i).1)
 }
 
 impl Telemetry {
@@ -268,6 +345,64 @@ mod tests {
         assert!(enabled(env(&[endpoint])));
         assert!(enabled(env(&[endpoint, ("OTEL_SDK_DISABLED", "false")])));
         assert!(!enabled(env(&[endpoint, ("OTEL_SDK_DISABLED", "TRUE")])));
+    }
+
+    #[test]
+    fn stored_trace_context_round_trips_and_garbage_is_ignored() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+
+        let span = SpanContext::new(
+            TraceId::from_hex("4bf92f3577b34da6a3ce929d0e0e4736").unwrap(),
+            SpanId::from_hex("00f067aa0ba902b7").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+        let mut carrier = HashMap::new();
+        TraceContextPropagator::new().inject_context(
+            &Context::new().with_remote_span_context(span.clone()),
+            &mut carrier,
+        );
+        let stored = &carrier["traceparent"];
+        assert_eq!(
+            stored,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        let parent = extract(stored).unwrap();
+        assert_eq!(parent.span().span_context(), &span);
+
+        for garbage in ["", "nonsense", "00-0000-00f067aa0ba902b7-01", "ff-x-y-z"] {
+            assert!(extract(garbage).is_none(), "{garbage}");
+        }
+        // No OpenTelemetry layer (export off): nothing to store or remember.
+        assert_eq!(traceparent(), None);
+        remember_message(1);
+        assert!(take_message(1).is_none());
+        // Harmless on a span that isn't exported.
+        continue_trace(&tracing::Span::none(), Some(stored));
+        continue_trace(&tracing::Span::none(), Some("nonsense"));
+    }
+
+    #[test]
+    fn message_traces_are_taken_once_and_bounded() {
+        let context =
+            Context::new().with_remote_span_context(opentelemetry::trace::SpanContext::new(
+                opentelemetry::trace::TraceId::from(1),
+                opentelemetry::trace::SpanId::from(2),
+                opentelemetry::trace::TraceFlags::SAMPLED,
+                true,
+                Default::default(),
+            ));
+        remember(-7, context.clone());
+        for id in 0..MESSAGE_TRACES_MAX as i64 {
+            remember(-1_000_000 - id, context.clone());
+        }
+        // The oldest half went to make room.
+        assert!(take_message(-7).is_none());
+        remember(-7, context);
+        assert!(take_message(-7).is_some());
+        assert!(take_message(-7).is_none());
+        assert!(MESSAGE_TRACES.lock().unwrap().len() <= MESSAGE_TRACES_MAX);
     }
 
     #[test]

@@ -1,13 +1,20 @@
 //! Sending Kiki's reply to Discord, and tagging it into the conversation.
 
+use std::time::Duration;
+
 use anyhow::{Context as _, ensure};
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, field::Empty, info_span, warn};
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::{channel::message::AllowedMentions, http::attachment::Attachment, id::Id};
 
 use super::{Agent, RunRecord, context::Context, emoji::Reaction, host::ImageRef};
-use crate::{guild_settings::reply_channel, store};
+use crate::{
+    guild_settings::reply_channel,
+    metrics::{self, Send},
+    router::unix_millis,
+    store,
+};
 
 /// Discord allows 2000 characters per message; leave room for safety.
 pub(super) const MAX_MESSAGE_CHARS: usize = 1900;
@@ -70,6 +77,9 @@ impl Agent {
     /// instead, its first message pinging the author with a link back.
     ///
     /// Sends aren't retried: a retry after a timeout could post the reply twice.
+    ///
+    /// A reply's first message sent ends `kiki.reply.latency`, from when Discord
+    /// created the message it answers.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn send(
         &self,
@@ -79,6 +89,7 @@ impl Agent {
         plan: &[super::delivery::Message],
         images: &[Attachment],
         reference: bool,
+        kind: Send,
         record: &mut RunRecord,
     ) -> anyhow::Result<()> {
         let target = self
@@ -126,13 +137,42 @@ impl Agent {
                     .reply(Id::new(context.reply_to as u64))
                     .fail_if_not_exists(false);
             }
-            let response = request.await.context("sending reply")?;
-            let bytes = response.bytes().await.context("reading sent message")?;
-            let message: Value = serde_json::from_slice(&bytes).context("parsing sent message")?;
-            let id: i64 = message["id"]
-                .as_str()
-                .and_then(|id| id.parse().ok())
-                .context("sent message has no id")?;
+            let span = info_span!(
+                "discord_send",
+                otel.kind = "client",
+                kind = kind.as_str(),
+                channel_id = target.channel_id,
+                reply_to = context.reply_to,
+                message_id = Empty,
+            );
+            let sent = async {
+                let response = request.await.context("sending reply")?;
+                let bytes = response.bytes().await.context("reading sent message")?;
+                let message: Value =
+                    serde_json::from_slice(&bytes).context("parsing sent message")?;
+                let id: i64 = message["id"]
+                    .as_str()
+                    .and_then(|id| id.parse().ok())
+                    .context("sent message has no id")?;
+                anyhow::Ok((message, id))
+            }
+            .instrument(span.clone())
+            .await;
+            let (message, id) = match sent {
+                Ok(sent) => sent,
+                Err(e) => {
+                    metrics::send_error(kind);
+                    return Err(e);
+                }
+            };
+            span.record("message_id", id);
+            metrics::message_sent(kind);
+            if kind == Send::Reply && i == 0 {
+                let created = metrics::snowflake_ms(context.reply_to);
+                metrics::reply_latency(Duration::from_millis(
+                    (unix_millis() - created).max(0) as u64
+                ));
+            }
             record.reply_message_ids.push(id);
 
             let mut tx = self.db.begin().await?;
@@ -180,7 +220,9 @@ impl Agent {
                 Id::new(message_id as u64),
                 &emoji,
             );
-            match request.await {
+            let result = request.await;
+            metrics::reaction(result.is_ok());
+            match result {
                 Ok(_) => {
                     record.reactions.push(reaction.to_string());
                     record.reacted_to = Some(message_id);

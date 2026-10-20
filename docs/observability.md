@@ -155,6 +155,16 @@ attribute. Cost comes from OpenRouter's `usage.cost`. Tokens are a counter, not
 semconv's `gen_ai.client.token.usage` histogram: per-call distributions aren't
 worth ten buckets per purpose and model; rates and totals are what we read.
 Cost keeps the currency in its name: the annotation unit `{USD}` adds no suffix.
+`kiki.llm.*` is recorded where the model is called: the ingester calls only Jev
+(`purpose=jev`, **live**: calls, cost and duration; the Decisions API reports no
+token counts), and the agent host every other purpose, including the topic,
+drawing and emoji jobs the ingester asks it for (never counted again from their
+results). `model` is the model the provider reports (`~typesafe/jev-latest`),
+else the configured one; anything not shaped like a model ID is `other`.
+Admins choose models and aliases resolve to new versions, so `model` isn't an
+allowlist but capped per process: the first 16 distinct values keep their name,
+later ones are `other` (`metrics::Capped` in the ingester; the agent host does
+the same).
 
 In the agent host these are **live** for every purpose but `jev` (the ingester's).
 Each is recorded where the call is made, with the model actually called (the
@@ -176,35 +186,78 @@ way still shows as an `interrupted` job.
 
 | Metric | Type | Unit | Attributes | Prometheus |
 |---|---|---|---|---|
-| `kiki.gateway.events` | counter | `{event}` | `type` (handled Gateway events, else `other`) | `kiki_gateway_events_total` |
-| `kiki.gateway.reconnects` | counter | `{reconnect}` | `reason` | `kiki_gateway_reconnects_total` |
-| `kiki.gateway.lag` | histogram | `s` | | `kiki_gateway_lag_seconds_*` |
-| `kiki.gateway.store_errors` | counter | `{error}` | | `kiki_gateway_store_errors_total` |
-| `kiki.messages.ingested` | counter | `{message}` | `author=human\|bot\|kiki` | `kiki_messages_ingested_total` |
-| `kiki.router.admissions` | counter | `{message}` | `result`, `reason` | `kiki_router_admissions_total` |
-| `kiki.router.classifications` | counter | `{pool}` | `check`, `outcome` | `kiki_router_classifications_total` |
-| `kiki.jev.confidence` | histogram | `1` | | `kiki_jev_confidence_*` |
-| `kiki.agent_runs.queued` | counter | `{run}` | `kind` | `kiki_agent_runs_queued_total` |
-| `kiki.agent_runs.finished` | counter | `{run}` | `kind`, `status=done\|failed\|superseded\|expired\|interrupted` | `kiki_agent_runs_finished_total` |
-| `kiki.agent_run.duration` | histogram | `s` | `kind` | `kiki_agent_run_duration_seconds_*` |
-| `kiki.agent.workers.active` | gauge | `{worker}` | | `kiki_agent_workers_active` |
-| `kiki.agent_host.requests` | counter | `{request}` | `endpoint=jobs\|images\|emojis`, `status` (HTTP code, or `error`) | `kiki_agent_host_requests_total` |
-| `kiki.agent_host.retries` | counter | `{retry}` | `reason` | `kiki_agent_host_retries_total` |
-| `kiki.drawings.finished` | counter | `{drawing}` | `outcome` | `kiki_drawings_finished_total` |
-| `kiki.conversations.started` | counter | `{conversation}` | | `kiki_conversations_started_total` |
-| `kiki.conversations.closed` | counter | `{conversation}` | `reason` | `kiki_conversations_closed_total` |
-| `kiki.conversation.messages` | histogram | `{message}` | (recorded at close) | `kiki_conversation_messages_*` |
-| `kiki.discord.messages_sent` | counter | `{message}` | `kind` | `kiki_discord_messages_sent_total` |
-| `kiki.discord.send_errors` | counter | `{error}` | `kind` | `kiki_discord_send_errors_total` |
-| `kiki.discord.reactions` | counter | `{reaction}` | `result` | `kiki_discord_reactions_total` |
-| `kiki.discord.rest.retries` | counter | `{retry}` | `reason` | `kiki_discord_rest_retries_total` |
-| `kiki.reply.latency` | histogram | `s` | | `kiki_reply_latency_seconds_*` |
+| `kiki.gateway.events` | counter | `{event}` | `type` (Discord's dispatch name, e.g. `MESSAGE_CREATE`, for the 15 handled; else `other`) | `kiki_gateway_events_total` — **live** |
+| `kiki.gateway.reconnects` | counter | `{reconnect}` | `reason=requested\|invalid_session\|transport\|closed` | `kiki_gateway_reconnects_total` — **live** |
+| `kiki.gateway.lag` | histogram | `s` | | `kiki_gateway_lag_seconds_*` — **live** |
+| `kiki.gateway.store_errors` | counter | `{error}` | | `kiki_gateway_store_errors_total` — **live** |
+| `kiki.messages.ingested` | counter | `{message}` | `author=human\|bot\|kiki` | `kiki_messages_ingested_total` — **live** |
+| `kiki.router.admissions` | counter | `{message}` | `result=admitted\|skipped`, `reason=none\|bot\|other_guild\|too_old\|channel_not_allowed\|unparseable` | `kiki_router_admissions_total` — **live** |
+| `kiki.router.classifications` | counter | `{pool}` | `check=reply\|mention\|keyword\|active_conversation\|none`, `outcome=continue\|new\|no` | `kiki_router_classifications_total` — **live** |
+| `kiki.jev.confidence` | histogram | `1` | | `kiki_jev_confidence_*` — **live** |
+| `kiki.agent_runs.queued` | counter | `{run}` | `kind=reply\|mention\|keyword\|active_conversation\|other` | `kiki_agent_runs_queued_total` — **live** |
+| `kiki.agent_runs.finished` | counter | `{run}` | `kind`, `status=done\|failed\|superseded\|expired\|interrupted` | `kiki_agent_runs_finished_total` — **live** |
+| `kiki.agent_run.duration` | histogram | `s` | `kind` | `kiki_agent_run_duration_seconds_*` — **live** |
+| `kiki.agent.workers.active` | gauge | `{worker}` | | `kiki_agent_workers_active` — **live** |
+| `kiki.agent_host.requests` | counter | `{request}` | `endpoint=jobs\|images\|emojis`, `status` (HTTP code, or `error`) | `kiki_agent_host_requests_total` — **live** |
+| `kiki.agent_host.retries` | counter | `{retry}` | `reason=timeout\|connection\|http\|running` | `kiki_agent_host_retries_total` — **live** |
+| `kiki.drawings.finished` | counter | `{drawing}` | `outcome=drawn\|refused\|failed\|expired\|interrupted` | `kiki_drawings_finished_total` — **live** |
+| `kiki.conversations.started` | counter | `{conversation}` | | `kiki_conversations_started_total` — **live** |
+| `kiki.conversations.closed` | counter | `{conversation}` | `reason=evicted\|cleared` | `kiki_conversations_closed_total` — **live** |
+| `kiki.conversation.messages` | histogram | `{message}` | (recorded at close) | `kiki_conversation_messages_*` — **live** |
+| `kiki.discord.messages_sent` | counter | `{message}` | `kind=reply\|drawing` | `kiki_discord_messages_sent_total` — **live** |
+| `kiki.discord.send_errors` | counter | `{error}` | `kind` | `kiki_discord_send_errors_total` — **live** |
+| `kiki.discord.reactions` | counter | `{reaction}` | `result=ok\|error` | `kiki_discord_reactions_total` — **live** |
+| `kiki.discord.rest.retries` | counter | `{retry}` | `reason=rate_limit\|server\|network` | `kiki_discord_rest_retries_total` — **live** |
+| `kiki.reply.latency` | histogram | `s` | | `kiki_reply_latency_seconds_*` — **live** |
 | `kiki.leader.held` | gauge | | | `kiki_leader_held` — **live** |
-| `kiki.db.pool.connections` | gauge | `{connection}` | `state=used\|idle` | `kiki_db_pool_connections` |
+| `kiki.db.pool.connections` | gauge | `{connection}` | `state=used\|idle` | `kiki_db_pool_connections` — **live** |
 
 `kiki.reply.latency` (trigger message created → first reply sent) is the
-headline SLO. `kiki.gateway.lag` is Discord's message timestamp → receipt.
+headline SLO: from the Discord creation time of the message the reply answers
+(its snowflake) to the first message of the reply sent; reaction-only and
+silent runs have none, and drawings' follow-ups don't count. `kiki.gateway.lag`
+is Discord's message timestamp → receipt, for live `MESSAGE_CREATE`s.
 `kiki.leader.held` is 1 while the instance holds the leader lock, 0 after release.
+
+- Gateway: `reconnects` counts dropped connections by cause: Discord asked
+  (`requested`, opcode 7), invalidated the session (`invalid_session`, opcode
+  9), the connection broke (`transport`, 1006 or none), or Discord closed it with
+  a code (`closed`). Whether the shard then resumed or started a new session is
+  `kiki.gateway.events{type="RESUMED"|"READY"}`. `messages.ingested` counts live
+  `MESSAGE_CREATE`s (catch-up pages aren't counted).
+- Router: an admission is a stored message the router considered (every
+  `message_inserted` notification); `classifications` counts tagged pools.
+  Pools dropped as too old or all deleted aren't classifications.
+- Agent runs: `kind` is the routing check that queued the run (its first
+  trigger message's `classifications.check_hit`; `other` when unknown).
+  `expired` runs are older than `AGENT_RUN_MAX_AGE_SECS` (stored as `failed`);
+  `interrupted` ones were cut off mid-delivery and failed at startup. Runs and
+  drawings are counted once their final status is stored, so none counts twice.
+  `duration` is claim → finished, so queueing is in `kiki.reply.latency` only.
+- Agent host: one `requests` sample per POST attempt; `retries` by why the job
+  is asked again (`running`: the host is still on it).
+- Drawings: `refused` is the host's `refused` (the image model and its fallback
+  wouldn't draw it); `failed` includes host and Discord errors.
+- Discord: `reactions` are the ones Kiki chooses (not the pending emoji).
+  `rest.retries` are `rest::get_json` retries (sends aren't retried).
+
+Series, at most (attribute values multiplied, histograms × buckets + 2): about
+225, of which `kiki.agent_run.duration` is 60. Seen in the simulator after a
+few replies and drawings: 96.
+
+**Traces.** Spans carry IDs as attributes, never message text: `message_create`
+(a live message's storage) → `classify` (with `jev` and `tag`) → `agent_run` →
+`agent_host_request` per attempt (the agent host's `POST /v1/…` joins under it),
+`discord_send` per message, `topic_refresh` and `drawing`. `catch_up` is one span
+per run. Other Gateway events get no span. The router learns of a message from a
+Postgres notification, so the Gateway span's context is handed over in memory
+(bounded; the router runs in the same process). Runs and drawings are queued in
+Postgres: `agent_runs.trace_context` and `agent_image_jobs.trace_context` hold
+the queuing span's W3C `traceparent` (NULL when export is off), and the task that
+picks the row up starts its span as that span's child (and links the runs it
+superseded), so one trace runs from
+the message to Kiki's reply and her drawing. A missing or malformed value starts
+a new trace.
 
 ### Agent host
 

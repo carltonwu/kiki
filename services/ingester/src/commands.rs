@@ -409,6 +409,8 @@ impl Commands {
         conversation::lock_pool(&mut tx).await?;
         let closed = conversation::clear(&mut tx, invocation.guild_id).await?;
         tx.commit().await?;
+        crate::metrics::conversations_closed("cleared", closed.iter().map(|&(_, n)| n));
+        let closed: Vec<i64> = closed.into_iter().map(|(id, _)| id).collect();
         info!(
             guild_id = invocation.guild_id,
             actor,

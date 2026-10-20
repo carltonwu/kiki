@@ -468,7 +468,8 @@ impl Store {
                     .await?;
             }
         }
-        conversation::evict_beyond(&mut tx, guild_id, values.max_active_conversations).await?;
+        let evicted =
+            conversation::evict_beyond(&mut tx, guild_id, values.max_active_conversations).await?;
         let resolved = self.read(&mut *tx, guild_id).await?;
         // Re-resolution must not discard the proposed change to satisfy a constraint.
         if resolved.ignored.iter().any(|k| k == key) {
@@ -477,6 +478,7 @@ impl Store {
             );
         }
         tx.commit().await?;
+        crate::metrics::conversations_closed("evicted", evicted.iter().map(|&(_, n)| n));
         self.cache
             .write()
             .expect("settings cache poisoned")
@@ -646,7 +648,7 @@ pub mod tests {
             .execute(&db)
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE TABLE conversations (id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ, closed_reason TEXT)").execute(&db).await.unwrap();
+        sqlx::raw_sql("CREATE TABLE conversations (id BIGSERIAL PRIMARY KEY, guild_id BIGINT NOT NULL, message_count INTEGER NOT NULL DEFAULT 0, last_active_at TIMESTAMPTZ NOT NULL DEFAULT now(), closed_at TIMESTAMPTZ, closed_reason TEXT)").execute(&db).await.unwrap();
         Some((admin, db, schema))
     }
 

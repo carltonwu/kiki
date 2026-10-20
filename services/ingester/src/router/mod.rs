@@ -21,11 +21,18 @@ use anyhow::Context;
 use serde::Deserialize;
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::{sync::watch, time::Instant};
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, field::Empty, info, info_span, warn};
 use twilight_http::{Client, request::channel::reaction::RequestReactionType};
 use twilight_model::id::{Id, marker::GuildMarker};
 
-use crate::{catch_up::snowflake, config::RouterConfig, jev::Jev, rest::get_json};
+use crate::{
+    catch_up::snowflake,
+    config::RouterConfig,
+    jev::Jev,
+    metrics::{self, Admission},
+    rest::get_json,
+    telemetry,
+};
 
 const NOTIFY_CHANNEL: &str = "message_inserted";
 
@@ -58,6 +65,8 @@ struct Pool {
     guild_id: i64,
     settings: Arc<crate::guild_settings::Resolved>,
     message_ids: Vec<i64>,
+    /// The messages' Gateway spans, oldest first, where they're known.
+    traces: Vec<opentelemetry::Context>,
     first_at: Instant,
     deadline: Instant,
 }
@@ -181,16 +190,24 @@ impl Router {
             Ok(m) => m,
             Err(e) => {
                 warn!(error = %e, payload, "unparseable message notification");
+                metrics::admission(Admission::Unparseable);
                 return None;
             }
         };
+        let trace = telemetry::take_message(msg.id);
         // Kiki's own replies are tagged by the agent that sends them; other bots are ignored.
-        if msg.author_bot || !self.guild_ids.contains(&msg.guild_id) {
+        if msg.author_bot {
+            metrics::admission(Admission::Bot);
+            return None;
+        }
+        if !self.guild_ids.contains(&msg.guild_id) {
+            metrics::admission(Admission::OtherGuild);
             return None;
         }
         let age_ms = unix_millis() - msg.created_at_ms;
         if age_ms > self.config.max_message_age.as_millis() as i64 {
             debug!(message_id = msg.id, age_ms, "not routing an old message");
+            metrics::admission(Admission::TooOld);
             return None;
         }
         // Stored and read as context, but Kiki has nowhere to reply from here.
@@ -201,8 +218,10 @@ impl Router {
                 channel_id = msg.channel_id,
                 "not routing: channel not allowed and no default channel"
             );
+            metrics::admission(Admission::ChannelNotAllowed);
             return None;
         }
+        metrics::admission(Admission::Admitted);
 
         let router = self.clone();
         tokio::spawn(async move {
@@ -220,10 +239,12 @@ impl Router {
             guild_id: msg.guild_id,
             settings,
             message_ids: Vec::new(),
+            traces: Vec::new(),
             first_at: now,
             deadline: now,
         });
         pool.message_ids.push(msg.id);
+        pool.traces.extend(trace);
         pool.deadline = (now + Duration::from_millis(pool.settings.pool_debounce))
             .min(pool.first_at + Duration::from_millis(pool.settings.pool_max_wait));
         if pool.message_ids.len() >= pool.settings.pool_max_messages {
@@ -235,18 +256,39 @@ impl Router {
     fn spawn_classify(self: Arc<Self>, (key, pool): (PoolKey, Pool)) {
         // Classification time: when the pool closed, before waiting for the channel.
         let classified_at = SystemTime::now();
-        tokio::spawn(async move {
-            let lock = self.channel_lock(key.channel_id);
-            let _guard = lock.lock().await;
-            if let Err(e) = self.classify(key, &pool, classified_at).await {
-                warn!(
-                    channel_id = key.channel_id,
-                    message_ids = ?pool.message_ids,
-                    error = format!("{e:#}"),
-                    "classification failed"
-                );
+        // Continues the newest message's trace; the others are linked.
+        let span = info_span!(
+            "classify",
+            channel_id = key.channel_id,
+            user_id = key.user_id,
+            pool_id = pool.message_ids.last(),
+            messages = pool.message_ids.len(),
+            check = Empty,
+            outcome = Empty,
+            conversation_id = Empty,
+            run_id = Empty,
+        );
+        if let Some((newest, earlier)) = pool.traces.split_last() {
+            telemetry::set_parent(&span, newest);
+            for context in earlier {
+                telemetry::link(&span, context);
             }
-        });
+        }
+        tokio::spawn(
+            async move {
+                let lock = self.channel_lock(key.channel_id);
+                let _guard = lock.lock().await;
+                if let Err(e) = self.classify(key, &pool, classified_at).await {
+                    warn!(
+                        channel_id = key.channel_id,
+                        message_ids = ?pool.message_ids,
+                        error = format!("{e:#}"),
+                        "classification failed"
+                    );
+                }
+            }
+            .instrument(span),
+        );
     }
 
     /// Reacts to a routed message so it's visible that Kiki was triggered and a
