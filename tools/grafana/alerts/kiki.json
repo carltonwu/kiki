@@ -68,7 +68,7 @@
           "datasourceUid": "${prom}",
           "model": {
             "refId": "A",
-            "expr": "sum(increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[15m])) or vector(0)",
+            "expr": "sum(increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[15m] anchored)) or vector(0)",
             "instant": true,
             "range": false,
             "intervalMs": 60000,
@@ -87,7 +87,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {
@@ -185,7 +185,7 @@
           "datasourceUid": "${prom}",
           "model": {
             "refId": "A",
-            "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[24h]))",
+            "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[24h] anchored))",
             "instant": true,
             "range": false,
             "intervalMs": 60000,
@@ -204,7 +204,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {
@@ -224,7 +224,7 @@
           "datasourceUid": "${prom}",
           "model": {
             "refId": "A",
-            "expr": "sum(increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired\"}[15m])) or vector(0)",
+            "expr": "sum(increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired\"}[15m] anchored)) or vector(0)",
             "instant": true,
             "range": false,
             "intervalMs": 60000,
@@ -237,7 +237,7 @@
           "datasourceUid": "${prom}",
           "model": {
             "refId": "B",
-            "expr": "sum(increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[15m])) or vector(0)",
+            "expr": "sum(increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[15m] anchored)) or vector(0)",
             "instant": true,
             "range": false,
             "intervalMs": 60000,
@@ -261,7 +261,7 @@
         }
       ],
       "noDataState": "OK",
-      "execErrState": "KeepLast",
+      "execErrState": "Error",
       "for": "5m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {

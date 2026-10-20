@@ -110,7 +110,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[1h]))",
+          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[1h] anchored))",
           "legendFormat": "{{kind}} {{outcome}}",
           "editorMode": "code",
           "instant": false,
@@ -207,7 +207,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -239,7 +239,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -297,7 +298,7 @@
     {
       "type": "bargauge",
       "title": "Rejected (selected range)",
-      "description": "Job requests turned away: busy (503, no slot freed within 0.1 s), conflict (409, a job ID reused with different input). No data: none rejected.",
+      "description": "Job requests turned away: busy (503, no slot freed within 0.1 s), conflict (409, a job ID reused with different input). No data: none rejected. A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -309,7 +310,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (reason) (increase(kiki_agent_jobs_rejected_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (reason) (increase(kiki_agent_jobs_rejected_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "{{reason}}",
           "editorMode": "code",
           "instant": true,
@@ -337,7 +338,8 @@
           },
           "min": 0,
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -387,7 +389,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h])))",
+          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h] anchored)))",
           "legendFormat": "{{kind}} p50",
           "editorMode": "code",
           "instant": false,
@@ -399,7 +401,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h] anchored)))",
           "legendFormat": "{{kind}} p95",
           "editorMode": "code",
           "instant": false,
@@ -521,7 +523,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -534,7 +536,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -571,7 +573,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -582,7 +585,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "unit": "short"
         },
         "overrides": [
@@ -660,7 +674,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_agent_job_model_requests_sum{job=\"kiki/agent\"}[$__range])) / sum(increase(kiki_agent_job_model_requests_count{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum(increase(kiki_agent_job_model_requests_sum{job=\"kiki/agent\"}[$__range] anchored)) / sum(increase(kiki_agent_job_model_requests_count{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "mean",
           "editorMode": "code",
           "instant": true,
@@ -672,7 +686,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_agent_job_model_requests_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (increase(kiki_agent_job_model_requests_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "p95",
           "editorMode": "code",
           "instant": true,
@@ -694,7 +708,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "decimals": 1
         },
         "overrides": []
@@ -751,7 +776,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[1h]))",
+          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[1h] anchored))",
           "legendFormat": "{{purpose}} {{result}}",
           "editorMode": "code",
           "instant": false,
@@ -848,7 +873,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, purpose) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.5, sum by (le, purpose) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -861,7 +886,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, purpose) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, purpose) (increase(kiki_llm_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -874,7 +899,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (purpose) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -911,7 +936,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -922,7 +948,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "unit": "short"
         },
         "overrides": [
@@ -1018,7 +1055,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (model, result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (model, result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1050,7 +1087,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -1074,6 +1112,18 @@
               {
                 "id": "decimals",
                 "value": 0
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Model"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 200
               }
             ]
           }
@@ -1101,7 +1151,7 @@
       "gridPos": {
         "x": 0,
         "y": 27,
-        "w": 8,
+        "w": 7,
         "h": 8
       }
     },
@@ -1120,7 +1170,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[1h]))",
+          "expr": "sum by (result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[1h] anchored))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": false,
@@ -1257,16 +1307,16 @@
       "interval": "15m",
       "id": 13,
       "gridPos": {
-        "x": 8,
+        "x": 7,
         "y": 27,
-        "w": 8,
+        "w": 7,
         "h": 8
       }
     },
     {
       "type": "bargauge",
-      "title": "Fallback outcomes (selected range)",
-      "description": "Attempts on OPENROUTER_IMAGE_FALLBACK_MODEL after a safety block, by whether they drew. No data: no fallback attempts (or no fallback model set).",
+      "title": "Fallbacks (range)",
+      "description": "Attempts on OPENROUTER_IMAGE_FALLBACK_MODEL after a safety block, by whether they drew. No data: no fallback attempts (or no fallback model set). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1278,7 +1328,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_images_fallback_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (result) (increase(kiki_images_fallback_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": true,
@@ -1303,7 +1353,8 @@
           },
           "min": 0,
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -1332,7 +1383,7 @@
       },
       "id": 14,
       "gridPos": {
-        "x": 16,
+        "x": 14,
         "y": 27,
         "w": 4,
         "h": 8
@@ -1353,7 +1404,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, model) (increase(kiki_images_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.5, sum by (le, model) (increase(kiki_images_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1366,7 +1417,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, model) (increase(kiki_images_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, model) (increase(kiki_images_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1402,7 +1453,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -1413,7 +1465,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "unit": "short"
         },
         "overrides": [
@@ -1440,6 +1503,18 @@
                 "value": "s"
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Model"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
           }
         ]
       },
@@ -1458,9 +1533,9 @@
       },
       "id": 15,
       "gridPos": {
-        "x": 20,
+        "x": 18,
         "y": 27,
-        "w": 4,
+        "w": 6,
         "h": 8
       }
     },
@@ -1492,7 +1567,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (tool, outcome) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (tool, outcome) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1524,7 +1599,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -1594,7 +1670,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (tool) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[1h]))",
+          "expr": "sum by (tool) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[1h] anchored))",
           "legendFormat": "{{tool}}",
           "editorMode": "code",
           "instant": false,
@@ -1691,7 +1767,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, tool) (increase(kiki_tools_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.5, sum by (le, tool) (increase(kiki_tools_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1704,7 +1780,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, tool) (increase(kiki_tools_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, tool) (increase(kiki_tools_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1740,7 +1816,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -1751,7 +1828,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "unit": "short"
         },
         "overrides": [
@@ -1810,7 +1898,7 @@
     {
       "type": "timeseries",
       "title": "Web calls (rolling 1 h)",
-      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. OpenRouter web searches and fetches made during reply runs, in the hour before each point.",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. OpenRouter web searches and fetches made during reply runs, in the hour before each point. A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1822,7 +1910,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_web_calls_total{job=\"kiki/agent\"}[1h]))",
+          "expr": "sum by (kind) (increase(kiki_web_calls_total{job=\"kiki/agent\"}[1h] anchored))",
           "legendFormat": "{{kind}}",
           "editorMode": "code",
           "instant": false,
@@ -1878,7 +1966,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -1907,7 +1996,7 @@
     {
       "type": "table",
       "title": "HTTP requests (selected range)",
-      "description": "The agent host's own FastAPI server spans: requests and p95 duration by route and status.",
+      "description": "The agent host's own FastAPI server spans: requests and p95 duration by route and status. Until the agent host recorded this histogram in its duration buckets (0.5, 2.5, 10, 30, 120 s), its buckets were semconv's, ending at 10 s, so a p95 read 10 s for any request that took longer. For up to 7 days after that deploy, a range holds both bucket sets: the old le series (0.005 to 10) and the new ones are summed together, so p95 is skewed (the shared 0.5, 2.5 and 10 bounds mix old and new counts). Trust it again once the range starts after the deploy.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1919,7 +2008,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (http_route, http_response_status_code) (increase(http_server_request_duration_seconds_count{job=\"kiki/agent\"}[$__range]))",
+          "expr": "sum by (http_route, http_response_status_code) (increase(http_server_request_duration_seconds_count{job=\"kiki/agent\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1932,7 +2021,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, http_route, http_response_status_code) (increase(http_server_request_duration_seconds_bucket{job=\"kiki/agent\"}[$__range])))",
+          "expr": "histogram_quantile(0.95, sum by (le, http_route, http_response_status_code) (increase(http_server_request_duration_seconds_bucket{job=\"kiki/agent\"}[$__range] anchored)))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1969,7 +2058,8 @@
               "type": "auto"
             },
             "inspect": false,
-            "filterable": false
+            "filterable": false,
+            "minWidth": 60
           },
           "thresholds": {
             "mode": "absolute",
@@ -1980,7 +2070,18 @@
               }
             ]
           },
-          "mappings": [],
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "nan",
+                "result": {
+                  "text": "–",
+                  "index": 0
+                }
+              }
+            }
+          ],
           "unit": "short"
         },
         "overrides": [

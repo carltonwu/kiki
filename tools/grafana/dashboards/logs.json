@@ -135,7 +135,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "sum by (service_name, detected_level) (count_over_time({service_name=~\"ingester|agent\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ \"(?i)$search\" [$__auto]))",
+          "expr": "sum by (service_name, detected_level) (count_over_time({service_name=~\"ingester|agent\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ `(?i)${search:regex}` [$__auto]))",
           "legendFormat": "{{service_name}} {{detected_level}}",
           "queryType": "range",
           "editorMode": "code"
@@ -243,7 +243,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "{service_name=\"ingester\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ \"(?i)$search\"",
+          "expr": "{service_name=\"ingester\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ `(?i)${search:regex}`",
           "queryType": "range",
           "editorMode": "code"
         }
@@ -264,7 +264,7 @@
         "x": 0,
         "y": 6,
         "w": 12,
-        "h": 14
+        "h": 18
       }
     },
     {
@@ -282,7 +282,7 @@
             "type": "loki",
             "uid": "${loki}"
           },
-          "expr": "{service_name=\"agent\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ \"(?i)$search\" | logfmt",
+          "expr": "{service_name=\"agent\"} | service_namespace=\"kiki\" | detected_level=~\"$level\" |~ `(?i)${search:regex}` | logfmt",
           "queryType": "range",
           "editorMode": "code"
         }
@@ -303,7 +303,7 @@
         "x": 12,
         "y": 6,
         "w": 12,
-        "h": 14
+        "h": 18
       }
     },
     {
@@ -325,7 +325,7 @@
           "query": "{resource.service.name=\"ingester\" && name=\"agent_run\"}",
           "limit": 20,
           "spss": 3,
-          "tableType": "traces",
+          "tableType": "spans",
           "filters": []
         }
       ],
@@ -349,7 +349,104 @@
           },
           "mappings": []
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceIdHidden"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceService"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceName"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "service.name"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "name"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "time"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Start time"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Run duration"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spanID"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "agent_run span (opens the trace)"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "showHeader": true,
@@ -367,8 +464,8 @@
       "id": 4,
       "gridPos": {
         "x": 0,
-        "y": 20,
-        "w": 8,
+        "y": 24,
+        "w": 12,
         "h": 10
       }
     },
@@ -391,7 +488,7 @@
           "query": "{resource.service.name=\"ingester\" && name=\"agent_run\" && duration > 20s}",
           "limit": 20,
           "spss": 3,
-          "tableType": "traces",
+          "tableType": "spans",
           "filters": []
         }
       ],
@@ -415,7 +512,104 @@
           },
           "mappings": []
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceIdHidden"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceService"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "traceName"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "service.name"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "name"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "time"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Start time"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Run duration"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "spanID"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "agent_run span (opens the trace)"
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "showHeader": true,
@@ -432,9 +626,9 @@
       },
       "id": 5,
       "gridPos": {
-        "x": 8,
-        "y": 20,
-        "w": 8,
+        "x": 12,
+        "y": 24,
+        "w": 12,
         "h": 10
       }
     },
@@ -498,9 +692,9 @@
       },
       "id": 6,
       "gridPos": {
-        "x": 16,
-        "y": 20,
-        "w": 8,
+        "x": 0,
+        "y": 34,
+        "w": 24,
         "h": 10
       }
     }

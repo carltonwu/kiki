@@ -1,7 +1,7 @@
 {
   "uid": "kiki-cost",
   "title": "Kiki / Cost",
-  "description": "LLM spend from OpenRouter's usage.cost (kiki_llm_cost_usd_total), calls and tokens, for both services.",
+  "description": "LLM spend from OpenRouter's billed usage.cost (kiki_llm_cost_usd_total), calls and tokens, for both services. Every panel reads that one counter split by purpose (jev, reply, topic, vision, embedding, image, failure_note, emoji) and model; everything billed counts, failed runs included. Totals are increase(…[$__range] anchored): exact sums of what was recorded, no extrapolation. How purposes map to the database's cost columns (/kiki stats): docs/observability.md, Cost categories.",
   "tags": [
     "kiki",
     "cost"
@@ -85,7 +85,7 @@
     {
       "type": "stat",
       "title": "Spend",
-      "description": "Total LLM cost over the selected range.",
+      "description": "Total LLM cost over the selected range, both services: sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored)). All purposes; see docs/observability.md, Cost categories, for how they map to /kiki stats. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -97,7 +97,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "spend",
           "editorMode": "code",
           "instant": true,
@@ -120,7 +120,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 2
+          "decimals": 2,
+          "noValue": "$0.00"
         },
         "overrides": []
       },
@@ -151,7 +152,7 @@
     {
       "type": "stat",
       "title": "Average per day",
-      "description": "Spend over the selected range, scaled to a day. The daily spend alert is $5 per rolling 24 h by default.",
+      "description": "Spend over the selected range, scaled to a day. A range longer than the data (the first days after export started) reads low. The daily spend alert is $5 per rolling 24 h by default. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -163,7 +164,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range])) * 86400 / $__range_s",
+          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored)) * 86400 / $__range_s",
           "legendFormat": "per day",
           "editorMode": "code",
           "instant": true,
@@ -194,7 +195,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 2
+          "decimals": 2,
+          "noValue": "$0.00"
         },
         "overrides": []
       },
@@ -224,8 +226,8 @@
     },
     {
       "type": "stat",
-      "title": "Projected month (selected range)",
-      "description": "30 days at the selected range's pace. Short ranges swing with the time of day; prefer the 7-day projection.",
+      "title": "Month at the range's pace",
+      "description": "30 days at the selected range's pace. Short ranges swing with the time of day; prefer the 7-day projection. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -237,7 +239,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range])) * 30 * 86400 / $__range_s",
+          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored)) * 30 * 86400 / $__range_s",
           "legendFormat": "projected",
           "editorMode": "code",
           "instant": true,
@@ -260,7 +262,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 2
+          "decimals": 2,
+          "noValue": "$0.00"
         },
         "overrides": []
       },
@@ -290,8 +293,8 @@
     },
     {
       "type": "stat",
-      "title": "Projected month (last 7 days)",
-      "description": "30 days at the last 7 days' pace, independent of the time picker.",
+      "title": "Month at the 7-day pace",
+      "description": "30 days at the last 7 days' pace, independent of the time picker. A \"$0.00\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -303,7 +306,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[7d])) * 30 / 7",
+          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[7d] anchored)) * 30 / 7",
           "legendFormat": "projected",
           "editorMode": "code",
           "instant": true,
@@ -334,7 +337,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 2
+          "decimals": 2,
+          "noValue": "$0.00"
         },
         "overrides": []
       },
@@ -365,7 +369,7 @@
     {
       "type": "stat",
       "title": "Calls",
-      "description": "LLM calls over the selected range (a reply or topic run is one call however many model requests it makes).",
+      "description": "LLM calls over the selected range (a reply or topic run is one call however many model requests it makes). A \"0\" can also mean telemetry export is down: check that Kiki / Pipeline's Leader panel has recent data.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -377,7 +381,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum(increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "calls",
           "editorMode": "code",
           "instant": true,
@@ -400,7 +404,8 @@
             ]
           },
           "mappings": [],
-          "decimals": 0
+          "decimals": 0,
+          "noValue": "0"
         },
         "overrides": []
       },
@@ -456,7 +461,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h]))",
+          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h] anchored))",
           "legendFormat": "{{purpose}}",
           "editorMode": "code",
           "instant": false,
@@ -511,8 +516,7 @@
               }
             ]
           },
-          "mappings": [],
-          "decimals": 4
+          "mappings": []
         },
         "overrides": []
       },
@@ -553,7 +557,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h]))",
+          "expr": "sum by (model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h] anchored))",
           "legendFormat": "{{model}}",
           "editorMode": "code",
           "instant": false,
@@ -608,8 +612,7 @@
               }
             ]
           },
-          "mappings": [],
-          "decimals": 4
+          "mappings": []
         },
         "overrides": []
       },
@@ -650,7 +653,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "{{purpose}}",
           "editorMode": "code",
           "instant": true,
@@ -674,8 +677,7 @@
             ]
           },
           "min": 0,
-          "mappings": [],
-          "decimals": 2
+          "mappings": []
         },
         "overrides": []
       },
@@ -725,7 +727,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, type) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\"}[1h]))",
+          "expr": "sum by (purpose, type) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\"}[1h] anchored))",
           "legendFormat": "{{purpose}} {{type}}",
           "editorMode": "code",
           "instant": false,
@@ -741,7 +743,7 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 20,
+            "fillOpacity": 0,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
@@ -749,7 +751,7 @@
             "lineInterpolation": "linear",
             "barAlignment": 0,
             "stacking": {
-              "mode": "normal",
+              "mode": "none",
               "group": "A"
             },
             "axisPlacement": "auto",
@@ -759,7 +761,8 @@
             "axisLabel": "",
             "axisSoftMin": 0,
             "scaleDistribution": {
-              "type": "linear"
+              "type": "log",
+              "log": 10
             },
             "thresholdsStyle": {
               "mode": "off"
@@ -834,7 +837,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum by (purpose, model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -847,7 +850,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, model) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum by (purpose, model) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -860,7 +863,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, model) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\", type=\"input\"}[$__range]))",
+          "expr": "sum by (purpose, model) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\", type=\"input\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -873,7 +876,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, model) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\", type=\"output\"}[$__range]))",
+          "expr": "sum by (purpose, model) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\", type=\"output\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -946,10 +949,6 @@
             },
             "properties": [
               {
-                "id": "decimals",
-                "value": 4
-              },
-              {
                 "id": "custom.cellOptions",
                 "value": {
                   "type": "gauge",
@@ -974,6 +973,30 @@
               {
                 "id": "unit",
                 "value": "currencyUSD"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Model"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 250
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Purpose"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
               }
             ]
           }
@@ -1001,7 +1024,7 @@
       "gridPos": {
         "x": 0,
         "y": 23,
-        "w": 14,
+        "w": 16,
         "h": 9
       }
     },
@@ -1020,7 +1043,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range]))",
+          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__range] anchored))",
           "legendFormat": "__auto",
           "editorMode": "code",
           "instant": true,
@@ -1101,9 +1124,9 @@
       },
       "id": 14,
       "gridPos": {
-        "x": 14,
+        "x": 16,
         "y": 23,
-        "w": 10,
+        "w": 8,
         "h": 9
       }
     },
@@ -1122,7 +1145,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[1h]))",
+          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[1h] anchored))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": false,

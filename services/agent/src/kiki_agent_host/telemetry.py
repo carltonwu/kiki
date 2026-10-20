@@ -120,7 +120,11 @@ def configure() -> bool:
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-    from opentelemetry.sdk.metrics.view import DropAggregation, View
+    from opentelemetry.sdk.metrics.view import (
+        DropAggregation,
+        ExplicitBucketHistogramAggregation,
+        View,
+    )
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -139,12 +143,20 @@ def configure() -> bool:
     reader = PeriodicExportingMetricReader(exporter, export_interval_millis=math.inf)
     # Series spent on nothing we read: request and response size histograms, and
     # database client metrics (made only if the database semconv is opted into).
-    drop = [
+    views = [
         View(instrument_name=name, aggregation=DropAggregation())
         for name in ("http.server.*.body.size", "db.client.*")
     ]
+    # FastAPI's request duration in our duration buckets: semconv's end at 10 s,
+    # and a job request takes tens of seconds, so every p95 read "10 s".
+    views.append(
+        View(
+            instrument_name="http.server.request.duration",
+            aggregation=ExplicitBucketHistogramAggregation(DURATION_BUCKETS),
+        )
+    )
     meter_provider = MeterProvider(
-        resource=resource, metric_readers=[reader], views=drop, shutdown_on_exit=False
+        resource=resource, metric_readers=[reader], views=views, shutdown_on_exit=False
     )
     logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
     logger_provider.add_log_record_processor(

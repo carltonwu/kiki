@@ -44,6 +44,46 @@ VAR_REF = re.compile(r"^\$\{?(\w+)\}?$")
 PARAM = re.compile(r"\$\{(\w+)\}")
 NO_DATA = {"NoData", "Alerting", "OK", "KeepLast"}
 EXEC_ERR = {"Error", "Alerting", "OK", "KeepLast"}
+# increase() calls are checked for Mimir's `anchored` modifier: plain increase()
+# extrapolates, which reads the agent host's sparse series at up to about 2x
+# (docs/observability.md, zero baselines).
+INCREASE_CALL = re.compile(r"\bincrease\s*\(")
+UNANCHORED_HINT = "increase() without `anchored` extrapolates; write increase(…[w] anchored)"
+
+
+def unanchored(expr: str) -> bool:
+    """Whether some increase() reads a range selector without `anchored`.
+
+    For each increase( the argument is scanned for its own range, the first `[`
+    at the call's top level: brackets inside label matchers' strings ("[0-9]+")
+    and inside nested calls don't count. A subquery's range ([1h:5m]) needs no
+    modifier: Mimir rejects `anchored` on subqueries."""
+    for call in INCREASE_CALL.finditer(expr):
+        depth, quote, i = 0, None, call.end()
+        while i < len(expr):
+            c = expr[i]
+            if quote:
+                if c == "\\":
+                    i += 1
+                elif c == quote:
+                    quote = None
+            elif c in "\"'`":
+                quote = c
+            elif c in "({":
+                depth += 1
+            elif c in ")}":
+                if depth == 0:
+                    break  # the call ended without a range of its own
+                depth -= 1
+            elif c == "[" and depth == 0:
+                end = expr.find("]", i)
+                if end < 0:
+                    break
+                if ":" not in expr[i:end] and not re.match(r"\s*anchored\b", expr[end + 1 :]):
+                    return True
+                break
+            i += 1
+    return False
 
 
 class Refused(Exception):
@@ -149,6 +189,8 @@ def check_dashboard(model: dict) -> list[str]:
                 errors.append(f"{title}: query {target.get('refId')} is empty")
             elif query.count("(") != query.count(")") or query.count("{") != query.count("}"):
                 errors.append(f"{title}: query {target.get('refId')} has unbalanced brackets")
+            elif target.get("expr") and unanchored(target["expr"]):
+                errors.append(f"{title}: query {target.get('refId')}: {UNANCHORED_HINT}")
     return errors
 
 
@@ -232,6 +274,8 @@ def check_rule(rule: dict) -> list[str]:
         elif VAR_REF.match(ds) and VAR_REF.match(ds).group(1) in DS_TYPES:
             if not model.get("expr"):
                 errors.append(f"{query.get('refId')}: empty expr")
+            elif unanchored(model["expr"]):
+                errors.append(f"{query.get('refId')}: {UNANCHORED_HINT}")
             if not isinstance(query.get("relativeTimeRange", {}).get("from"), int):
                 errors.append(f"{query.get('refId')}: relativeTimeRange.from must be seconds")
         else:

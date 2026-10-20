@@ -190,6 +190,61 @@ class Files(unittest.TestCase):
         self.assertEqual(errors + alert_errors, [])
         self.assertTrue(groups and groups[0]["rules"])
 
+    def test_increase_must_be_anchored(self):
+        def panel(expr):
+            return {
+                "uid": "u",
+                "title": "t",
+                "schemaVersion": 41,
+                "templating": {"list": [{"name": "prom", "type": "datasource", "query": "prometheus"}]},
+                "panels": [
+                    {
+                        "id": 1,
+                        "type": "stat",
+                        "title": "p",
+                        "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+                        "datasource": {"uid": "${prom}"},
+                        "targets": [{"refId": "A", "datasource": {"uid": "${prom}"}, "expr": expr}],
+                    }
+                ],
+            }
+
+        self.assertEqual(apply.check_dashboard(panel("sum(increase(x_total[$__range] anchored))")), [])
+        self.assertEqual(apply.check_dashboard(panel("sum(rate(x_total[$__rate_interval]))")), [])
+        errors = apply.check_dashboard(panel("sum(increase(x_total{a=\"b\"}[1h])) / sum(increase(y[1h] anchored))"))
+        self.assertEqual(len(errors), 1)
+        self.assertIn("anchored", errors[0])
+
+    def test_unanchored_finds_each_increases_own_range(self):
+        cases = {
+            "increase(x[1h] anchored)": False,
+            "increase(x[1h])": True,
+            "increase (x[1h])": True,  # a space before the parenthesis
+            "increase(x[$__range]  anchored) + increase(y[5m])": True,
+            # A matcher's regex brackets aren't the range.
+            'increase(x{status=~"[0-9]+"}[1h] anchored)': False,
+            'increase(x{status=~"[0-9]+"}[1h])': True,
+            "increase(x{a='[b]'}[1h] anchored)": False,
+            # Subqueries take no modifier (Mimir rejects `anchored` on them).
+            "increase(x[1h:5m])": False,
+            "increase(rate(x[5m])[1h:5m])": False,
+            "sum(rate(x[5m])) / increase(y[1h])": True,
+            "rate(x[5m])": False,
+            "my_increase(x[1h])": False,
+            "histogram_quantile(0.5, sum by (le) (increase(x_bucket[$__interval] anchored)))": False,
+        }
+        for expr, expected in cases.items():
+            with self.subTest(expr=expr):
+                self.assertEqual(apply.unanchored(expr), expected)
+
+    def test_alert_rules_reading_anchored_counters_fail_loudly(self):
+        # If Mimir stops accepting `anchored`, KeepLast would hold such a rule at OK for good.
+        groups, errors = apply.load_alerts({})
+        self.assertEqual(errors, [])
+        for rule in groups[0]["rules"]:
+            if any("anchored" in q["model"].get("expr", "") for q in rule["data"]):
+                self.assertEqual(rule["execErrState"], "Error", rule["uid"])
+
     def test_param_override(self):
         groups, errors = apply.load_alerts({"daily_llm_spend_usd": "12.5"})
         self.assertEqual(errors, [])
