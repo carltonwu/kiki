@@ -400,6 +400,7 @@ async def test_a_slow_thinking_read_leaves_its_retry_time(monkeypatch):
         await asyncio.sleep(30)  # thinking, and thinking
 
     monkeypatch.setattr(vision_module, "UNTHINKING_SECONDS", 0.4)
+    monkeypatch.setattr(vision_module, "MIN_THINKING_SECONDS", 0.1)
     vision = Vision(FunctionModel(respond), "test/vision")
     started = time.monotonic()
     with run_deadline(1.0):  # read_image's deadline, as the guard sets it
@@ -414,3 +415,46 @@ async def test_a_slow_thinking_read_leaves_its_retry_time(monkeypatch):
 
 def billed_answer(text):
     return FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(text)]))
+
+
+def thinking_slowly(seen):
+    async def respond(messages, info: AgentInfo) -> ModelResponse:
+        import asyncio
+
+        seen.append(info.model_settings)
+        if (info.model_settings.get("openrouter_reasoning") or {}).get("enabled") is False:
+            return ModelResponse(parts=[TextPart("Image 1: a dog.")])
+        await asyncio.sleep(30)
+
+    return Vision(FunctionModel(respond), "test/vision")
+
+
+async def test_a_short_deadline_still_leaves_the_retry_half(monkeypatch):
+    """Review round 3: with 12-24 s left (downloads or the run's answer reserve
+    took the rest), thinking got the whole budget and the retry none. Now thinking
+    gets half, the retry the other half."""
+    import time
+
+    from kiki_agent_host.deadline import run_deadline
+    from kiki_agent_host.media import vision as vision_module
+
+    monkeypatch.setattr(vision_module, "UNTHINKING_SECONDS", 0.5)
+    monkeypatch.setattr(vision_module, "MIN_THINKING_SECONDS", 0.2)
+    seen = []
+    started = time.monotonic()
+    with run_deadline(0.8):  # between 1 and 2 times UNTHINKING_SECONDS
+        assert await look(thinking_slowly(seen), ["describe"], max_tokens=100) == "Image 1: a dog."
+    assert 0.35 < time.monotonic() - started < 0.8  # thinking had about half
+    assert len(seen) == 2
+
+
+async def test_too_little_time_to_think_asks_without_thinking_at_once(monkeypatch):
+    from kiki_agent_host.deadline import run_deadline
+    from kiki_agent_host.media import vision as vision_module
+
+    monkeypatch.setattr(vision_module, "MIN_THINKING_SECONDS", 5)
+    seen = []
+    with run_deadline(3):
+        assert await look(thinking_slowly(seen), ["describe"], max_tokens=100) == "Image 1: a dog."
+    [settings] = seen
+    assert settings["openrouter_reasoning"] == {"enabled": False}

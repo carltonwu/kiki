@@ -80,10 +80,14 @@ VERIFY_TIMEOUT_SECONDS = 30
 # fits one with room; a second wave (5+ subjects; 27 s each in review) is cut.
 REFERENCES_SECONDS = 25
 STAGE_GRACE = 5  # past the deadline, for downloads in flight; then the stage is cut
+# Scheduling and cancelling the stage's tasks take a little past its deadline
+# and grace (12 ms in review), which exact sums don't allow for.
+STAGE_HEADROOM = 3
 # What the stage, its grace included, leaves of the job for an image attempt and
 # the failure note: the executor's MIN_IMAGE_SECONDS (20) and NOTE_TIMEOUT_SECONDS
-# (15), plus STAGE_GRACE. Less and the attempt would be skipped (a resumed job).
-IMAGE_KEEP_SECONDS = 20 + 15 + STAGE_GRACE
+# (15), STAGE_GRACE and STAGE_HEADROOM. Less and the attempt would be skipped
+# (a resumed job).
+IMAGE_KEEP_SECONDS = 20 + 15 + STAGE_GRACE + STAGE_HEADROOM
 MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
 # A short verdict per photo, without thinking (`think=False`): a reasoning model
 # spent over 2,000 tokens and 20 s on five photos, past the check's deadline.

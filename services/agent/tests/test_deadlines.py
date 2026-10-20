@@ -335,7 +335,10 @@ def test_the_image_keeps_what_a_resumed_job_needs():
     from kiki_agent_host.media import drawing
 
     assert drawing.IMAGE_KEEP_SECONDS == (
-        agent_executor.MIN_IMAGE_SECONDS + agent_executor.NOTE_TIMEOUT_SECONDS + drawing.STAGE_GRACE
+        agent_executor.MIN_IMAGE_SECONDS
+        + agent_executor.NOTE_TIMEOUT_SECONDS
+        + drawing.STAGE_GRACE
+        + drawing.STAGE_HEADROOM
     )
 
 
@@ -349,3 +352,38 @@ async def test_a_resumed_drawing_still_gets_an_image_attempt():
         used = stage.time_left() + drawing.STAGE_GRACE
         attempt = time_left() - used - agent_executor.NOTE_TIMEOUT_SECONDS
     assert attempt >= agent_executor.MIN_IMAGE_SECONDS - 0.1
+
+
+async def test_a_resumed_drawing_runs_its_stage_out_and_still_draws(monkeypatch):
+    """Review round 3: running the stages, not adding up their budgets. A
+    reference stage that uses its whole deadline and grace, then the image
+    attempt, in a job with only IMAGE_KEEP_SECONDS and a bit left. The exact sum
+    left 34.988 s of the 35 needed (cancelling takes a little time), so the
+    attempt was skipped. Minimums are scaled down; the headroom is the real one."""
+    from kiki_agent_host.contracts import Drawing, Subject
+    from kiki_agent_host.media import drawing
+
+    monkeypatch.setattr(agent_executor, "MIN_IMAGE_SECONDS", 0.4)
+    monkeypatch.setattr(agent_executor, "NOTE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(drawing, "STAGE_GRACE", 0.2)
+    keep = 0.4 + 0.3 + 0.2 + drawing.STAGE_HEADROOM
+    monkeypatch.setattr(drawing, "IMAGE_KEEP_SECONDS", keep)
+
+    async def find_forever(subject):
+        await asyncio.sleep(60)
+
+    async def no_shared(ids):
+        return []
+
+    run = executor()
+    drawn = ImageModel()
+    run.image_models = {PRIMARY: drawn}
+    plan = Drawing(prompt="x", subjects=[Subject(name="Nougie")])
+    with run_deadline(keep + 0.3):
+        gather = drawing.Gatherer(None, None, None, "", seconds=drawing.REFERENCES_SECONDS)
+        monkeypatch.setattr(gather, "find", find_forever)
+        monkeypatch.setattr(gather, "shared", no_shared)
+        found, shared = await gather.everything(plan)  # cut at its deadline + grace
+        assert found[0].subject.name == "Nougie"
+        data, *_ = await run.generate(image_job(), found, shared)
+    assert data  # the image model was called and drew
