@@ -2,7 +2,6 @@ import logging
 import os
 import subprocess
 import sys
-import time
 
 import pytest
 
@@ -67,12 +66,14 @@ def test_http_client_and_exporter_logs_are_never_exported():
 
 
 # Runs in a subprocess (providers are process-wide) with a local OTLP receiver
-# that records every request; RECEIVED holds (path, headers).
+# that records every request; RECEIVED holds (path, headers), and EXPORTING is
+# set once the first has arrived.
 RECEIVER = """
 import asyncio, os, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RECEIVED = []
+EXPORTING = threading.Event()
 
 class Receiver(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -84,6 +85,7 @@ class Receiver(BaseHTTPRequestHandler):
 
     def reply(self):
         RECEIVED.append((self.path, dict(self.headers)))
+        EXPORTING.set()
         time.sleep(float(os.environ.get("RECEIVER_DELAY", "0")))
         self.send_response(200)
         self.send_header("Content-Length", "0")
@@ -208,8 +210,9 @@ assert telemetry.flush_soon() is None
 
 
 def test_process_exit_keeps_to_the_shutdown_deadline():
-    """A flush in flight, batches queued and a slow backend: neither the flush
-    thread nor the SDK's exit handlers may hold the process past shutdown()."""
+    """A flush in flight, batches queued and a slow backend: shutdown() keeps to
+    its deadline, and neither the flush thread nor the SDK's exit handlers hold
+    the process long after (unbounded, they'd drain 20 batches at 1.6 s each)."""
     script = """
 from opentelemetry import trace
 
@@ -218,9 +221,15 @@ async def main():
     for _ in range(200):
         tracer.start_span("queued").end()
     telemetry.flush_soon()
-    await asyncio.sleep(0.2)  # the flush is now waiting on the receiver
-    print("shutdown at", time.monotonic(), flush=True)
-    await asyncio.to_thread(telemetry.shutdown)
+    # The flush is now waiting on the receiver.
+    assert await asyncio.to_thread(EXPORTING.wait, 10)
+
+    def stop():
+        started = time.monotonic()
+        telemetry.shutdown()
+        return time.monotonic() - started
+
+    print("shutdown took", await asyncio.to_thread(stop), flush=True)
 
 asyncio.run(main())
 """
@@ -233,8 +242,57 @@ asyncio.run(main())
     process = subprocess.Popen(
         [sys.executable, "-c", RECEIVER + script], env=env, stdout=subprocess.PIPE, text=True
     )
-    line = next(line for line in process.stdout if line.startswith("shutdown at"))
-    shutting_down = float(line.split()[-1])
-    assert process.wait(timeout=60) == 0
-    elapsed = time.monotonic() - shutting_down
-    assert elapsed < telemetry.SHUTDOWN_SECONDS + 1, elapsed
+    try:
+        out, _ = process.communicate(timeout=telemetry.SHUTDOWN_SECONDS + 15)
+    finally:
+        process.kill()
+    assert process.returncode == 0
+    took = float(
+        next(line for line in out.splitlines() if line.startswith("shutdown took")).split()[-1]
+    )
+    assert took < telemetry.SHUTDOWN_SECONDS + 0.5, took
+
+
+def test_queries_are_traced_inside_a_request_without_sql_or_values():
+    """Spans named by the operation: composed SQL renders its values into the
+    text, and Postgres quotes them in its errors, so a failed query keeps only
+    its type."""
+    if not os.getenv("TEST_DATABASE_URL"):
+        pytest.skip("set TEST_DATABASE_URL for Postgres integration tests")
+    run(
+        """
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from psycopg import sql
+from kiki_agent_host import db
+
+spans = InMemorySpanExporter()
+trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(spans))
+
+async def main():
+    async with await db.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        await connection.execute("SELECT %s::text", ("outside-secret",))
+        with trace.get_tracer("test").start_as_current_span("job"):
+            await connection.execute("SELECT %s::text", ("inside-secret",))
+            # Rendered with its value by the instrumentation.
+            await connection.execute(sql.SQL("SELECT {}::text").format(sql.Literal("secret")))
+            try:
+                await connection.execute("SELECT %s::int", ("not-a-number-secret",))
+            except Exception as error:
+                assert "secret" in str(error)  # what the span must not keep
+
+asyncio.run(main())
+queries = [s for s in spans.get_finished_spans() if s.name == "SELECT"]
+assert len(queries) == 3, spans.get_finished_spans()
+for query in queries:
+    assert query.attributes["db.system"] == "postgresql", query.attributes
+    assert query.attributes["db.name"] == "kiki", query.attributes
+    assert not telemetry.SQL_TEXT & set(query.attributes), query.attributes
+assert queries[2].attributes["error.type"] == "InvalidTextRepresentation", queries[2].attributes
+for span in spans.get_finished_spans():
+    assert not span.events, span.events
+    assert "secret" not in str(span.status.description)
+    assert not any("secret" in str(v) for v in span.attributes.values()), span.attributes
+"""
+    )

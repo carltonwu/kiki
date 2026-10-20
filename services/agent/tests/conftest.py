@@ -44,3 +44,50 @@ async def database_url():
             await connection.execute(
                 sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))
             )
+
+
+class Recorded:
+    """What the host recorded while export was on, in memory."""
+
+    def __init__(self, reader, spans):
+        self.reader, self.spans = reader, spans
+
+    def value(self, name: str, **attributes) -> float | None:
+        """A counter's value, or a histogram's count, for exactly `attributes`."""
+        data = self.reader.get_metrics_data()  # None before anything is recorded
+        found = [
+            point
+            for resource in (data.resource_metrics if data else [])
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+            if metric.name == name
+            for point in metric.data.data_points
+            if dict(point.attributes) == attributes
+        ]
+        if not found:
+            return None
+        [point] = found
+        return point.count if hasattr(point, "count") else point.value
+
+    def finished(self, name: str) -> list:
+        return [s for s in self.spans.get_finished_spans() if s.name == name]
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    """The host's metrics and spans for one test, recorded in memory."""
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    from kiki_agent_host import telemetry
+
+    reader, spans = InMemoryMetricReader(), InMemorySpanExporter()
+    tracer_provider = TracerProvider()
+    tracer_provider.add_span_processor(SimpleSpanProcessor(spans))
+    recorder = telemetry.Recorder(MeterProvider(metric_readers=[reader]), tracer_provider)
+    monkeypatch.setattr(telemetry, "_recorder", recorder)
+    monkeypatch.setattr(telemetry, "_models", set())
+    return Recorded(reader, spans)

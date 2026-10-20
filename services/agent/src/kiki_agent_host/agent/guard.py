@@ -1,5 +1,6 @@
-"""Every tool call runs through `guarded`: a deadline, a per-reply budget, and one
-log line. Errors the model can act on come back as `{"error": ...}` results."""
+"""Every tool call runs through `guarded`: a deadline, a per-reply budget, one log
+line, and its telemetry (kiki.tools.*, a span). Errors the model can act on come
+back as `{"error": ...}` results."""
 
 import asyncio
 import contextlib
@@ -10,6 +11,7 @@ from dataclasses import dataclass
 
 from pydantic_ai import RunContext
 
+from .. import telemetry
 from ..media.vision import ImageRefused
 from .deps import Deps
 
@@ -43,27 +45,33 @@ async def guarded(
     their own cap, so searching can't block a drawing. `lock` is taken before the
     deadline starts."""
     deps = ctx.deps
-    if budget:
-        deps.spent[budget.name] += 1
-        if deps.spent[budget.name] > budget.calls:
-            logger.debug(
-                "%s budget exhausted job_id=%s tool=%s", budget.name.lower(), deps.job_id, name
-            )
-            return {"error": f"{budget.name} budget used up. Answer with what you have."}
-    started = time.monotonic()
-    outcome = "ok"
-    try:
-        async with lock or contextlib.nullcontext(), asyncio.timeout(timeout):
-            result = await work()
-    except TimeoutError:
-        outcome = "timeout"
-        result = {"error": "Timed out."}
-    except ImageRefused as e:
-        outcome = "refused"
-        result = {"error": str(e)}
-    except ValueError as e:
-        outcome = "invalid_arguments"
-        result = {"error": str(e)}
+    with telemetry.tool_call(name) as call:
+        if budget:
+            deps.spent[budget.name] += 1
+            if deps.spent[budget.name] > budget.calls:
+                logger.debug(
+                    "%s budget exhausted job_id=%s tool=%s",
+                    budget.name.lower(),
+                    deps.job_id,
+                    name,
+                )
+                call.outcome = "budget_exhausted"
+                return {"error": f"{budget.name} budget used up. Answer with what you have."}
+        started = time.monotonic()
+        try:
+            async with lock or contextlib.nullcontext(), asyncio.timeout(timeout):
+                result = await work()
+        except TimeoutError:
+            call.outcome = "timeout"
+            result = {"error": "Timed out."}
+        except ImageRefused as e:
+            call.outcome = "refused"
+            result = {"error": str(e)}
+        except ValueError as e:
+            call.outcome = "invalid_arguments"
+            result = {"error": str(e)}
+        if call.outcome == "ok" and "error" in result:
+            call.outcome = "error"
     hits = next(
         (result[k] for k in ("messages", "images", "emojis", "entries", "groups") if k in result),
         [],
@@ -78,6 +86,6 @@ async def guarded(
         (time.monotonic() - started) * 1000,
         len(hits),
         result.get("semantic", "-"),
-        "error" if outcome == "ok" and "error" in result else outcome,
+        call.outcome,
     )
     return result

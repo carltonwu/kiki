@@ -39,13 +39,14 @@ from pydantic_ai.messages import BinaryContent, BinaryImage, ModelResponse, Text
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
+from .. import telemetry
 from ..chat.attachments import images_in
 from ..chat.scope import HEARD, Scope
 from ..contracts import Drawing, JobRequest, Reference, Subject
 from ..prompt import history
 from . import links
 from .fetch import allowed, client, download, refresh, sniff
-from .vision import ImageRefused, Vision, billed_cost, look
+from .vision import ImageRefused, Vision, bill, billed_cost, look
 
 logger = logging.getLogger(__name__)
 
@@ -578,13 +579,18 @@ async def failure_note(
         messages = history(request.messages)
         if ack.strip():
             messages.append(ModelResponse(parts=[TextPart(ack)]))
-        run = await note_writer.run(
-            FAILURE_NOTE.format(reason=reason),
-            model=model,
-            message_history=messages,
-            model_settings={"max_tokens": NOTE_MAX_TOKENS, "openrouter_usage": {"include": True}},
-            usage_limits=UsageLimits(request_limit=1),
-        )
+        with telemetry.llm_call("failure_note", model.model_name) as call:
+            run = await note_writer.run(
+                FAILURE_NOTE.format(reason=reason),
+                model=model,
+                message_history=messages,
+                model_settings={
+                    "max_tokens": NOTE_MAX_TOKENS,
+                    "openrouter_usage": {"include": True},
+                },
+                usage_limits=UsageLimits(request_limit=1),
+            )
+            bill(call, run)
     except Exception as error:  # noqa: BLE001 - the notice must not fail the job
         logger.warning(
             "failure note failed reply_job=%s error_type=%s", reply_job, type(error).__name__

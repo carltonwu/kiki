@@ -14,10 +14,11 @@ from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import BinaryContent, ModelResponse
 from pydantic_ai.models import Model
+from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
 
-from .. import db
+from .. import db, telemetry
 from ..chat import emojis
 from ..chat.scope import Roster, Scope
 from ..config import cdn_base
@@ -34,7 +35,7 @@ from ..contracts import (
 )
 from ..executor import TransientError
 from ..media import drawing, generation
-from ..media.vision import ImageRefused, Vision, billed_cost, look
+from ..media.vision import ImageRefused, Vision, billed_cost, look, response_cost
 from ..openrouter.chat import WebOpenRouterModel
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
@@ -55,6 +56,25 @@ EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadli
 IMAGE_TIMEOUT_SECONDS = 75
 
 topic_agent = Agent()
+
+
+class Metered(WrapperModel):
+    """A run's model, billing each response to the run's telemetry call as it
+    arrives, with its web searches and fetches: a run that fails later (a usage
+    limit, a tool, the provider) still paid for the requests before."""
+
+    def __init__(self, wrapped: Model, call: telemetry.Call):
+        super().__init__(wrapped)
+        self.call = call
+
+    # Runs don't stream, so request_stream isn't metered.
+    async def request(self, *args, **kwargs) -> ModelResponse:
+        response = await super().request(*args, **kwargs)
+        usage = response.usage
+        self.call.bill(response_cost(response), usage.input_tokens, usage.output_tokens)
+        web = web_use([response])
+        telemetry.web_calls(web.searches, web.fetches)
+        return response
 
 
 class PydanticExecutor:
@@ -101,8 +121,11 @@ class PydanticExecutor:
         if request.messages[-1].role != "user":
             raise ValueError("the last message must be from the user")
         prompt, earlier = request.messages[-1].content, history(request.messages[:-1])
+        # One telemetry call for the run, however many model requests it makes;
+        # its tools' calls are their own (guard.py).
+        billed = telemetry.Call()
         options = {
-            "model": self.model(request.model),
+            "model": Metered(self.model(request.model), billed),
             "message_history": earlier,
             "model_settings": {
                 "max_tokens": request.max_output_tokens,
@@ -117,7 +140,8 @@ class PydanticExecutor:
         deps = None
         try:
             if request.kind == "topic":
-                result = await topic_agent.run(prompt, **options)
+                with telemetry.llm_call("topic", request.model, call=billed):
+                    result = await topic_agent.run(prompt, **options)
             else:
                 async with await db.connect(self.database_url) as connection:
                     scope = Scope(
@@ -139,9 +163,10 @@ class PydanticExecutor:
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
-                        result = await reply_agent.run(
-                            prompt, deps=deps, capabilities=self.web_tools, **options
-                        )
+                        with telemetry.llm_call("reply", request.model, call=billed):
+                            result = await reply_agent.run(
+                                prompt, deps=deps, capabilities=self.web_tools, **options
+                            )
                     finally:
                         await finish(deps.indexing)
                         await deps.memory.close()
@@ -155,6 +180,7 @@ class PydanticExecutor:
         usage = result.usage
         responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
         web = web_use(responses)
+        telemetry.model_requests(usage.requests)
         cost = billed_cost(result)  # includes OpenRouter's web tool fees
         extra = embed.cost + vision.cost
         if extra:
@@ -216,14 +242,17 @@ class PydanticExecutor:
             prompt, references, pictures = drawing.compose(
                 plan, found, shared, max_references=reference_limit(model)
             )
+            rescue = model != request.image_model
             try:
-                async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
-                    data, mime_type, cost = await generation.generate(
-                        self.image_model(model),
-                        prompt,
-                        aspect_ratio_for(model, plan.aspect_ratio),
-                        pictures,
-                    )
+                with telemetry.image_attempt(model, attempt_result, fallback=rescue) as attempt:
+                    async with asyncio.timeout(IMAGE_TIMEOUT_SECONDS):
+                        data, mime_type, cost = await generation.generate(
+                            self.image_model(model),
+                            prompt,
+                            aspect_ratio_for(model, plan.aspect_ratio),
+                            pictures,
+                            attempt,
+                        )
                 return data, mime_type, cost, model, prompt, references
             except generation.SafetyRefused:
                 if fallback is None:
@@ -344,7 +373,7 @@ class PydanticExecutor:
     async def describe_emojis(self, request: DescribeEmojisRequest) -> DescribeEmojisResult:
         """Describes one batch of the guild's undescribed emoji with a vision model."""
         # The same model call as read_image; the model is Rust's OPENROUTER_EMOJI_MODEL.
-        vision = Vision(self.model(request.model), request.model)
+        vision = Vision(self.model(request.model), request.model, purpose="emoji")
 
         async def describe(
             name: str, animated: bool, image: BinaryContent
@@ -371,3 +400,15 @@ class PydanticExecutor:
         except OperationalError as e:
             raise TransientError(type(e).__name__) from e
         return DescribeEmojisResult(**counts)
+
+
+def attempt_result(error: BaseException) -> str:
+    """A failed image model attempt as kiki.images.attempts counts it, matching the
+    error `draw` reports for it."""
+    if isinstance(error, generation.SafetyRefused):
+        return "safety_blocked"
+    if isinstance(error, ImageRefused):
+        return "refused"
+    if isinstance(error, APIStatusError) and 400 <= error.status_code < 500:
+        return "refused"
+    return "failed"

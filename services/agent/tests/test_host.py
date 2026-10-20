@@ -48,7 +48,7 @@ class FakeExecutor:
         return JobResult(text="hello from the test executor", model=request.model)
 
 
-async def test_result_survives_new_app_and_conflicting_input_is_rejected(database_url):
+async def test_result_survives_new_app_and_conflicting_input_is_rejected(database_url, recorded):
     executor = FakeExecutor()
     settings = Settings(database_url, TOKEN)
     async with client(create_app(settings, executor)) as http:
@@ -63,6 +63,10 @@ async def test_result_survives_new_app_and_conflicting_input_is_rejected(databas
         changed = job()
         changed["messages"][0]["content"] = "different"
         assert (await http.post("/v1/jobs", json=changed, headers=HEADERS)).status_code == 409
+    assert recorded.value("kiki.agent.jobs", kind="reply", outcome="completed") == 2
+    assert recorded.value("kiki.agent.jobs.rejected", reason="conflict") == 1
+    # Only the attempt that ran it: the second was answered from the saved result.
+    assert recorded.value("kiki.agent.job.duration", kind="reply") == 1
 
 
 async def test_requests_saved_before_image_model_existed_still_match(database_url):
@@ -179,7 +183,7 @@ async def test_timeout_releases_lock_and_same_job_can_be_recovered(database_url)
         assert executor.calls == 1
 
 
-async def test_capacity_is_bounded(database_url):
+async def test_capacity_is_bounded(database_url, recorded):
     entered, release = asyncio.Event(), asyncio.Event()
 
     class BlockingExecutor(FakeExecutor):
@@ -195,6 +199,7 @@ async def test_capacity_is_bounded(database_url):
         try:
             response = await http.post("/v1/jobs", json=job("reply:43"), headers=HEADERS)
             assert response.status_code == 503
+            assert recorded.value("kiki.agent.jobs.rejected", reason="busy") == 1
         finally:
             release.set()
         await first

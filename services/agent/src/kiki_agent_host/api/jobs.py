@@ -1,11 +1,12 @@
 """Durable results and session locks, with connections only during a job."""
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 
 from psycopg.types.json import Jsonb
 
-from .. import db
+from .. import db, telemetry
 from ..contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
 from ..executor import Executor, TransientError
 
@@ -76,6 +77,7 @@ async def durable(
                 (request.id, Jsonb(payload)),
             )
 
+        started = time.monotonic()
         try:
             result = await execute()
         except TransientError:
@@ -97,6 +99,10 @@ async def durable(
                 (error, request.id),
             )
             return JobResponse(id=request.id, status="failed", error=error)
+        finally:
+            # Each attempt that ran the job: a retry answered from the saved
+            # result, or turned away as running, didn't.
+            telemetry.job_ran(kind, time.monotonic() - started)
 
         await connection.execute(
             "UPDATE agent_host_jobs SET status = 'completed', result = %s, error = NULL, "

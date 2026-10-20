@@ -2,6 +2,8 @@
 
 from openai import AsyncOpenAI
 
+from .. import telemetry
+
 EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DIMENSIONS = 1024  # Qwen3 embeddings are Matryoshka: a prefix is a valid embedding.
 QUERY_INSTRUCTION = (
@@ -22,8 +24,11 @@ class Embedder:
     ) -> list[str]:
         if query:
             texts = [instruction + t for t in texts]
-        response = await self.client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-        self.cost += float(getattr(response.usage, "cost", None) or 0)
+        with telemetry.llm_call("embedding", EMBEDDING_MODEL) as call:
+            response = await self.client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+            cost = float(getattr(response.usage, "cost", None) or 0)
+            call.bill(cost, getattr(response.usage, "prompt_tokens", 0))
+        self.cost += cost
         return [
             "[" + ",".join(f"{x:.5g}" for x in item.embedding[:DIMENSIONS]) + "]"
             for item in sorted(response.data, key=lambda item: item.index)

@@ -9,6 +9,8 @@ from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
 from pydantic_ai.images import ImageGenerationModel, ImageGenerationSettings
 from pydantic_ai.messages import BinaryImage
 
+from .. import telemetry
+from ..openrouter.images import NoImage
 from .fetch import sniff
 from .vision import ImageRefused
 
@@ -27,9 +29,12 @@ async def generate(
     prompt: str,
     aspect_ratio: str | None = None,
     references: Sequence[BinaryImage] = (),
+    attempt: telemetry.Call | None = None,
 ) -> tuple[bytes, str, float]:
     """The image's bytes, MIME type and billed cost, or ImageRefused/ValueError.
-    `references` go to the model in order, as the prompt numbers them."""
+    `references` go to the model in order, as the prompt numbers them. The cost is
+    billed to `attempt` as soon as the provider reports it: an image refused after
+    that (too large, an unsupported type) was still paid for."""
     prompt = prompt.strip()
     if not prompt:
         raise ValueError("prompt must describe the image")
@@ -48,10 +53,14 @@ async def generate(
             f"The image model's safety filter blocked this picture{about}. Asking again "
             "won't get it through; only a tamer version of the idea could be drawn."
         ) from None
-    except UnexpectedModelBehavior:
+    except UnexpectedModelBehavior as e:
+        if isinstance(e, NoImage) and attempt is not None:
+            attempt.bill(e.cost)  # paid for all the same
         raise ImageRefused("No image was generated.") from None
     image = result.image
     cost = float((result.provider_details or {}).get("cost") or 0)
+    if attempt is not None:
+        attempt.bill(cost)
     # The bytes decide the type (`fetch.sniff`), as for images Kiki reads: a
     # provider's declared type can be wrong, and Discord shows these inline.
     if len(image.data) > MAX_IMAGE_BYTES:

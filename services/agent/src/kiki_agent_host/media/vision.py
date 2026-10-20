@@ -12,6 +12,8 @@ from pydantic_ai.messages import ModelResponse, UserContent
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
+from .. import telemetry
+
 logger = logging.getLogger(__name__)
 
 
@@ -29,6 +31,8 @@ class Vision:
     calls: int = 0
     # The bot token, to refresh expired attachment links (`refresh`); none skips it.
     discord_token: str = ""
+    # What its calls are for in kiki.llm.*: vision, or emoji for descriptions.
+    purpose: str = "vision"
 
 
 class ImageRefused(ValueError):
@@ -53,13 +57,15 @@ async def look(
         settings["openrouter_reasoning"] = {"enabled": False}
         settings["temperature"] = 0  # the same photos get the same verdicts
     try:
-        run = await viewer.run(
-            prompt,
-            model=vision.model,
-            instructions=instructions,
-            model_settings=settings,
-            usage_limits=UsageLimits(request_limit=1),
-        )
+        with telemetry.llm_call(vision.purpose, vision.name) as call:
+            run = await viewer.run(
+                prompt,
+                model=vision.model,
+                instructions=instructions,
+                model_settings=settings,
+                usage_limits=UsageLimits(request_limit=1),
+            )
+            bill(call, run)
     except ModelHTTPError as error:
         logger.warning(
             "vision call failed model=%s fallback=%s status=%d",
@@ -89,12 +95,23 @@ async def look(
     return run.output.strip()
 
 
+def bill(call: telemetry.Call, run) -> None:
+    """Puts a run's billed cost and tokens on its telemetry call."""
+    call.bill(billed_cost(run), run.usage.input_tokens, run.usage.output_tokens)
+
+
+def response_cost(response: ModelResponse) -> float | None:
+    """OpenRouter's billed cost for one response; Pydantic's price table lags new
+    models."""
+    return (response.provider_details or {}).get("cost")
+
+
 def billed_cost(result) -> float | None:
-    """OpenRouter's billed cost per response; Pydantic's price table lags new models."""
+    """OpenRouter's billed cost per response, summed."""
     billed = [
-        m.provider_details["cost"]
+        cost
         for m in result.new_messages()
-        if isinstance(m, ModelResponse) and "cost" in (m.provider_details or {})
+        if isinstance(m, ModelResponse) and (cost := response_cost(m)) is not None
     ]
     if billed:
         return sum(billed)
