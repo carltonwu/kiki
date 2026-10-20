@@ -11,7 +11,7 @@
   "interval": "1m",
   "params": {
     "daily_llm_spend_usd": 5,
-    "gateway_silence_seconds": 900,
+    "gateway_reconnects_per_15m": 5,
     "run_pending_seconds": 120,
     "error_spike_count": 3,
     "postgres_memory_limit_bytes": 384000000,
@@ -19,17 +19,17 @@
   },
   "rules": [
     {
-      "uid": "kiki-gateway-silent",
-      "title": "Kiki: no Gateway events",
+      "uid": "kiki-ingester-down",
+      "title": "Kiki: ingester down",
       "condition": "C",
       "data": [
         {
           "refId": "A",
-          "relativeTimeRange": {"from": "${gateway_silence_seconds}", "to": 0},
+          "relativeTimeRange": {"from": 300, "to": 0},
           "datasourceUid": "${prom}",
           "model": {
             "refId": "A",
-            "expr": "sum(increase(kiki_gateway_events_total{job=\"kiki/ingester\"}[${gateway_silence_seconds}s])) or vector(0)",
+            "expr": "max(last_over_time(kiki_leader_held{job=\"kiki/ingester\"}[5m])) or vector(0)",
             "instant": true,
             "range": false,
             "intervalMs": 60000,
@@ -52,8 +52,47 @@
       "for": "5m",
       "labels": {"service": "kiki", "severity": "critical"},
       "annotations": {
-        "summary": "The ingester has received no Discord Gateway dispatches for ${gateway_silence_seconds} s.",
-        "description": "kiki_gateway_events_total did not increase. Either the Gateway connection is down or the ingester is not running or not exporting (a missing series counts as 0, so it alerts). A very quiet guild can also go this long without a message; raise gateway_silence_seconds if it does.",
+        "summary": "No ingester has held the leader lock for 10 minutes.",
+        "description": "kiki_leader_held{job=\"kiki/ingester\"} has had no 1 in the last 5 minutes, for 5 minutes: the ingester is down, crash-looping, not exporting, or running without the leader lock (so nothing ingests or polls). A missing series counts as 0. Deploys hand the lock over within seconds and don't trip it.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-gateway-reconnects",
+      "title": "Kiki: Gateway reconnect storm",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 900, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[15m])) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${gateway_reconnects_per_15m}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "5m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "The Gateway connection dropped {{ printf \"%.0f\" $values.A.Value }} times in 15 minutes.",
+        "description": "More than ${gateway_reconnects_per_15m} Gateway reconnects in 15 minutes, for 5 minutes: the connection keeps failing (see kiki_gateway_reconnects_total by reason on the Pipeline dashboard). Discord's occasional reconnect requests stay well below this.",
         "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
       }
     },
@@ -260,13 +299,13 @@
           }
         }
       ],
-      "noDataState": "NoData",
+      "noDataState": "OK",
       "execErrState": "KeepLast",
       "for": "10m",
       "labels": {"service": "kiki", "severity": "warning"},
       "annotations": {
-        "summary": "Postgres memory is near its ${postgres_memory_limit_bytes}-byte limit{{ with $values.A }} ({{ humanizePercentage .Value }}){{ end }}.",
-        "description": "kiki_railway_memory_bytes{service=\"postgres\"} has been above ${postgres_memory_ratio} of the limit for 10 minutes. Railway restarts Postgres at the limit. Without Railway metrics (no RAILWAY_METRICS_TOKEN) the rule shows No Data instead of alerting.",
+        "summary": "Postgres memory is {{ humanizePercentage $values.A.Value }} of its {{ humanize ${postgres_memory_limit_bytes} }}B limit.",
+        "description": "kiki_railway_memory_bytes{service=\"postgres\"} has been above ${postgres_memory_ratio} of the limit for 10 minutes; Railway restarts Postgres at the limit. Railway metrics are optional (RAILWAY_METRICS_TOKEN on the ingester): without them the rule has no data and stays OK.",
         "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
       }
     }

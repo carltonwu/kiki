@@ -1,7 +1,7 @@
 {
   "uid": "kiki-agent",
   "title": "Kiki / Agent host",
-  "description": "The Python agent host: jobs, model requests, images, tools and web calls. The agent host sleeps and exports only after each job, so its series are sparse: panels use increase() over the interval (at least 15 min) or the selected range, never instant values.",
+  "description": "The Python agent host: jobs, model requests, images, tools and web calls. The agent host sleeps and exports only after each job, so its series are sparse: time series are rolling 1 h counts and totals one increase() over the selected range, never instant values.",
   "tags": [
     "kiki"
   ],
@@ -97,8 +97,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Jobs by kind and outcome",
-      "description": "Answered job requests per interval (at least 15 min): kind reply, topic, image; outcome completed, failed, running (another request holds the job), interrupted (503, retried). Counts are per request, not per job. The agent host sleeps and exports only after each job, so its series are sparse: panels use increase() over the interval (at least 15 min) or the selected range, never instant values.",
+      "title": "Jobs by kind and outcome (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Answered job requests in the hour before each point: kind reply, topic, image; outcome completed, failed, running (another request holds the job), interrupted (503, retried). Counts are per request, not per job. The agent host sleeps and exports only after each job, so its series are sparse: time series are rolling 1 h counts and totals one increase() over the selected range, never instant values.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -110,7 +110,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[$__interval]))",
+          "expr": "sum by (kind, outcome) (increase(kiki_agent_jobs_total{job=\"kiki/agent\"}[1h]))",
           "legendFormat": "{{kind}} {{outcome}}",
           "editorMode": "code",
           "instant": false,
@@ -124,15 +124,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -374,8 +374,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Job duration",
-      "description": "Time spent running a job, per attempt that ran it, p50 and p95 by kind. AGENT_HOST_JOB_TIMEOUT_SECS defaults to 120 s. The agent host's duration buckets are coarse (0.5, 2.5, 10, 30, 120 s), so quantiles are interpolated within them.",
+      "title": "Job duration (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Time spent running a job, per attempt that ran it, p50 and p95 by kind. AGENT_HOST_JOB_TIMEOUT_SECS defaults to 120 s. The agent host's duration buckets are coarse (0.5, 2.5, 10, 30, 120 s), so quantiles are interpolated within them.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -387,7 +387,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__interval])))",
+          "expr": "histogram_quantile(0.5, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h])))",
           "legendFormat": "{{kind}} p50",
           "editorMode": "code",
           "instant": false,
@@ -399,7 +399,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[$__interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, kind) (increase(kiki_agent_job_duration_seconds_bucket{job=\"kiki/agent\"}[1h])))",
           "legendFormat": "{{kind}} p95",
           "editorMode": "code",
           "instant": false,
@@ -415,7 +415,7 @@
           "custom": {
             "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 10,
+            "fillOpacity": 0,
             "gradientMode": "none",
             "showPoints": "always",
             "pointSize": 4,
@@ -738,8 +738,8 @@
     },
     {
       "type": "timeseries",
-      "title": "LLM calls by purpose",
-      "description": "The agent host's model calls per interval by purpose and result. Cost: see the Cost dashboard.",
+      "title": "LLM calls by purpose (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. The agent host's model calls in the hour before each point by purpose and result. Cost: see the Cost dashboard.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -751,7 +751,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[$__interval]))",
+          "expr": "sum by (purpose, result) (increase(kiki_llm_calls_total{job=\"kiki/agent\"}[1h]))",
           "legendFormat": "{{purpose}} {{result}}",
           "editorMode": "code",
           "instant": false,
@@ -765,15 +765,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -1107,8 +1107,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Image attempts",
-      "description": "Image attempts per interval by result.",
+      "title": "Image attempts (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Image attempts in the hour before each point by result.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1120,7 +1120,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[$__interval]))",
+          "expr": "sum by (result) (increase(kiki_images_attempts_total{job=\"kiki/agent\"}[1h]))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": false,
@@ -1134,15 +1134,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -1581,8 +1581,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Tool calls",
-      "description": "Tool calls per interval by tool.",
+      "title": "Tool calls (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Tool calls in the hour before each point by tool.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1594,7 +1594,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (tool) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[$__interval]))",
+          "expr": "sum by (tool) (increase(kiki_tools_calls_total{job=\"kiki/agent\"}[1h]))",
           "legendFormat": "{{tool}}",
           "editorMode": "code",
           "instant": false,
@@ -1608,15 +1608,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -1809,8 +1809,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Web calls",
-      "description": "OpenRouter web searches and fetches made during reply runs, per interval.",
+      "title": "Web calls (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. OpenRouter web searches and fetches made during reply runs, in the hour before each point.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1822,7 +1822,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (kind) (increase(kiki_web_calls_total{job=\"kiki/agent\"}[$__interval]))",
+          "expr": "sum by (kind) (increase(kiki_web_calls_total{job=\"kiki/agent\"}[1h]))",
           "legendFormat": "{{kind}}",
           "editorMode": "code",
           "instant": false,
@@ -1836,15 +1836,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"

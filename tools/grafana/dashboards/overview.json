@@ -1187,8 +1187,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Errors per hour",
-      "description": "Failures per hour: agent runs failed, expired or interrupted; Discord sends that failed; LLM calls not `ok`; agent host responses other than 2xx (503 while it wakes is normal); Gateway payloads that failed to store.",
+      "title": "Errors (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Failures in the hour before each point: agent runs failed, expired or interrupted; Discord sends that failed; LLM calls not `ok`; agent host responses other than 2xx (503 while it wakes is normal); Gateway payloads that failed to store.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1200,7 +1200,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (status) (rate(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired|interrupted\"}[$__interval])) * 3600",
+          "expr": "sum by (status) (increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired|interrupted\"}[1h]))",
           "legendFormat": "runs {{status}}",
           "editorMode": "code",
           "instant": false,
@@ -1212,7 +1212,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(rate(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[$__interval])) * 3600",
+          "expr": "sum(increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[1h]))",
           "legendFormat": "Discord send errors",
           "editorMode": "code",
           "instant": false,
@@ -1224,7 +1224,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (job) (rate(kiki_llm_calls_total{job=~\"kiki/.+\", result!=\"ok\"}[$__interval])) * 3600",
+          "expr": "sum by (job) (increase(kiki_llm_calls_total{job=~\"kiki/.+\", result!=\"ok\"}[1h]))",
           "legendFormat": "LLM errors ({{job}})",
           "editorMode": "code",
           "instant": false,
@@ -1236,7 +1236,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(rate(kiki_agent_host_requests_total{job=\"kiki/ingester\", status!~\"2..\"}[$__interval])) * 3600",
+          "expr": "sum(increase(kiki_agent_host_requests_total{job=\"kiki/ingester\", status!~\"2..\"}[1h]))",
           "legendFormat": "agent host non-2xx",
           "editorMode": "code",
           "instant": false,
@@ -1248,7 +1248,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(rate(kiki_gateway_store_errors_total{job=\"kiki/ingester\"}[$__interval])) * 3600",
+          "expr": "sum(increase(kiki_gateway_store_errors_total{job=\"kiki/ingester\"}[1h]))",
           "legendFormat": "Gateway store errors",
           "editorMode": "code",
           "instant": false,
@@ -1257,20 +1257,20 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "suffix:/h",
+          "unit": "short",
           "color": {
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"

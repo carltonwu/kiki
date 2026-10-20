@@ -443,8 +443,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Cost by purpose",
-      "description": "Cost per interval (at least 15 min) by purpose: jev, reply, topic, vision, embedding, image, emoji, failure_note.",
+      "title": "Cost by purpose (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Cost in the hour before each point by purpose: jev, reply, topic, vision, embedding, image, emoji, failure_note.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -456,7 +456,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__interval]))",
+          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h]))",
           "legendFormat": "{{purpose}}",
           "editorMode": "code",
           "instant": false,
@@ -470,15 +470,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -540,8 +540,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Cost by model",
-      "description": "Cost per interval (at least 15 min) by model.",
+      "title": "Cost by model (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Cost in the hour before each point by model.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -553,7 +553,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__interval]))",
+          "expr": "sum by (model) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[1h]))",
           "legendFormat": "{{model}}",
           "editorMode": "code",
           "instant": false,
@@ -567,15 +567,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -636,9 +636,9 @@
       }
     },
     {
-      "type": "timeseries",
-      "title": "Cumulative spend (selected range)",
-      "description": "Running total of cost from the start of the selected range.",
+      "type": "bargauge",
+      "title": "Spend by purpose (selected range)",
+      "description": "Cost per purpose over the whole selected range, each one increase() over the range (summing short windows would lose the agent host's sparse samples).",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -650,51 +650,19 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__interval]))",
-          "legendFormat": "spend",
+          "expr": "sum by (purpose) (increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[$__range]))",
+          "legendFormat": "{{purpose}}",
           "editorMode": "code",
-          "instant": false,
-          "range": true
+          "instant": true,
+          "range": false
         }
       ],
       "fieldConfig": {
         "defaults": {
           "unit": "currencyUSD",
           "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 20,
-            "gradientMode": "none",
-            "showPoints": "auto",
-            "pointSize": 4,
-            "spanNulls": false,
-            "lineInterpolation": "linear",
-            "barAlignment": 0,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisPlacement": "auto",
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisSoftMin": 0,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            },
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false
+            "mode": "fixed",
+            "fixedColor": "blue"
           },
           "thresholds": {
             "mode": "absolute",
@@ -705,53 +673,47 @@
               }
             ]
           },
+          "min": 0,
           "mappings": [],
           "decimals": 2
         },
         "overrides": []
       },
       "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "horizontal",
+        "displayMode": "basic",
+        "valueMode": "color",
+        "namePlacement": "left",
+        "showUnfilled": true,
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "maxVizHeight": 24,
         "legend": {
-          "showLegend": true,
+          "showLegend": false,
           "displayMode": "list",
           "placement": "bottom",
           "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc",
-          "hideZeros": false
         }
       },
-      "interval": "15m",
       "id": 10,
       "gridPos": {
         "x": 0,
         "y": 14,
         "w": 12,
         "h": 8
-      },
-      "transformations": [
-        {
-          "id": "calculateField",
-          "options": {
-            "mode": "cumulativeFunctions",
-            "cumulative": {
-              "field": "spend",
-              "reducer": "sum"
-            },
-            "replaceFields": true,
-            "reduce": {
-              "reducer": "sum"
-            }
-          }
-        }
-      ]
+      }
     },
     {
       "type": "timeseries",
-      "title": "Tokens by purpose",
-      "description": "Input and output tokens per interval. Jev and image calls report none.",
+      "title": "Tokens by purpose (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. Input and output tokens in the hour before each point. Jev and image calls report none.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -763,7 +725,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (purpose, type) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\"}[$__interval]))",
+          "expr": "sum by (purpose, type) (increase(kiki_llm_tokens_total{job=~\"kiki/.+\"}[1h]))",
           "legendFormat": "{{purpose}} {{type}}",
           "editorMode": "code",
           "instant": false,
@@ -777,15 +739,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"
@@ -1147,8 +1109,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Calls by result over time",
-      "description": "LLM calls per interval by result.",
+      "title": "Calls by result over time (rolling 1 h)",
+      "description": "Rolling 1 h: each point counts the hour before it. The agent host exports only after a job, so a shorter window often holds a single sample of a series and increase() returns nothing for it. LLM calls in the hour before each point by result.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1160,7 +1122,7 @@
             "type": "prometheus",
             "uid": "${prom}"
           },
-          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[$__interval]))",
+          "expr": "sum by (result) (increase(kiki_llm_calls_total{job=~\"kiki/.+\"}[1h]))",
           "legendFormat": "{{result}}",
           "editorMode": "code",
           "instant": false,
@@ -1174,15 +1136,15 @@
             "mode": "palette-classic"
           },
           "custom": {
-            "drawStyle": "bars",
+            "drawStyle": "line",
             "lineWidth": 1,
-            "fillOpacity": 80,
+            "fillOpacity": 20,
             "gradientMode": "none",
             "showPoints": "auto",
             "pointSize": 4,
             "spanNulls": false,
             "lineInterpolation": "linear",
-            "barAlignment": -1,
+            "barAlignment": 0,
             "stacking": {
               "mode": "normal",
               "group": "A"

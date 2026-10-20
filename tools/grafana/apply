@@ -20,6 +20,7 @@ Details: docs/observability.md, "Dashboards and alerts".
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -60,11 +61,18 @@ def parse_dotenv(path: Path) -> dict[str, str]:
         key, sep, value = line.partition("=")
         if not sep:
             continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        values[key.strip()] = value
+        values[key.strip()] = dotenv_value(value.strip())
     return values
+
+
+def dotenv_value(value: str) -> str:
+    """A quoted value ends at its closing quote (anything after, such as a comment, is
+    dropped); an unquoted one at a ` #` comment."""
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        if end > 0:
+            return value[1:end]
+    return re.split(r"\s+#", value, maxsplit=1)[0].strip()
 
 
 def setting(name: str, dotenv: dict[str, str]) -> str:
@@ -111,6 +119,10 @@ def check_dashboard(model: dict) -> list[str]:
     for name, var in variables.items():
         if var.get("type") == "datasource" and name in DS_TYPES and var.get("query") != DS_TYPES[name]:
             errors.append(f"variable {name} should be a {DS_TYPES[name]} datasource variable")
+    panels_json = json.dumps(model.get("panels", []))
+    for name, var in variables.items():
+        if var.get("type") == "datasource" and f"${{{name}}}" not in panels_json:
+            errors.append(f"datasource variable {name} is not used by any query or link")
     ids = set()
     for panel in walk_panels(model.get("panels", [])):
         title = panel.get("title") or f"panel {panel.get('id')}"
@@ -231,10 +243,20 @@ def check_rule(rule: dict) -> list[str]:
 # --- Grafana API ------------------------------------------------------------------
 
 
+HEADER_SAFE = re.compile(r"[\x21-\x7e]+")
+
+
 class Grafana:
     def __init__(self, url: str, token: str):
         self.url = url.rstrip("/")
-        self._token = token
+        self._token = token.strip()
+        # Checked here, with a message that can't contain the token: urllib's own error
+        # for a bad header value (a newline, say) quotes the whole Authorization header.
+        if not HEADER_SAFE.fullmatch(self._token):
+            raise SystemExit("The Grafana token is empty or has spaces or characters not allowed in an HTTP header.")
+
+    def redact(self, text: str) -> str:
+        return text.replace(self._token, "<token>") if self._token else text
 
     def call(self, method: str, path: str, body=None, headers=None, ok404=False):
         data = json.dumps(body).encode() if body is not None else None
@@ -246,19 +268,26 @@ class Grafana:
             request.add_header("Content-Type", "application/json")
         for k, v in (headers or {}).items():
             request.add_header(k, v)
+        # No error text below may carry request headers: messages are built from the
+        # status, the response body and the exception type only, all with the token redacted.
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 raw = response.read()
         except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")[:500]
+            detail = self.redact(e.read().decode(errors="replace")[:500])
             if e.code == 404 and ok404:
                 return None
             if e.code in (401, 403):
                 raise Refused(f"{method} {path}: HTTP {e.code} {detail}") from None
             raise SystemExit(f"{method} {path}: HTTP {e.code} {detail}") from None
         except urllib.error.URLError as e:
-            raise SystemExit(f"{method} {path}: {e.reason}") from None
-        return json.loads(raw) if raw.strip() else {}
+            raise SystemExit(self.redact(f"{method} {path}: {e.reason}")) from None
+        except (ValueError, OSError, http.client.HTTPException) as e:  # bad header, socket, protocol
+            raise SystemExit(f"{method} {path}: request failed ({type(e).__name__})") from None
+        try:
+            return json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raise SystemExit(f"{method} {path}: the response isn't JSON (is GRAFANA_URL the stack's URL?)") from None
 
 
 def pick_datasource(kind: str, datasources: list[dict]) -> dict | None:
@@ -329,9 +358,9 @@ def main() -> int:
         return 0
 
     dotenv = parse_dotenv(args.env_file)
-    url = setting("GRAFANA_URL", dotenv)
+    url = setting("GRAFANA_URL", dotenv).strip()
     token_name = "GRAFANA_SA_TOKEN" if setting("GRAFANA_SA_TOKEN", dotenv) else "GRAFANA_APP_TOKEN"
-    token = setting(token_name, dotenv)
+    token = setting(token_name, dotenv).strip()
     if not url or not token:
         print(
             "Set GRAFANA_URL and GRAFANA_APP_TOKEN (or GRAFANA_SA_TOKEN) in the environment or .env.", file=sys.stderr
