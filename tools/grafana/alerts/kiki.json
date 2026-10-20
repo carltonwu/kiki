@@ -1,0 +1,313 @@
+{
+  "_comment": [
+    "Grafana-managed alert rules for Kiki, applied by tools/grafana/apply (docs/observability.md, Dashboards and alerts).",
+    "Rules are in the provisioning API's format. apply fills in folderUID, ruleGroup and orgID, replaces ${prom} with the",
+    "Prometheus datasource's UID, and replaces ${name} with params[name] (a string that is exactly ${name} becomes the",
+    "number itself). Override a param with: tools/grafana/apply --param daily_llm_spend_usd=10.",
+    "No contact point is set: alerts go to the stack's default notification policy."
+  ],
+  "folder": {"uid": "kiki", "title": "Kiki"},
+  "group": "kiki",
+  "interval": "1m",
+  "params": {
+    "daily_llm_spend_usd": 5,
+    "gateway_reconnects_per_15m": 5,
+    "run_pending_seconds": 120,
+    "error_spike_count": 3,
+    "postgres_memory_limit_bytes": 384000000,
+    "postgres_memory_ratio": 0.9
+  },
+  "rules": [
+    {
+      "uid": "kiki-ingester-down",
+      "title": "Kiki: ingester down",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 300, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "max(last_over_time(kiki_leader_held{job=\"kiki/ingester\"}[5m])) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "lt", "params": [1]}}]
+          }
+        }
+      ],
+      "noDataState": "Alerting",
+      "execErrState": "KeepLast",
+      "for": "5m",
+      "labels": {"service": "kiki", "severity": "critical"},
+      "annotations": {
+        "summary": "The ingester hasn't reported holding the leader lock for 5 minutes.",
+        "description": "The newest kiki_leader_held{job=\"kiki/ingester\"} sample of the last 5 minutes isn't 1 (or there is none), and that has lasted 5 minutes: the ingester is down, crash-looping, not exporting, or running without the leader lock (so nothing ingests or polls). A stopped ingester exports 0 on its way out, so this fires about 5 minutes after it stops; one that dies without exporting goes silent instead, and fires up to 10 minutes after its last sample. A deploy hands the lock to the new instance within about a minute, inside the pending period. A missing series counts as 0.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-gateway-reconnects",
+      "title": "Kiki: Gateway reconnect storm",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 900, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(kiki_gateway_reconnects_total{job=\"kiki/ingester\"}[15m])) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${gateway_reconnects_per_15m}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "5m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "The Gateway connection dropped {{ printf \"%.0f\" $values.A.Value }} times in 15 minutes.",
+        "description": "More than ${gateway_reconnects_per_15m} Gateway reconnects in 15 minutes, for 5 minutes: the connection keeps failing (see kiki_gateway_reconnects_total by reason on the Pipeline dashboard). Discord's occasional reconnect requests stay well below this.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-run-pending",
+      "title": "Kiki: agent run pending",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 300, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "max(kiki_queue_oldest_pending_age_seconds{job=\"kiki/ingester\", queue=\"agent_runs\"})",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${run_pending_seconds}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "1m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "An agent run has been pending for {{ humanizeDuration $values.A.Value }}.",
+        "description": "The oldest pending agent run is older than ${run_pending_seconds} s: no worker is claiming runs (agent host down or workers wedged). Runs older than AGENT_RUN_MAX_AGE_SECS expire unanswered. No data (no leader polling) is OK; the Gateway alert covers a dead ingester.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-runs-stuck",
+      "title": "Kiki: stuck agent runs",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 300, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "max(kiki_agent_runs_stuck{job=\"kiki/ingester\"})",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": [0]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "10m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "{{ $values.A.Value }} agent run(s) stuck running or delivering for over 10 minutes.",
+        "description": "kiki_agent_runs_stuck has been above 0 for 10 minutes. Host requests give up after 180 s, so these runs are wedged; check the ingester logs and the agent_runs table.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-daily-llm-spend",
+      "title": "Kiki: daily LLM spend",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 86400, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(kiki_llm_cost_usd_total{job=~\"kiki/.+\"}[24h]))",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${daily_llm_spend_usd}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "5m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "LLM spend over the last 24 h is ${{ printf \"%.2f\" $values.A.Value }} (threshold $${daily_llm_spend_usd}).",
+        "description": "kiki_llm_cost_usd_total over a rolling 24 h, both services. See the Kiki / Cost dashboard for the purpose and model behind it.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-error-spike",
+      "title": "Kiki: run failures or Discord send errors",
+      "condition": "D",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 900, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(kiki_agent_runs_finished_total{job=\"kiki/ingester\", status=~\"failed|expired\"}[15m])) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "B",
+          "relativeTimeRange": {"from": 900, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "B",
+            "expr": "sum(increase(kiki_discord_send_errors_total{job=\"kiki/ingester\"}[15m])) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {"refId": "C", "type": "math", "expression": "$A + $B"}
+        },
+        {
+          "refId": "D",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "D",
+            "type": "threshold",
+            "expression": "C",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${error_spike_count}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "5m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "{{ printf \"%.0f\" $values.A.Value }} failed or expired agent run(s) and {{ printf \"%.0f\" $values.B.Value }} Discord send error(s) in 15 min.",
+        "description": "More than ${error_spike_count} agent run failures plus Discord send errors in 15 minutes. Interrupted runs (a restart mid-delivery) are left out so deploys don't page. See the Kiki / Pipeline dashboard.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-postgres-memory",
+      "title": "Kiki: Postgres memory near limit",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 600, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "max(kiki_railway_memory_bytes{job=\"kiki/ingester\", service=\"postgres\"}) / ${postgres_memory_limit_bytes}",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${postgres_memory_ratio}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "KeepLast",
+      "for": "10m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "Postgres memory is {{ humanizePercentage $values.A.Value }} of its {{ humanize ${postgres_memory_limit_bytes} }}B limit.",
+        "description": "kiki_railway_memory_bytes{service=\"postgres\"} has been above ${postgres_memory_ratio} of the limit for 10 minutes; Railway restarts Postgres at the limit. Railway metrics are optional (RAILWAY_METRICS_TOKEN on the ingester): without them the rule has no data and stays OK.",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    }
+  ]
+}

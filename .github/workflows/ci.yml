@@ -31,6 +31,9 @@ jobs:
       TEST_DATABASE_URL: postgres://kiki:kiki@localhost:5432/kiki
     steps:
       - uses: actions/checkout@v7
+      # Grafana dashboards and alert rules: validate only (stdlib, no network).
+      - run: tools/grafana/apply --dry-run
+      - run: python3 -m unittest discover -s tools/grafana
       - uses: astral-sh/setup-uv@v7
         with:
           version: "0.11.7"
