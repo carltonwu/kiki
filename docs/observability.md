@@ -167,7 +167,10 @@ with OpenRouter's web fees, and `tokens` its requests' sum (the requests per run
 are in `kiki.agent.job.model_requests`). Vision, embedding and drawing calls made
 during a reply count under their own purposes. An image attempt that doesn't draw
 (a safety block included) is an `error`; the Images API reports no tokens, so
-`image` has cost only. `timeout` covers the job's deadline and client timeouts.
+`image` has cost only. `timeout` is a client or tool deadline. A call given up
+on (indexing a reply stopped waiting for, a run past the job's deadline) has no
+result, so it is only a span (`error.type=CancelledError`); a run cut off that
+way still shows as an `interrupted` job.
 
 ### Ingester
 
@@ -240,7 +243,8 @@ emoji-description endpoint is not a job.
 - `kiki.tools.calls` is per call through the tool guard (`agent/guard.py`).
   `tool` is one of the reply agent's fixed tools (`search_messages`, `recall`,
   …). `error` is an error result or an exception; `budget_exhausted` a call
-  turned away by the per-reply budget, which never ran, so has no duration.
+  turned away by the per-reply budget, which never ran, so has no duration. As
+  for model calls, a cancelled tool call or image attempt is only a span.
 - `kiki.web.calls` is OpenRouter's web searches and fetches per reply run, as its
   server tool usage reports them.
 

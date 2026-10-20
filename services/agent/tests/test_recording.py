@@ -270,3 +270,20 @@ assert not loaded, loaded
         [sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False
     )
     assert ran.returncode == 0, ran.stderr
+
+
+async def test_a_call_given_up_on_is_a_span_but_not_counted(recorded):
+    async def embed_forever():
+        with telemetry.llm_call("embedding", EMBEDDING_MODEL):
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(embed_forever())
+    await asyncio.sleep(0.01)
+    task.cancel()  # what finish() does to indexing a reply didn't wait for
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for result in ("ok", "error", "timeout"):
+        labels = {"purpose": "embedding", "model": EMBEDDING_MODEL, "result": result}
+        assert recorded.value("kiki.llm.calls", **labels) is None
+    [span] = recorded.finished("llm embedding")
+    assert span.attributes["error.type"] == "CancelledError"

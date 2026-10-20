@@ -54,9 +54,10 @@ class Recorded:
 
     def value(self, name: str, **attributes) -> float | None:
         """A counter's value, or a histogram's count, for exactly `attributes`."""
+        data = self.reader.get_metrics_data()  # None before anything is recorded
         found = [
             point
-            for resource in self.reader.get_metrics_data().resource_metrics
+            for resource in (data.resource_metrics if data else [])
             for scope in resource.scope_metrics
             for metric in scope.metrics
             if metric.name == name

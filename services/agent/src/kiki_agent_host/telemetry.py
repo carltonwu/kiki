@@ -442,18 +442,24 @@ def model_label(model: str) -> str:
     return "other"
 
 
-def timed_out(error: BaseException) -> bool:
-    # A job's deadline cancels its task; openai's and httpx's timeouts aren't
-    # TimeoutErrors.
-    return isinstance(error, TimeoutError | asyncio.CancelledError) or (
-        "Timeout" in type(error).__name__
-    )
+# A call given up on (indexing a reply stopped waiting for, a job past its
+# deadline) has no result: its span says so, and no metric counts it.
+CANCELLED = "cancelled"
+
+
+def call_result(error: BaseException) -> str:
+    if isinstance(error, asyncio.CancelledError):
+        return CANCELLED
+    # openai's and httpx's timeouts aren't TimeoutErrors.
+    timeout = isinstance(error, TimeoutError) or "Timeout" in type(error).__name__
+    return "timeout" if timeout else "error"
 
 
 @contextlib.contextmanager
 def llm_call(purpose: str, model: str, *, span: str = "") -> Iterator[Call]:
     """One model call as kiki.llm.* (`purpose` and the model actually called) and a
-    span with its cost and tokens. An exception makes it an error or a timeout."""
+    span with its cost and tokens. An exception makes it an error or a timeout.
+    Cancelled, it is only a span."""
     call = Call()
     if (recorder := _recorder) is None:
         yield call
@@ -466,11 +472,12 @@ def llm_call(purpose: str, model: str, *, span: str = "") -> Iterator[Call]:
         try:
             yield call
         except BaseException as error:
-            call.outcome = "timeout" if timed_out(error) else "error"
+            call.outcome = call_result(error)
             raise
         finally:
-            recorder.llm_calls.add(1, {**labels, "result": call.outcome})
-            recorder.llm_duration.record(time.monotonic() - started, labels)
+            if call.outcome != CANCELLED:
+                recorder.llm_calls.add(1, {**labels, "result": call.outcome})
+                recorder.llm_duration.record(time.monotonic() - started, labels)
             if call.cost:
                 recorder.llm_cost.add(call.cost, labels)
             for kind, tokens in (("input", call.input_tokens), ("output", call.output_tokens)):
@@ -499,10 +506,10 @@ def image_attempt(
         try:
             yield call
         except BaseException as error:
-            result = failed_as(error)
+            result = CANCELLED if isinstance(error, asyncio.CancelledError) else failed_as(error)
             raise
         finally:
-            if (recorder := _recorder) is not None:
+            if (recorder := _recorder) is not None and result != CANCELLED:
                 label = model_label(model)
                 recorder.image_attempts.add(1, {"model": label, "result": result})
                 recorder.image_duration.record(time.monotonic() - started, {"model": label})
@@ -516,8 +523,8 @@ def image_attempt(
 @contextlib.contextmanager
 def tool_call(tool: str) -> Iterator[Call]:
     """One tool call as kiki.tools.* and a span. The caller sets the outcome; an
-    exception makes it an error. One turned away (budget_exhausted) never ran, so
-    it has no duration."""
+    exception makes it an error (cancelled: only a span). One turned away
+    (budget_exhausted) never ran, so it has no duration."""
     call = Call()
     if (recorder := _recorder) is None:
         yield call
@@ -526,12 +533,13 @@ def tool_call(tool: str) -> Iterator[Call]:
     with recorder.span(f"execute_tool {tool}", {"gen_ai.tool.name": tool}) as call.span:
         try:
             yield call
-        except BaseException:
-            call.outcome = "error"
+        except BaseException as error:
+            call.outcome = CANCELLED if isinstance(error, asyncio.CancelledError) else "error"
             raise
         finally:
-            recorder.tool_calls.add(1, {"tool": tool, "outcome": call.outcome})
-            if call.outcome != "budget_exhausted":
+            if call.outcome != CANCELLED:
+                recorder.tool_calls.add(1, {"tool": tool, "outcome": call.outcome})
+            if call.outcome not in (CANCELLED, "budget_exhausted"):
                 recorder.tool_duration.record(time.monotonic() - started, {"tool": tool})
             call.span.set_attribute("kiki.tool.outcome", call.outcome)
 
