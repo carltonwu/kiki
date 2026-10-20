@@ -1,11 +1,12 @@
 """The `generate_image` tool: queues a picture to draw after the reply
 (docs/image-generation.md)."""
 
+import json
 import logging
 import re
-from typing import Annotated, get_args
+from typing import Annotated, Any, get_args
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, Field, model_validator
 from pydantic_ai import RunContext, Tool
 from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
@@ -25,15 +26,51 @@ logger = logging.getLogger(__name__)
 MAX_IMAGES = 2  # pictures one reply may queue
 
 
+def listed(value: Any) -> Any:
+    """A list as models send one: null for none, one item on its own, or the
+    list as a JSON string."""
+    if value is None:
+        return []
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return [value]
+    return value if isinstance(value, list) else [value]
+
+
+# Message IDs, sent as numbers as often as strings.
+IDs = Annotated[
+    list[Annotated[str, BeforeValidator(lambda v: str(v) if isinstance(v, int) else v)]],
+    BeforeValidator(listed),
+]
+
+
 class Pictured(BaseModel):
     """Someone or something in the picture."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def lenient(cls, value: Any) -> Any:
+        """Nulls for left-out fields, a ref as a bare number (2 for u2), and a
+        subject given only by ref or as Kiki."""
+        if isinstance(value, str):
+            return {"name": value}
+        if not isinstance(value, dict):
+            return value
+        value = {k: v for k, v in value.items() if v is not None}
+        if isinstance(value.get("person"), int):
+            value["person"] = f"u{value['person']}"
+        if not str(value.get("name") or "").strip() and (value.get("me") or value.get("person")):
+            value["name"] = "Kiki" if value.get("me") else value["person"]
+        return value
 
     name: str = Field(description='What to call them in the picture, like "Ethan" or "Nougie".')
     person: str | None = Field(
         default=None, description="Their ref, like u2, when it's someone in this server."
     )
     me: bool = Field(default=False, description="True when it's you, Kiki.")
-    photos: list[str] = Field(
+    photos: IDs = Field(
         default_factory=list,
         description="IDs of messages whose images show them, when you or the people asking "
         "already picked some (like the message in [image: …; message 123]; a Discord message "
@@ -48,11 +85,13 @@ class Pictured(BaseModel):
     )
 
 
-# Lenient where models slip: a bare name for a subject, or a ratio the image model
-# doesn't take. Each rejection costs a tool retry, and two failed a reply in prod.
-Subjects = list[
-    Annotated[Pictured, BeforeValidator(lambda v: {"name": v} if isinstance(v, str) else v)]
-]
+# Lenient where models slip: a bare name for a subject, nulls, numbers for IDs, one
+# item for a list, or a ratio the image model doesn't take. Each rejection costs a
+# tool retry, and running out of them fails the whole reply (seen in prod).
+Subjects = Annotated[list[Pictured] | None, BeforeValidator(listed)]
+Shared = Annotated[IDs | None, BeforeValidator(listed)]
+Text = Annotated[str, BeforeValidator(lambda v: "" if v is None else v)]
+Flag = Annotated[bool, BeforeValidator(lambda v: False if v is None else v)]
 Ratio = Annotated[
     AspectRatio | None, BeforeValidator(lambda v: v if v in get_args(AspectRatio) else None)
 ]
@@ -78,9 +117,10 @@ async def generate_image(
     subjects: Subjects | None = None,
     style: str | None = None,
     aspect_ratio: Ratio = None,
-    caption: str = "",
-    edit: bool = False,
-    shared: list[str] | None = None,
+    caption: Text = "",
+    edit: Flag = False,
+    shared: Shared = None,
+    **unknown: Any,  # keys the model made up (negative_prompt): ignored, not a retry
 ) -> dict:
     """Make a picture. It's drawn after your reply and posted as its own message.
 
