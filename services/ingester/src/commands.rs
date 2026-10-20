@@ -1728,7 +1728,7 @@ mod tests {
         .await
         .unwrap();
 
-        crate::test_db::migrate(&db).await;
+        crate::MIGRATOR.run(&db).await.unwrap();
         let saved = |id: &'static str| {
             let db = db.clone();
             async move {
@@ -1797,7 +1797,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        crate::test_db::migrate(&db).await;
+        crate::MIGRATOR.run(&db).await.unwrap();
         assert_eq!(windows(&db, |c| c.emoji).await, [0.0, 0.0, 0.25]);
 
         // Redescribed today, as the agent host writes it: only today's cost is today's.

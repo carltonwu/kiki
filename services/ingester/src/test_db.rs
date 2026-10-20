@@ -25,7 +25,7 @@ pub async fn migrated(prefix: &str) -> Option<TestDb> {
 }
 
 /// A fresh schema with the migrations up to `version` only, to test an
-/// upgrade: seed it, then `migrate` for the rest.
+/// upgrade: seed it, then run `crate::MIGRATOR` for the rest.
 pub async fn migrated_through(prefix: &str, version: i64) -> Option<TestDb> {
     let url = std::env::var("TEST_DATABASE_URL").ok()?;
     let admin = PgPool::connect(&url).await.unwrap();
@@ -42,23 +42,6 @@ pub async fn migrated_through(prefix: &str, version: i64) -> Option<TestDb> {
     let options: PgConnectOptions = url.parse().unwrap();
     let options = options.options([("search_path", format!("{schema},public"))]);
     let db = PgPoolOptions::new().connect_with(options).await.unwrap();
-    run_through(&db, version).await;
-    Some(TestDb { admin, db, schema })
-}
-
-/// The rest of the migrations, after `migrated_through` and seeding.
-pub async fn migrate(db: &PgPool) {
-    run_through(db, i64::MAX).await;
-}
-
-async fn run_through(db: &PgPool, version: i64) {
-    crate::migrate::run(db, &migrator_through(version))
-        .await
-        .unwrap();
-}
-
-/// The migrations up to `version`, without sqlx's lock.
-pub fn migrator_through(version: i64) -> sqlx::migrate::Migrator {
     let mut migrator = sqlx::migrate::Migrator::DEFAULT;
     migrator.migrations = crate::MIGRATOR
         .iter()
@@ -66,12 +49,8 @@ pub fn migrator_through(version: i64) -> sqlx::migrate::Migrator {
         .cloned()
         .collect::<Vec<_>>()
         .into();
-    // sqlx's lock is per database, so it would serialize unrelated schemas, and
-    // deadlock them: a CREATE INDEX CONCURRENTLY (0031) waits out every open
-    // transaction, including another test's migrator waiting for the lock it holds.
-    // Each schema has its own migrations table; production has one migrator.
-    migrator.set_locking(false);
-    migrator
+    migrator.run(&db).await.unwrap();
+    Some(TestDb { admin, db, schema })
 }
 
 impl TestDb {

@@ -15,7 +15,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
 from ..openrouter.embeddings import Embedder
-from .scope import MENTION, NO_ROSTER, PEOPLES, Roster, Scope, resolve_person
+from .scope import MENTION, NO_ROSTER, PEOPLES, REF, USER_ID, Roster, Scope
 from .search import (
     CITE_SECONDS,
     COLUMNS,
@@ -35,9 +35,9 @@ from .search import (
 logger = logging.getLogger(__name__)
 
 MAX_LIMIT = 50
-# A page's text, about 10k tokens (as channel_history's): quotes come whole, and
-# a message can be 4,000 characters.
-PAGE_CHARS = 40_000
+# A page's text, about 3k tokens: quotes come whole (a message can be 4,000
+# characters), and four lookups of 40k would flood the context.
+PAGE_CHARS = 12_000
 
 # Every saved message once, with its newest quote post. A missing original
 # (`found` false) wasn't ingested; one that's deleted, a bot's or an ignored
@@ -75,6 +75,40 @@ JOIN user_names n ON n.guild_id = %(guild)s AND n.name_norm = name_norm(w.who)
                  AND n.name_norm <> ''
 GROUP BY w.who
 """
+
+# Everyone who has gone by a name in the guild, whether or not a message of theirs
+# is stored: the quoted often aren't (a copy's author, an old member).
+QUOTED = """
+SELECT DISTINCT user_id FROM user_names
+WHERE guild_id = %(guild)s AND name_norm = name_norm(%(name)s) AND name_norm <> ''
+  AND (NOT %(username_only)s OR kind = 'username')
+ORDER BY user_id
+"""
+
+
+async def resolve_quoted(
+    connection: AsyncConnection, scope: Scope, roster: Roster, person: str
+) -> list[int]:
+    """User IDs `person` can mean, as search's resolve_person (a ref, a mention or
+    ID, an @username, or a name), but anyone the guild has seen: a quote's
+    author needn't have a stored message."""
+    person = person.strip()
+    if REF.match(person):
+        if person not in roster.ids:
+            raise ValueError(f"{person} is not in this conversation's people list")
+        return [roster.ids[person]]
+    if match := USER_ID.match(person):
+        return [int(match[1] or match[2])]
+    found = await connection.execute(
+        QUOTED,
+        {
+            "guild": scope.guild_id,
+            "name": person.removeprefix("@"),
+            "username_only": person.startswith("@"),
+        },
+    )
+    return [row[0] for row in await found.fetchall()]
+
 
 # Of these accounts, the ones Kiki doesn't read: ignored authors and bots, known
 # as bots from their messages or from any message that showed them (`people.bot`
@@ -206,12 +240,12 @@ async def find_quotes(
             authors = await bounded(
                 connection,
                 min(RESOLVE_SECONDS, deadline.left(keep=STATEMENT_SECONDS + CITE_SECONDS)),
-                lambda: resolve_person(connection, scope, roster, person),
+                lambda: resolve_quoted(connection, scope, roster, person),
             )
         except TimeoutError:
             return TOO_LONG
         if not authors:
-            return {"error": f"No one named {person!r} has written in this server."}
+            return {"error": f"No one in this server has gone by {person!r}."}
 
     async def gather():
         cursor = connection.cursor(row_factory=dict_row)

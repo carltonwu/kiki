@@ -92,4 +92,10 @@ RETURN (SELECT CASE WHEN snowflake(ids[1]) IS NOT NULL AND snowflake(ids[2]) IS 
                   '\]\(https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/([0-9]+)/([0-9]+)/([0-9]+)\)',
                   'i') AS ids) link);
 
--- The index on these is 0031: built concurrently, outside a transaction.
+-- A guild's quote posts: about 1,400 in prod, where finding them without this
+-- reads every message (2.4 s). A plain build: it blocks message writes for the
+-- 2-3 s it takes to read the table at deploy (the ingester's writes wait, then
+-- go on). A concurrent build would avoid that, but in its own non-transactional
+-- migration it can fail half way and leave an invalid index sqlx can't recover.
+CREATE INDEX messages_quote_posts_idx ON messages (guild_id, quoted_message_id(raw))
+    WHERE author_bot AND quoted_message_id(raw) IS NOT NULL;

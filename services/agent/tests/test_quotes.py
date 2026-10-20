@@ -6,7 +6,6 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -387,19 +386,17 @@ async def test_older_formats_name_who_said_it(db):
     ]
 
 
-async def test_the_quote_index_is_built_concurrently_and_valid(db):
-    migration = (
-        Path(__file__).parents[3] / "services/ingester/migrations/0031_quote_posts_index.sql"
-    )
-    assert migration.read_text().startswith("-- no-transaction\n")
-    row = await (
+async def test_the_quote_index_finds_a_guilds_posts(db):
+    await ub3r_quote(db, 20, 1, 10, ALEX, "pizza for lunch")
+    await db.execute("SET enable_seqscan = off")
+    plan = await (
         await db.execute(
-            # This schema's (the search path's): other tests' schemas have their own.
-            "SELECT indisvalid FROM pg_index"
-            " WHERE indexrelid = 'messages_quote_posts_idx'::regclass"
+            "EXPLAIN SELECT id FROM messages WHERE guild_id = %s AND author_bot"
+            " AND quoted_message_id(raw) IS NOT NULL",
+            (GUILD,),
         )
-    ).fetchone()
-    assert row == (True,)
+    ).fetchall()
+    assert "messages_quote_posts_idx" in "\n".join(row[0] for row in plan)
 
 
 async def name(db, user_id, kind, value):
@@ -467,12 +464,14 @@ async def test_a_page_of_long_quotes_stops_at_its_text_budget(db):
     for i in range(15):
         await add(db, 10 + i, f"{i} {text}", days_ago=i + 1)
         await ub3r_quote(db, 100 + i, i, 10 + i, ALEX, "the quote")
-    first = await quotes(db, limit=50)
-    kept = len(first["messages"])
-    assert kept == PAGE_CHARS // 4001 and first["next_offset"] == kept
-    assert all(len(q["text"]) == 4001 for q in first["messages"])
-    rest = await quotes(db, limit=50, offset=kept)
-    assert len(rest["messages"]) == 15 - kept and "next_offset" not in rest
+    pages, offset = [], 0
+    while offset is not None:
+        page = await quotes(db, limit=50, offset=offset)
+        pages.append(len(page["messages"]))
+        assert all(q["text"].endswith(text) for q in page["messages"])  # whole
+        offset = page.get("next_offset")
+    per_page = PAGE_CHARS // 4001
+    assert sum(pages) == 15 and pages[0] == per_page and max(pages) == per_page
 
 
 class HangingEmbeddings:
@@ -494,3 +493,20 @@ async def test_finding_quotes_keeps_to_its_deadline(db):
     )
     assert time.monotonic() - started < 3
     assert [int(q["id"]) for q in result["messages"]] == [10]
+
+
+async def test_quotes_of_someone_with_no_stored_message_of_their_own(db):
+    # Review round 3: person="@samwise" said "No one named..." (search's lookup
+    # needs a stored message by them) while Sam's copies came back unfiltered.
+    mention = {"id": str(SAM), "username": "samwise", "global_name": "Sam"}
+    await add(db, 5, f"<@{SAM}> said the best thing", mentions=[mention])
+    await ub3r_quote(db, 20, 1, 1000000000000000001, SAM, "sam's words")
+    await ub3r_quote(db, 21, 2, 1000000000000000002, ALEX, "alex's words")
+    for person in ("@samwise", "Sam", f"<@{SAM}>"):
+        result = await quotes(db, person=person)
+        assert "messages" in result, (person, result)
+        assert [q["text"] for q in result["messages"]] == ["sam's words"], (
+            person,
+            result,
+        )
+    assert "error" in await quotes(db, person="@nobody")
