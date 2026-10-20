@@ -156,6 +156,17 @@ semconv's `gen_ai.client.token.usage` histogram: per-call distributions aren't
 worth ten buckets per purpose and model; rates and totals are what we read.
 Cost keeps the currency in its name: the annotation unit `{USD}` adds no suffix.
 
+In the agent host these are **live** for every purpose but `jev` (the ingester's).
+Each is recorded where the call is made, with the model actually called (the
+vision model, or the chat model standing in for it; the fallback image model).
+A reply or topic run is one call however many model requests it makes:
+`duration` is the whole run, its tools' time included, `cost_usd` its billed cost
+with OpenRouter's web fees, and `tokens` its requests' sum (the requests per run
+are in `kiki.agent.job.model_requests`). Vision, embedding and drawing calls made
+during a reply count under their own purposes. An image attempt that doesn't draw
+(a safety block included) is an `error`; the Images API reports no tokens, so
+`image` has cost only. `timeout` covers the job's deadline and client timeouts.
+
 ### Ingester
 
 | Metric | Type | Unit | Attributes | Prometheus |
@@ -195,20 +206,58 @@ headline SLO. `kiki.gateway.lag` is Discord's message timestamp → receipt.
 | Metric | Type | Unit | Attributes | Prometheus |
 |---|---|---|---|---|
 | `kiki.agent.jobs` | counter | `{job}` | `kind=reply\|topic\|image`, `outcome=completed\|failed\|running\|interrupted` | `kiki_agent_jobs_total` — **live** |
-| `kiki.agent.job.duration` | histogram | `s` | `kind` | `kiki_agent_job_duration_seconds_*` |
-| `kiki.agent.jobs.rejected` | counter | `{job}` | `reason=busy\|conflict` | `kiki_agent_jobs_rejected_total` |
-| `kiki.agent.job.model_requests` | histogram | `{request}` | | `kiki_agent_job_model_requests_*` |
-| `kiki.images.attempts` | counter | `{attempt}` | `model`, `result=drawn\|safety_blocked\|refused\|failed` | `kiki_images_attempts_total` |
-| `kiki.images.fallback` | counter | `{attempt}` | `result=drawn\|failed` | `kiki_images_fallback_total` |
-| `kiki.images.duration` | histogram | `s` | `model` | `kiki_images_duration_seconds_*` |
-| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|budget_exhausted` | `kiki_tools_calls_total` |
-| `kiki.tools.duration` | histogram | `s` | `tool` | `kiki_tools_duration_seconds_*` |
-| `kiki.web.calls` | counter | `{call}` | `kind=search\|fetch` | `kiki_web_calls_total` |
+| `kiki.agent.job.duration` | histogram | `s` | `kind` | `kiki_agent_job_duration_seconds_*` — **live** |
+| `kiki.agent.jobs.rejected` | counter | `{job}` | `reason=busy\|conflict` | `kiki_agent_jobs_rejected_total` — **live** |
+| `kiki.agent.job.model_requests` | histogram | `{request}` | | `kiki_agent_job_model_requests_*` — **live** |
+| `kiki.images.attempts` | counter | `{attempt}` | `model`, `result=drawn\|safety_blocked\|refused\|failed` | `kiki_images_attempts_total` — **live** |
+| `kiki.images.fallback` | counter | `{attempt}` | `result=drawn\|failed` | `kiki_images_fallback_total` — **live** |
+| `kiki.images.duration` | histogram | `s` | `model` | `kiki_images_duration_seconds_*` — **live** |
+| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|budget_exhausted` | `kiki_tools_calls_total` — **live** |
+| `kiki.tools.duration` | histogram | `s` | `tool` | `kiki_tools_duration_seconds_*` — **live** |
+| `kiki.web.calls` | counter | `{call}` | `kind=search\|fetch` | `kiki_web_calls_total` — **live** |
 
 `kiki.agent.jobs` counts answered job requests (`running`: another request holds
 the same job ID); `interrupted` ones return 503 and are retried with the same ID.
 Busy and conflicting requests go to `kiki.agent.jobs.rejected` instead. The
 emoji-description endpoint is not a job.
+
+- Every count is per request, not per job: the ingester retries a job with the
+  same ID after a 503 (`interrupted`, or `busy`) and polls a `running` one, so one
+  job can count as `interrupted` and then `completed`, and a retry answered from
+  the saved result counts again.
+- `kiki.agent.job.duration` is the time spent running the job, per attempt that
+  ran it (a retry answered from the saved result, or turned away as running,
+  didn't). `kiki.agent.jobs.rejected{reason}`: `busy` is the 503 when no slot frees
+  within 0.1 s, `conflict` the 409 for a job ID reused with different input.
+- `kiki.agent.job.model_requests` is per finished reply or topic run.
+- `kiki.images.attempts` is per model attempt, with the error the drawing reports
+  for it: `safety_blocked` (the model's safety filter), `refused` (no usable image,
+  or another 4xx), `failed` (5xx, network, timeout, bad prompt). A safety block
+  tries the fallback model (`OPENROUTER_IMAGE_FALLBACK_MODEL`), if one is set;
+  `kiki.images.fallback` counts those attempts by whether they drew.
+- `kiki.tools.calls` is per call through the tool guard (`agent/guard.py`).
+  `tool` is one of the reply agent's fixed tools (`search_messages`, `recall`,
+  …). `error` is an error result or an exception; `budget_exhausted` a call
+  turned away by the per-reply budget, which never ran, so has no duration.
+- `kiki.web.calls` is OpenRouter's web searches and fetches per reply run, as its
+  server tool usage reports them.
+
+Agent host spans (no prompt, reply, message or SQL values in any; a failure keeps
+its `error.type` only, never the exception's message):
+
+- `llm <purpose>`, one per model call or run: `kiki.purpose`,
+  `gen_ai.request.model`, `gen_ai.usage.input_tokens`/`output_tokens`,
+  `kiki.cost_usd`, `kiki.llm.result`. Vision (`llm vision`), embedding and the
+  reply run itself (`llm reply`, with its tools' spans inside) included.
+- `image attempt`, one per image model attempt: the same, plus `kiki.image.result`.
+- `execute_tool <tool>`: `gen_ai.tool.name`, `kiki.tool.outcome`.
+- Postgres queries (psycopg instrumentation), named by operation (`SELECT`), with
+  the SQL text (`db.statement`, placeholders only: parameters aren't captured,
+  and no query inlines a value). Only inside a request's trace, so the `index`
+  command doesn't start one per query.
+
+The agent host's log lines keep their `key=value` text, so Loki parses them with
+`| logfmt` (`{service_name="agent"} | logfmt | outcome="timeout"`).
 
 ### Platform poller (ingester, leader only, every 60 s)
 
