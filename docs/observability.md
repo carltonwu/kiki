@@ -71,6 +71,12 @@ agent host (Python) ─OTLP────┘
     totals come from the database: `agent_runs.cost_usd`,
     `classifications.jev_cost_usd`, `conversations.topic_cost_usd`,
     `agent_image_jobs.cost_usd` and `guild_emojis.describe_cost_usd`.
+  - **A partly rejected export counts as acknowledged.** The SDK's OTLP
+    exporter reports success on HTTP 200 without looking at
+    `partial_success.rejected_data_points`. If Mimir rejected a zero but
+    accepted the rest (a series limit, say), its value is released anyway and
+    that series' first job goes uncounted, as before baselines. That is rare
+    enough not to justify replacing the exporter.
   - **The ingester** isn't baselined. It runs always, so only the first event
     of each attribute set after a deploy or restart goes uncounted.
 - **The ingester runs always**, so it exports normally: spans and logs in batches,
