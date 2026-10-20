@@ -9,10 +9,10 @@ import time
 import httpx
 from openai import APIError, APIStatusError
 from psycopg import OperationalError
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError
+from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.images import ImageGenerationModel
-from pydantic_ai.messages import BinaryContent, ModelResponse
+from pydantic_ai.messages import BinaryContent, ModelMessage, ModelResponse, RetryPromptPart
 from pydantic_ai.models import Model
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
@@ -56,6 +56,31 @@ EMBEDDING_TIMEOUT_SECONDS = 4  # two calls (index, query) fit in the tool deadli
 IMAGE_TIMEOUT_SECONDS = 75
 
 topic_agent = Agent()
+
+
+def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> None:
+    """Why a run gave up on the model, without what it said (the error's message
+    can quote it): each rejected tool call's tool and invalid fields, and how the
+    last response ended."""
+    retries = [
+        f"{part.tool_name}:"
+        + (
+            ",".join(f"{'.'.join(map(str, e['loc']))}={e['type']}" for e in part.content)
+            if isinstance(part.content, list)
+            else "retry"
+        )
+        for message in messages
+        for part in message.parts
+        if isinstance(part, RetryPromptPart)
+    ]
+    last = next((m for m in reversed(messages) if isinstance(m, ModelResponse)), None)
+    logger.warning(
+        "model misbehaved job_id=%s retries=%s last_finish=%s last_parts=%s",
+        job_id,
+        ";".join(retries) or "-",
+        last.finish_reason if last else "-",
+        ",".join(p.part_kind for p in last.parts) if last else "-",
+    )
 
 
 class Metered(WrapperModel):
@@ -163,10 +188,17 @@ class PydanticExecutor:
                     # rather than when it first searches.
                     deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
-                        with telemetry.llm_call("reply", request.model, call=billed):
-                            result = await reply_agent.run(
-                                prompt, deps=deps, capabilities=self.web_tools, **options
-                            )
+                        with (
+                            telemetry.llm_call("reply", request.model, call=billed),
+                            capture_run_messages() as messages,
+                        ):
+                            try:
+                                result = await reply_agent.run(
+                                    prompt, deps=deps, capabilities=self.web_tools, **options
+                                )
+                            except UnexpectedModelBehavior:
+                                log_misbehavior(request.id, messages)
+                                raise
                     finally:
                         await finish(deps.indexing)
                         await deps.memory.close()

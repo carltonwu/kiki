@@ -1097,7 +1097,7 @@
                 "type": "object"
               }
             },
-            "additionalProperties": false,
+            "additionalProperties": true,
             "properties": {
               "aspect_ratio": {
                 "anyOf": [

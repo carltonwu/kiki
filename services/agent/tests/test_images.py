@@ -424,6 +424,44 @@ async def test_common_argument_slips_queue_rather_than_fail_the_reply(database_u
     assert queued.aspect_ratio is None
 
 
+async def test_nulls_numbers_and_made_up_keys_queue_rather_than_fail_the_reply(database_url):
+    # Each of these was a validation error, so a tool retry; a model that repeats
+    # its slip runs out of them and the reply fails (UnexpectedModelBehavior).
+    await seed(database_url, (90, 200, "hi", [attachment(91, "a.jpg")]))
+    args = {
+        "prompt": "a meme",
+        "subjects": json.dumps(
+            [
+                {"name": "Ethan", "person": 2, "photos": [90], "description": None},
+                {"name": None, "me": True, "photos": None},
+            ]
+        ),
+        "caption": None,
+        "edit": None,
+        "shared": 90,
+        "negative_prompt": "blurry",
+    }
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.user_id, s.kiki, s.photos) for s in queued.subjects] == [
+        ("Ethan", "200", False, ["90"]),
+        ("Kiki", None, True, []),
+    ]
+    assert queued.caption == "" and not queued.edit and queued.shared == ["90"]
+
+
+async def test_a_reply_that_runs_out_of_tool_retries_logs_why(database_url, caplog):
+    def respond(messages, info):
+        return ModelResponse(parts=[ToolCallPart("generate_image", {"caption": "x"})])
+
+    run = executor(database_url, FakeImageModel(), respond)
+    with pytest.raises(UnexpectedModelBehavior):
+        await run.execute(request("test/image"))
+    [line] = [r.getMessage() for r in caplog.records if "model misbehaved" in r.getMessage()]
+    assert "retries=generate_image:prompt=missing;" in line
+    assert "last_parts=tool-call" in line
+
+
 async def test_pasted_message_and_attachment_links_are_photos(database_url):
     # Seen in prod: a message link and a pasted CDN link for "use this photo" were
     # dropped, since photos took only message IDs.
