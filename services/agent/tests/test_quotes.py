@@ -547,3 +547,26 @@ async def test_a_name_several_people_share_says_so(db):
     assert "matches 2 different people" in result["note"]
     assert "u1 Alex" in result["note"] and "u2 Sam" in result["note"]
     assert "note" not in await quotes(db, person="u1")
+
+
+async def test_her_failure_notes_arent_found_as_hers_or_as_quotes(db):
+    """The ingester's note isn't Kiki's words (migration 0033): searching her own
+    messages leaves it out, recorded on its run or not, and so does find_quotes
+    when someone quotes it."""
+    note = "(couldn't answer that one, try again?)"
+    await add(db, 10, "chrissy has real taste", author_id=KIKI, bot=True, days_ago=1)
+    await add(db, 11, note, author_id=KIKI, bot=True)  # recorded on its run
+    await add(db, 12, note, author_id=KIKI, bot=True)  # response lost
+    await add(db, 13, "try again kiki", author_id=SAM)
+    await db.execute(
+        "INSERT INTO agent_runs (conversation_id, trigger_message_ids, reply_message_ids, status,"
+        " failure_note) VALUES (%s, '{13}', '{10}', 'done', false),"
+        " (%s, '{13}', '{11}', 'failed', true)",
+        (CONVERSATION, CONVERSATION),
+    )
+    own = await search(db, embedder(), SCOPE, "taste answer again", person="you", roster=ROSTER)
+    assert [int(m["id"]) for m in own["messages"]] == [10]
+    await ub3r_quote(db, 20, 1, 11, KIKI, note)
+    await ub3r_quote(db, 21, 2, 13, SAM, "try again kiki")
+    result = await quotes(db)
+    assert [q["text"] for q in result["messages"]] == ["try again kiki"]

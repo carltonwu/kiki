@@ -119,3 +119,43 @@ async def test_pages_stop_before_flooding_the_context(db, monkeypatch):
     assert ids(page) == [62, 63]
     # Reading back keeps the newest.
     assert ids(await read(db)) == [62, 63]
+
+
+async def test_failure_notes_are_left_out(db):
+    """The ingester's "(couldn't answer that one, try again?)" isn't Kiki's words
+    (migration 0033): no tool reads it back. By the run that posted it, or by its
+    text when its send response was lost, alone or under the redirect header.
+    Kiki's other messages are hers."""
+    note = "(couldn't answer that one, try again?)"
+    header = "-# ↪ <@100> in https://discord.com/channels/1/2/20"
+    await add(db, 20, "help kiki where my meme at", minute=0)
+    await add(db, 21, note, minute=1, bot=True)  # recorded on its run
+    await add(db, 22, note, minute=2, bot=True)  # response lost: no run has it
+    await add(db, 23, f"{header}\n{note}", minute=3, bot=True)  # redirected
+    await add(db, 24, "found it, one sec", minute=4, bot=True)
+    await add(db, 25, f"{note} jk", minute=5, bot=True)  # not the note
+    await db.execute(
+        "INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, %s, %s, 100)",
+        (GUILD, GENERAL),
+    )
+    await db.execute(
+        "INSERT INTO agent_runs (conversation_id, trigger_message_ids, status, reply_message_ids,"
+        " failure_note) VALUES (1, '{20}', 'failed', '{21}', true), (1, '{20}', 'done', '{24}', false)"
+    )
+    assert ids(await read(db)) == [20, 24, 25]
+
+
+def test_the_failure_note_filter_is_the_ingesters():
+    """Rust's `agent::NOT_A_FAILURE_NOTE`, character for character."""
+    import re
+    from pathlib import Path
+
+    from kiki_agent_host.chat.scope import NOT_A_FAILURE_NOTE
+
+    rust = (Path(__file__).parents[2] / "ingester/src/agent/mod.rs").read_text()
+    [fragment] = re.findall(
+        r'pub\(crate\) const NOT_A_FAILURE_NOTE: &str = r"(.*?)";', rust, re.DOTALL
+    )
+    assert fragment == NOT_A_FAILURE_NOTE
+    [note] = re.findall(r'pub\(crate\) const FAILURE_NOTE: &str = "(.*?)";', rust)
+    assert note.replace("'", "''") in NOT_A_FAILURE_NOTE

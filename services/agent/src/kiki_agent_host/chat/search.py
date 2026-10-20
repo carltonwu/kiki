@@ -23,6 +23,7 @@ from .scope import (
     HEARD,
     MENTION,
     NO_ROSTER,
+    NOT_A_FAILURE_NOTE,
     PEOPLES,
     TEXT,
     Roster,
@@ -115,10 +116,10 @@ Semantic = Literal["full", "partial", "off"]
 
 
 # `own` is Kiki's user ID when the search is for her own messages: bots' are
-# otherwise left out, hers included.
+# otherwise left out, hers included. Her failure notes aren't hers to find.
 SCOPE = f"""
 m.guild_id = %(guild)s AND m.deleted_at IS NULL
-AND ({PEOPLES} OR m.author_id = %(own)s::bigint)
+AND ({PEOPLES} OR (m.author_id = %(own)s::bigint AND {NOT_A_FAILURE_NOTE}))
 AND (%(channels)s::bigint[] IS NULL OR m.channel_id = ANY(%(channels)s))
 AND (%(authors)s::bigint[] IS NULL OR {AUTHOR} = ANY(%(authors)s))
 AND (%(after)s::timestamptz IS NULL OR m.created_at >= %(after)s)

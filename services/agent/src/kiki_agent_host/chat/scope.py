@@ -115,11 +115,27 @@ async def speakers(
 # their reposts of someone's message (a link fixer's; migration 0024). Not an
 # anti-join: the one-row table is never auto-analyzed, and the planner's guess
 # of 1,200 rows turned the guild-wide pending scan into an 84 s nested loop.
-HEARD = (
+AUTHORS_HEARD = (
     "(m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)) OR m.relayed_for IS NOT NULL)"
 )
+# The ingester's failure notes: a bot's message with their exact text, alone or
+# under the redirect header (which covers one whose send response was lost), or
+# one their run recorded (migration 0033); only bots' rows get any of it. Rust's
+# `agent::NOT_A_FAILURE_NOTE`, character for character (test_history.py checks).
+NOT_A_FAILURE_NOTE = (
+    r"NOT (m.author_bot AND m.relayed_for IS NULL AND"
+    r" (m.content = '(couldn''t answer that one, try again?)'"
+    r" OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in"
+    r" https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one,"
+    r" try again\?\)$')"
+    r" OR m.id IN (SELECT x FROM agent_runs n, unnest(n.reply_message_ids) AS x"
+    r" WHERE n.failure_note AND x IS NOT NULL)))"
+)
+HEARD = f"({AUTHORS_HEARD} AND {NOT_A_FAILURE_NOTE})"
 # People's messages Kiki reads: no bots', but a link fixer's reposts of theirs.
-PEOPLES = f"(NOT m.author_bot OR m.relayed_for IS NOT NULL) AND {HEARD}"
+# Failure notes are Kiki's, so excluded already; this stays the rule migration
+# 0029's embedding queue repeats.
+PEOPLES = f"(NOT m.author_bot OR m.relayed_for IS NOT NULL) AND {AUTHORS_HEARD}"
 # Who wrote a message and what they wrote, a repost's as its author's.
 AUTHOR = "coalesce(m.relayed_for, m.author_id)"
 TEXT = "coalesce(m.relayed_text, m.content)"

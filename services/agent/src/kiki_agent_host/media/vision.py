@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, UserContent
+from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, UserContent
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
@@ -153,6 +153,8 @@ async def _look(
             "The image model is unavailable right now; try again later." + NOT_SEEN
         ) from None
     vision.cost += billed_cost(run) or 0.0
+    if out_of_room(run.response):  # thinking and blank text: pydantic-ai let it through
+        raise _OutOfRoom
     if not run.output.strip():
         raise ImageRefused("The image model returned no description." + NOT_SEEN)
     if run.response.finish_reason == "length":
@@ -163,9 +165,14 @@ async def _look(
 
 
 def out_of_room(response: ModelResponse) -> bool:
-    """Whether the token limit hit before any text (pydantic-ai's "token limit
-    exceeded before any response"): all thinking, no answer."""
-    return response.finish_reason == "length" and not response.text
+    """Whether the token limit hit with nothing to show or do (pydantic-ai's
+    "token limit exceeded before any response"): only thinking, if anything. A
+    complete tool call that ends right at the limit still counts; whitespace
+    doesn't (Kiki's reply would be rejected as empty)."""
+    return response.finish_reason == "length" and all(
+        isinstance(p, ThinkingPart) or (isinstance(p, TextPart) and not p.content.strip())
+        for p in response.parts
+    )
 
 
 def bill(call: telemetry.Call, run) -> None:

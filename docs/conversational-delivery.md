@@ -31,6 +31,40 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
   reactions added before the setting changed. This toggle does not ban emoji in
   Kiki's message text.
 
+## When a reply fails
+
+A chat model that thinks does so inside `max_tokens`. For a model that
+OpenRouter's catalog lists with the `reasoning` parameter (or one it can't
+look up; the host fetches the catalog at startup and refreshes it in the
+background, so a reply never waits on it), each request's cap is `reply_max_tokens` + `REASONING_TOKENS` (2000),
+shared by thinking and answer: OpenRouter can't cap the visible answer on its
+own, so on this path `reply_max_tokens` doesn't strictly limit the answer.
+Other models get `reply_max_tokens` alone. If a response ends at the limit with
+only thinking (no text but whitespace, and no tool call; reply:404 on 2026-10-20), pydantic-ai's
+`FallbackModel` sends the same request again with thinking off and the plain
+`reply_max_tokens` (`PydanticExecutor.chat_model`), so the run keeps its tool
+results.
+
+If the host job still fails, for this or any other reason, Rust marks the run
+delivering and posts `(couldn't answer that one, try again?)` in place of the
+reply (`Agent::post_failure_note`). The run is still recorded as failed; a crash
+after the send fails it at startup rather than posting the note again. The run is
+flagged `failure_note` (migration 0033) before the send, and every prompt
+source leaves out the messages such a run posted: the conversation, what a
+message replies to, recent channel context, Jev's routing context, Kiki's search of her own messages and the
+host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). The same filter
+also leaves out any bot message that is exactly the note's text, alone or under
+the redirect header (`-# ↪ <@author> in <link>`, when the reply went to the
+default channel). That covers a note Discord posted whose response was lost, or
+a crash before it was recorded on its run, with no work at ingest. Only bots'
+rows get either check, the text equality first, so the hot context queries pay
+next to nothing (0.06 ms against 0.01 ms for a channel-context query on 200k
+messages, 0.4 ms for a history page with 1,000 notes among 100k runs). The one
+false positive is Kiki writing exactly that parenthesised sentence herself,
+which would only hide that message. Normal replies have the same lost-response
+gap, with no repair: a reply posted without a response is stored, but isn't
+tagged into its conversation or attributed to its run.
+
 ## Files and behavior
 
 - `services/ingester/src/guild_settings.rs`: settings, boolean parsing, min/max

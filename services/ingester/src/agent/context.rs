@@ -18,7 +18,7 @@ use serde::Deserialize;
 use sqlx::FromRow;
 
 use super::{
-    Agent, emoji,
+    Agent, NOT_A_FAILURE_NOTE, emoji,
     people::{PersonRef, Roster},
 };
 use crate::{
@@ -414,6 +414,7 @@ impl Agent {
                 SELECT DISTINCT ON (m.id) hop.from_author, hop.how, hop.depth, {MESSAGE_COLUMNS}
                 FROM hop JOIN messages m ON m.id = hop.id
                 WHERE hop.depth > 0 AND m.guild_id = $2 AND m.deleted_at IS NULL AND m.id <> ALL($1)
+                  AND {NOT_A_FAILURE_NOTE}
                   AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
                 ORDER BY m.id, hop.depth
             ) pointed ORDER BY depth, id LIMIT 6
@@ -465,7 +466,7 @@ impl Agent {
             SELECT * FROM (
                 SELECT {MESSAGE_COLUMNS}
                 FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
-                WHERE cm.conversation_id = $1 AND m.deleted_at IS NULL
+                WHERE cm.conversation_id = $1 AND m.deleted_at IS NULL AND {NOT_A_FAILURE_NOTE}
                 ORDER BY m.id DESC LIMIT $2
             ) latest ORDER BY id
             "#
@@ -485,7 +486,7 @@ impl Agent {
         let mut messages: Vec<StoredMessage> = sqlx::query_as(&format!(
             r#"
             SELECT {MESSAGE_COLUMNS} FROM messages m
-            WHERE m.channel_id = $1 AND m.deleted_at IS NULL AND m.type <> $5
+            WHERE m.channel_id = $1 AND m.deleted_at IS NULL AND m.type <> $5 AND {NOT_A_FAILURE_NOTE}
               AND m.created_at > now() - make_interval(secs => $2)
               AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
               AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
@@ -533,6 +534,7 @@ impl Agent {
             r#"
             SELECT {MESSAGE_COLUMNS} FROM messages m
             WHERE m.id = $1 AND m.guild_id = $2 AND m.channel_id <> $3 AND m.deleted_at IS NULL
+              AND {NOT_A_FAILURE_NOTE}
               AND (m.relayed_for IS NOT NULL OR NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id))
             "#
         ))
@@ -1619,6 +1621,402 @@ pub(super) mod tests {
                 "Only a title"
             ]
         );
+        test.drop().await;
+    }
+
+    /// reply:404 (10-20) failed and left silence; now a failure note is posted.
+    /// Like a reply, it's marked delivering before the send, so a crash after
+    /// Discord accepted it fails the run at startup instead of requeueing it
+    /// (the host would return the same failure, and a second note would follow).
+    #[tokio::test]
+    async fn a_failure_note_is_not_posted_twice_after_a_crash() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Json, Router, extract::State, routing::post};
+
+        let Some(test) = crate::test_db::migrated("ingester_failure_note").await else {
+            return;
+        };
+        let db = test.db.clone();
+        // A Discord that accepts every send.
+        let sends = Arc::new(AtomicUsize::new(0));
+        let accept = |State(sends): State<Arc<AtomicUsize>>, Json(body): Json<Value>| async move {
+            let n = sends.fetch_add(1, Ordering::SeqCst) as i64;
+            let mut sent = message(
+                500 + n,
+                json!({"id": "1", "username": "Kiki", "bot": true}),
+                json!({}),
+                body["content"].as_str().unwrap_or_default(),
+                json!([]),
+            );
+            sent["guild_id"] = json!(GUILD.to_string());
+            Json(sent)
+        };
+        let app = Router::new()
+            .route("/api/v10/channels/{channel}/messages", post(accept))
+            .with_state(sends.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let alex = json!({"id": "101", "username": "alex"});
+        let ask = message(10, alex, json!({}), "help kiki where my meme at", json!([]));
+        store::upsert_messages(&db, GUILD, &[ask]).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO guilds (id, name) VALUES (9, 'Theatre');
+            INSERT INTO channels (id, guild_id, name, type) VALUES (2, 9, 'general', 0);
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (10, 1, 'mention');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status)
+            VALUES (1, 1, '{10}', 'running'), (2, 1, '{10}', 'running');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut agent = agent(db.clone());
+        agent.http = Arc::new(
+            twilight_http::Client::builder()
+                .proxy(address.to_string(), true)
+                .ratelimiter(None)
+                .build(),
+        );
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let claim = crate::agent::Claim {
+            run_id: 1,
+            kind: "mention",
+            trace_context: None,
+            superseded_traces: Vec::new(),
+            conversation_id: 1,
+            channel_id: CHANNEL,
+            trigger_message_ids: vec![10],
+            created_at_ms: 0,
+            host_request: None,
+        };
+        let mut record = crate::agent::RunRecord::default();
+        agent.post_failure_note(&claim, &context, &mut record).await;
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(record.reply_message_ids, [500]);
+
+        // Asked again, she doesn't see the note as something she said.
+        let again = message(
+            600,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "kiki??",
+            json!([]),
+        );
+        store::upsert_messages(&db, GUILD, &[again]).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (600, 1, 'decide')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let context = agent.context(1, &[600]).await.unwrap().unwrap();
+        let prompt: Vec<&str> = context
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            prompt
+                .iter()
+                .any(|m| m.contains("help kiki where my meme at"))
+        );
+        assert!(
+            !prompt
+                .iter()
+                .any(|m| m.contains(crate::agent::FAILURE_NOTE))
+        );
+
+        // The ingester crashes here, before `finish`; then it starts again.
+        let (interrupted, requeued) = crate::agent::recover_runs(&db).await.unwrap();
+        assert_eq!((interrupted.len(), requeued), (1, 1));
+        type Run = (i64, String, Option<String>, Option<Vec<i64>>);
+        let runs: Vec<Run> = sqlx::query_as(
+            "SELECT id, status, error, reply_message_ids FROM agent_runs ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            runs,
+            [
+                // Failed, not requeued: no second note.
+                (
+                    1,
+                    "failed".into(),
+                    Some("interrupted".into()),
+                    Some(vec![500])
+                ),
+                // A run that hadn't started sending is still retried.
+                (2, "pending".into(), None, None),
+            ]
+        );
+        test.drop().await;
+    }
+
+    /// A Discord that answers every send with `status`; for 200, the message.
+    async fn fake_discord(
+        status: u16,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{
+            Json, Router, extract::State, http::StatusCode, response::IntoResponse, routing::post,
+        };
+
+        let sends = Arc::new(AtomicUsize::new(0));
+        let accept = move |State(sends): State<Arc<AtomicUsize>>, Json(body): Json<Value>| async move {
+            let n = sends.fetch_add(1, Ordering::SeqCst) as i64;
+            if status != 200 {
+                return (StatusCode::from_u16(status).unwrap(), "{}").into_response();
+            }
+            let mut sent = message(
+                500 + n,
+                json!({"id": "1", "username": "Kiki", "bot": true}),
+                json!({}),
+                body["content"].as_str().unwrap_or_default(),
+                json!([]),
+            );
+            sent["guild_id"] = json!(GUILD.to_string());
+            Json(sent).into_response()
+        };
+        let app = Router::new()
+            .route("/api/v10/channels/{channel}/messages", post(accept))
+            .with_state(sends.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address, sends)
+    }
+
+    fn proxied(agent: &mut Agent, address: std::net::SocketAddr) {
+        agent.http = Arc::new(
+            twilight_http::Client::builder()
+                .proxy(address.to_string(), true)
+                .ratelimiter(None)
+                .build(),
+        );
+    }
+
+    fn failed_claim(run_id: i64, conversation_id: i64, trigger: i64) -> crate::agent::Claim {
+        crate::agent::Claim {
+            run_id,
+            kind: "mention",
+            trace_context: None,
+            superseded_traces: Vec::new(),
+            conversation_id,
+            channel_id: CHANNEL,
+            trigger_message_ids: vec![trigger],
+            created_at_ms: 0,
+            host_request: None,
+        }
+    }
+
+    async fn seed_failed_run(db: &PgPool) {
+        let alex = json!({"id": "101", "username": "alex"});
+        let ask = message(10, alex, json!({}), "help kiki where my meme at", json!([]));
+        store::upsert_messages(db, GUILD, &[ask]).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO guilds (id, name) VALUES (9, 'Theatre');
+            INSERT INTO channels (id, guild_id, name, type) VALUES (2, 9, 'general', 0);
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (10, 1, 'mention');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status)
+            VALUES (1, 1, '{10}', 'running');
+            "#,
+        )
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    /// A send Discord refuses: nothing posted, the run isn't retried into a note
+    /// either, and the reply still fails (`answer` records it).
+    #[tokio::test]
+    async fn a_failure_note_discord_refuses_is_only_logged() {
+        let Some(test) = crate::test_db::migrated("ingester_failure_note_refused").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let (address, sends) = fake_discord(500).await;
+        seed_failed_run(&db).await;
+        let mut agent = agent(db.clone());
+        proxied(&mut agent, address);
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let mut record = crate::agent::RunRecord::default();
+        agent
+            .post_failure_note(&failed_claim(1, 1, 10), &context, &mut record)
+            .await;
+        assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(record.reply_message_ids.is_empty());
+        let run: (String, bool) =
+            sqlx::query_as("SELECT status, failure_note FROM agent_runs WHERE id = 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(run, ("delivering".into(), true));
+        crate::agent::recover_runs(&db).await.unwrap();
+        let status: String = sqlx::query_scalar("SELECT status FROM agent_runs WHERE id = 1")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed", "not requeued into a second try");
+        test.drop().await;
+    }
+
+    /// No prompt shows the note: not the conversation, not a reply to it, not
+    /// another conversation's channel context. Kiki's own words still show.
+    #[tokio::test]
+    async fn no_prompt_shows_a_failure_note() {
+        let Some(test) = crate::test_db::migrated("ingester_failure_note_prompts").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let (address, _) = fake_discord(200).await;
+        seed_failed_run(&db).await;
+        let mut agent = agent(db.clone());
+        proxied(&mut agent, address);
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let mut record = crate::agent::RunRecord::default();
+        agent
+            .post_failure_note(&failed_claim(1, 1, 10), &context, &mut record)
+            .await;
+        assert_eq!(record.reply_message_ids, [500]);
+
+        let alex = json!({"id": "101", "username": "alex"});
+        let sam = json!({"id": "102", "username": "sam"});
+        let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
+        let mut answer = message(601, alex, json!({}), "ok trying again", json!([]));
+        answer["type"] = json!(19);
+        answer["message_reference"] = json!({"message_id": "500"});
+        let elsewhere = message(602, sam, json!({}), "kiki what's for lunch", json!([]));
+        // Kiki's own reply, later.
+        let hers = message(603, kiki, json!({}), "here's the meme", json!([]));
+        store::upsert_messages(&db, GUILD, &[answer, elsewhere])
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (2, 9, 2, 102);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES
+                (601, 1, 'reply'), (602, 2, 'mention');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let shown = |context: &super::Context| {
+            context
+                .messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        // Replying to the note: the history and what it replies to.
+        let replying = shown(&agent.context(1, &[601]).await.unwrap().unwrap());
+        assert!(replying.contains("ok trying again"), "{replying}");
+        assert!(!replying.contains(crate::agent::FAILURE_NOTE), "{replying}");
+        // Another conversation in the channel: the recent channel context.
+        let other = shown(&agent.context(2, &[602]).await.unwrap().unwrap());
+        assert!(other.contains("help kiki where my meme at"), "{other}");
+        assert!(!other.contains(crate::agent::FAILURE_NOTE), "{other}");
+
+        // Her own reply is hers, and shows.
+        store::upsert_messages(&db, GUILD, &[hers]).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (603, 1, 'agent');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status, reply_message_ids)
+            VALUES (2, 1, '{601}', 'done', '{603}');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut again = message(
+            604,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "lol",
+            json!([]),
+        );
+        again["guild_id"] = json!(GUILD.to_string());
+        store::upsert_messages(&db, GUILD, &[again]).await.unwrap();
+        sqlx::query("INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (604, 1, 'decide')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let later = shown(&agent.context(1, &[604]).await.unwrap().unwrap());
+        assert!(later.contains("here's the meme"), "{later}");
+        assert!(!later.contains(crate::agent::FAILURE_NOTE), "{later}");
+        test.drop().await;
+    }
+
+    /// Discord posts the note but the response never arrives (or the ingester
+    /// crashes before recording it), so no run claims the Gateway's or
+    /// catch-up's copy: it's left out by its text, as is a note redirected to
+    /// the default channel under its header. Kiki's other words still show.
+    #[tokio::test]
+    async fn a_failure_note_whose_response_was_lost_is_left_out_by_its_text() {
+        let Some(test) = crate::test_db::migrated("ingester_failure_note_lost").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let (address, _) = fake_discord(500).await; // accepted, but no answer we can use
+        seed_failed_run(&db).await;
+        let mut agent = agent(db.clone());
+        proxied(&mut agent, address);
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let mut record = crate::agent::RunRecord::default();
+        agent
+            .post_failure_note(&failed_claim(1, 1, 10), &context, &mut record)
+            .await;
+        assert!(record.reply_message_ids.is_empty());
+
+        let kiki = json!({"id": "1", "username": "Kiki", "bot": true});
+        let note = crate::agent::FAILURE_NOTE;
+        // As the Gateway (or a catch-up page) stores them.
+        let posted = message(900, kiki.clone(), json!({}), note, json!([]));
+        let header = super::super::discord::redirect_header(GUILD, 44, 45, 101);
+        let redirected = message(
+            901,
+            kiki.clone(),
+            json!({}),
+            &format!("{header}\n{note}"),
+            json!([]),
+        );
+        let hers = message(902, kiki, json!({}), "found it, one sec", json!([]));
+        let alex = json!({"id": "101", "username": "alex"});
+        let again = message(903, alex, json!({}), "??", json!([]));
+        store::upsert_messages(&db, GUILD, &[posted, redirected, hers, again])
+            .await
+            .unwrap();
+        let ids: Option<Vec<i64>> =
+            sqlx::query_scalar("SELECT reply_message_ids FROM agent_runs WHERE id = 1")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(ids, None, "nothing ties them to the run");
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (2, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (903, 2, 'mention');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let prompt = agent.context(2, &[903]).await.unwrap().unwrap();
+        let shown: String = prompt.messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(shown.contains("found it, one sec"), "{shown}");
+        assert!(!shown.contains(note), "{shown}");
         test.drop().await;
     }
 }

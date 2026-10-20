@@ -7,7 +7,7 @@ import httpx
 import pytest
 from psycopg import AsyncConnection
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host.agent import executor as agent_executor
@@ -807,3 +807,77 @@ def test_separator_matching_stays_linear_and_unchanged():
     checked = emojis.check("hi <:fake:1>\n---" + "1" * 15_900 + "x", SERVER)
     assert checked.problems and checked.stripped.startswith("hi\n---1")
     assert time.monotonic() - started < 2
+
+
+# #67's output validator and LastRequestAnswers with #68's FallbackModel: a
+# response that is all thinking goes again without thinking within the same
+# request, so the last request offers no tools on either attempt, and the emoji
+# check runs on what the fallback wrote.
+
+
+def overthinking(thinking_script, unthinking_script):
+    """Like `turns`, for a model that thinks (`thinking_script`, where None is a
+    response that thinks until the limit) and its fallback without thinking.
+    Records, per attempt, which model it was and the tools offered."""
+    attempts: list[tuple[str, list[str]]] = []
+
+    def respond(name, script):
+        async def respond(messages, info: AgentInfo) -> ModelResponse:
+            attempts.append((name, [t.name for t in info.function_tools]))
+            step = script[min(sum(1 for a in attempts if a[0] == name), len(script)) - 1]
+            if step is None:
+                return ModelResponse(parts=[ThinkingPart("hmm " * 50)], finish_reason="length")
+            if isinstance(step, tuple):
+                _, tool, args = step
+                return ModelResponse(
+                    parts=[ToolCallPart(tool, args, tool_call_id=f"c{len(attempts)}")]
+                )
+            return ModelResponse(parts=[TextPart(step)])
+
+        return respond
+
+    class TestExecutor(PydanticExecutor):
+        web_tools = ()
+
+        def model(self, name):
+            return FunctionModel(respond("thinking", thinking_script))
+
+        def unthinking(self, name):
+            return FunctionModel(respond("unthinking", unthinking_script))
+
+    return TestExecutor, attempts
+
+
+async def run_overthinking(database_url, thinking_script, unthinking_script):
+    Executor, attempts = overthinking(thinking_script, unthinking_script)
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    return (await executor.execute(reply_request())).text, attempts
+
+
+async def test_the_last_request_offers_no_tools_to_the_fallback_either(
+    database_url, db, monkeypatch
+):
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(agent_executor, "MAX_MODEL_REQUESTS", 2)
+    text, attempts = await run_overthinking(
+        database_url,
+        [("tool", "find_emoji", {"name": "salute"}), None],
+        ["ten <:salute:1>"],
+    )
+    # The fallback's bad emoji is checked, and cut: no request is left to retry.
+    assert text == "ten"
+    assert [name for name, _ in attempts] == ["thinking", "thinking", "unthinking"]
+    assert attempts[0][1] != []
+    assert attempts[1][1] == [] and attempts[2][1] == [], "the last request, both attempts"
+
+
+async def test_the_emoji_check_runs_on_the_fallbacks_answer(database_url, db, monkeypatch):
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(agent_executor, "MAX_MODEL_REQUESTS", 3)
+    text, attempts = await run_overthinking(
+        database_url, [None, "ten <:huh:11>"], ["ten <:salute:1>"]
+    )
+    # The fallback's emoji was rejected with a retry, and the retry fixed it.
+    assert text == "ten <:huh:11>"
+    assert [name for name, _ in attempts] == ["thinking", "unthinking", "thinking"]

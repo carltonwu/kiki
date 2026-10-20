@@ -5,7 +5,7 @@
         "extra_body": {
           "max_tool_calls": 3
         },
-        "max_tokens": 100,
+        "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
         }
@@ -690,7 +690,7 @@
         "extra_body": {
           "max_tool_calls": 3
         },
-        "max_tokens": 100,
+        "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
         }
@@ -1510,7 +1510,7 @@
     },
     "topic": {
       "model_settings": {
-        "max_tokens": 100,
+        "max_tokens": 2100,
         "openrouter_usage": {
           "include": true
         }

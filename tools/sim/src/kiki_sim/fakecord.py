@@ -599,7 +599,7 @@ class Fakecord:
                             "id": model,
                             "name": model,
                             "architecture": {"output_modalities": ["text"]},
-                            "supported_parameters": ["tools"],
+                            "supported_parameters": ["tools", "reasoning"],
                             "pricing": {"prompt": "0", "completion": "0"},
                         }
                         for model in STUB_MODELS
@@ -632,6 +632,18 @@ class Fakecord:
             return web.json_response(embeddings(body))
         self.world.unexpected.append({"method": request.method, "path": f"openrouter/{path}"})
         return web.json_response({"error": {"code": 404, "message": "kiki-sim"}}, status=404)
+
+    def overthinks(self, text: str, body: dict) -> dict | None:
+        """`reply: {overthinks: true}`: while thinking is on, the reply request is all
+        thinking up to the limit; `overthinks: always` stays that way without it."""
+        thinking = (body.get("reasoning") or {}).get("enabled") is not False
+        for entry in self.world.scripts["reply"]:
+            mode = entry.get("overthinks")
+            overthinking = mode == "always" or (mode and thinking)
+            if overthinking and not entry.get("used") and re.search(entry["match"], text, re.S):
+                entry["used"] = not thinking  # the last try: the host has nothing to turn off
+                return {"thinking_only": True}
+        return None
 
     def take(self, kind: str, text: str) -> dict | None:
         for entry in self.world.scripts[kind]:
@@ -838,11 +850,17 @@ class Fakecord:
                     )
                     message = {"role": "assistant", "content": text}
             else:
-                entry = self.take("reply", trigger)
+                entry = self.overthinks(trigger, body) or self.take("reply", trigger)
                 tools = (entry or {}).get("tools") or (
                     [entry["tool"]] if entry and entry.get("tool") else []
                 )
-                if tools:
+                if entry and entry.get("thinking_only"):
+                    # A reasoning model that thinks until `max_tokens` and writes
+                    # nothing (reply:404 on 10-20); the entry stays for the retry.
+                    record["kind"] = "reply_out_of_room"
+                    message = {"role": "assistant", "content": None, "reasoning": "hmm " * 50}
+                    finish = "length"
+                elif tools:
                     entry["pending"] = True
                     # `{image_message}`: the message ID of the trigger's image marker,
                     # else of the newest marker in the conversation (like Kiki's drawing).

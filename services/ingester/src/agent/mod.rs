@@ -45,6 +45,18 @@ const RUN_KIND: &str = "(SELECT c.check_hit FROM classifications c \
                          WHERE c.message_id = r.trigger_message_ids[1])";
 
 const NOTIFY_CHANNEL: &str = "agent_run_queued";
+/// Posted when a reply run fails after its trigger was accepted, like a
+/// drawing's `(couldn't make that picture)`: the request must not end in silence.
+pub(crate) const FAILURE_NOTE: &str = "(couldn't answer that one, try again?)";
+/// Leaves out the failure notes (`m` is the message): a bot's own message that
+/// is exactly `FAILURE_NOTE`, or `FAILURE_NOTE` under the redirect header
+/// (`discord::redirect_header`), which also covers a note whose send response
+/// was lost or a crash before it was recorded; or one a `failure_note` run
+/// recorded (by provenance: a hashed subplan over a partial index). Only bots'
+/// rows get any of it, the text equality first. The one false positive: Kiki
+/// writing exactly that sentence herself. `chat/scope.py` has the same for the
+/// host's tools (test_history.py checks they match).
+pub(crate) const NOT_A_FAILURE_NOTE: &str = r"NOT (m.author_bot AND m.relayed_for IS NULL AND (m.content = '(couldn''t answer that one, try again?)' OR (starts_with(m.content, '-# ↪ <@') AND m.content ~ '^-# ↪ <@[0-9]+> in https://discord\.com/channels/[0-9]+/[0-9]+/[0-9]+\n\(couldn''t answer that one, try again\?\)$') OR m.id IN (SELECT x FROM agent_runs n, unnest(n.reply_message_ids) AS x WHERE n.failure_note AND x IS NOT NULL)))";
 /// Pending runs are also checked this often, in case a notification was lost
 /// while the listener reconnected.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -119,12 +131,7 @@ impl Agent {
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         // Delivery is not safely retryable after a crash. Host execution can
         // reuse a saved result through its stable job ID.
-        let interrupted: Vec<Option<String>> = sqlx::query_scalar(&format!(
-            "UPDATE agent_runs r SET status = 'failed', error = 'interrupted', finished_at = now() \
-             WHERE status = 'delivering' RETURNING {RUN_KIND}"
-        ))
-        .fetch_all(&self.db)
-        .await?;
+        let (interrupted, recovered) = recover_runs(&self.db).await?;
         for kind in &interrupted {
             metrics::run_finished(metrics::run_kind(kind.as_deref()), RunStatus::Interrupted);
         }
@@ -136,11 +143,6 @@ impl Agent {
             );
         }
 
-        let recovered =
-            sqlx::query("UPDATE agent_runs SET status = 'pending' WHERE status = 'running'")
-                .execute(&self.db)
-                .await?
-                .rows_affected();
         if recovered > 0 {
             info!(runs = recovered, "requeued interrupted agent runs");
         }
@@ -454,7 +456,13 @@ impl Agent {
                 request
             }
         };
-        let result = self.host.execute(&request).await?;
+        let result = match self.host.execute(&request).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.post_failure_note(claim, &context, record).await;
+                return Err(e);
+            }
+        };
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
@@ -483,12 +491,7 @@ impl Agent {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
-        // Commit before any Discord send: a crash from here may have posted a
-        // reply, so startup fails this run instead of posting it again.
-        sqlx::query("UPDATE agent_runs SET status = 'delivering', reply_to_id = $2 WHERE id = $1")
-            .bind(claim.run_id)
-            .bind(context.reply_to)
-            .execute(&self.db)
+        self.mark_delivering(claim.run_id, context.reply_to, false)
             .await?;
         self.react(&context, &plan.reactions, record).await;
         if plan.messages.is_empty() {
@@ -506,6 +509,67 @@ impl Agent {
             record,
         )
         .await
+    }
+
+    /// Someone was waiting on this reply and the host couldn't write one (the
+    /// model failed, or the host is down): say so, rather than leave silence.
+    /// The run still fails; a note that can't be sent is only logged.
+    async fn post_failure_note(
+        &self,
+        claim: &Claim,
+        context: &context::Context,
+        record: &mut RunRecord,
+    ) {
+        let note = [delivery::Message {
+            text: FAILURE_NOTE.to_owned(),
+            delay: Duration::ZERO,
+        }];
+        // As for a reply: once it may have been posted, a crash fails the run at
+        // startup instead of requeueing it, which would post the note again.
+        if let Err(e) = self
+            .mark_delivering(claim.run_id, context.reply_to, true)
+            .await
+        {
+            warn!(run_id = claim.run_id, error = %e, "couldn't post the failure note");
+            return;
+        }
+        if let Err(e) = self
+            .send(
+                context,
+                claim.run_id,
+                claim.conversation_id,
+                &note,
+                &[],
+                context.settings.chat_reply_reference,
+                metrics::Send::Reply,
+                record,
+            )
+            .await
+        {
+            warn!(run_id = claim.run_id, error = %e, "couldn't post the failure note");
+        }
+    }
+
+    /// Commit before any Discord send: a crash from here may have posted, so
+    /// startup fails the run (`recover_runs`) instead of sending again.
+    /// `failure_note`: what's sent is the failure note, which prompts leave out
+    /// (`NOT_A_FAILURE_NOTE`).
+    async fn mark_delivering(
+        &self,
+        run_id: i64,
+        reply_to: i64,
+        failure_note: bool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'delivering', reply_to_id = $2, failure_note = $3 \
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .bind(reply_to)
+        .bind(failure_note)
+        .execute(&self.db)
+        .await
+        .map(|_| ())
     }
 
     async fn finish(
@@ -573,6 +637,23 @@ impl std::fmt::Display for Expired {
 }
 
 impl std::error::Error for Expired {}
+
+/// At startup: runs that were delivering may have posted, so they fail
+/// (their kinds, for metrics); runs still running go back to pending, since
+/// the host reuses a saved result by job ID. Returns both.
+async fn recover_runs(db: &PgPool) -> sqlx::Result<(Vec<Option<String>>, u64)> {
+    let interrupted: Vec<Option<String>> = sqlx::query_scalar(&format!(
+        "UPDATE agent_runs r SET status = 'failed', error = 'interrupted', finished_at = now() \
+         WHERE status = 'delivering' RETURNING {RUN_KIND}"
+    ))
+    .fetch_all(db)
+    .await?;
+    let requeued = sqlx::query("UPDATE agent_runs SET status = 'pending' WHERE status = 'running'")
+        .execute(db)
+        .await?
+        .rows_affected();
+    Ok((interrupted, requeued))
+}
 
 fn clean_reply(text: &str) -> String {
     fix_custom_emoji(strip_speaker(text.trim()).trim())

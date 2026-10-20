@@ -1,0 +1,15 @@
+name: a reply that's all thinking goes again without thinking, and a failed reply says so
+# Production 10-20 (reply:404): DeepSeek V4.1 Flash thought through every token
+# and wrote nothing; the run failed and nobody got an answer, like 388-390
+# ("help kiki where my meme at").
+steps:
+  - say: {as: alex, in: general, text: "kiki where my meme at"}
+    reply: {text: "on its way", overthinks: true}
+  - expect:
+      reply: true
+      text_contains: "on its way"
+  - say: {as: sam, in: general, text: "kiki what's the plan for saturday"}
+    reply: {text: "never sent", overthinks: always}
+  - expect:
+      reply: true
+      text_contains: "(couldn't answer that one, try again?)"
