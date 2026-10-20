@@ -437,7 +437,7 @@ queries are an argument error returned to the model.
   resync:true` (Manage Server) replaces the list from `GET guilds/{id}/emojis` and
   describes the new ones; until then, new emoji are found by name only.
   Descriptions survive renames, since an emoji's image never changes. Syncs of a
-  guild take turns (an advisory lock), and `guild_emoji_syncs` (migration 0029)
+  guild take turns (an advisory lock), and `guild_emoji_syncs` (migration 0032)
   keeps the latest one's snapshot time. A sync whose list was read earlier is
   skipped, so a resync's REST list, read before a Gateway update was applied,
   can't bring a deleted emoji back. The table also tells a synced guild with no
