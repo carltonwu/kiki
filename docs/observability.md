@@ -70,7 +70,7 @@ agent host (Python) ─OTLP────┘
     holds more samples. Before baselines such a window read 0. Exact billing
     totals come from the database: `agent_runs.cost_usd`,
     `classifications.jev_cost_usd`, `topic_summaries.cost_usd`,
-    `agent_image_jobs.cost_usd` and `guild_emojis.describe_cost_usd`, which
+    `agent_image_jobs.cost_usd` and `emoji_description_costs.cost_usd`, which
     `/kiki stats` sums per server. They miss three costs the metrics count: a
     reply run that fails (the host reports no result,
     so `agent_runs.cost_usd` stays NULL, though its requests were billed),

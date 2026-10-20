@@ -1110,7 +1110,7 @@ impl Commands {
 /// searches' embeddings and images read during the reply), drawings
 /// (`agent_image_jobs`: the image, its references' vision and any failure note),
 /// Decide (`classifications`), topic summaries (`topic_summaries`) and emoji
-/// descriptions (`guild_emojis`). All are OpenRouter's (or Jev's) billed cost.
+/// descriptions (`emoji_description_costs`). All are OpenRouter's (or Jev's) billed cost.
 async fn guild_costs(db: &PgPool, guild_id: i64) -> sqlx::Result<Vec<Costs>> {
     sqlx::query_as(
         r#"
@@ -1128,9 +1128,8 @@ async fn guild_costs(db: &PgPool, guild_id: i64) -> sqlx::Result<Vec<Costs>> {
                    WHERE m.guild_id = $1 AND c.message_id = c.pool_id),
         topics AS (SELECT t.cost_usd, t.created_at AS at
                    FROM topic_summaries t JOIN conv ON conv.id = t.conversation_id),
-        -- A redescribed emoji's cost adds up, counted when it was last described.
-        emoji AS (SELECT describe_cost_usd AS cost_usd, described_at AS at
-                  FROM guild_emojis WHERE guild_id = $1)
+        emoji AS (SELECT cost_usd, created_at AS at
+                  FROM emoji_description_costs WHERE guild_id = $1)
         SELECT
             (SELECT coalesce(sum(cost_usd), 0) FROM runs WHERE at > w.since) AS replies,
             (SELECT coalesce(sum(cost_usd), 0) FROM drawings WHERE at > w.since) AS drawings,
@@ -1652,10 +1651,11 @@ mod tests {
                 ('topic:1:10:12', 1, 0.0625, now() - interval '1 hour'),
                 ('topic:1:11:12', 1, 0.03125, now() - interval '10 days'),
                 ('topic:2:20:12', 2, 64, now());
-            INSERT INTO guild_emojis (id, guild_id, name, raw, describe_cost_usd, described_at) VALUES
-                (81, 9, 'froge', '{}', 0.015625, now() - interval '2 days'),
-                (82, 9, 'huh', '{}', NULL, NULL),
-                (83, 8, 'oop', '{}', 64, now());
+            INSERT INTO guild_emojis (id, guild_id, name, raw) VALUES
+                (81, 9, 'froge', '{}'), (82, 9, 'huh', '{}'), (83, 8, 'oop', '{}');
+            INSERT INTO emoji_description_costs (emoji_id, guild_id, cost_usd, created_at) VALUES
+                (81, 9, 0.015625, now() - interval '2 days'),
+                (83, 8, 64, now());
             "#,
         )
         .execute(&db)
@@ -1685,6 +1685,143 @@ mod tests {
             ["Replies", "Drawings", "Decide", "Topics", "Emoji", "Total"]
         );
         assert_eq!(rows[5], ["Total", "$1.44", "$1.95", "$3.98"]);
+        test.drop().await;
+    }
+
+    /// Guild 9's costs in each window, as (24 h, 7 d, all) for one kind.
+    async fn windows(db: &sqlx::PgPool, kind: fn(&super::Costs) -> f64) -> [f64; 3] {
+        let costs = super::guild_costs(db, 9).await.unwrap();
+        [kind(&costs[0]), kind(&costs[1]), kind(&costs[2])]
+    }
+
+    #[tokio::test]
+    async fn topic_costs_survive_the_upgrade_and_an_old_ingester_finishing_jobs() {
+        // A database from before topic_summaries, with topic jobs the host saved.
+        let Some(test) = crate::test_db::migrated_through("topic_upgrade_test", 26).await else {
+            return;
+        };
+        let db = test.db.clone();
+        let job = |id: &str, conversation: &str, status: &str, cost: &str| {
+            format!(
+                "('{id}', '{{\"kind\": \"topic\", \"scope\": {{\"conversation_id\": \"{conversation}\"}}}}', \
+                 '{status}', {result}, now() - interval '3 days')",
+                result = if status == "completed" {
+                    format!("'{{\"usage\": {{\"cost\": {cost}}}}}'")
+                } else {
+                    "NULL".to_owned()
+                },
+            )
+        };
+        sqlx::raw_sql(&format!(
+            "INSERT INTO conversations (id, guild_id, channel_id, started_by, topic_cost_usd) \
+                 VALUES (1, 9, 2, 100, 0.5);
+             INSERT INTO agent_host_jobs (id, request, status, result, updated_at) VALUES {}, {}, {}, {},
+                 ('reply:7', '{{\"kind\": \"reply\", \"scope\": {{\"conversation_id\": \"1\"}}}}',
+                  'completed', '{{\"usage\": {{\"cost\": 64}}}}', now());",
+            job("topic:1:100:12", "1", "completed", "0.25"),
+            job("topic:1:101:12", "1", "running", ""),
+            // A conversation that doesn't exist, and a cost that isn't a number.
+            job("topic:99:1:12", "99", "completed", "0.5"),
+            job("topic:1:99:12", "1", "completed", "\"n/a\""),
+        ))
+        .execute(&db)
+        .await
+        .unwrap();
+
+        crate::MIGRATOR.run(&db).await.unwrap();
+        let saved = |id: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, f64>(
+                    "SELECT cost_usd FROM topic_summaries WHERE job_id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&db)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(saved("topic:1:100:12").await, Some(0.25));
+        assert_eq!(saved("topic:1:99:12").await, Some(0.0));
+        assert_eq!(saved("topic:99:1:12").await, None);
+        assert_eq!(saved("reply:7").await, None);
+        assert_eq!(windows(&db, |c| c.topics).await, [0.0, 0.25, 0.25]);
+
+        // The host finishes a job an older ingester asked for after the migration
+        // ran (that ingester writes only topic_cost_usd, and won't ask again).
+        let complete = "UPDATE agent_host_jobs SET status = 'completed', \
+                        result = '{\"usage\": {\"cost\": 0.125}}', updated_at = now() WHERE id = $1";
+        sqlx::query(complete)
+            .bind("topic:1:101:12")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversations SET topic_cost_usd = topic_cost_usd + 0.125 WHERE id = 1",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(windows(&db, |c| c.topics).await, [0.125, 0.375, 0.375]);
+        // Saved again (a resumed job) or reused by a retry: counted once.
+        sqlx::query(complete)
+            .bind("topic:1:101:12")
+            .execute(&db)
+            .await
+            .unwrap();
+        // A job saved as completed straight away is recorded too.
+        sqlx::raw_sql(
+            r#"INSERT INTO agent_host_jobs (id, request, status, result) VALUES
+                ('topic:1:102:12', '{"kind": "topic", "scope": {"conversation_id": "1"}}',
+                 'completed', '{"usage": {"cost": 0.0625}}')"#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(windows(&db, |c| c.topics).await, [0.1875, 0.4375, 0.4375]);
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn an_emoji_description_counts_in_the_window_it_was_made() {
+        // Described a month ago, before emoji_description_costs existed.
+        let Some(test) = crate::test_db::migrated_through("emoji_cost_test", 27).await else {
+            return;
+        };
+        let db = test.db.clone();
+        sqlx::raw_sql(
+            "INSERT INTO guild_emojis (id, guild_id, name, raw, description, described_at, describe_cost_usd) VALUES
+                 (81, 9, 'froge', '{}', 'a frog', now() - interval '30 days', 0.25),
+                 (82, 9, 'huh', '{}', NULL, NULL, NULL);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        crate::MIGRATOR.run(&db).await.unwrap();
+        assert_eq!(windows(&db, |c| c.emoji).await, [0.0, 0.0, 0.25]);
+
+        // Redescribed today, as the agent host writes it: only today's cost is today's.
+        let describe = "UPDATE guild_emojis SET description = 'a smug frog', described_at = now(), \
+                        describe_cost_usd = coalesce(describe_cost_usd, 0) + $2 WHERE id = $1";
+        for (emoji, cost) in [(81, 0.125), (82, 0.0625), (82, 0.0)] {
+            sqlx::query(describe)
+                .bind(emoji)
+                .bind(cost)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        // A rename (the ingester's sync) isn't a charge.
+        sqlx::query("UPDATE guild_emojis SET name = 'froggy' WHERE id = 81")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_eq!(windows(&db, |c| c.emoji).await, [0.1875, 0.1875, 0.4375]);
+        let charges: i64 = sqlx::query_scalar("SELECT count(*) FROM emoji_description_costs")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(charges, 3);
         test.drop().await;
     }
 

@@ -6,7 +6,7 @@ from psycopg.types.json import Jsonb
 
 from kiki_agent_host.api.app import application, create_app
 from kiki_agent_host.config import Settings
-from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult
+from kiki_agent_host.contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResult, Usage
 from kiki_agent_host.executor import TransientError
 
 TOKEN = "test-host-token"
@@ -229,3 +229,30 @@ async def test_the_factory_configures_an_executor_only_with_an_openrouter_key(mo
     monkeypatch.setenv("OPENROUTER_CHAT_API_KEY", "test-key")
     async with client(application()) as http:
         assert (await http.get("/health")).json()["executor_configured"] is True
+
+
+async def test_a_completed_topic_job_records_its_cost_once(database_url):
+    """topic_summaries (an ingester migration's trigger) records the cost where the
+    host saves the result, whichever ingester asked for it; a retry answered from
+    the saved result adds nothing."""
+
+    class TopicExecutor(FakeExecutor):
+        async def execute(self, request):
+            self.calls += 1
+            return JobResult(text="weekend plans", model=request.model, usage=Usage(cost=0.25))
+
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (3, 1, 2, 9)"
+        )
+    topic = {**job("topic:3:100:12"), "kind": "topic"}
+    executor = TopicExecutor()
+    async with client(create_app(Settings(database_url, TOKEN), executor)) as http:
+        for _ in range(2):
+            response = await http.post("/v1/jobs", json=topic, headers=HEADERS)
+            assert response.json()["status"] == "completed"
+        assert (await http.post("/v1/jobs", json=job(), headers=HEADERS)).status_code == 200
+    assert executor.calls == 2  # the topic once, the reply once
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        cursor = await db.execute("SELECT job_id, conversation_id, cost_usd FROM topic_summaries")
+        assert await cursor.fetchall() == [("topic:3:100:12", 3, 0.25)]

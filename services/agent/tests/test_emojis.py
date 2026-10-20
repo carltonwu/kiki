@@ -283,3 +283,34 @@ async def test_emoji_images_are_fetched_and_described_like_read_image(
     assert len(prompts) == 2 and all("custom Discord emoji" in p for p in prompts)
     cursor = await db.execute("SELECT description FROM guild_emojis WHERE id = 11")
     assert (await cursor.fetchone())[0] == "a confused face"
+
+
+async def test_each_description_is_charged_when_it_is_made(db):
+    """emoji_description_costs (an ingester migration's trigger) keeps one charge
+    per paid description, so a redescription doesn't move earlier spend into
+    today's window. Unpaid descriptions charge nothing."""
+    await add(db, 11, "huh")
+    await add(db, 12, "free")
+
+    async def describe_all(cost, **options):
+        return await emojis.describe_pending(
+            db,
+            lambda name, animated, image: _async(
+                (f"a {name} face", None if name == "free" else cost)
+            ),
+            embedder(),
+            guild_id=GUILD,
+            model="m",
+            attempted_before=await database_now(db),
+            client=cdn(),
+            **options,
+        )
+
+    assert (await describe_all(0.25))["described"] == 2
+    assert (await describe_all(0.125, redescribe=True))["described"] == 2
+    cursor = await db.execute(
+        "SELECT emoji_id, guild_id, cost_usd FROM emoji_description_costs ORDER BY id"
+    )
+    assert await cursor.fetchall() == [(11, GUILD, 0.25), (11, GUILD, 0.125)]
+    cursor = await db.execute("SELECT describe_cost_usd FROM guild_emojis WHERE id = 11")
+    assert (await cursor.fetchone())[0] == 0.375
