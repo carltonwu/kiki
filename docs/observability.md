@@ -36,6 +36,31 @@ agent host (Python) ─OTLP────┘
   So the host's metric samples are sparse: a counter has a sample only after a
   job, and an instant query goes stale five minutes later. Query them over a
   range (`increase(kiki_agent_jobs_total[$__range])`, `last_over_time(…[1h])`).
+- **Zero baselines (agent host counters).** Every wake is a new process, so
+  every series starts again, and `increase()`/`rate()` ignore a series' first
+  sample (Grafana Cloud doesn't ingest OTLP start times as created timestamps).
+  Exported as is, the first job after each wake would go uncounted: its cost,
+  tokens, calls, tool calls and image attempts. So a counter's attribute set
+  that is new in the process is added 0 at once and its values held back
+  (`Baselines` in `telemetry.py`): the job's flush sends the zero, then adds
+  the held-back values and flushes again at least 10 ms later (Mimir keeps
+  milliseconds, so the two points stay distinct). Only a flush with new series
+  flushes twice, in practice the first after a wake; between jobs nothing is
+  sent, as before. Shutdown does the same for values recorded outside a job
+  (`kiki-agent-host index`). Limits:
+  - **Histograms aren't baselined**: no SDK measurement makes a point with a
+    count of 0 (recording 0 would count an observation in the lowest bucket).
+    Their `_count`, `_sum` and buckets miss the first observation per
+    attribute set per wake under `increase()`. Count jobs, calls and cost with
+    the counters (`kiki_agent_jobs_total`, `kiki_llm_calls_total`,
+    `kiki_llm_cost_usd_total`, `kiki_llm_tokens_total`), not histogram counts;
+    use the histograms for distributions.
+  - **`increase()` extrapolates** to the window's end by half the average gap
+    between samples. A window holding only a wake's zero and one value reads
+    1.5× that value (four samples: 1.17×); the excess shrinks as the range
+    holds more samples. Before baselines it read 0.
+  - **The ingester** isn't baselined. It runs always, so only the first event
+    of each attribute set after a deploy or restart goes uncounted.
 - **The ingester runs always**, so it exports normally: spans and logs in batches,
   metrics every 60 s. Its main flushes and stops the exporters on every exit path,
   all three in parallel within 5 s (3 s per export request), so a stalled one
