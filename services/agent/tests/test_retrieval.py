@@ -3,6 +3,7 @@ import json
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from pydantic_ai.models.test import TestModel
 from kiki_agent_host import db as db_module
 from kiki_agent_host.agent.deps import MemorySession
 from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.guard import guarded
 from kiki_agent_host.agent.tools import memory as memory_tools
 from kiki_agent_host.agent.tools import messages as message_tools
 from kiki_agent_host.agent.tools.messages import OptionalTime
@@ -549,6 +551,79 @@ async def test_a_search_fits_its_deadline_when_every_step_is_slow(db, database_u
     assert result["semantic"] == "off"
     assert [m["id"] for m in result["messages"]] == ["98"]
     deps.indexing.cancel()
+
+
+async def test_slow_citations_still_return_the_results(db, database_url, monkeypatch):
+    """Seen in review (times here are a fifth): a 2 s index wait, a 1.5 s
+    connect and a 3.3 s embedding left the citations starting at 6.8 s, and a
+    3.5 s citation query ran past the tool's 10 s, throwing the results away."""
+    await add(db, 99, "release plan <@100>")
+    await index_pending(db, embedder(), guild_id=GUILD)
+    monkeypatch.setattr(message_tools, "SEARCH_SECONDS", 9 / 5)
+    monkeypatch.setattr(message_tools, "INDEX_WAIT_SECONDS", 2 / 5)
+    monkeypatch.setattr(message_tools, "CONNECT_SECONDS", 2 / 5)
+    monkeypatch.setattr(search_module, "EMBED_SECONDS", 4 / 5)
+    monkeypatch.setattr(search_module, "STATEMENT_SECONDS", 3 / 5)
+    monkeypatch.setattr(search_module, "LEXICAL_SECONDS", 1 / 5)
+    monkeypatch.setattr(search_module, "CITE_SECONDS", 1 / 5)
+    # The outer guard, scaled the same way.
+    monkeypatch.setattr(message_tools, "guarded", partial(guarded, timeout=10 / 5))
+    connect = db_module.connect
+
+    async def slow_connect(url, **kwargs):
+        await asyncio.sleep(1.5 / 5)
+        return await connect(url, **kwargs)
+
+    monkeypatch.setattr(db_module, "connect", slow_connect)
+
+    class SlowEmbeddings(FakeEmbeddings):
+        async def create(self, model, input):
+            await asyncio.sleep(3.3 / 5)
+            return await super().create(model, input)
+
+    async def slow_channel_names(connection, scope, ids):
+        await connection.execute("SELECT pg_sleep(3.5 / 5)")
+        return {}
+
+    monkeypatch.setattr(search_module, "channel_names", slow_channel_names)
+    deps = SimpleNamespace(
+        connection=db,
+        embed=Embedder(SimpleNamespace(embeddings=SlowEmbeddings())),
+        scope=SCOPE,
+        roster=Roster({"u1": 100}, {100: "u1 Alex"}),
+        spent=Counter(),
+        job_id="reply:test",
+        indexing=asyncio.create_task(asyncio.sleep(10, "full")),
+        memory=MemorySession(database_url),
+    )
+    result = await message_tools.search_messages(SimpleNamespace(deps=deps), "release plan")
+    deps.indexing.cancel()
+    # The results, labeled with what's at hand, not {"error": "Timed out."}.
+    assert result["enriched"] is False
+    assert "couldn't be looked up in time" in result["note"]
+    [hit] = result["messages"]
+    assert hit["id"] == "99"
+    assert hit["author"] == "u1 Alex"  # from the prompt's roster
+    assert hit["channel"] == f"#{CHANNEL}"
+    assert hit["text"] == "release plan @u1 Alex"
+    # The connection is fine afterwards, and keeps no timeout.
+    cursor = await db.execute("SELECT current_setting('statement_timeout')")
+    assert (await cursor.fetchone())[0] == "0"
+
+
+async def test_slow_name_resolution_is_bounded(db, monkeypatch):
+    await add(db, 100, "release plan")
+
+    async def slow_resolve(connection, scope, roster, person):
+        await connection.execute("SELECT pg_sleep(1)")
+        return [100]
+
+    monkeypatch.setattr(search_module, "resolve_person", slow_resolve)
+    monkeypatch.setattr(search_module, "RESOLVE_SECONDS", 0.1)
+    result = await search(
+        db, embedder(), SCOPE, "release plan", person="alex", deadline=search_module.Deadline(5)
+    )
+    assert result == {"error": "The search took too long. Try again, or narrow it down."}
 
 
 async def test_database_errors_in_indexing_leave_search_partial(monkeypatch):

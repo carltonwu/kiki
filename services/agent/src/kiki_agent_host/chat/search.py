@@ -58,7 +58,39 @@ INDEX_SETTINGS = "SET hnsw.ef_search = 200; SET hnsw.iterative_scan = relaxed_or
 EMBED_SECONDS = 4  # the query embedding; past it, the search is lexical
 STATEMENT_SECONDS = 3  # the hybrid query; past it, a lexical one is tried
 LEXICAL_SECONDS = 1  # kept back for that lexical query
-CITE_SECONDS = 1  # kept back for citing the results (names, channels, links)
+CITE_SECONDS = 1  # kept back for citing the results (names, channels); past it, IDs
+RESOLVE_SECONDS = 1  # resolving `person` and `channel`
+MIN_STEP_SECONDS = 0.05  # less than this left, a step isn't started
+UNCITED_NOTE = (
+    "Some names and channels couldn't be looked up in time: they're shown as IDs or "
+    "as they were when posted."
+)
+
+
+# The client-side backstop's grace past `seconds`, so the server's statement
+# timeout normally fires first and the transaction ends cleanly; the deadline
+# leaves a second before the tool's own.
+BACKSTOP_GRACE_SECONDS = 0.2
+
+
+async def bounded(connection: AsyncConnection, seconds: float, work):
+    """`await work()`, whose queries run on `connection`, within about `seconds`:
+    each statement under a server-side statement_timeout (SET LOCAL, in a
+    transaction), the whole under a client-side backstop. Raises TimeoutError."""
+    if seconds < MIN_STEP_SECONDS:
+        raise TimeoutError
+    if math.isinf(seconds):  # no deadline (tests, the CLI)
+        async with connection.transaction():
+            return await work()
+    try:
+        async with (
+            asyncio.timeout(seconds + BACKSTOP_GRACE_SECONDS),
+            connection.transaction(),
+        ):
+            await connection.execute(f"SET LOCAL statement_timeout = '{int(seconds * 1000)}ms'")
+            return await work()
+    except errors.QueryCanceled as error:
+        raise TimeoutError from error
 
 
 class Deadline:
@@ -140,18 +172,18 @@ LIMIT %(limit)s
 
 
 async def run_search(connection: AsyncConnection, params: dict, seconds: float) -> list | None:
-    """SEARCH under a server-side statement timeout; None if it ran out (or no
-    time was left to start it)."""
-    if seconds < 0.05:
-        return None
+    """SEARCH within `seconds` (`bounded`); None if it ran out (or no time was
+    left to start it)."""
     cursor = connection.cursor(row_factory=dict_row)
+
+    async def work():
+        await cursor.execute(INDEX_SETTINGS)
+        await cursor.execute(SEARCH, params)
+        return await cursor.fetchall()
+
     try:
-        async with connection.transaction():
-            await cursor.execute(f"SET LOCAL statement_timeout = '{int(seconds * 1000)}ms'")
-            await cursor.execute(INDEX_SETTINGS)
-            await cursor.execute(SEARCH, params)
-            return await cursor.fetchall()
-    except errors.QueryCanceled:
+        return await bounded(connection, seconds, work)
+    except TimeoutError:
         return None
 
 
@@ -175,15 +207,29 @@ async def search(
     to a lexical search rather than running the caller out of time."""
     if not query.strip():
         raise ValueError("query must not be empty")
-    authors = None
-    if person and person.strip():
-        authors = await resolve_person(connection, scope, roster, person)
-        if not authors:
+    authors = channels = None
+    if (person and person.strip()) or (channel and channel.strip()):
+
+        async def resolve():
+            found_authors = found_channels = None
+            if person and person.strip():
+                found_authors = await resolve_person(connection, scope, roster, person)
+            if channel and channel.strip():
+                found_channels = await resolve_channel(connection, scope, channel)
+            return found_authors, found_channels
+
+        try:
+            authors, channels = await bounded(
+                connection,
+                min(RESOLVE_SECONDS, deadline.left(keep=LEXICAL_SECONDS + CITE_SECONDS)),
+                resolve,
+            )
+        except TimeoutError:
+            # No results yet to fall back on.
+            return {"error": "The search took too long. Try again, or narrow it down."}
+        if authors is not None and not authors:
             return {"error": f"No one named {person!r} has written in this server."}
-    channels = None
-    if channel and channel.strip():
-        channels = await resolve_channel(connection, scope, channel)
-        if not channels:
+        if channels is not None and not channels:
             return {"error": f"There's no channel named {channel!r} in this server."}
     try:
         # A total, unlike the client's own timeouts (per connect, read, ...).
@@ -253,9 +299,31 @@ async def search(
         max(similarities, default=None),
         semantic,
     )
-    result = {"semantic": semantic, "messages": await cite_all(connection, scope, roster, rows)}
+
+    async def enrich():
+        cited = await cite_all(connection, scope, roster, rows)
+        names = {}
+        if authors and len(authors) > 1:
+            names = await speakers(connection, scope, roster, set(authors))
+        return cited, names
+
+    try:
+        cited, names = await bounded(connection, deadline.left(), enrich)
+    except TimeoutError:
+        # The results stand; only the lookups that label them ran out of time.
+        logger.info(
+            "search citations timed out channel_id=%s conversation_id=%s hits=%d",
+            scope.channel_id,
+            scope.conversation_id,
+            len(rows),
+        )
+        names = dict(roster.speakers)
+        cited = [cite(scope, m, names, {}) for m in rows]
+        result = {"semantic": semantic, "messages": cited, "enriched": False}
+        result["note"] = UNCITED_NOTE
+        return result
+    result = {"semantic": semantic, "messages": cited}
     if authors and len(authors) > 1:
-        names = await speakers(connection, scope, roster, set(authors))
         result["note"] = (
             f"{person!r} matches {len(authors)} different people: "
             + "; ".join(names.get(a, str(a)) for a in authors)
