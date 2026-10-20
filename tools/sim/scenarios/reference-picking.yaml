@@ -1,0 +1,42 @@
+name: the drawing's reference picker looks at several candidates and sends the clearest photos first, not the newest or a meme
+steps:
+  # Three posts name Bear: a clear photo (oldest), a meme, and a blurry photo (newest).
+  # By search order alone the blurry one came first and the meme was a candidate.
+  - send:
+      as: sam
+      in: lore
+      text: "Bear at the vet, such a good boy"
+      age_s: 7200
+      attachments: [{filename: IMG_0101.jpg, content_type: image/jpeg, label: "clear photo of bear up close"}]
+  - send:
+      as: sam
+      in: lore
+      text: "bear meme lol"
+      age_s: 3600
+      attachments: [{filename: meme.png, label: "a meme screenshot about bear"}]
+  - send:
+      as: sam
+      in: lore
+      text: "Bear zooming at the park"
+      age_s: 600
+      attachments: [{filename: IMG_0102.jpg, content_type: image/jpeg, label: "blurry photo of bear running"}]
+  - say: {as: ethan, in: general, text: "kiki draw bear as an astronaut"}
+    reply:
+      tool:
+        name: generate_image
+        args:
+          prompt: "Bear the dog floating in a space station, in a small astronaut suit"
+          subjects: [{name: Bear, description: "sam's black dog"}]
+          caption: "one small step for bear"
+      text: "suiting him up 🚀"
+  - expect:
+      run: done
+      tool_called: generate_image
+      text_contains: "suiting him up"
+  # The picker judged every candidate (JSON verdicts) and the clearest photo leads.
+  - expect:
+      followup: {status: done, attachments: 1, text_contains: "one small step for bear"}
+      image_references: ["clear photo of bear up close", "blurry photo of bear running"]
+      image_prompt_contains:
+        - "Bear, shown in reference images 1-2: sam's black dog."
+  - expect: {sql: "SELECT jsonb_array_length(reference_images) FROM agent_host_images ORDER BY id DESC LIMIT 1", equals: 2}

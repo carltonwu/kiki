@@ -228,13 +228,49 @@ def test_compose_numbers_references_and_defaults_to_a_phone_photo():
     assert edited.endswith(drawing.EDIT) and "Reference image 1 is the photo to edit" in edited
 
 
-def test_verdicts_read_the_vision_check():
-    answer = (
-        "Image 1: a white dog on a couch => yes\nImage 2: a meme => no\n"
-        "**Image 3:** the dog, a selfie (yes) => **Yes**\nimage 4: blurry => maybe\n"
-        "Image 5: says yes on a sign => no"
-    )
-    assert drawing.verdicts(answer) == {1, 3}
+def test_attachments_that_look_like_photos_rank_first():
+    # Seen in prod: a 300x225 meme and phone screenshots ranked with selfies.
+    now = ((1561578462123266113 >> 22) + drawing.DISCORD_EPOCH_MS) + 1000
+    recent = 1561578462123266113
+
+    def rank(name, content_type, width, height, message_id=recent):
+        attachment = {"filename": name, "content_type": content_type}
+        attachment |= {"width": width, "height": height}
+        return drawing.likely(attachment, message_id, now)
+
+    camera = rank("IMG_8637.jpg", "image/jpeg", 2160, 2880)
+    screenshot = rank("Screenshot 2026-10-18.png", "image/png", 1179, 2556)
+    thumbnail = rank("image0.jpg", "image/jpeg", 300, 225)
+    pasted = rank("image.png", "image/png", 1200, 900)
+    years_old = rank("IMG_1.jpg", "image/jpeg", 2160, 2880, message_id=1 << 22)
+    drawn = rank("kiki-16.png", "image/png", 1024, 1024)
+    assert camera > years_old > thumbnail
+    assert camera > pasted > screenshot
+    assert drawn < -5
+
+
+def picks(judge):
+    """A vision model answering the reference picker: JSON verdicts for each
+    candidate image, `judge(label)` giving (subject, clarity) from its label."""
+
+    def respond(messages, info):
+        texts = [p for p in messages[-1].parts[0].content if isinstance(p, str)]
+        labels = [t for t in texts if t.startswith("Candidate image ")]
+        verdicts = []
+        for n, label in enumerate(labels, 1):
+            subject, clarity = judge(label)
+            verdicts.append(
+                {
+                    "image": n,
+                    "shows": label,
+                    "kind": "photo" if subject else "meme",
+                    "subject": subject,
+                    "clarity": clarity,
+                }
+            )
+        return ModelResponse(parts=[TextPart(json.dumps({"verdicts": verdicts}))])
+
+    return respond
 
 
 def test_links_expire_and_refresh_only_for_discord():
@@ -681,18 +717,11 @@ async def test_drawing_finds_checks_and_numbers_references(database_url):
     }
     checks = []
 
+    judged = picks(lambda label: ("meme" not in label and "avatar" not in label, 2))
+
     def chat(messages, info):
-        prompt = messages[-1].parts[0].content
-        texts = [p for p in prompt if isinstance(p, str)]
-        checks.append(texts)
-        if "draw Nougie" in texts[0]:
-            # Newest first: snow, meme, adopted. The meme is turned down.
-            return ModelResponse(
-                parts=[TextPart("Image 1: dog => yes\nImage 2: meme => no\nImage 3: dog => yes")]
-            )
-        return ModelResponse(
-            parts=[TextPart("Image 1: selfie => yes\nImage 2: cartoon avatar => no")]
-        )
+        checks.append([p for p in messages[-1].parts[0].content if isinstance(p, str)])
+        return judged(messages, info)
 
     model = FakeImageModel()
     run = executor(database_url, model, chat)
@@ -755,8 +784,7 @@ async def test_shared_images_come_last_and_given_photos_are_not_sent_twice(datab
         "/attachments/2/83/meme.png": PNG + b"meme",
     }
 
-    def chat(messages, info):
-        return ModelResponse(parts=[TextPart("Image 1: a man => yes")])
+    chat = picks(lambda label: (True, 3))
 
     model = FakeImageModel()
     run = executor(database_url, model, chat)
@@ -984,3 +1012,534 @@ def test_binary_keeps_only_types_the_image_model_takes():
     assert drawing.binary(PNG).media_type == "image/png"
     assert drawing.binary(b"GIF89a....") is None
     assert isinstance(BinaryContent(PNG, media_type="image/png"), BinaryContent)
+
+
+async def test_the_picker_takes_the_clearest_photos_of_several_candidates(database_url):
+    # Seen in prod: the first approved candidates were taken in search order, and
+    # a meme of a monkey and a game character were taken for Reece.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (100, 200, "me at the lake", [attachment(101, "IMG_1.jpg")]),
+        (102, 200, "me lol", [attachment(103, "IMG_2.jpg")]),
+        (104, 200, "my soup", [attachment(105, "IMG_3.jpg")]),
+        (106, 300, "user200 as a monkey", [attachment(107, "monkey.png", "image/png")]),
+    )
+    files = {
+        "/attachments/2/101/IMG_1.jpg": JPEG + b"lake",
+        "/attachments/2/103/IMG_2.jpg": JPEG + b"close",
+        "/attachments/2/105/IMG_3.jpg": JPEG + b"soup",
+        "/attachments/2/107/monkey.png": PNG + b"monkey",
+    }
+    clarity = {"lake": 1, "lol": 3}
+    prompts = []
+    judged = picks(
+        lambda label: next(((True, c) for k, c in clarity.items() if k in label), (False, 0))
+    )
+
+    def chat(messages, info):
+        prompts.append([p for p in messages[-1].parts[0].content if isinstance(p, str)])
+        return judged(messages, info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord(files, [])
+    job = image_job([Subject(name="user200", user_id="200")], prompt="a portrait")
+    result = await run.draw(job)
+    # The clear close-up first, then the blurry lake photo; soup and monkey are out.
+    assert [r.message_id for r in result.references] == ["102", "100"]
+    [texts] = prompts
+    assert sum(t.startswith("Candidate image ") for t in texts) == 4  # (no avatar served)
+    assert 'The picture to draw: "a portrait"' in texts[0]
+
+
+async def test_given_photos_anchor_the_picker_and_bad_answers_get_one_retry(database_url):
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (110, 300, "this is what reece looks like", [attachment(111, "reece.jpg")]),
+        (112, 300, "Reece at the beach", [attachment(113, "beach.jpg")]),
+    )
+    files = {
+        "/attachments/2/111/reece.jpg": JPEG + b"reece",
+        "/attachments/2/113/beach.jpg": JPEG + b"beach",
+    }
+    requests = []
+    judged = picks(lambda label: (True, 2))
+
+    def chat(messages, info):
+        requests.append(messages)
+        if len(messages) == 1:  # skips the only candidate: retried through ModelRetry
+            return ModelResponse(parts=[TextPart('{"verdicts": []}')])
+        return judged(messages[:1], info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord(files, [])
+    result = await run.draw(image_job([Subject(name="Reece", photos=["110"])]))
+    assert [r.message_id for r in result.references] == ["110", "112"]
+    assert len(requests) == 2  # the first answer had no verdict for image 1
+    texts = [p for p in requests[0][0].parts[0].content if isinstance(p, str)]
+    assert "Known photo A of Reece (not a candidate)" in texts
+    assert "the same one as in the known photos" in texts[0]
+    assert [t for t in texts if t.startswith("Candidate image ")] == [
+        'Candidate image 1; caption: "Reece at the beach"'
+    ]
+
+
+async def test_photos_cited_in_memory_are_candidates(database_url):
+    await reply_job(database_url)
+    await seed(database_url, (120, 300, "look at her go", [attachment(121, "IMG_9.jpg")]))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        cursor = await db.execute(
+            "INSERT INTO memory_subjects (guild_id, kind, name, name_norm)"
+            " VALUES (%s, 'thing', 'Piper', name_norm('Piper')) RETURNING id",
+            (GUILD,),
+        )
+        [subject] = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO memory_entries (doc_id, kind, text, sources, first_observed_at,"
+            " last_observed_at) SELECT id, 'fact', 'Piper is a merle dog', '{120}', now(), now()"
+            " FROM memory_docs WHERE subject_id = %s",
+            (subject,),
+        )
+    model = FakeImageModel()
+    run = executor(database_url, model, picks(lambda label: (True, 3)))
+    run.transport = discord({"/attachments/2/121/IMG_9.jpg": JPEG + b"piper"}, [])
+    result = await run.draw(image_job([Subject(name="Piper")], prompt="Piper in snow"))
+    # The caption doesn't name her: only her memory points at the photo.
+    assert [r.message_id for r in result.references] == ["120"]
+
+
+async def test_a_name_two_people_had_means_the_one_going_by_it(database_url):
+    # Seen in prod: Ethan had once been nicknamed "Reece", so "Reece" meant nobody
+    # and Reece was searched for as a thing.
+    await seed(database_url, (130, 200, "hi", []), (131, 400, "hey", []))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO user_names (guild_id, user_id, kind, name, name_norm, first_seen,"
+            " last_seen) VALUES (%s, 200, 'nick', 'Reece', 'reece', now(), now()),"
+            " (%s, 400, 'nick', 'Reece', 'reece', now(), now()) ON CONFLICT DO NOTHING",
+            (GUILD, GUILD),
+        )
+        await db.execute(
+            "INSERT INTO people (guild_id, user_id, username, nick, seen_at) VALUES"
+            " (%s, 200, 'user200', 'Ethan', now()), (%s, 400, 'rqc2', 'Reece', now())"
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET nick = excluded.nick",
+            (GUILD, GUILD),
+        )
+    args = {"prompt": "x", "subjects": [{"name": "Reece"}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.user_id) for s in queued.subjects] == [("Reece", "400")]
+
+
+async def test_a_message_id_in_a_name_is_a_photo_and_kikis_drawings_are_not(database_url):
+    # Seen in prod: "Reece (from the selfie he shared, message …)" with no photos,
+    # and Kiki's own picture of Reece given as his photo.
+    await reply_job(database_url)
+    await seed(database_url, (1561574753435652146, 300, "me", [attachment(141, "me.jpg")]))
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        # Her saved drawings, posted in every format Rust names by type, and another
+        # bot's file that only looks like hers (no saved drawing has its number).
+        await db.execute(
+            "INSERT INTO agent_host_images (id, job_id, mime_type, data) VALUES"
+            " (16, 'reply:1', 'image/png', 'x'), (17, 'reply:1', 'image/jpeg', 'x'),"
+            " (18, 'reply:1', 'image/webp', 'x'), (19, 'reply:1', 'image/gif', 'x')"
+        )
+        for id, name, mime in (
+            (142, "kiki-16.png", "image/png"),
+            (144, "kiki-17.jpg", "image/jpeg"),
+            (146, "kiki-18.webp", "image/webp"),
+            (148, "kiki-19.gif", "image/gif"),
+            (150, "picture.png", "image/png"),  # her image job's follow-up, by provenance
+            (152, "kiki-99.png", "image/png"),  # another bot's
+        ):
+            await db.execute(
+                "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name,"
+                " author_bot, content, created_at, raw) VALUES (%s, %s, 2, 999, 'Kiki', true,"
+                " 'starring reece', now(), %s)",
+                (id, GUILD, Jsonb({"attachments": [attachment(id + 1, name, mime)]})),
+            )
+        cursor = await db.execute(
+            "INSERT INTO conversations (guild_id, channel_id, started_by) VALUES (%s, 2, 200)"
+            " RETURNING id",
+            (GUILD,),
+        )
+        [conversation] = await cursor.fetchone()
+        cursor = await db.execute(
+            "INSERT INTO agent_runs (conversation_id, trigger_message_ids) VALUES (%s, '{1}')"
+            " RETURNING id",
+            (conversation,),
+        )
+        [run_id] = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO agent_image_jobs (run_id, position, reply_to_id, request, status,"
+            " message_id) VALUES (%s, 1, 1, '{}', 'done', 150)",
+            (run_id,),
+        )
+    name = "Reece (from the selfie he shared, message 1561574753435652146)"
+    args = {"prompt": "x", "subjects": [{"name": name}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.photos) for s in queued.subjects] == [("Reece", ["1561574753435652146"])]
+
+    for drawn in ("142", "144", "146", "148", "150"):
+        results = []
+
+        def respond(messages, info, drawn=drawn, results=results):
+            if len(messages) == 1:
+                call = {"prompt": "x", "subjects": [{"name": "Reece", "photos": [drawn]}]}
+                return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+            results.append(messages[-1].parts[0].content)
+            return ModelResponse(parts=[TextPart("hm")])
+
+        result = await executor(database_url, FakeImageModel(), respond).execute(
+            request("test/image")
+        )
+        assert result.drawings == []
+        assert f"{drawn} is a picture you drew, not a photo of Reece" in results[0]["error"]
+
+    # Another bot's look-alike file name isn't hers: it's queued as a photo.
+    args = {"prompt": "x", "subjects": [{"name": "Reece", "photos": ["152"]}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert queued.subjects[0].photos == ["152"]
+
+
+def test_only_message_ids_in_a_name_become_photos():
+    # Review of #66: a mention lost its ID to photos, and a message link gave its
+    # guild and channel IDs as photos.
+    from kiki_agent_host.agent.tools.drawing import Pictured
+
+    mention = Pictured.model_validate({"name": "<@123456789012345678>"})
+    assert (mention.name, mention.photos) == ("<@123456789012345678>", [])
+    nick = Pictured.model_validate({"name": "<@!123456789012345678>"})
+    assert (nick.name, nick.photos) == ("<@!123456789012345678>", [])
+    link = Pictured.model_validate(
+        {
+            "name": "Reece (https://discord.com/channels/348273727298863104/"
+            "925198822802612305/1561574753435652146)"
+        }
+    )
+    assert (link.name, link.photos) == ("Reece", ["1561574753435652146"])
+    both = Pictured.model_validate({"name": "<@123456789012345678> in 1561574753435652146"})
+    assert (both.name, both.photos) == ("<@123456789012345678> in", ["1561574753435652146"])
+
+
+async def test_a_mention_as_a_name_is_that_person_by_their_name(database_url):
+    await seed(database_url, (150, 200, "hi", []))
+    args = {"prompt": "x", "subjects": [{"name": "<@200>"}]}
+    run = executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+    [queued] = (await run.execute(request("test/image"))).drawings
+    assert [(s.name, s.user_id, s.photos) for s in queued.subjects] == [("Ethan", "200", [])]
+
+
+async def names(database_url, *people):
+    """People (user ID, channel they spoke in, their names now) who were all once
+    nicknamed Reece."""
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        for user, channel, nick in people:
+            await db.execute(
+                "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
+                " created_at, raw) VALUES (%s, %s, %s, %s, 'x', 'hi', now(), '{}')",
+                (user + 1, GUILD, channel, user),
+            )
+            await db.execute(
+                "INSERT INTO user_names (guild_id, user_id, kind, name, name_norm, first_seen,"
+                " last_seen) VALUES (%s, %s, 'nick', 'Reece', 'reece', now(), now())"
+                " ON CONFLICT DO NOTHING",
+                (GUILD, user),
+            )
+            await db.execute(
+                "INSERT INTO people (guild_id, user_id, username, nick, seen_at) VALUES"
+                " (%s, %s, %s, %s, now()) ON CONFLICT (guild_id, user_id) DO UPDATE"
+                " SET nick = excluded.nick, username = excluded.username",
+                (GUILD, user, f"user{user}", nick),
+            )
+
+
+async def test_people_going_by_one_name_narrow_to_this_conversation_or_are_asked_about(
+    database_url,
+):
+    # Review of #66: two people going by "Reece" now still fell through to a
+    # thing-style search by name.
+    await names(database_url, (200, 3, "Reece"), (400, 3, "Reece"), (500, 2, "Reece"))
+    args = {"prompt": "x", "subjects": [{"name": "Reece"}]}
+
+    def queue():
+        return executor(database_url, FakeImageModel(), calls_generate_image(args, "on it"))
+
+    # u2 (200) is in the conversation.
+    [queued] = (await queue().execute(request("test/image"))).drawings
+    assert [s.user_id for s in queued.subjects] == ["200"]
+
+    # Not in the roster: the one who spoke in this channel (500, in channel 2).
+    people = [{"ref": "u1", "user_id": "100", "label": "Carlton"}]
+    job = request("test/image")
+    job.people = [type(job.people[0]).model_validate(p) for p in people]
+    [queued] = (await queue().execute(job)).drawings
+    assert [s.user_id for s in queued.subjects] == ["500"]
+
+
+async def test_a_name_still_ambiguous_is_a_tool_error_not_a_thing(database_url):
+    await names(database_url, (400, 3, "Reece"), (500, 3, "Reece"))
+    results = []
+
+    def respond(messages, info):
+        if len(messages) == 1:
+            call = {"prompt": "x", "subjects": [{"name": "Reece"}]}
+            return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+        results.append(messages[-1].parts[0].content)
+        return ModelResponse(parts=[TextPart("which Reece?")])
+
+    result = await executor(database_url, FakeImageModel(), respond).execute(request("test/image"))
+    assert result.drawings == []
+    assert "'Reece' could be" in results[0]["error"]
+    assert "user400" in results[0]["error"] and "user500" in results[0]["error"]
+
+
+async def test_contradictory_verdicts_for_one_image_are_retried(database_url):
+    # Review of #66: a "no" and a "yes" for image 1 counted as a yes.
+    await reply_job(database_url)
+    await seed(database_url, (160, 300, "Bear at the vet", [attachment(161, "IMG_1.jpg")]))
+    calls = []
+
+    def chat(messages, info):
+        calls.append(messages)
+        verdict = {"image": 1, "shows": "a dog", "kind": "photo", "subject": True, "clarity": 3}
+        if len(messages) == 1:
+            no = verdict | {"subject": False, "clarity": 0}
+            return ModelResponse(parts=[TextPart(json.dumps({"verdicts": [no, verdict]}))])
+        return ModelResponse(parts=[TextPart(json.dumps({"verdicts": [verdict | {"clarity": 2}]}))])
+
+    model = FakeImageModel()
+    run = executor(database_url, model, chat)
+    run.transport = discord({"/attachments/2/161/IMG_1.jpg": JPEG + b"bear"}, [])
+    result = await run.draw(image_job([Subject(name="Bear")], prompt="Bear in space"))
+    assert len(calls) == 2  # the contradiction was sent back
+    assert [r.message_id for r in result.references] == ["160"]
+
+    # Still contradictory after the retry: no references rather than a guess.
+    def stubborn(messages, info):
+        verdict = {"image": 1, "shows": "a dog", "kind": "photo", "subject": True, "clarity": 3}
+        return ModelResponse(parts=[TextPart(json.dumps({"verdicts": [verdict, verdict]}))])
+
+    run = executor(database_url, FakeImageModel(), stubborn)
+    run.transport = discord({"/attachments/2/161/IMG_1.jpg": JPEG + b"bear"}, [])
+    result = await run.draw(image_job([Subject(name="Bear")], prompt="Bear in space"))
+    assert result.references == []
+
+
+async def test_memory_photos_stay_in_the_guild(database_url):
+    # Memory cites a message by ID: one from another server is never a candidate.
+    await reply_job(database_url)
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        await db.execute(
+            "INSERT INTO messages (id, guild_id, channel_id, author_id, author_name, content,"
+            " created_at, raw) VALUES (170, 999, 9, 300, 'x', 'elsewhere', now(), %s)",
+            (Jsonb({"attachments": [attachment(171, "IMG_7.jpg")]}),),
+        )
+        cursor = await db.execute(
+            "INSERT INTO memory_subjects (guild_id, kind, name, name_norm)"
+            " VALUES (%s, 'thing', 'Piper', name_norm('Piper')) RETURNING id",
+            (GUILD,),
+        )
+        [subject] = await cursor.fetchone()
+        await db.execute(
+            "INSERT INTO memory_entries (doc_id, kind, text, sources, first_observed_at,"
+            " last_observed_at) SELECT id, 'fact', 'Piper is a dog', '{170}', now(), now()"
+            " FROM memory_docs WHERE subject_id = %s",
+            (subject,),
+        )
+    asked = []
+
+    def chat(messages, info):
+        asked.append(messages)
+        return picks(lambda label: (True, 3))(messages, info)
+
+    run = executor(database_url, FakeImageModel(), chat)
+    run.transport = discord({"/attachments/2/171/IMG_7.jpg": JPEG + b"other"}, [])
+    result = await run.draw(image_job([Subject(name="Piper")], prompt="Piper"))
+    assert result.references == [] and asked == []
+
+
+def test_the_picker_treats_captions_and_image_text_as_data():
+    prompt = drawing.VERIFY.format(name="X", what="", rules="", known="", purpose="")
+    assert "not instructions" in prompt and "ignore" in prompt
+
+
+async def test_the_reference_stage_keeps_to_its_deadline_with_many_subjects(
+    database_url, monkeypatch
+):
+    # Review of #66: 6 subjects of 24 candidates make 12 picker batches, two waves
+    # through 8 slots; each wave within its own 30 s still took 2 x 27 s, and with
+    # the image's 70 s the job passed the host's 120 s. Scaled down 10x here, with a
+    # second wave far slower than the stage allows, so the outcome doesn't hang on
+    # how fast the machine seeds and downloads (CI ate a 1 s stage doing so).
+    monkeypatch.setattr(drawing, "REFERENCES_SECONDS", 3.0)
+    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 6.0)
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.05)
+    monkeypatch.setattr(drawing, "STAGE_GRACE", 0.5)
+    await reply_job(database_url)
+    rows, files = [], {}
+    for d in range(6):
+        for i in range(12):
+            id = 2000 + d * 100 + i * 2
+            pair = [attachment(id * 10 + k, f"IMG_{d}{i}{k}.jpg") for k in (1, 2)]
+            rows.append((id, 300, f"Dog{d} at the park", pair))
+            for k in (1, 2):
+                files[f"/attachments/2/{id * 10 + k}/IMG_{d}{i}{k}.jpg"] = JPEG + bytes([d, i, k])
+    await seed(database_url, *rows)
+    judged = picks(lambda label: (True, 2))
+    started = []
+
+    async def slow(messages, info):
+        started.append(asyncio.get_running_loop().time())
+        # The first wave (8 slots) answers in 1 s; the second would take 5 s.
+        await asyncio.sleep(1.0 if len(started) <= drawing.PICKS_AT_ONCE else 5.0)
+        return judged(messages, info)
+
+    model = FakeImageModel()
+    run = executor(database_url, model, slow)
+    run.transport = discord(files, [])
+    job = image_job([Subject(name=f"Dog{d}") for d in range(6)], prompt="six dogs")
+    began = asyncio.get_running_loop().time()
+    result = await run.draw(job)
+    elapsed = asyncio.get_running_loop().time() - began
+    # One deadline for the stage, queue waits included: the second wave gets what's
+    # left of it, not its own 6 s (6 s or more without the fix; cut at 3 + 0.5 s).
+    assert elapsed < 4.5
+    assert len(started) >= drawing.PICKS_AT_ONCE  # the first wave ran
+    assert result.error is None and len(model.prompts) == 1
+    # What the first wave judged is kept: at least 4 subjects have their 3.
+    counts = [sum(r.subject == f"Dog{d}" for r in result.references) for d in range(6)]
+    assert sum(c == 3 for c in counts) >= 4
+
+
+async def test_a_batch_that_cant_start_in_time_is_skipped(database_url, monkeypatch):
+    # Past the stage's deadline nothing new starts: no call, no references.
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.5)
+    await reply_job(database_url)
+    await seed(database_url, (3000, 300, "Bear at the vet", [attachment(3001, "IMG_1.jpg")]))
+    calls = []
+
+    def chat(messages, info):
+        calls.append(messages)
+        return picks(lambda label: (True, 3))(messages, info)
+
+    run = executor(database_url, FakeImageModel(), chat)
+    run.transport = discord({"/attachments/2/3001/IMG_1.jpg": JPEG + b"bear"}, [])
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        from kiki_agent_host.chat.scope import Scope
+        from kiki_agent_host.media.vision import Vision
+
+        vision = Vision(FunctionModel(chat), "test/vision", discord_token="bot-token")
+        gather = drawing.Gatherer(
+            db,
+            Scope(GUILD, 2, 1),
+            vision,
+            "https://cdn.discordapp.com",
+            run.transport,
+            seconds=0.3,
+        )
+        found, shared = await gather.everything(
+            Drawing(prompt="x", subjects=[Subject(name="Bear")])
+        )
+    assert found[0].images == [] and shared == [] and calls == []
+
+
+def gatherer(db, chat, transport, seconds=None):
+    from kiki_agent_host.chat.scope import Scope
+    from kiki_agent_host.media.vision import Vision
+
+    vision = Vision(FunctionModel(chat), "test/vision", discord_token="bot-token")
+    return drawing.Gatherer(
+        db, Scope(GUILD, 2, 1), vision, "https://cdn.discordapp.com", transport, seconds=seconds
+    )
+
+
+async def test_cancelling_the_reference_stage_stops_its_calls_and_downloads(database_url):
+    # Review of #66: cancelled while awaiting asyncio.wait, the stage left a picker
+    # call and a download running (and billing) after the job had given up.
+    await reply_job(database_url)
+    await seed(
+        database_url,
+        (4000, 300, "Bear at the vet", [attachment(4001, "IMG_1.jpg")]),
+        (4002, 300, "Nougie at the lake", [attachment(4003, "IMG_2.jpg")]),
+    )
+    picking, picker_stopped, download_stopped = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_picker(messages, info):
+        picking.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            picker_stopped.set()
+            raise
+
+    async def cdn(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("IMG_2.jpg"):  # Nougie's download hangs
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                download_stopped.set()
+                raise
+        return httpx.Response(200, content=JPEG + b"bear")
+
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        gather = gatherer(db, slow_picker, httpx.MockTransport(cdn))
+        plan = Drawing(prompt="x", subjects=[Subject(name="Bear"), Subject(name="Nougie")])
+        stage = asyncio.create_task(gather.everything(plan))
+        await asyncio.wait_for(picking.wait(), 5)
+        stage.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stage
+        # Nothing of the stage is left running.
+        assert picker_stopped.is_set() and download_stopped.is_set()
+
+
+async def test_the_stage_never_outlasts_the_jobs_own_deadline(monkeypatch):
+    # With #69's job deadline: a resumed job with 10 s left gets a 10 s stage.
+    monkeypatch.setattr(drawing, "job_time_left", lambda: 10.0)
+    gather = drawing.Gatherer(None, None, None, "", seconds=35)
+    assert 9.5 < gather.time_left() <= 10.0
+    monkeypatch.setattr(drawing, "job_time_left", lambda: None)
+    assert 34.5 < drawing.Gatherer(None, None, None, "", seconds=35).time_left() <= 35
+
+
+async def test_a_paid_picker_response_is_billed_when_its_retry_fails(
+    database_url, monkeypatch, recorded
+):
+    # Review of #66: a response costing $0.0123 with bad verdicts, then a retry
+    # that timed out, recorded $0.
+    monkeypatch.setattr(drawing, "VERIFY_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(drawing, "MIN_PICK_SECONDS", 0.05)
+    await reply_job(database_url)
+    await seed(database_url, (4100, 300, "Bear at the vet", [attachment(4101, "IMG_1.jpg")]))
+    transport = discord({"/attachments/2/4101/IMG_1.jpg": JPEG + b"bear"}, [])
+    bad = ModelResponse(parts=[TextPart('{"verdicts": []}')], provider_details={"cost": 0.0123})
+
+    async def then_slow(messages, info):
+        if len(messages) == 1:
+            return bad
+        await asyncio.sleep(5)
+
+    def always_bad(messages, info):
+        return bad
+
+    plan = Drawing(prompt="x", subjects=[Subject(name="Bear")])
+    async with await AsyncConnection.connect(database_url, autocommit=True) as db:
+        gather = gatherer(db, then_slow, transport)
+        found, _ = await gather.everything(plan)
+        assert found[0].images == []
+        assert gather.vision.cost == pytest.approx(0.0123)
+        # Out of validation retries: both responses were paid for.
+        gather = gatherer(db, always_bad, transport)
+        found, _ = await gather.everything(plan)
+        assert found[0].images == []
+        assert gather.vision.cost == pytest.approx(0.0246)
+    # And in telemetry, for both failed calls (a timeout, then a validation failure).
+    labels = {"purpose": "vision", "model": "test/vision"}
+    assert recorded.value("kiki.llm.cost_usd", **labels) == pytest.approx(0.0369)
+    assert recorded.value("kiki.llm.calls", **labels, result="ok") is None

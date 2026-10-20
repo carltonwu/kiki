@@ -318,11 +318,16 @@ class PydanticExecutor:
         drew_with = request.image_model
         try:
             async with await db.connect(self.database_url) as connection:
-                gather = drawing.Gatherer(connection, scope, vision, cdn_base(), self.transport)
-                found, shared = await asyncio.gather(
-                    asyncio.gather(*(gather.find(s) for s in plan.subjects)),
-                    gather.shared(plan.shared),
+                gather = drawing.Gatherer(
+                    connection,
+                    scope,
+                    vision,
+                    cdn_base(),
+                    self.transport,
+                    purpose=plan.prompt,
+                    seconds=drawing.REFERENCES_SECONDS,
                 )
+                found, shared = await gather.everything(plan)
                 # Recorded with a failure too: what the server's model was asked for.
                 prompt, references, _ = drawing.compose(
                     plan, found, shared, max_references=reference_limit(request.image_model)

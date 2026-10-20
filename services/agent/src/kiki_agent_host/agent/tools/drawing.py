@@ -12,10 +12,10 @@ from pydantic_ai.tools import ToolDefinition
 from pydantic_ai.toolsets import FunctionToolset
 
 from ...chat.attachments import images_in
-from ...chat.scope import HEARD, resolve_person
+from ...chat.scope import HEARD, resolve_person, speakers
 from ...contracts import AspectRatio, Drawing, Subject
 from ...media import links
-from ...media.drawing import PICK
+from ...media.drawing import DRAWN_BY_KIKI, PICK
 from ...media.links import reddit, x
 from ..deps import Deps
 from ..guard import guarded
@@ -24,6 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 MAX_IMAGES = 2  # pictures one reply may queue
+RECENT_MESSAGES = 200  # the channel's latest messages, for who's been around
+MENTION_NAME = re.compile(r"^<@!?[0-9]+>$")
+# A message ID (a snowflake) in a subject's name, and the clause around it.
+# What a subject's name may carry besides the name: a mention (kept, it names a
+# person), a Discord message link or a bare message ID (photos).
+NAME_TOKEN = re.compile(
+    r"(?P<mention><(?:@[!&]?|#)[0-9]+>)"
+    r"|(?P<link>(?:https?://)?(?:\w+\.)?discord(?:app)?\.com/channels/[0-9@me]+/[0-9]+/(?P<message>[0-9]+)\S*)"
+    r"|(?P<id>\b[0-9]{17,20}\b)"
+)
+# A bracketed aside holding a photo: "(from the selfie he shared, message 123…)".
+NAME_ASIDE = re.compile(r"\s*[(\[][^)\]]*[)\]]")
 
 
 def listed(value: Any) -> Any:
@@ -59,6 +71,12 @@ class Pictured(BaseModel):
         if not isinstance(value, dict):
             return value
         value = {k: v for k, v in value.items() if v is not None}
+        # A message ID put in the name ("Reece (from the selfie he shared, message
+        # 1561574753435652146)", seen in prod with no photos) is a photo.
+        name = str(value.get("name") or "")
+        if not value.get("photos") and (photos := photos_in(name)):
+            value["photos"] = photos
+            value["name"] = without_photos(name) or name
         if isinstance(value.get("person"), int):
             value["person"] = f"u{value['person']}"
         if not str(value.get("name") or "").strip() and (value.get("me") or value.get("person")):
@@ -83,6 +101,24 @@ class Pictured(BaseModel):
         description="Who or what they are and what they look like, as far as you know from "
         'the chat or memory, like "traumagotchi\'s dog, a small fluffy white mutt".',
     )
+
+
+def photos_in(name: str) -> list[str]:
+    """Message IDs a name carries: a message link's message (not its guild or
+    channel), or a bare ID. Mentions are names, not photos."""
+    return [t["message"] or t["id"] for t in NAME_TOKEN.finditer(name) if t["message"] or t["id"]]
+
+
+def without_photos(name: str) -> str:
+    """The name without the photos in it: an aside holding one goes whole."""
+
+    def aside(m: re.Match) -> str:
+        return "" if photos_in(m[0]) else m[0]
+
+    def token(m: re.Match) -> str:
+        return m[0] if m["mention"] else ""
+
+    return NAME_TOKEN.sub(token, NAME_ASIDE.sub(aside, name)).strip(" ,;:-")
 
 
 # Lenient where models slip: a bare name for a subject, nulls, numbers for IDs, one
@@ -189,12 +225,35 @@ async def generate_image(
                 tries = [f"@{label['username']}"] if label and label["username"] else []
                 for who in [*tries, name]:
                     ids = await resolve_person(deps.connection, deps.scope, deps.roster, who)
+                    if len(ids) > 1:
+                        ids = await going_by(deps, ids, who)
+                    if len(ids) > 1:
+                        # A person, but which: never a thing (searched by name, a
+                        # game character and a monkey became Reece's references).
+                        who_is = await speakers(deps.connection, deps.scope, deps.roster, set(ids))
+                        raise ValueError(
+                            f"{who!r} could be {' or '.join(sorted(who_is.values()))}: give "
+                            "the person's ref, or ask who they mean"
+                        )
                     if len(ids) == 1:
                         user_id = str(ids[0])
+                        if MENTION_NAME.match(name):  # <@id>: draw them by their name
+                            names = await speakers(
+                                deps.connection, deps.scope, deps.roster, {ids[0]}
+                            )
+                            label = LABEL.match(names.get(ids[0], name))
+                            name = label["name"] if label else name
                         break
             photos = [await photo_message(deps, p.strip()) for p in s.photos if p.strip()]
             if missing := await without_images(deps, photos):
                 raise ValueError(f"No message with images among {missing} in this server")
+            if not (s.me or edit) and (drawn := await drawn_by_kiki(deps, photos)):
+                # Seen in prod: her own "starring reece" picture as Reece's photo, so
+                # the next one was drawn from a drawing and drifted further.
+                raise ValueError(
+                    f"{', '.join(drawn)} is a picture you drew, not a photo of {name}: put it "
+                    "in shared to redraw it, or leave photos empty to use real photos of them"
+                )
             pictured.append(
                 Subject(
                     name=name,
@@ -241,6 +300,44 @@ async def generate_image(
         }
 
     return await guarded(ctx, "generate_image", work, budget=None)
+
+
+async def going_by(deps: Deps, ids: list[int], name: str) -> list[int]:
+    """Of the people a name has meant, those who go by it now (else all of them),
+    narrowed to those in this conversation, then to those who spoke in this channel
+    lately. More than one left is for the model to sort out. In prod Ethan had once been nicknamed "Reece", so "Reece" meant
+    nobody and Reece was searched for as a thing: a game character and a monkey
+    became his references."""
+    cursor = await deps.connection.execute(
+        "SELECT user_id FROM people WHERE guild_id = %s AND user_id = ANY(%s)"
+        " AND name_norm(%s) IN (name_norm(coalesce(nick, '')), name_norm(coalesce(global_name, '')),"
+        " name_norm(coalesce(username, '')))",
+        (deps.scope.guild_id, ids, name.removeprefix("@")),
+    )
+    pool = [row[0] for row in await cursor.fetchall()] or ids
+    if len(pool) > 1:  # several go by it: the one in this conversation
+        pool = [i for i in pool if i in deps.roster.speakers] or pool
+    if len(pool) > 1:  # or the one who spoke here lately
+        cursor = await deps.connection.execute(
+            "SELECT DISTINCT author_id FROM (SELECT author_id FROM messages WHERE channel_id = %s"
+            " AND guild_id = %s AND deleted_at IS NULL ORDER BY id DESC LIMIT %s) recent"
+            " WHERE author_id = ANY(%s)",
+            (deps.scope.channel_id, deps.scope.guild_id, RECENT_MESSAGES, pool),
+        )
+        pool = [row[0] for row in await cursor.fetchall()] or pool
+    return sorted(pool)
+
+
+async def drawn_by_kiki(deps: Deps, picks: list[str]) -> list[str]:
+    """The picks that are Kiki's own pictures (`DRAWN_BY_KIKI`)."""
+    ids = [int(m[1]) for p in picks if (m := PICK.match(p))]
+    if not ids:
+        return []
+    cursor = await deps.connection.execute(
+        DRAWN_BY_KIKI, {"guild": deps.scope.guild_id, "ids": ids}
+    )
+    drawn = {str(row[0]) for row in await cursor.fetchall()}
+    return [p for p in picks if p.split(":")[0] in drawn]
 
 
 async def photo_message(deps: Deps, photo: str) -> str:
