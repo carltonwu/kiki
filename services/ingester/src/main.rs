@@ -17,6 +17,7 @@ mod guild_settings;
 mod health;
 mod jev;
 mod leader;
+mod metrics;
 mod platform;
 mod rest;
 mod router;
@@ -72,6 +73,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
         }
         Some(other) => bail!("unknown command `{other}` (expected `migrate` or no arguments)"),
     }
+    metrics::observe_pool(&pool);
 
     let discord = DiscordConfig::from_env()?;
     let router_config = RouterConfig::from_env()?;
@@ -194,6 +196,7 @@ async fn ingest(
         commands,
         db: pool,
         catch_up,
+        bot_user_id: router.bot_user_id(),
         guild_ids: discord.guild_ids.iter().map(|id| id.get() as i64).collect(),
         gateway_url: discord.gateway_url.clone(),
     };

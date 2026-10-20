@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info_span, warn};
 
 use super::{
     Agent,
@@ -27,15 +27,20 @@ topic, describe the new one, not the history. Messages start with the sender in 
 impl Agent {
     pub(super) fn spawn_topic_refresh(self: &Arc<Self>, conversation_id: i64) {
         let agent = self.clone();
-        tokio::spawn(async move {
-            if let Err(e) = agent.refresh_topic(conversation_id).await {
-                warn!(
-                    conversation_id,
-                    error = format!("{e:#}"),
-                    "couldn't refresh the topic"
-                );
+        // A child of the run that prompted it.
+        let span = info_span!("topic_refresh", conversation_id);
+        tokio::spawn(
+            async move {
+                if let Err(e) = agent.refresh_topic(conversation_id).await {
+                    warn!(
+                        conversation_id,
+                        error = format!("{e:#}"),
+                        "couldn't refresh the topic"
+                    );
+                }
             }
-        });
+            .instrument(span),
+        );
     }
 
     async fn refresh_topic(&self, conversation_id: i64) -> anyhow::Result<()> {
