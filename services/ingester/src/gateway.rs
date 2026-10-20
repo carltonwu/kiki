@@ -22,6 +22,7 @@ use twilight_model::{id::Id, util::Timestamp};
 use crate::{
     catch_up::{CatchUp, snowflake},
     commands::Commands,
+    emojis,
     metrics::{self, Author, Reconnect},
     store, telemetry,
 };
@@ -46,7 +47,11 @@ impl Listener {
         mut shutdown: watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         // MESSAGE_CONTENT is privileged: enable it in the Discord developer portal.
-        let intents = Intents::GUILDS | Intents::GUILD_MESSAGES | Intents::MESSAGE_CONTENT;
+        // GUILD_EMOJIS_AND_STICKERS (not privileged) sends GUILD_EMOJIS_UPDATE.
+        let intents = Intents::GUILDS
+            | Intents::GUILD_MESSAGES
+            | Intents::MESSAGE_CONTENT
+            | Intents::GUILD_EMOJIS_AND_STICKERS;
         let mut config = ConfigBuilder::new(token, intents);
         if let Some(url) = &self.gateway_url {
             config = config.proxy_url(url.clone());
@@ -212,6 +217,7 @@ impl Listener {
                     store::delete_channel(&self.db, id).await?;
                 }
             }
+            "GUILD_EMOJIS_UPDATE" => self.sync_emojis(guild_id, &d["emojis"]).await?,
             "THREAD_LIST_SYNC" => {
                 let threads = d["threads"].as_array().cloned().unwrap_or_default();
                 store::upsert_channels(&self.db, guild_id, &threads).await?;
@@ -227,6 +233,7 @@ impl Listener {
                 let mut channels = d["channels"].as_array().cloned().unwrap_or_default();
                 channels.extend(d["threads"].as_array().cloned().unwrap_or_default());
                 store::upsert_channels(&self.db, guild_id, &channels).await?;
+                self.sync_emojis(guild_id, &d["emojis"]).await?;
                 info!(
                     guild_id,
                     name = d["name"].as_str(),
@@ -236,6 +243,23 @@ impl Listener {
                 tokio::spawn(async move { catch_up.run_logged(Id::new(guild_id as u64)).await });
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// The server's emoji list, from `GUILD_CREATE` or `GUILD_EMOJIS_UPDATE`.
+    async fn sync_emojis(&self, guild_id: i64, emojis: &Value) -> anyhow::Result<()> {
+        if let Some(synced) = emojis::sync_listed(&self.db, guild_id, emojis).await?
+            && synced.added + synced.renamed + synced.removed > 0
+        {
+            info!(
+                guild_id,
+                total = synced.total,
+                added = synced.added,
+                renamed = synced.renamed,
+                removed = synced.removed,
+                "custom emoji synced from the Gateway"
+            );
         }
         Ok(())
     }

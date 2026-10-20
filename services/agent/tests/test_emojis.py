@@ -7,9 +7,10 @@ import httpx
 import pytest
 from psycopg import AsyncConnection
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelResponse, TextPart
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from kiki_agent_host.agent import executor as agent_executor
 from kiki_agent_host.agent.executor import PydanticExecutor
 from kiki_agent_host.api.app import create_app
 from kiki_agent_host.chat import emojis
@@ -446,3 +447,141 @@ async def test_emoji_tools_are_offered_only_once_emoji_are_synced(database_url):
     # Nothing synced: no emoji tools, and written-out emoji can't be checked.
     assert (await executor.execute(reply_request())).text == "hey <:froge:81>"
     assert not {"search_emojis", "find_emoji"} & set(seen[0][1])
+
+
+# Review of PR #67 (GPT-6.1-Sol), one test per finding.
+
+
+def turns(*script, db=None):
+    """A model following `script`: a text answer, a ("tool", name, args) call, or
+    an async callable run first (it returns the answer). Records the tools each
+    request offered."""
+    offered: list[list[str]] = []
+
+    async def respond(messages, info: AgentInfo) -> ModelResponse:
+        offered.append([t.name for t in info.function_tools])
+        step = script[min(len(offered), len(script)) - 1]
+        if callable(step):
+            step = await step()
+        if isinstance(step, tuple):
+            _, name, args = step
+            return ModelResponse(parts=[ToolCallPart(name, args, tool_call_id=f"c{len(offered)}")])
+        return ModelResponse(parts=[TextPart(step)])
+
+    class TestExecutor(PydanticExecutor):
+        web_tools = ()
+
+        def model(self, name):
+            return FunctionModel(respond)
+
+    return TestExecutor, offered
+
+
+async def run_turns(database_url, *script):
+    Executor, offered = turns(*script)
+    executor = Executor(database_url, "unused-key")
+    executor.embeddings = SimpleNamespace(embeddings=FakeEmbeddings())
+    return (await executor.execute(reply_request())).text, offered
+
+
+async def test_a_bad_emoji_on_the_last_allowed_request_is_cut_not_retried(
+    database_url, db, monkeypatch
+):
+    """Finding 1: a retry past the request limit lost the whole reply."""
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(agent_executor, "MAX_MODEL_REQUESTS", 2)
+    text, offered = await run_turns(
+        database_url, ("tool", "find_emoji", {"name": "salute"}), "ten <:salute:1>"
+    )
+    assert text == "ten"
+    assert offered[1] == [], "the last allowed request is offered no tools"
+    assert len(offered) == 2
+
+
+async def test_a_retry_that_searches_stays_within_the_request_limit(database_url, db, monkeypatch):
+    """Finding 1: the retry may search first; the last request still answers."""
+    await add(db, 11, "huh", "a confused face")
+    monkeypatch.setattr(agent_executor, "MAX_MODEL_REQUESTS", 3)
+    text, offered = await run_turns(
+        database_url,
+        "ten <:salute:1>",
+        ("tool", "search_emojis", {"query": "salute"}),
+        "ten <:huh:11>",
+    )
+    assert text == "ten <:huh:11>"
+    assert "search_emojis" in offered[1] and offered[2] == []
+
+
+async def test_a_reply_of_only_bad_emoji_becomes_silence(database_url, db):
+    """Finding 2: stripping to nothing brought the invalid text back."""
+    await add(db, 11, "huh", "a confused face")
+    for only in ["<:salute:1>", "react: <:salute:1>", "react: :salute:, :nope:"]:
+        assert emojis.check(only, SERVER).stripped.strip() == "", only
+        text, _ = await run_turns(database_url, only)
+        assert text == "NO_REPLY", only
+
+
+def test_links_and_quotes_are_left_as_written():
+    """Finding 3: shortcodes inside URLs and quotes were rewritten or cut."""
+    for text in [
+        "see https://example.com/:huh:/docs",
+        "see https://example.com/:salute:/docs ok",
+        "see <https://example.com/:salute:/x>",
+        "[the doc](https://example.com/:salute:/x)",
+        "> Alex said :salute:",
+        ">>> quoting\nall of :salute: this",
+    ]:
+        checked = emojis.check(text, SERVER)
+        assert (checked.text, checked.problems) == (text, []), text
+    # Kiki's own words after a quote are still checked.
+    checked = emojis.check("> Alex said :salute:\nme too :huh:", SERVER)
+    assert checked.text == "> Alex said :salute:\nme too <:huh:1085017182301339648>"
+
+
+def test_cutting_keeps_code_and_other_spacing_verbatim():
+    """Finding 4: tidying collapsed spaces inside code."""
+    text = '```py\ns = "a  b"\n```\nten  out of ten <:salute:1>\n`x  y`  ok'
+    checked = emojis.check(text, SERVER)
+    assert checked.stripped == '```py\ns = "a  b"\n```\nten  out of ten\n`x  y`  ok'
+    assert emojis.check("lol <:salute:1>, ok", SERVER).stripped == "lol, ok"
+    assert emojis.check("a <:salute:1> b", SERVER).stripped == "a b"
+
+
+def test_code_delimiters_follow_commonmark():
+    """Finding 5: inline code ignored backtick run lengths, and long fences
+    closed early."""
+    for text in [
+        "``a ` :salute: ` b``",
+        "````\n```\n:salute:\n```\n````",
+        "~~~\n:salute:\n```\n:skull:\n~~~",
+        "```\nunclosed :salute:",
+    ]:
+        assert emojis.check(text, SERVER).problems == [], text
+    # An unmatched backtick is literal text, so what follows is checked.
+    assert emojis.check("it's `odd :salute:", SERVER).problems
+    # A one-line ```ls``` is inline code, not a fence.
+    assert emojis.check("```ls``` then :salute:", SERVER).problems
+
+
+async def test_an_emoji_synced_during_the_run_is_accepted(database_url, db):
+    """Finding 6: the run's catalog went stale; it's reloaded before rejecting."""
+    await add(db, 11, "huh", "a confused face")
+
+    async def gateway_adds_one():
+        await add(db, 12, "fresh")  # GUILD_EMOJIS_UPDATE synced it mid-run
+        return "new one <:fresh:12>"
+
+    text, offered = await run_turns(database_url, gateway_adds_one)
+    assert (text, len(offered)) == ("new one <:fresh:12>", 1)
+
+
+def test_react_lines_lose_leftover_separators():
+    """Finding 7: `react: :salute:, :nope:` was left as `react: ,`."""
+    cases = {
+        "react: :salute:, :nope:\nok": "ok",
+        "react: :salute:, 😂\nok": "react: 😂\nok",
+        "react: 😂, <:salute:1>,💀\nok": "react: 😂 💀\nok",
+        "Kiki: react: <:salute:1>\nok": "ok",
+    }
+    for text, stripped in cases.items():
+        assert emojis.check(text, SERVER).stripped == stripped, text

@@ -24,6 +24,7 @@ from pydantic_ai.messages import BinaryContent
 from ..config import cdn_base
 from ..media import fetch
 from ..openrouter.embeddings import EMBED_BATCH, Embedder
+from . import markdown
 from .search import CANDIDATES, MIN_SIMILARITY, RRF_K
 
 logger = logging.getLogger(__name__)
@@ -346,13 +347,16 @@ def epoch_ms(value: int) -> datetime:
 # its ID is one Kiki can use. Anything else is posted as text and silently dropped
 # as a reaction: an invented `<:salute:1>` (Discord stores it as `:salute:`), a
 # `<:huh:>` with no ID, or a `:skull:` shortcode, which Discord never converts in a
-# bot's message.
+# bot's message. Code, links and quotes are left as written (`markdown.protected`).
 TOKEN = re.compile(
     r"(?P<custom><(?P<a>a?):(?P<name>\w*):(?P<id>[0-9]*):?>)"
     r"|(?<![\w:<]):(?P<code>\w{2,32}):(?![\w:])"
 )
-CODE = re.compile(r"```.*?(?:```|\Z)|~~~.*?(?:~~~|\Z)|`[^`\n]+`", re.DOTALL)
-EMPTY_REACT = re.compile(r"^\s*(?:\**\[?Kiki\]?\**:)?\s*react:\s*$", re.IGNORECASE)
+# A cut emoji's place, until `tidy` closes the gap around it.
+CUT = "\x00"
+GAP = re.compile(r"[ \t]*\x00(?:[ \t,]*\x00)*[ \t]*")
+# A `react:` line as Rust's `delivery::plan` reads it (after a speaker label).
+REACT = re.compile(r"(\s*(?:Kiki:|\*\*Kiki\*\*:|\[Kiki\]:?)?\s*react:)(.*)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -383,6 +387,8 @@ def written(row: dict) -> str:
 
 
 async def catalog(connection: AsyncConnection, guild_id: int) -> Catalog:
+    """The server's emoji as `guild_emojis` has them now: the Gateway keeps it
+    current (`GUILD_CREATE`, `GUILD_EMOJIS_UPDATE`), and so does a resync."""
     cursor = connection.cursor(row_factory=dict_row)
     await cursor.execute(
         "SELECT id, name, animated, available, removed_at IS NOT NULL AS removed"
@@ -400,8 +406,9 @@ async def catalog(connection: AsyncConnection, guild_id: int) -> Catalog:
 @dataclass
 class Checked:
     """`text` with fixable emoji written the way Discord needs them, `problems`
-    naming each one that can't be fixed (for the model), and `stripped`, which
-    is `text` without those."""
+    naming each one that can't be fixed (for the model), and `stripped`: `text`
+    without those, and without a `react:` line or emoji-only line left empty.
+    `stripped` may be blank when the reply was nothing but bad emoji."""
 
     text: str
     stripped: str
@@ -410,13 +417,11 @@ class Checked:
 
 
 def check(text: str, emojis: Catalog) -> Checked:
-    """Checks a reply's custom emoji and `:shortcodes:` (outside code) against the
-    server's catalog. A known name is rewritten as `<:name:id>` with its real ID and
-    animated flag. When the server has no emoji synced (`/kiki emojis
-    resync:true`), written-out custom emoji can't be checked and pass. Shortcodes
-    never render either way."""
+    """Checks a reply's custom emoji and `:shortcodes:` against the server's
+    catalog. A known name is rewritten as `<:name:id>` with its real ID and
+    animated flag. When the server has no emoji synced, written-out custom emoji
+    can't be checked and pass. Shortcodes never render either way."""
     problems: list[str] = []
-    fixed = 0
 
     def custom(match: re.Match) -> str | None:
         """The emoji as it should be written, or None when it can't be used."""
@@ -449,29 +454,21 @@ def check(text: str, emojis: Catalog) -> Checked:
         problems.append(problem)
         return None
 
-    def scan(segment: str) -> tuple[str, str]:
-        nonlocal fixed
-        kept, cut, last = [], [], 0
-        for match in TOKEN.finditer(segment):
-            right = custom(match) if match["custom"] else shortcode(match)
-            before = segment[last : match.start()]
-            kept += [before, match[0] if right is None else right]
-            cut += [before, right or ""]
-            fixed += right is not None and right != match[0]
-            last = match.end()
-        kept.append(segment[last:])
-        cut.append(segment[last:])
-        return "".join(kept), "".join(cut)
-
-    kept, cut, last = [], [], 0
-    for code in CODE.finditer(text):
-        k, c = scan(text[last : code.start()])
-        kept += [k, code[0]]
-        cut += [c, code[0]]
-        last = code.end()
-    k, c = scan(text[last:])
-    kept.append(k)
-    cut.append(c)
+    mask = markdown.protected(text)
+    kept, cut, last, fixed = [], [], 0, 0
+    for match in TOKEN.finditer(text):
+        if any(mask[match.start() : match.end()]):
+            continue
+        right = custom(match) if match["custom"] else shortcode(match)
+        if right == match[0]:
+            continue
+        before = text[last : match.start()]
+        kept += [before, match[0] if right is None else right]
+        cut += [before, CUT if right is None else right]
+        fixed += right is not None
+        last = match.end()
+    kept.append(text[last:])
+    cut.append(text[last:])
     result = "".join(kept)
     return Checked(result, tidy("".join(cut)) if problems else result, problems, fixed)
 
@@ -484,11 +481,33 @@ def unknown(token: str, name: str, emojis: Catalog) -> str:
 
 
 def tidy(text: str) -> str:
-    """Cleans up after emoji are cut: no doubled spaces left behind, and no
-    `react:` line left empty, which Rust would post as text."""
-    lines = [
-        re.sub(r"(?<=\S) {2,}(?=\S)", " ", line).rstrip()
-        for line in text.split("\n")
-        if not EMPTY_REACT.match(line)
-    ]
-    return "\n".join(lines).strip()
+    """Closes the gaps cut emoji left (`CUT`), touching only those lines and
+    only around the cuts, so code elsewhere stays verbatim. A `react:` line
+    keeps its other emoji, single-spaced. Drops one left with none, which Rust
+    would post as text, and a line that held only cut emoji."""
+    lines = []
+    for line in text.split("\n"):
+        if CUT not in line:
+            lines.append(line)
+            continue
+        line = GAP.sub(join_gap, line)
+        if react := REACT.fullmatch(line):
+            rest = re.sub(r"[\s,]+", " ", react[2]).strip()
+            if not rest:
+                continue
+            line = f"{react[1]} {rest}"
+        elif not line.strip():
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def join_gap(gap: re.Match) -> str:
+    """One space between words the cut separated; none at the line's ends or
+    before punctuation."""
+    line = gap.string
+    before = line[gap.start() - 1] if gap.start() else ""
+    after = line[gap.end()] if gap.end() < len(line) else ""
+    if before and not before.isspace() and after and not after.isspace():
+        return "" if after in ",.!?;:)" else " "
+    return ""

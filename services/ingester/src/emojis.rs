@@ -86,6 +86,23 @@ pub async fn sync(db: &PgPool, guild_id: i64, emojis: &[Value]) -> sqlx::Result<
     .await
 }
 
+/// Syncs from a Gateway event's `emojis` (`GUILD_CREATE` after every new session,
+/// `GUILD_EMOJIS_UPDATE` when one is added, renamed or deleted), so Kiki's emoji
+/// check (the agent host's `check_emojis`) neither rejects a new emoji nor passes
+/// a deleted one. Descriptions are still `/kiki emojis resync:true`'s: an event
+/// shouldn't spend on a vision model. `None` when the payload has no list, which
+/// would otherwise mark every emoji removed.
+pub async fn sync_listed(
+    db: &PgPool,
+    guild_id: i64,
+    emojis: &Value,
+) -> sqlx::Result<Option<Synced>> {
+    match emojis.as_array() {
+        Some(list) => sync(db, guild_id, list).await.map(Some),
+        None => Ok(None),
+    }
+}
+
 /// The server's current emoji, by name.
 pub async fn list(db: &PgPool, guild_id: i64) -> sqlx::Result<Vec<Emoji>> {
     sqlx::query_as(
@@ -139,7 +156,7 @@ pub async fn now_ms(db: &PgPool) -> sqlx::Result<i64> {
 mod tests {
     use serde_json::json;
 
-    use super::{Synced, list, named, sync};
+    use super::{Synced, list, named, sync, sync_listed};
 
     #[tokio::test]
     async fn sync_adds_renames_removes_and_keeps_descriptions() {
@@ -221,6 +238,42 @@ mod tests {
         };
         assert_eq!(oop.mention(), "<a:oop:12>");
 
+        test.drop().await;
+    }
+
+    #[tokio::test]
+    async fn gateway_events_keep_the_list_current() {
+        let Some(test) = crate::test_db::migrated("emojis_gateway_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let event = |names: &[(&str, &str)]| {
+            json!(
+                names
+                    .iter()
+                    .map(|(id, name)| json!({"id": id, "name": name, "animated": false}))
+                    .collect::<Vec<_>>()
+            )
+        };
+        let first = sync_listed(&db, 1, &event(&[("11", "huh"), ("12", "oop")]))
+            .await
+            .unwrap();
+        assert_eq!(first.map(|s| s.added), Some(2));
+        // An emoji added and one deleted in Discord, as GUILD_EMOJIS_UPDATE sends them.
+        let update = sync_listed(&db, 1, &event(&[("11", "huh"), ("13", "fresh")]))
+            .await
+            .unwrap();
+        assert_eq!(update.map(|s| (s.added, s.removed)), Some((1, 1)));
+        let names: Vec<String> = list(&db, 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, ["fresh", "huh"]);
+        // A payload without a list (an unavailable guild) changes nothing.
+        assert_eq!(sync_listed(&db, 1, &json!(null)).await.unwrap(), None);
+        assert_eq!(list(&db, 1).await.unwrap().len(), 2);
         test.drop().await;
     }
 }

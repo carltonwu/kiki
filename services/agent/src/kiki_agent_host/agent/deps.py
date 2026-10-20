@@ -49,6 +49,8 @@ class Deps:
     vision: Vision
     memory: MemorySession
     job_id: str = ""
+    # The run's model request limit (UsageLimits), for tools that plan around it.
+    request_limit: int = 10
     # The server's image model, when it has drawing on; drawings run after the reply.
     image_model: str | None = None
     # Calls made per budget (`guard.Budget.name`).
@@ -58,3 +60,4 @@ class Deps:
     # The server's custom emoji, loaded once per run: the reply's emoji are checked
     # against them (`tools.check_emojis`).
     emojis: Catalog = field(default_factory=lambda: Catalog({}, {}))
+    emojis_reloaded: bool = False

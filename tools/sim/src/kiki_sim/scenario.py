@@ -22,7 +22,7 @@
       - drop_gateway: {}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
-      - remove_emoji: bruh                  # in fakecord; Kiki notices on resync
+      - remove_emoji: bruh                  # in fakecord, with GUILD_EMOJIS_UPDATE
       - wait: 1.5
 
 `say`/`send` take `reply_to` (a step id, or `kiki` for Kiki's latest message in

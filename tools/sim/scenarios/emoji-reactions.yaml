@@ -21,12 +21,10 @@ steps:
       reaction: {emoji: "🎉", present: true}
   - expect: {reaction: {emoji: "huh:900000000000005001", present: true}}
   - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "🎉 <:huh:900000000000005001>"}
-  # A :name: is looked up in the server's emoji catalog once it's synced;
-  # Unicode shortcodes aren't resolved but never show up as text.
+  # A :name: is looked up in the server's emoji catalog, which the Gateway's
+  # GUILD_CREATE synced; Unicode shortcodes aren't resolved but never show up as text.
   - say: {as: alex, in: general, text: "@kiki the set fell over", reply: {text: "react: :tannah:\noh no"}}
-  - expect: {run: done, reply: true, text_lacks: "react|tannah", reaction: {emoji: "tannah:900000000000005003", present: false, added: false}}
-  - slash: {as: alex, in: general, command: emojis, options: {resync: true}}
-  - expect: {response_contains: "3 new"}
+  - expect: {run: done, reply: true, text_lacks: "react|tannah", reaction: {emoji: "tannah:900000000000005003", present: true}}
   - say: {as: alex, in: general, text: "@kiki we won the regional", reply: {text: "react: :TANNAH: :skull:"}}
   - expect: {run: done, reply: false, reaction: {emoji: "tannah:900000000000005003", present: true}}
   - expect: {sql: "SELECT array_to_string(reactions, ' ') FROM agent_runs ORDER BY id DESC LIMIT 1", equals: "<a:tannah:900000000000005003>"}

@@ -429,10 +429,14 @@ queries are an argument error returned to the model.
   `removed_at`: they're excluded from search, but `find_emoji` still explains one
   written out in an old message. A trigger drops the embedding when the name or
   description changes.
-- **Sync (Rust):** `/kiki emojis resync:true` (Manage Server) replaces the list from
-  `GET guilds/{id}/emojis`. There's no Gateway sync yet (it would need the
-  `GUILD_EXPRESSIONS` intent); admins resync after adding emoji. Descriptions survive
-  renames, since an emoji's image never changes.
+- **Sync (Rust):** the Gateway keeps the list current. `GUILD_CREATE`, after every
+  new session, carries the whole list, and `GUILD_EMOJIS_UPDATE` (the
+  non-privileged `GUILD_EMOJIS_AND_STICKERS` intent) sends it again whenever an emoji
+  is added, renamed or deleted. Both replace the list (`emojis::sync_listed`) but
+  describe nothing: an event shouldn't spend on a vision model. `/kiki emojis
+  resync:true` (Manage Server) replaces the list from `GET guilds/{id}/emojis` and
+  describes the new ones; until then, new emoji are found by name only.
+  Descriptions survive renames, since an emoji's image never changes.
 - **Describe (Python):** Rust then calls `POST /v1/emojis/describe` in batches of 8
   until none are left (at most 10 minutes; the interaction token lasts 15). The host
   downloads each emoji as a 128 px PNG (the first frame if animated) and asks
@@ -461,14 +465,22 @@ queries are an argument error returned to the model.
   no ID, or a `:skull:` shortcode, which Discord never converts in a bot's
   message. So the reply agent has an output validator (`tools.check_emojis`,
   `chat/emojis.py` `check`). It compares every custom emoji and `:shortcode:`
-  outside code against the run's catalog, which is loaded once before indexing
-  starts. A known name is rewritten as Discord needs it: its real ID, the `a`
-  for an animated emoji, and its exact name. Anything else raises `ModelRetry`,
-  naming close matches. On the last attempt the emoji is cut instead, along
-  with any `react:` line left empty, so a bad emoji never costs the reply.
-  Before a server's first resync, written-out emoji can't be checked and pass.
-  The emoji tools are offered (a toolset `prepare`) only once the server has
-  emoji synced.
+  against the run's catalog. It skips code (CommonMark fences and backtick runs,
+  `chat/markdown.py`), links and quotes, which aren't Kiki's own words.
+  - A known name is rewritten as Discord needs it: its real ID, the `a` for an
+    animated emoji, and its exact name.
+  - Before anything is rejected, the catalog is reloaded once, since the Gateway
+    may have synced a new emoji during the run.
+  - An unusable emoji raises `ModelRetry`, naming close matches, while the run has
+    an output retry and a model request left. A retry costs at least one request,
+    more if the model searches first. `LastRequestAnswers` offers no tools on the
+    last request the limit allows, so a retry can never push the run over it.
+  - Otherwise the emoji is cut. Only the gap is tidied, so code stays verbatim. A
+    `react:` line keeps its good emoji and drops leftover commas, and a line left
+    empty is dropped. A reply of nothing but bad emoji becomes `NO_REPLY`
+    (silence; a server that disallows silence fails the run rather than post them).
+  - Before a server's emoji are first synced, written-out emoji can't be checked
+    and pass. The emoji tools are offered (a toolset `prepare`) only once some are.
 
 ## Failures and retries
 
