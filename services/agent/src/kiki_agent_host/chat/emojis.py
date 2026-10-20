@@ -29,9 +29,9 @@ logger = logging.getLogger(__name__)
 DESCRIBE_BATCH = 8  # per call: Rust repeats calls until none are left
 DESCRIBE_CONCURRENCY = 4
 DESCRIPTION_CHARS = 400
-# Room for a reasoning model to think before its one- or two-sentence answer;
-# too little and it stops mid-thought with no description.
-DESCRIBE_MAX_TOKENS = 2000
+# The one- or two-sentence answer's room; `look` adds room for thinking
+# (`media.vision.REASONING_TOKENS`).
+DESCRIBE_MAX_TOKENS = 200
 INDEX_LIMIT = 256
 QUERY_INSTRUCTION = (
     "Instruct: Given a mood, reaction or subject, retrieve custom Discord emoji that fit it\n"

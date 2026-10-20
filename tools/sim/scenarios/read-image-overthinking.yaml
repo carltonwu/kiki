@@ -1,0 +1,16 @@
+name: read_image still describes a photo when the vision model thinks until its token limit
+# Production 10-20 (reply:399, 401, 402): DeepSeek V4.1 Flash spent read_image's
+# whole max_tokens thinking and wrote nothing, so Kiki said her image reader was
+# down. The host now asks once more without thinking.
+steps:
+  - say:
+      as: alex
+      in: general
+      text: "kiki this is nougat. identify his color pattern"
+      attachments: [{filename: IMG_6023.jpg, label: "[overthinks] a tricolor dog lying on the floor"}]
+    reply: {tool: {name: read_image, args: {message_id: "{image_message}"}}, text: "ok {result}"}
+  - expect:
+      reply: true
+      tool_called: read_image
+      tool_result_contains: ["Image 1: [overthinks] a tricolor dog lying on the floor"]
+      text_contains: "tricolor dog"

@@ -4,7 +4,7 @@ import httpx
 import pytest
 from psycopg import AsyncConnection
 from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
+from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart, ThinkingPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from kiki_agent_host.chat.attachments import images_in, sized
@@ -13,7 +13,7 @@ from kiki_agent_host.chat.search import message_context
 from kiki_agent_host.media import fetch
 from kiki_agent_host.media.fetch import allowed
 from kiki_agent_host.media.reading import read_image
-from kiki_agent_host.media.vision import Vision
+from kiki_agent_host.media.vision import REASONING_TOKENS, ImageRefused, Vision, look
 
 GUILD, CHANNEL, CONVERSATION = 1, 2, 1
 SCOPE = Scope(GUILD, CHANNEL, CONVERSATION)
@@ -205,7 +205,87 @@ async def test_reads_a_gallery_image_by_image_and_as_a_whole(db):
         "image/webp",
         "image/png",
     ]
-    assert info.model_settings["max_tokens"] == 2200
+    # 600 + 400 per image for the description, plus room to think first.
+    assert info.model_settings["max_tokens"] == 2200 + REASONING_TOKENS
+
+
+async def test_thinking_gets_room_beyond_the_answer():
+    """A reasoning model thinks inside `max_tokens`: on production galleries
+    DeepSeek used 400 to 1,100 tokens of a 1,400 cap, so descriptions failed
+    (no text) or were cut off."""
+    model, seen = fake_vision("Image 1: a cat.")
+    assert await look(model, ["what is this"], max_tokens=300) == "Image 1: a cat."
+    assert await look(model, ["yes or no"], max_tokens=300, think=False) == "Image 1: a cat."
+    assert [info.model_settings["max_tokens"] for _, info in seen] == [
+        300 + REASONING_TOKENS,
+        300,
+    ]
+
+
+async def test_a_cut_off_description_says_so():
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart("Image 1: a person in a wi")], finish_reason="length")
+
+    vision = Vision(FunctionModel(respond), "test/vision")
+    text = await look(vision, ["describe"], max_tokens=100)
+    assert text == "Image 1: a person in a wi\n(The description was cut off here.)"
+
+
+def thinks_too_long(answer="Image 1: a dog lying on the floor."):
+    """Like DeepSeek V4.1 Flash on 10-20 (reply:399, 401, 402): with thinking on, it
+    thinks until the token limit and writes nothing; without, it answers."""
+    seen = []
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        seen.append(info.model_settings)
+        if (info.model_settings.get("openrouter_reasoning") or {}).get("enabled") is False:
+            return ModelResponse(parts=[TextPart(answer)], provider_details={"cost": 0.001})
+        return ModelResponse(
+            parts=[ThinkingPart("hmm " * 50)],
+            finish_reason="length",
+            provider_details={"cost": 0.003},
+        )
+
+    return Vision(FunctionModel(respond), "test/vision"), seen
+
+
+async def test_thinking_that_runs_out_is_asked_again_without_thinking():
+    vision, seen = thinks_too_long()
+    assert await look(vision, ["describe"], max_tokens=100) == "Image 1: a dog lying on the floor."
+    assert [s["max_tokens"] for s in seen] == [100 + REASONING_TOKENS, 100]
+    assert "openrouter_reasoning" not in seen[0]
+    assert seen[1]["openrouter_reasoning"] == {"enabled": False}
+    # Both requests are billed, the one that only thought too.
+    assert vision.calls == 2
+    assert vision.cost == pytest.approx(0.004)
+
+
+async def test_a_read_survives_thinking_that_runs_out(db):
+    await add(
+        db,
+        80,
+        "This is nougat. Identify his color pattern.",
+        {"attachments": [attachment("a.png")]},
+    )
+    vision, _ = thinks_too_long()
+    result = await read(db, vision, 80)
+    assert result["description"] == "Image 1: a dog lying on the floor."
+    assert "error" not in result
+
+
+async def test_no_answer_even_without_thinking_is_an_error_for_kiki():
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ThinkingPart("hmm " * 50)], finish_reason="length")
+
+    vision = Vision(FunctionModel(respond), "test/vision")
+    with pytest.raises(ImageRefused, match="ran out of room") as refused:
+        await look(vision, ["describe"], max_tokens=100)
+    # Kiki is told not to fill the gap herself.
+    assert "rather than guessing" in str(refused.value)
+    assert vision.calls == 2
+    with pytest.raises(ImageRefused, match="ran out of room"):
+        await look(vision, ["yes or no"], max_tokens=100, think=False)
+    assert vision.calls == 3  # without thinking there's nothing to turn off
 
 
 async def test_reads_a_single_image(db):
