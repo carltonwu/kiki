@@ -1555,7 +1555,7 @@
     {
       "type": "table",
       "title": "Tool calls: tool × outcome (selected range)",
-      "description": "Calls through the tool guard by tool and outcome: ok, error, timeout, refused, invalid_arguments, budget_exhausted (turned away by the per-reply budget).",
+      "description": "Calls through the tool guard by tool and outcome: ok, error, timeout, refused, invalid_arguments, budget_exhausted (turned away by the per-reply budget), out_of_time (turned away by the run deadline).",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"
@@ -1755,7 +1755,7 @@
     {
       "type": "table",
       "title": "Tool duration (selected range)",
-      "description": "Tool call duration by tool (budget_exhausted calls never ran, so have none). The agent host's duration buckets are coarse (0.5, 2.5, 10, 30, 120 s), so quantiles are interpolated within them.",
+      "description": "Tool call duration by tool (budget_exhausted and out_of_time calls never ran, so have none). The agent host's duration buckets are coarse (0.5, 2.5, 10, 30, 120 s), so quantiles are interpolated within them.",
       "datasource": {
         "type": "prometheus",
         "uid": "${prom}"

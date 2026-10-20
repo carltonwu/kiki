@@ -14,8 +14,9 @@ from ..executor import Executor, TransientError
 
 logger = logging.getLogger(__name__)
 
-# A job's error when it ran out of time. Rust reads it (`host::TIMED_OUT`): it is
-# final, so a retry of the same ID doesn't run the whole job again.
+# A job's error when it ran out of time. Like every `failed` result it is saved,
+# so a retry of the same ID returns it rather than running the job again, and
+# Rust treats it as final.
 TIMED_OUT = "timed out"
 # A job with less work time than this left isn't started, or retried, again.
 MIN_RESUME_SECONDS = 5

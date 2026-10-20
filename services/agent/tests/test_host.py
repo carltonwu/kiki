@@ -349,3 +349,44 @@ async def test_a_completed_topic_job_records_its_cost_once(database_url):
     async with await AsyncConnection.connect(database_url, autocommit=True) as db:
         cursor = await db.execute("SELECT job_id, conversation_id, cost_usd FROM topic_summaries")
         assert await cursor.fetchall() == [("topic:3:100:12", 3, 0.25)]
+
+
+async def test_a_job_that_keeps_timing_out_retries_until_it_is_saved_as_timed_out(
+    database_url, monkeypatch
+):
+    """Review round 2: the whole chain. Each attempt's step times out with job
+    time left (503, Rust retries the same ID); each retry gets only what's left
+    of the job; once that's under MIN_RESUME_SECONDS the timeout is saved, and
+    later retries get it without running anything."""
+    from kiki_agent_host.api import jobs
+
+    monkeypatch.setattr(jobs, "JOB_MARGIN_SECONDS", 0.1)
+    monkeypatch.setattr(jobs, "MIN_RESUME_SECONDS", 0.5)
+
+    class StepAlwaysTimesOut(FakeExecutor):
+        async def execute(self, request):
+            self.calls += 1
+            await asyncio.sleep(0.4)
+            raise TimeoutError
+
+    executor = StepAlwaysTimesOut()
+    statuses = []
+    async with client(
+        create_app(Settings(database_url, TOKEN, job_timeout_seconds=1.6), executor)
+    ) as http:
+        for _ in range(10):  # Rust's loop, without its back-off
+            response = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+            statuses.append(response.status_code)
+            if response.status_code != 503:
+                break
+        assert response.json()["error"] == "timed out"
+        again = await http.post("/v1/jobs", json=job(), headers=HEADERS)
+        assert again.json()["error"] == "timed out"
+    assert statuses[:-1] == [503] * (len(statuses) - 1) and statuses[-1] == 200
+    assert 2 <= len(statuses) <= 4, statuses
+    assert executor.calls == len(statuses)  # the saved timeout ran nothing
+    async with await AsyncConnection.connect(database_url, autocommit=True) as connection:
+        cursor = await connection.execute(
+            "SELECT status, error FROM agent_host_jobs WHERE id = %s", (job()["id"],)
+        )
+        assert await cursor.fetchone() == ("failed", "timed out")

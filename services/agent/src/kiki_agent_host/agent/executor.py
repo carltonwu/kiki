@@ -131,9 +131,11 @@ class Metered(WrapperModel):
 
     Each request gets `MODEL_REQUEST_TIMEOUT_SECONDS` in all, no more than the run
     has left, less `keep`: the time a request after it needs, as the request
-    without thinking that may follow a thinking one (it raises `CutShort` when
-    that cut it). A request cut short with the job's time left is retried by
-    Rust like a provider error (`api/jobs.py`)."""
+    without thinking that may follow a thinking one. With a `keep`, any timeout
+    raises `CutShort`, so the thinking model always falls back to its twin first
+    rather than failing the job. A request cut short without one is retried by
+    Rust like a provider error while the job has time (`api/jobs.py`). Either is
+    logged: OpenRouter may still bill a request given up on."""
 
     def __init__(
         self,
@@ -142,11 +144,13 @@ class Metered(WrapperModel):
         *,
         max_tokens: int | None = None,
         keep: float = 0,
+        job_id: str = "-",
     ):
         super().__init__(wrapped)
         self.call = call
         self.max_tokens = max_tokens
         self.keep = keep
+        self.job_id = job_id
 
     # Runs don't stream, so request_stream isn't metered.
     async def request(self, messages, model_settings, model_request_parameters) -> ModelResponse:
@@ -162,7 +166,15 @@ class Metered(WrapperModel):
             async with asyncio.timeout(timeout):
                 response = await super().request(messages, model_settings, model_request_parameters)
         except TimeoutError:
-            if timeout < cap:
+            logger.warning(
+                "model request timed out job_id=%s model=%s timeout_s=%.1f left_s=%s%s",
+                self.job_id,
+                self.model_name,
+                timeout,
+                "-" if left is None else int(left),
+                "; falling back" if self.keep else "",
+            )
+            if self.keep:
                 raise CutShort from None
             raise
         usage = response.usage
@@ -226,7 +238,9 @@ class PydanticExecutor:
     async def thinks(self, name: str) -> bool:
         return catalog.reasons(name)  # the copy at hand: replies don't wait on it
 
-    async def chat_model(self, name: str, billed: telemetry.Call, max_tokens: int) -> Model:
+    async def chat_model(
+        self, name: str, billed: telemetry.Call, max_tokens: int, job_id: str = "-"
+    ) -> Model:
         """A run's model, each response billed to `billed`, with `max_tokens`
         (`reply_max_tokens`) per request. A model that thinks does so inside
         `max_tokens`, so it gets `REASONING_TOKENS` more; if its thinking still
@@ -234,7 +248,7 @@ class PydanticExecutor:
         after two read_images), the same request goes again with thinking off and
         the plain cap, so the run keeps its tool results instead of failing."""
         if not await self.thinks(name):
-            return Metered(self.model(name), billed, max_tokens=max_tokens)
+            return Metered(self.model(name), billed, max_tokens=max_tokens, job_id=job_id)
         # The thinking request leaves the one without thinking its time
         # (UNTHINKING_SECONDS), and is dropped for it when that cuts it short.
         return FallbackModel(
@@ -243,8 +257,9 @@ class PydanticExecutor:
                 billed,
                 max_tokens=max_tokens + REASONING_TOKENS,
                 keep=UNTHINKING_SECONDS,
+                job_id=job_id,
             ),
-            Metered(self.unthinking(name), billed, max_tokens=max_tokens),
+            Metered(self.unthinking(name), billed, max_tokens=max_tokens, job_id=job_id),
             fallback_on=(out_of_room, CutShort),
         )
 
@@ -260,7 +275,9 @@ class PydanticExecutor:
         # its tools' calls are their own (guard.py).
         billed = telemetry.Call()
         options = {
-            "model": await self.chat_model(request.model, billed, request.max_output_tokens),
+            "model": await self.chat_model(
+                request.model, billed, request.max_output_tokens, request.id
+            ),
             "message_history": earlier,
             "model_settings": {
                 "max_tokens": request.max_output_tokens,  # each model sets its own

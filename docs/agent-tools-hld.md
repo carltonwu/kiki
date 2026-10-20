@@ -223,12 +223,13 @@ a timeout cancels the work under it:
 | Rust's deadline for a host job, wake-up and busy retries included | `AGENT_HOST_TIMEOUT_MS` (`host.rs`) | 180 s |
 | The host's job deadline, counted from the job's first attempt (a resumed job gets what's left) | `AGENT_HOST_JOB_TIMEOUT_SECS` (`api/jobs.py`) | 120 s |
 | The job's work, cancelled there; saving the result uses the rest | 10 s before that (`JOB_MARGIN_SECONDS`) | 110 s |
-| One chat model request, the SDK's retries included (`Metered`) | `MODEL_REQUEST_TIMEOUT_SECONDS`, and no more than the work has left; a thinking request leaves 12 s of it for the same request without thinking (`keep`, `UNTHINKING_SECONDS`) | 45 s |
+| One chat model request, the SDK's retries included (`Metered`) | `MODEL_REQUEST_TIMEOUT_SECONDS`, and no more than the work has left; a thinking request leaves 12 s of it for the same request without thinking (`keep`, `UNTHINKING_SECONDS`), and any timeout of it falls back to that one (`CutShort`) | 45 s |
 | A tool call | its own (10 s, 45 for `read_image`/`read_link`), and no more than the work has left less 45 s kept for the last turn (`ANSWER_RESERVE_SECONDS`: a 31 s thinking request and its fallback) | |
-| A drawing's reference stage (`Gatherer`) | its 35 s, and no more than the job has left less 35 s for the image call and the note (`IMAGE_KEEP_SECONDS`) | 35 s |
+| A vision call inside a tool (`look`) | the tool's deadline; a thinking call leaves 12 s of it for the retry without thinking (`vision.UNTHINKING_SECONDS`) | |
+| A drawing's reference stage (`Gatherer`) | `REFERENCES_SECONDS`, and no more than the job has left less 40 s: the image attempt's minimum, the note and the stage's 5 s grace (`IMAGE_KEEP_SECONDS`). A fresh job's attempt then gets 65 s | 25 s |
 | An image attempt / Kiki's note on a failed drawing | 75 s / 15 s, and no more than the drawing has left; the fallback model isn't tried without 20 s for it | |
 
-Once the run is out of lookup time, `LastRequestAnswers` offers no tools (the model answers rather than spending a request on a refused call). The emoji check's retry (`check_emojis`) is skipped without time for a whole last turn: the bad emoji are cut instead.
+A tool turned away for time is `out_of_time` (not charged to its budget). Inside a tool, `deadline.time_left()` is the tool's own deadline. Once the run is out of lookup time, `LastRequestAnswers` offers no tools (the model answers rather than spending a request on a refused call). The emoji check's retry (`check_emojis`) is skipped without time for a whole last turn: the bad emoji are cut instead.
 
 `deadline.within(seconds)` caps any step to the time left (`deadline.time_left()`),
 for code that runs inside a job (it reads `time.monotonic()`, so also from

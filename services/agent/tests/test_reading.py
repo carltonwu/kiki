@@ -379,3 +379,38 @@ async def test_kiki_reads_her_own_drawings_from_the_store(db):
     await add(db, 81, "", {"attachments": [attachment(f"kiki-{mine}.png")]})
     result = await read(db, model, 81, files={})
     assert result["error"] == "none of the images could be downloaded"
+
+
+async def test_a_slow_thinking_read_leaves_its_retry_time(monkeypatch):
+    """reply:461 on 10-20: a thinking vision call ran 41 s into read_image's 45 s,
+    so the request without thinking never happened. Thinking now stops in time
+    to leave UNTHINKING_SECONDS of the deadline for it."""
+    import asyncio
+    import time
+
+    from kiki_agent_host.deadline import run_deadline
+    from kiki_agent_host.media import vision as vision_module
+
+    seen = []
+
+    async def respond(messages, info: AgentInfo) -> ModelResponse:
+        seen.append(info.model_settings)
+        if (info.model_settings.get("openrouter_reasoning") or {}).get("enabled") is False:
+            return ModelResponse(parts=[TextPart("Image 1: a dog.")])
+        await asyncio.sleep(30)  # thinking, and thinking
+
+    monkeypatch.setattr(vision_module, "UNTHINKING_SECONDS", 0.4)
+    vision = Vision(FunctionModel(respond), "test/vision")
+    started = time.monotonic()
+    with run_deadline(1.0):  # read_image's deadline, as the guard sets it
+        assert await look(vision, ["describe"], max_tokens=100) == "Image 1: a dog."
+    assert time.monotonic() - started < 1.0
+    assert len(seen) == 2
+
+    # Without a deadline (emoji descriptions, say), nothing is cut.
+    fast = Vision(billed_answer("Image 1: a cat."), "test/vision")
+    assert await look(fast, ["describe"], max_tokens=100) == "Image 1: a cat."
+
+
+def billed_answer(text):
+    return FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(text)]))

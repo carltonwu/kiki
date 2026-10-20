@@ -489,7 +489,7 @@ a new trace.
 | `kiki.images.attempts` | counter | `{attempt}` | `model`, `result=drawn\|safety_blocked\|refused\|failed` | `kiki_images_attempts_total` — **live** |
 | `kiki.images.fallback` | counter | `{attempt}` | `result=drawn\|failed` | `kiki_images_fallback_total` — **live** |
 | `kiki.images.duration` | histogram | `s` | `model` | `kiki_images_duration_seconds_*` — **live** |
-| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|budget_exhausted` | `kiki_tools_calls_total` — **live** |
+| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|budget_exhausted\|out_of_time` | `kiki_tools_calls_total` — **live** |
 | `kiki.tools.duration` | histogram | `s` | `tool` | `kiki_tools_duration_seconds_*` — **live** |
 | `kiki.web.calls` | counter | `{call}` | `kind=search\|fetch` | `kiki_web_calls_total` — **live** |
 
@@ -515,7 +515,8 @@ emoji-description endpoint is not a job.
 - `kiki.tools.calls` is per call through the tool guard (`agent/guard.py`).
   `tool` is one of the reply agent's fixed tools (`search_messages`, `recall`,
   …). `error` is an error result or an exception; `budget_exhausted` a call
-  turned away by the per-reply budget, which never ran, so has no duration. As
+  turned away by the per-reply budget, and `out_of_time` one turned away by the
+  run deadline (`guard.py`); neither ran, so neither has a duration. As
   for model calls, a cancelled tool call or image attempt is only a span.
 - `kiki.web.calls` is OpenRouter's web searches and fetches, as its server tool
   usage reports them per model response (counted as each arrives, like cost).

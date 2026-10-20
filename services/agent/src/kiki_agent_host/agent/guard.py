@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pydantic_ai import RunContext
 
 from .. import telemetry
-from ..deadline import time_left
+from ..deadline import run_deadline, time_left
 from ..media.vision import ImageRefused
 from .deps import Deps
 
@@ -73,11 +73,20 @@ async def guarded(
 ) -> dict:
     """Runs a tool with a deadline. Tools without a budget (generate_image) have
     their own cap, so searching can't block a drawing. `lock` is taken before the
-    deadline starts; the run deadline bounds the wait for it too."""
+    deadline starts; the run deadline bounds the wait for it too. Inside, the
+    tool's own deadline is the job's (`deadline.time_left`), so its steps (a
+    vision call and its retry, say) can share it out.
+
+    A call turned away for the run deadline is `out_of_time`, and doesn't count
+    against the tool budget: it never ran."""
     deps = ctx.deps
     left = time_left()
     cap = None if left is None else left - ANSWER_RESERVE_SECONDS
     with telemetry.tool_call(name) as call:
+        if cap is not None and cap < MIN_TOOL_SECONDS:
+            logger.info("out of time for a tool job_id=%s tool=%s", deps.job_id, name)
+            call.outcome = "out_of_time"
+            return {"error": OUT_OF_TIME}
         if budget:
             deps.spent[budget.name] += 1
             if deps.spent[budget.name] > budget.calls:
@@ -91,16 +100,11 @@ async def guarded(
                 return {"error": f"{budget.name} budget used up. Answer with what you have."}
         started = time.monotonic()
         try:
-            if cap is not None and cap < MIN_TOOL_SECONDS:
-                logger.info("out of time for a tool job_id=%s tool=%s", deps.job_id, name)
-                call.outcome = "budget_exhausted"
-                return {"error": OUT_OF_TIME}
-            async with (
-                asyncio.timeout(cap),
-                lock or contextlib.nullcontext(),
-                asyncio.timeout(timeout if cap is None else min(timeout, cap)),
-            ):
-                result = await work()
+            async with asyncio.timeout(cap), lock or contextlib.nullcontext():
+                own = timeout if cap is None else min(timeout, cap - (time.monotonic() - started))
+                async with asyncio.timeout(own):
+                    with run_deadline(own):
+                        result = await work()
         except TimeoutError:
             call.outcome = "timeout"
             result = {"error": "Timed out."}

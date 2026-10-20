@@ -73,14 +73,18 @@ PICKS_AT_ONCE = 8
 ANCHORS = 2  # given photos shown to the picker as what the subject looks like
 VERIFY_TIMEOUT_SECONDS = 30
 # The whole reference stage (search, downloads, picker queue and calls) gets this
-# much of the job's 120 s, so the image call keeps its 75 s. In review, 6 subjects
-# of 24 candidates made 12 batches, two waves of 27 s: 124 s with the image.
-REFERENCES_SECONDS = 35
-# What the stage leaves of the job for the image call and the failure note: the
-# executor's MIN_IMAGE_SECONDS (20) and NOTE_TIMEOUT_SECONDS (15).
-IMAGE_KEEP_SECONDS = 35
-MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
+# much of the job's work time (110 s of its 120). After it and STAGE_GRACE, an
+# image attempt gets min(75, 110 - 30 - the note's 15) = 65 s; prod's attempts
+# took 16-19 s, a blocked one and its fallback 59 s together. One wave of picker
+# batches (up to PICKS_AT_ONCE, 4+ subjects) took 5-17 s on prod data, so 25 s
+# fits one with room; a second wave (5+ subjects; 27 s each in review) is cut.
+REFERENCES_SECONDS = 25
 STAGE_GRACE = 5  # past the deadline, for downloads in flight; then the stage is cut
+# What the stage, its grace included, leaves of the job for an image attempt and
+# the failure note: the executor's MIN_IMAGE_SECONDS (20) and NOTE_TIMEOUT_SECONDS
+# (15), plus STAGE_GRACE. Less and the attempt would be skipped (a resumed job).
+IMAGE_KEEP_SECONDS = 20 + 15 + STAGE_GRACE
+MIN_PICK_SECONDS = 3  # a batch that can't have this long isn't started
 # A short verdict per photo, without thinking (`think=False`): a reasoning model
 # spent over 2,000 tokens and 20 s on five photos, past the check's deadline.
 VERIFY_MAX_TOKENS = 2000
