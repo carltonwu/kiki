@@ -17,7 +17,7 @@ use sqlx::FromRow;
 use tracing::{Span, debug, field::Empty, info, warn};
 
 use super::{Pool, PoolKey, Router, unix_millis};
-use crate::{conversation, metrics, telemetry};
+use crate::{agent::NOT_A_FAILURE_NOTE, conversation, metrics, telemetry};
 
 const INSTRUCTIONS: &str = "Kiki is an AI member of this Discord server, a close friend group where \
 banter, teasing and roasting are normal. Based on new_messages, is their author talking to Kiki: \
@@ -301,14 +301,14 @@ impl Router {
             .filter(|c| c.channel_id == channel_id)
             .take(CONVERSATION_CHOICES)
         {
-            let latest: Vec<(i64, Option<String>, String)> = sqlx::query_as(
+            let latest: Vec<(i64, Option<String>, String)> = sqlx::query_as(&format!(
                 r#"
                 SELECT m.author_id, m.author_name, m.content
                 FROM conversation_messages cm JOIN messages m ON m.id = cm.message_id
-                WHERE cm.conversation_id = $1 AND m.deleted_at IS NULL
+                WHERE cm.conversation_id = $1 AND m.deleted_at IS NULL AND {NOT_A_FAILURE_NOTE}
                 ORDER BY m.id DESC LIMIT $2
                 "#,
-            )
+            ))
             .bind(c.id)
             .bind(preview)
             .fetch_all(&self.db)
@@ -612,7 +612,7 @@ impl Router {
             Option<i64>,
             Option<i64>,
             Option<String>,
-        )> = sqlx::query_as(
+        )> = sqlx::query_as(&format!(
             r#"
             SELECT m.author_id, m.author_name, m.content, cm.conversation_id,
                    r.author_id, r.author_name
@@ -625,9 +625,10 @@ impl Router {
             ))
             WHERE m.channel_id = $1 AND m.id < $2 AND m.deleted_at IS NULL
               AND NOT EXISTS (SELECT 1 FROM ignored_authors i WHERE i.user_id = m.author_id)
+              AND {NOT_A_FAILURE_NOTE}
             ORDER BY m.id DESC LIMIT $3
             "#,
-        )
+        ))
         .bind(key.channel_id)
         .bind(first)
         .bind(pool.settings.decide_recent_messages)

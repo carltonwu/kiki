@@ -130,4 +130,6 @@ def model_catalog(monkeypatch):
     monkeypatch.setattr(catalog, "fetch", fetch)
     monkeypatch.setattr(catalog, "_catalog", {})
     monkeypatch.setattr(catalog, "_fetched_at", -float("inf"))
+    monkeypatch.setattr(catalog, "_attempted_at", -float("inf"))
+    monkeypatch.setattr(catalog, "_refreshing", None)
     return listed

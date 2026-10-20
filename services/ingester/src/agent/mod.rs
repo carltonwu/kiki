@@ -48,6 +48,11 @@ const NOTIFY_CHANNEL: &str = "agent_run_queued";
 /// Posted when a reply run fails after its trigger was accepted, like a
 /// drawing's `(couldn't make that picture)`: the request must not end in silence.
 const FAILURE_NOTE: &str = "(couldn't answer that one, try again?)";
+/// Leaves out the failure notes (`m` is the message), by the run that posted
+/// them, not their text: one InitPlan, like the ignored-authors filter.
+/// `chat/scope.py` HEARD has the same for the host's tools.
+pub(crate) const NOT_A_FAILURE_NOTE: &str = "m.id <> ALL (ARRAY(SELECT unnest(n.reply_message_ids) \
+     FROM agent_runs n WHERE n.failure_note))";
 /// Pending runs are also checked this often, in case a notification was lost
 /// while the listener reconnected.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -482,7 +487,8 @@ impl Agent {
             debug!(run_id = claim.run_id, "agent chose silence");
             return Ok(());
         }
-        self.mark_delivering(claim.run_id, context.reply_to).await?;
+        self.mark_delivering(claim.run_id, context.reply_to, false)
+            .await?;
         self.react(&context, &plan.reactions, record).await;
         if plan.messages.is_empty() {
             debug!(run_id = claim.run_id, "agent only reacted");
@@ -516,7 +522,10 @@ impl Agent {
         }];
         // As for a reply: once it may have been posted, a crash fails the run at
         // startup instead of requeueing it, which would post the note again.
-        if let Err(e) = self.mark_delivering(claim.run_id, context.reply_to).await {
+        if let Err(e) = self
+            .mark_delivering(claim.run_id, context.reply_to, true)
+            .await
+        {
             warn!(run_id = claim.run_id, error = %e, "couldn't post the failure note");
             return;
         }
@@ -539,13 +548,24 @@ impl Agent {
 
     /// Commit before any Discord send: a crash from here may have posted, so
     /// startup fails the run (`recover_runs`) instead of sending again.
-    async fn mark_delivering(&self, run_id: i64, reply_to: i64) -> sqlx::Result<()> {
-        sqlx::query("UPDATE agent_runs SET status = 'delivering', reply_to_id = $2 WHERE id = $1")
-            .bind(run_id)
-            .bind(reply_to)
-            .execute(&self.db)
-            .await
-            .map(|_| ())
+    /// `failure_note`: what's sent is the failure note, which prompts leave out
+    /// (`NOT_A_FAILURE_NOTE`).
+    async fn mark_delivering(
+        &self,
+        run_id: i64,
+        reply_to: i64,
+        failure_note: bool,
+    ) -> sqlx::Result<()> {
+        sqlx::query(
+            "UPDATE agent_runs SET status = 'delivering', reply_to_id = $2, failure_note = $3 \
+             WHERE id = $1",
+        )
+        .bind(run_id)
+        .bind(reply_to)
+        .bind(failure_note)
+        .execute(&self.db)
+        .await
+        .map(|_| ())
     }
 
     async fn finish(

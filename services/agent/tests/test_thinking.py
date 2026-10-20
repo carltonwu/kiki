@@ -125,7 +125,10 @@ async def test_a_tool_call_that_ends_at_the_limit_is_acted_on(database_url):
 
 
 async def test_a_model_that_doesnt_think_keeps_the_plain_cap(model_catalog):
+    from kiki_agent_host.openrouter import catalog
+
     model_catalog["test/model"] = frozenset({"tools", "max_tokens"})
+    await catalog.refresh()  # at startup
     seen = []
 
     def plain(messages, info: AgentInfo) -> ModelResponse:
@@ -137,30 +140,101 @@ async def test_a_model_that_doesnt_think_keeps_the_plain_cap(model_catalog):
     assert seen == [100]
 
 
-async def test_the_catalog_says_which_models_think(model_catalog, monkeypatch):
+async def test_the_catalog_says_which_models_think(model_catalog):
     from kiki_agent_host.openrouter import catalog
 
     model_catalog |= {
         "deepseek/deepseek-v4.1-flash-1017": frozenset({"tools", "reasoning"}),
         "openai/gpt-4o-mini": frozenset({"tools"}),
     }
-    assert await catalog.reasons("deepseek/deepseek-v4.1-flash-1017")
-    assert not await catalog.reasons("openai/gpt-4o-mini")
-    assert await catalog.reasons("new/unlisted-model")  # unknown: give it room
+    assert catalog.reasons("openai/gpt-4o-mini")  # before the first fetch: room
+    await catalog._refreshing  # the background fetch it started
+    assert catalog.reasons("deepseek/deepseek-v4.1-flash-1017")
+    assert not catalog.reasons("openai/gpt-4o-mini")
+    assert catalog.reasons("new/unlisted-model")  # unknown: give it room
 
-    # Unreadable: every model gets room, and replies don't each wait on a retry.
-    fetches = []
+
+async def test_a_reply_never_waits_on_the_catalog(monkeypatch):
+    import asyncio
+
+    from kiki_agent_host.openrouter import catalog
+
+    stuck = asyncio.Event()
+
+    async def hangs():
+        await stuck.wait()
+        return {}
+
+    monkeypatch.setattr(catalog, "fetch", hangs)
+    assert catalog.reasons("test/model")  # answered from the copy, fetch still running
+    assert not catalog._refreshing.done()
+    assert catalog.reasons("test/model")  # one fetch at a time
+    stuck.set()
+    await catalog._refreshing
+
+
+async def test_a_failed_refresh_of_a_stale_copy_is_retried_soon(model_catalog, monkeypatch):
+    """The review of #68: a failed hourly refresh waited another hour, and a model
+    missing from a full copy never triggered one."""
+    from kiki_agent_host.openrouter import catalog
+
+    model_catalog["openai/gpt-4o-mini"] = frozenset({"tools"})
+    clock = [1000.0]
+    monkeypatch.setattr(catalog.time, "monotonic", lambda: clock[0])
+    await catalog.refresh()
+    assert not catalog.due("openai/gpt-4o-mini", clock[0])
 
     async def down():
-        fetches.append(1)
         raise catalog.httpx.ConnectError("down")
 
     monkeypatch.setattr(catalog, "fetch", down)
-    monkeypatch.setattr(catalog, "_catalog", {})
-    monkeypatch.setattr(catalog, "_fetched_at", -float("inf"))
-    assert await catalog.reasons("openai/gpt-4o-mini")
-    assert await catalog.reasons("openai/gpt-4o-mini")
-    assert fetches == [1]
+    clock[0] += catalog.CACHE_SECONDS + 1
+    assert catalog.due("openai/gpt-4o-mini", clock[0])
+    await catalog.refresh()  # fails: the stale copy stays
+    assert not catalog.reasons("openai/gpt-4o-mini")
+    assert not catalog.due("openai/gpt-4o-mini", clock[0] + catalog.RETRY_SECONDS - 1)
+    assert catalog.due("openai/gpt-4o-mini", clock[0] + catalog.RETRY_SECONDS + 1)
+    # A model the copy doesn't list: fetch again, at most once a minute.
+    clock[0] += catalog.RETRY_SECONDS + 1
+    model_catalog["new/model"] = frozenset({"tools"})
+    monkeypatch.setattr(catalog, "fetch", lambda: _listed(model_catalog))
+    await catalog.refresh()
+    assert not catalog.due("new/model", clock[0])
+    assert catalog.due("other/new-model", clock[0] + catalog.RETRY_SECONDS + 1)
+    assert not catalog.reasons("new/model")
+
+
+async def _listed(models):
+    return dict(models)
+
+
+async def test_whitespace_at_the_limit_goes_again_without_thinking():
+    """Thinking then " \n\t" at the limit: pydantic-ai takes it as text, and the
+    reply was rejected as empty (review of #68)."""
+
+    def blank(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[ThinkingPart("hmm"), TextPart(" \n\t")], finish_reason="length")
+
+    def unthinking(messages, info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart("memes")])
+
+    assert (await executor("unused", blank, unthinking).execute(job("topic"))).text == "memes"
+
+
+async def test_a_vision_answer_of_whitespace_at_the_limit_goes_again():
+    from kiki_agent_host.media.vision import Vision, look
+
+    seen = []
+
+    def respond(messages, info: AgentInfo) -> ModelResponse:
+        seen.append(info.model_settings.get("openrouter_reasoning"))
+        if seen[-1] == {"enabled": False}:
+            return ModelResponse(parts=[TextPart("Image 1: a dog.")])
+        return ModelResponse(parts=[ThinkingPart("hmm"), TextPart(" \n\t")], finish_reason="length")
+
+    vision = Vision(FunctionModel(respond), "test/vision")
+    assert await look(vision, ["describe"], max_tokens=100) == "Image 1: a dog."
+    assert seen == [None, {"enabled": False}]
 
 
 async def test_no_answer_even_without_thinking_fails_the_job():
@@ -168,3 +242,21 @@ async def test_no_answer_even_without_thinking_fails_the_job():
     # The job fails, and the ingester posts its failure note (agent/mod.rs).
     with pytest.raises(FallbackExceptionGroup):
         await e.execute(job("topic"))
+
+
+async def test_the_host_fetches_the_catalog_at_startup(model_catalog, monkeypatch):
+    import asyncio
+
+    from kiki_agent_host.api import app as host
+    from kiki_agent_host.config import Settings
+    from kiki_agent_host.openrouter import catalog
+
+    monkeypatch.setattr(host.telemetry, "shutdown", lambda: None)
+    model_catalog["openai/gpt-4o-mini"] = frozenset({"tools"})
+    app = host.create_app(
+        Settings("postgresql://unused.invalid/kiki", "t"), executor("unused", None, None)
+    )
+    async with host.lifespan(app):
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not catalog.reasons("openai/gpt-4o-mini")  # known before any reply

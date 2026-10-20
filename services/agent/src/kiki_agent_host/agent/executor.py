@@ -167,8 +167,12 @@ class PydanticExecutor:
             name, provider=self.provider, settings={"openrouter_reasoning": {"enabled": False}}
         )
 
+    async def warm(self) -> None:
+        """At startup (api.app): which chat models think, before a reply needs it."""
+        await catalog.refresh()
+
     async def thinks(self, name: str) -> bool:
-        return await catalog.reasons(name)
+        return catalog.reasons(name)  # the copy at hand: replies don't wait on it
 
     async def chat_model(self, name: str, billed: telemetry.Call, max_tokens: int) -> Model:
         """A run's model, each response billed to `billed`, with `max_tokens`

@@ -119,3 +119,21 @@ async def test_pages_stop_before_flooding_the_context(db, monkeypatch):
     assert ids(page) == [62, 63]
     # Reading back keeps the newest.
     assert ids(await read(db)) == [62, 63]
+
+
+async def test_failure_notes_are_left_out_by_the_run_that_posted_them(db):
+    """The ingester's "(couldn't answer that one, try again?)" isn't Kiki's words
+    (migration 0031): no tool reads it back. Her own reply with that text is hers."""
+    note = "(couldn't answer that one, try again?)"
+    await add(db, 20, "help kiki where my meme at", minute=0)
+    await add(db, 21, note, minute=1, bot=True)
+    await add(db, 22, note, minute=2, bot=True)
+    await db.execute(
+        "INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, %s, %s, 100)",
+        (GUILD, GENERAL),
+    )
+    await db.execute(
+        "INSERT INTO agent_runs (conversation_id, trigger_message_ids, status, reply_message_ids,"
+        " failure_note) VALUES (1, '{20}', 'failed', '{21}', true), (1, '{20}', 'done', '{22}', false)"
+    )
+    assert ids(await read(db)) == [20, 22]

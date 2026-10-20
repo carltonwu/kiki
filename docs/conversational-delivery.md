@@ -35,11 +35,12 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 
 A chat model that thinks does so inside `max_tokens`. For a model that
 OpenRouter's catalog lists with the `reasoning` parameter (or one it can't
-look up), each request's cap is `reply_max_tokens` + `REASONING_TOKENS` (2000),
+look up; the host fetches the catalog at startup and refreshes it in the
+background, so a reply never waits on it), each request's cap is `reply_max_tokens` + `REASONING_TOKENS` (2000),
 shared by thinking and answer: OpenRouter can't cap the visible answer on its
 own, so on this path `reply_max_tokens` doesn't strictly limit the answer.
 Other models get `reply_max_tokens` alone. If a response ends at the limit with
-only thinking (no text and no tool call; reply:404 on 2026-10-20), pydantic-ai's
+only thinking (no text but whitespace, and no tool call; reply:404 on 2026-10-20), pydantic-ai's
 `FallbackModel` sends the same request again with thinking off and the plain
 `reply_max_tokens` (`PydanticExecutor.chat_model`), so the run keeps its tool
 results.
@@ -47,8 +48,12 @@ results.
 If the host job still fails, for this or any other reason, Rust marks the run
 delivering and posts `(couldn't answer that one, try again?)` in place of the
 reply (`Agent::post_failure_note`). The run is still recorded as failed; a crash
-after the send fails it at startup rather than posting the note again. The note
-is left out of Kiki's history so she doesn't imitate it.
+after the send fails it at startup rather than posting the note again. The run is
+flagged `failure_note` (migration 0031) before the send, and every prompt
+source leaves out the messages such a run posted: the conversation, what a
+message replies to, recent channel context, Jev's routing context and the
+host's tools (`NOT_A_FAILURE_NOTE`, `chat/scope.py` HEARD). Kiki's own words are
+never dropped for matching the note's text.
 
 ## Files and behavior
 

@@ -115,8 +115,12 @@ async def speakers(
 # their reposts of someone's message (a link fixer's; migration 0024). Not an
 # anti-join: the one-row table is never auto-analyzed, and the planner's guess
 # of 1,200 rows turned the guild-wide pending scan into an 84 s nested loop.
+# Nor the ingester's failure notes, known by the run that posted them (migration
+# 0031; Rust `agent::NOT_A_FAILURE_NOTE`), also evaluated once.
 HEARD = (
-    "(m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)) OR m.relayed_for IS NOT NULL)"
+    "((m.author_id <> ALL (ARRAY(SELECT user_id FROM ignored_authors)) OR m.relayed_for IS NOT NULL)"
+    " AND m.id <> ALL (ARRAY(SELECT unnest(n.reply_message_ids) FROM agent_runs n"
+    " WHERE n.failure_note)))"
 )
 # People's messages Kiki reads: no bots', but a link fixer's reposts of theirs.
 PEOPLES = f"(NOT m.author_bot OR m.relayed_for IS NOT NULL) AND {HEARD}"

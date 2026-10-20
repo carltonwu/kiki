@@ -29,8 +29,13 @@ logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(app: FastAPI):
+    # What the executor fetches ahead of the first job (which chat models think).
+    warm = getattr(app.state.executor, "warm", None)
+    warming = asyncio.create_task(warm()) if warm else None
     yield
+    if warming:
+        warming.cancel()
     # Here, not after uvicorn.run(): uvicorn re-raises SIGTERM once it stops.
     await asyncio.to_thread(telemetry.shutdown)
 
@@ -39,6 +44,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
     app = FastAPI(
         title="Kiki agent host", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan
     )
+    app.state.executor = executor
     slots = asyncio.Semaphore(settings.max_concurrent_jobs)
     bearer = HTTPBearer(auto_error=False)
     telemetry.instrument_app(app)
