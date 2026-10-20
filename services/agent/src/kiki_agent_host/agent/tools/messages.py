@@ -15,6 +15,7 @@ from ... import db
 from ...chat.counting import GroupBy, count
 from ...chat.history import channel_history as read_history
 from ...chat.indexing import index_pending
+from ...chat.quotes import find_quotes as read_quotes
 from ...chat.search import Deadline, Semantic, message_context, search
 from ..deps import Deps
 from ..guard import guarded
@@ -53,11 +54,16 @@ async def search_messages(
     Recent matches rank slightly higher unless `before`/`after` is given. Older
     messages already shown to you in this conversation are not returned.
 
+    To quote someone, copy the hit's `text` word for word and link its `url`; if
+    nothing matches, say so rather than reconstructing what they might have said.
+    For quotes people saved with a quote bot, use find_quotes.
+
     Args:
         query: What to look for, in natural language or keywords.
         person: Only messages written by this person: a ref like u2 (best), an
             @username, or a name they've gone by. Names match exactly, so "Chris"
             won't find "Chrissy"; if several people share the name, results say so.
+            "you" searches your own past messages (what you said).
         channel: Only messages in this channel, like #general. Leave it out to
             search the whole server.
         before: Only messages sent before this time (ISO 8601, UTC).
@@ -99,6 +105,54 @@ async def search_messages(
             )
 
     return await guarded(ctx, "search_messages", work)
+
+
+async def find_quotes(
+    ctx: RunContext[Deps],
+    person: str | None = None,
+    query: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> dict:
+    """Find this server's saved quotes: messages people saved with a quote bot
+    (the `.quote` replies and "Quote #N" cards in a channel like #quotes).
+
+    Use it for someone's quotes ("X's best quotes", "the quote where..."), not
+    search_messages: the quotes are inside the bots' posts, which search skips.
+    Each is the saved message itself, with who said it, when and its link, and
+    its whole text, so quote it word for word. `total` is how many match.
+
+    Args:
+        person: Only quotes of this person: a ref like u2 (best), an @username, or
+            a name they've gone by.
+        query: Rank by meaning and keywords. Leave it out to list them newest first.
+        limit: Maximum quotes, up to 50; a page of long ones holds fewer.
+        offset: Skip this many, to read on: the previous result's `next_offset`.
+    """
+
+    async def work():
+        # The same deadline as search_messages: its steps (chat/quotes.py) each
+        # get what's left, so it answers inside the tool's 10 s.
+        deadline = Deadline(SEARCH_SECONDS)
+        # Its own connection: statement timeouts live in transactions, which
+        # mustn't interleave with other tools on the run's one.
+        wait = min(CONNECT_SECONDS, deadline.left())
+        async with asyncio.timeout(wait):
+            connection = await db.connect(ctx.deps.memory.database_url, timeout=wait)
+        async with connection:
+            return await read_quotes(
+                connection,
+                ctx.deps.embed,
+                ctx.deps.scope,
+                person=person,
+                query=query,
+                roster=ctx.deps.roster,
+                limit=limit,
+                offset=offset,
+                deadline=deadline,
+            )
+
+    return await guarded(ctx, "find_quotes", work)
 
 
 async def get_message_context(
@@ -261,4 +315,6 @@ async def finish(task: asyncio.Task) -> None:
         await task
 
 
-toolset = FunctionToolset([search_messages, get_message_context, channel_history, count_messages])
+toolset = FunctionToolset(
+    [search_messages, find_quotes, get_message_context, channel_history, count_messages]
+)

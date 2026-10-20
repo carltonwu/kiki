@@ -973,6 +973,10 @@ class Fakecord:
                     for a in body.get("attachments") or []
                 ],
             )
+            if components := body.get("components"):
+                # A bot's Components V2 card (IS_COMPONENTS_V2), sent with the message.
+                message["components"] = components
+                message["flags"] = 1 << 15
             await self.dispatch("MESSAGE_CREATE", message)
             if embeds := body.get("embeds"):
                 # Like Discord's unfurler: link previews arrive in a partial update.

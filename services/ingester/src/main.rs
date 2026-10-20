@@ -18,6 +18,7 @@ mod health;
 mod jev;
 mod leader;
 mod metrics;
+mod migrate;
 mod platform;
 mod rest;
 mod router;
@@ -67,7 +68,7 @@ async fn run(config: Config) -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         None => {}
         Some("migrate") => {
-            MIGRATOR.run(&pool).await.context("running migrations")?;
+            migrate::run(&pool, &MIGRATOR).await?;
             info!("migrations applied");
             return Ok(());
         }

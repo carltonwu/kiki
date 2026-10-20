@@ -1,0 +1,40 @@
+name: quote lookups read saved quotes inside quote bots' posts, and Kiki's own words
+steps:
+  # Seen in prod (reply:432, 442): asked for someone's quotes from #quotes, Kiki
+  # found only the `.quote 194` commands. The quotes are inside quote bots' posts
+  # (no content; a Components V2 card here, PilzBrots' format), which search skips.
+  - exec: "INSERT INTO ignored_authors (user_id, note) VALUES (900000000000000107, 'sim')"
+  - send: {as: sam, in: general, text: "the lighting rig is sentient and it hates me", id: saved, age_s: 3600}
+  - send: {as: alex, in: lore, text: ".quote 7"}
+  - send:
+      as: pilz
+      in: lore
+      text: ""
+      components:
+        - type: 17
+          components:
+            - {type: 10, content: "**Quote #7**"}
+            - {type: 10, content: "the lighting rig is sentient and it hates me"}
+            - type: 10
+              content: "Authored by <@900000000000000102> at 10/19/26. [View Original Message](https://discord.com/channels/{guild}/{channel:general}/{id:saved})"
+  - wait: 1
+  - say: {as: alex, in: general, text: "kiki what are sam's best quotes"}
+    reply: {tool: {name: find_quotes, args: {person: "@samwise"}}, text: "stub: {result}"}
+  - expect:
+      reply: true
+      tool_called: find_quotes
+      # The saved message itself: Sam's, in #general (not the bot's post in #lore).
+      tool_result_contains: ['"total":1', "the lighting rig is sentient and it hates me", "#general", "Sam"]
+
+  # reply:251: asked to find what she said, Kiki searched and claimed she'd never
+  # said it. Bots' messages, hers too, are left out of search unless she asks for
+  # her own (person "you").
+  - say: {as: alex, in: general, text: "kiki thoughts on the fog machine"}
+    reply: {text: "the fog machine is my emotional support appliance"}
+  - expect: {reply: true}
+  - say: {as: sam, in: staff, text: "kiki find what you said about the fog machine"}
+    reply: {tool: {name: search_messages, args: {query: "fog machine", person: "you"}}, text: "stub: {result}"}
+  - expect:
+      reply: true
+      tool_called: search_messages
+      tool_result_contains: ["the fog machine is my emotional support appliance", "#general"]

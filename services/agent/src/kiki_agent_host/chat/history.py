@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from .cards import shown_text
 from .scope import HEARD, NO_ROSTER, Roster, Scope, resolve_channel
 from .search import COLUMNS, SNIPPET_CHARS, cite_all
 
@@ -151,7 +152,7 @@ def fit(rows: list[dict], *, forward: bool) -> tuple[list[dict], bool]:
     ordered = rows if forward else rows[::-1]
     kept, chars = [], 0
     for row in ordered:
-        chars += min(len(row["content"]), SNIPPET_CHARS)
+        chars += min(len(shown_text(row)), SNIPPET_CHARS)
         if kept and chars > PAGE_CHARS:
             break
         kept.append(row)

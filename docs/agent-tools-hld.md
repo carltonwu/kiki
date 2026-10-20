@@ -80,10 +80,40 @@ model arguments, and arguments can only narrow them.
   @username or any name the person has had. It's resolved to user IDs
   ([identity-hld](identity-hld.md)), and authors are shown by their current
   label. `channel` accepts a name, channel mention or ID and only narrows search
-  within the guild.
+  within the guild. `person: "you"` (or "Kiki") searches Kiki's own past
+  messages, for "find what you said": by keywords only, since her messages aren't
+  embedded. Her user ID is the author of her latest reply in the guild
+  (`agent_runs.reply_message_ids`); the request doesn't carry it. A search with no
+  hits, or an unknown `person`, says what to try instead.
+- `find_quotes(person?, query?, limit=25, offset=0)` (`chat/quotes.py`) returns the
+  server's saved quotes: what people saved with a quote bot (UB3R-B0T's `.quote`
+  embeds, PilzBrots' "Quote #N" Components V2 cards). Those posts have no
+  `content`, so search skips them as bots' and history showed them blank; asked
+  for someone's quotes from #quotes, Kiki found only the `.quote 194` commands
+  (reply:432, 442). Migration 0030's `quote_parts(raw)` parses each bot's format
+  by its structure: the attribution is UB3R-B0T's last description line under a
+  `#N` embed author, or PilzBrots' last text display starting "(Authored )by"
+  after a `**Quote #N**` header, and `quoted_message_id(raw)` is that line's
+  link. A link inside the quote is never taken for the saved message. These run
+  in an index expression on every bot message's insert, so nothing raises: IDs are
+  range-checked before the cast (a malformed link is NULL), and anything
+  unexpected is "not a quote post". 0031 indexes the posts per guild, built
+  `CONCURRENTLY` (`-- no-transaction`). Each quote is the saved message itself,
+  so the text is verbatim and the author is who said it, not the bot; a quote
+  posted many times counts once. A deleted original is left out. One never
+  ingested is the bot's copy, marked `saved_copy`, only if its link is to this
+  guild and it isn't attributed to an ignored author or a bot (a mention, a bare
+  ID, or a name resolved through `user_names`). PilzBrots is an ignored author,
+  but its quote cards only point at people's messages, like a link fixer's
+  reposts. Without `query` it lists newest first (`total`, `next_offset`); with
+  one it ranks by keywords over every quote's text (copies included) and by
+  meaning over stored ones (reciprocal rank fusion, exact distances over a few
+  hundred rows). Its own connection, the lookup budget. In prod: 1,394 quote
+  posts, 419 quotes, 394 originals stored.
 - `get_message_context(message_id, before=5, after=5)` returns neighbors in the
   target message's own channel (at most 10 on each side) and the reply parent
-  if it is in the same guild.
+  if it is in the same guild. When the target is an ignored author's, a note says
+  it exists but isn't shown (reply:72 told the user it was deleted).
 - `channel_history(channel?, after?, before?, limit=100, cursor?)` (issue #39) reads a
   channel and its threads in time order, for catch-ups ("what did I miss"). `channel`
   defaults to the current one and resolves like search's; `after`/`before` are ISO
@@ -91,7 +121,7 @@ model arguments, and arguments can only narrow them.
   forward, otherwise it returns the newest messages; a page holds at most 100
   messages and about 40,000 characters of text, and `cursor` (`newer:<id>` or
   `older:<id>`) continues it. Unlike search it keeps bot messages (marked `bot`; voice
-  transcripts) and the current conversation, so the timeline has no holes, and lists
+  transcripts; a blank one reads as its card, below) and the current conversation, so the timeline has no holes, and lists
   attachment names as `files`. `total_in_range` lets the model judge how much is
   left. Query logic is in `chat/history.py`; a system prompt line points catch-ups at it.
 - `read_image(message_id, question?)` has another model look at a message's
@@ -122,8 +152,15 @@ model arguments, and arguments can only narrow them.
   by mood or meaning, or by name (`huh`, `:huh:`, `<:huh:123>`). See
   [Custom emoji](#custom-emoji).
 
-Search excludes deleted messages, bot messages (Kiki's replies are not evidence)
-and the current conversation's messages, which Rust already put in the prompt.
+Search excludes deleted messages, bot messages (Kiki's replies are not evidence,
+unless she asks for her own) and the current conversation's messages, which Rust
+already put in the prompt.
+
+A message with no `content` reads as its card (`chat/cards.py`): its rich embeds'
+author, title, description, fields and footer, and its Components V2 text
+displays at any depth. Link previews aren't cards, and a message with text keeps
+its text. This covers every tool's citations (history, context, search, quotes);
+Rust's prompt context still shows such a message as blank.
 
 ### Web search and fetch (issue #1)
 

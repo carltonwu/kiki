@@ -17,6 +17,7 @@ from psycopg.rows import dict_row
 
 from ..openrouter.embeddings import Embedder
 from .attachments import images_in
+from .cards import shown_text
 from .scope import (
     AUTHOR,
     HEARD,
@@ -113,8 +114,11 @@ NO_DEADLINE = Deadline(math.inf)
 Semantic = Literal["full", "partial", "off"]
 
 
+# `own` is Kiki's user ID when the search is for her own messages: bots' are
+# otherwise left out, hers included.
 SCOPE = f"""
-m.guild_id = %(guild)s AND m.deleted_at IS NULL AND {PEOPLES}
+m.guild_id = %(guild)s AND m.deleted_at IS NULL
+AND ({PEOPLES} OR m.author_id = %(own)s::bigint)
 AND (%(channels)s::bigint[] IS NULL OR m.channel_id = ANY(%(channels)s))
 AND (%(authors)s::bigint[] IS NULL OR {AUTHOR} = ANY(%(authors)s))
 AND (%(after)s::timestamptz IS NULL OR m.created_at >= %(after)s)
@@ -127,7 +131,8 @@ AND NOT EXISTS (SELECT 1 FROM conversation_messages cm
 COLUMNS = (
     "m.id, m.channel_id, CASE WHEN m.relayed_for IS NULL THEN m.author_name END AS author_name,"
     f" {AUTHOR} AS author_id, {TEXT} AS content, m.created_at,"
-    " m.raw->'attachments' AS attachments, m.raw->'embeds' AS embeds"
+    " m.raw->'attachments' AS attachments, m.raw->'embeds' AS embeds,"
+    " m.raw->'components' AS components"
 )
 
 
@@ -171,6 +176,23 @@ LIMIT %(limit)s
 """
 
 
+# How the search refers to Kiki herself (`person`).
+YOU = {"you", "yourself", "kiki"}
+
+# Kiki's user ID: the author of her latest reply in the guild. The host isn't told
+# it; her replies are recorded on their runs.
+OWN_ID = """
+SELECT m.author_id FROM agent_runs r JOIN messages m ON m.id = r.reply_message_ids[1]
+WHERE m.guild_id = %s AND cardinality(r.reply_message_ids) > 0
+ORDER BY r.id DESC LIMIT 1
+"""
+
+
+async def own_id(connection: AsyncConnection, scope: Scope) -> int | None:
+    row = await (await connection.execute(OWN_ID, (scope.guild_id,))).fetchone()
+    return row[0] if row else None
+
+
 async def run_search(connection: AsyncConnection, params: dict, seconds: float) -> list | None:
     """SEARCH within `seconds` (`bounded`); None if it ran out (or no time was
     left to start it)."""
@@ -207,19 +229,23 @@ async def search(
     to a lexical search rather than running the caller out of time."""
     if not query.strip():
         raise ValueError("query must not be empty")
-    authors = channels = None
+    authors = channels = own = None
+    yours = bool(person) and person.strip().removeprefix("@").lower() in YOU
     if (person and person.strip()) or (channel and channel.strip()):
 
         async def resolve():
-            found_authors = found_channels = None
-            if person and person.strip():
+            found_authors = found_channels = found_own = None
+            if yours:
+                found_own = await own_id(connection, scope)
+                found_authors = [] if found_own is None else [found_own]
+            elif person and person.strip():
                 found_authors = await resolve_person(connection, scope, roster, person)
             if channel and channel.strip():
                 found_channels = await resolve_channel(connection, scope, channel)
-            return found_authors, found_channels
+            return found_authors, found_channels, found_own
 
         try:
-            authors, channels = await bounded(
+            authors, channels, own = await bounded(
                 connection,
                 min(RESOLVE_SECONDS, deadline.left(keep=LEXICAL_SECONDS + CITE_SECONDS)),
                 resolve,
@@ -228,7 +254,13 @@ async def search(
             # No results yet to fall back on.
             return {"error": "The search took too long. Try again, or narrow it down."}
         if authors is not None and not authors:
-            return {"error": f"No one named {person!r} has written in this server."}
+            if yours:
+                return {"error": "You haven't posted in this server yet."}
+            return {
+                "error": f"No one named {person!r} has written in this server. Names match"
+                " exactly: try their ref, @username or another name they go by, or search"
+                " without `person` and check who wrote each hit."
+            }
         if channels is not None and not channels:
             return {"error": f"There's no channel named {channel!r} in this server."}
     try:
@@ -251,6 +283,7 @@ async def search(
         "channels": channels,
         "conversation": scope.conversation_id,
         "authors": authors,
+        "own": own,
         "before": before,
         "after": after,
         "query": query,
@@ -323,6 +356,14 @@ async def search(
         result["note"] = UNCITED_NOTE
         return result
     result = {"semantic": semantic, "messages": cited}
+    if own is not None:
+        # Her messages aren't embedded (indexing.PENDING): words only.
+        result["note"] = "Your own messages match by their words only, not by meaning."
+    elif not rows:
+        result["note"] = (
+            "Nothing matched. If it should be here, try the words they'd have used"
+            " (names, slang, a distinctive phrase) or fewer filters."
+        )
     if authors and len(authors) > 1:
         result["note"] = (
             f"{person!r} matches {len(authors)} different people: "
@@ -373,19 +414,32 @@ async def message_context(
     rows = await cursor.fetchall()
     if not rows:
         return {"error": "no such message in this server"}
-    return {"messages": await cite_all(connection, scope, roster, rows)}
+    result = {"messages": await cite_all(connection, scope, roster, rows)}
+    if all(row["id"] != message_id for row in rows):
+        # It exists (else no rows), but its author is one Kiki doesn't read.
+        result["note"] = (
+            "That message is from an author you don't read (another chatbot), so it"
+            " isn't shown; these are the messages around it. It wasn't deleted."
+        )
+    return result
 
 
 async def cite_all(
-    connection: AsyncConnection, scope: Scope, roster: Roster, rows: list[dict]
+    connection: AsyncConnection,
+    scope: Scope,
+    roster: Roster,
+    rows: list[dict],
+    *,
+    chars: int | None = SNIPPET_CHARS,
 ) -> list[dict]:
-    """Hits labeled by who the author is now, with mentions as names."""
+    """Hits labeled by who the author is now, with mentions as names: the first
+    `chars` of their text, or all of it."""
     ids = {m["author_id"] for m in rows}
     for m in rows:
-        ids.update(int(i) for i in MENTION.findall(m["content"]))
+        ids.update(int(i) for i in MENTION.findall(shown_text(m)))
     names = await speakers(connection, scope, roster, ids)
     channels = await channel_names(connection, scope, {m["channel_id"] for m in rows})
-    return [cite(scope, m, names, channels) for m in rows]
+    return [cite(scope, m, names, channels, chars) for m in rows]
 
 
 def image_count(m: dict) -> int:
@@ -393,7 +447,13 @@ def image_count(m: dict) -> int:
     return len(images_in({"attachments": m.get("attachments"), "embeds": m.get("embeds")}))
 
 
-def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str]) -> dict:
+def cite(
+    scope: Scope,
+    m: dict,
+    names: dict[int, str],
+    channels: dict[int, str],
+    chars: int | None = SNIPPET_CHARS,
+) -> dict:
     def mention(match: re.Match) -> str:
         user_id = int(match[1])
         return "@" + names.get(user_id, match[0])
@@ -404,7 +464,7 @@ def cite(scope: Scope, m: dict, names: dict[int, str], channels: dict[int, str])
         "channel": "#" + channels.get(m["channel_id"], str(m["channel_id"])),
         "time": m["created_at"].isoformat(timespec="minutes"),
         "url": f"https://discord.com/channels/{scope.guild_id}/{m['channel_id']}/{m['id']}",
-        "text": MENTION.sub(mention, m["content"])[:SNIPPET_CHARS],
+        "text": MENTION.sub(mention, shown_text(m))[:chars],
     }
     if images := image_count(m):
         cited["images"] = images  # read_image can look at them
