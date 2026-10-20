@@ -169,7 +169,7 @@ settings whose upper bound the operator can lower with an env var (see Bounds).
 | `history_messages` | env `AGENT_HISTORY_MESSAGES` | 30 | 1–190 | server, ceiling |
 | `channel_context` | const `CHANNEL_CONTEXT` | 8 | 0–30 | server, ceiling |
 | `channel_context_age` | const `CHANNEL_CONTEXT_SECS` | 30 min | 0–24 h | server |
-| `reply_max_tokens` | const `MAX_REPLY_TOKENS` | 2000 | 100–4000, **per model request** | server, ceiling |
+| `reply_max_tokens` | const `MAX_REPLY_TOKENS` | 2000 | 100–4000, **per model request** (the answer's room; the host adds `REASONING_TOKENS` for thinking) | server, ceiling |
 | `max_tool_calls` | Python `MAX_TOOL_CALLS` | 4 | 0–8, **tool calls executed per run** | server, ceiling |
 | `max_model_requests` | Python `MAX_MODEL_REQUESTS` | 6 | 1–10 | server, ceiling |
 | `search_results` | Python `search(limit=10)` | 10 | 1–25 | server, ceiling |

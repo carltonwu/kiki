@@ -45,6 +45,9 @@ const RUN_KIND: &str = "(SELECT c.check_hit FROM classifications c \
                          WHERE c.message_id = r.trigger_message_ids[1])";
 
 const NOTIFY_CHANNEL: &str = "agent_run_queued";
+/// Posted when a reply run fails after its trigger was accepted, like a
+/// drawing's `(couldn't make that picture)`: the request must not end in silence.
+const FAILURE_NOTE: &str = "(couldn't answer that one, try again?)";
 /// Pending runs are also checked this often, in case a notification was lost
 /// while the listener reconnected.
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -454,7 +457,13 @@ impl Agent {
                 request
             }
         };
-        let result = self.host.execute(&request).await?;
+        let result = match self.host.execute(&request).await {
+            Ok(result) => result,
+            Err(e) => {
+                self.post_failure_note(claim, &context, record).await;
+                return Err(e);
+            }
+        };
         record.steps = result.steps;
         record.usage = result.usage;
         record.model = result.model;
@@ -506,6 +515,36 @@ impl Agent {
             record,
         )
         .await
+    }
+
+    /// Someone was waiting on this reply and the host couldn't write one (the
+    /// model failed, or the host is down): say so, rather than leave silence.
+    /// The run still fails; a note that can't be sent is only logged.
+    async fn post_failure_note(
+        &self,
+        claim: &Claim,
+        context: &context::Context,
+        record: &mut RunRecord,
+    ) {
+        let note = [delivery::Message {
+            text: FAILURE_NOTE.to_owned(),
+            delay: Duration::ZERO,
+        }];
+        if let Err(e) = self
+            .send(
+                context,
+                claim.run_id,
+                claim.conversation_id,
+                &note,
+                &[],
+                context.settings.chat_reply_reference,
+                metrics::Send::Reply,
+                record,
+            )
+            .await
+        {
+            warn!(run_id = claim.run_id, error = %e, "couldn't post the failure note");
+        }
     }
 
     async fn finish(

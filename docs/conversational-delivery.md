@@ -31,6 +31,17 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
   reactions added before the setting changed. This toggle does not ban emoji in
   Kiki's message text.
 
+## When a reply fails
+
+A reasoning chat model thinks inside `max_tokens`, so the host gives each request
+`REASONING_TOKENS` (2000) beyond `reply_max_tokens`. If a response is still all
+thinking and no text (reply:404 on 2026-10-20), pydantic-ai's `FallbackModel`
+sends the same request again with thinking off (`PydanticExecutor.chat_model`),
+so the run keeps its tool results. If the host job still fails, for this or
+any other reason, Rust posts `(couldn't answer that one, try again?)` in place of
+the reply (`Agent::post_failure_note`). The run is still recorded as failed, and
+nobody is left waiting in silence.
+
 ## Files and behavior
 
 - `services/ingester/src/guild_settings.rs`: settings, boolean parsing, min/max

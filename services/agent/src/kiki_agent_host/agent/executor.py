@@ -10,10 +10,16 @@ import httpx
 from openai import APIError, APIStatusError
 from psycopg import OperationalError
 from pydantic_ai import Agent, capture_run_messages
-from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.exceptions import (
+    FallbackExceptionGroup,
+    ModelAPIError,
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+)
 from pydantic_ai.images import ImageGenerationModel
 from pydantic_ai.messages import BinaryContent, ModelMessage, ModelResponse, RetryPromptPart
 from pydantic_ai.models import Model
+from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
@@ -35,7 +41,15 @@ from ..contracts import (
 )
 from ..executor import TransientError
 from ..media import drawing, generation
-from ..media.vision import ImageRefused, Vision, billed_cost, look, response_cost
+from ..media.vision import (
+    REASONING_TOKENS,
+    ImageRefused,
+    Vision,
+    billed_cost,
+    look,
+    out_of_room,
+    response_cost,
+)
 from ..openrouter.chat import WebOpenRouterModel
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
@@ -142,6 +156,23 @@ class PydanticExecutor:
     def model(self, name: str) -> Model:
         return WebOpenRouterModel(name, provider=self.provider)
 
+    def unthinking(self, name: str) -> Model:
+        """The same model with a reasoning model's thinking turned off."""
+        return WebOpenRouterModel(
+            name, provider=self.provider, settings={"openrouter_reasoning": {"enabled": False}}
+        )
+
+    def chat_model(self, name: str, billed: telemetry.Call) -> Model:
+        """A run's model, each response billed to `billed`. If its thinking uses
+        every token and writes nothing (reply:404 on 10-20, after two read_images),
+        the same request goes again with thinking off, so the run keeps its tool
+        results instead of failing."""
+        return FallbackModel(
+            Metered(self.model(name), billed),
+            Metered(self.unthinking(name), billed),
+            fallback_on=out_of_room,
+        )
+
     def image_model(self, name: str) -> ImageGenerationModel:
         return OpenRouterImageModel(name, self.images)
 
@@ -154,10 +185,12 @@ class PydanticExecutor:
         # its tools' calls are their own (guard.py).
         billed = telemetry.Call()
         options = {
-            "model": Metered(self.model(request.model), billed),
+            "model": self.chat_model(request.model, billed),
             "message_history": earlier,
             "model_settings": {
-                "max_tokens": request.max_output_tokens,
+                # `max_output_tokens` is the answer's room; a reasoning model thinks
+                # inside `max_tokens` too.
+                "max_tokens": request.max_output_tokens + REASONING_TOKENS,
                 "openrouter_usage": {"include": True},
             },
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
@@ -203,7 +236,7 @@ class PydanticExecutor:
                                 result = await reply_agent.run(
                                     prompt, deps=deps, capabilities=self.web_tools, **options
                                 )
-                            except UnexpectedModelBehavior:
+                            except (UnexpectedModelBehavior, FallbackExceptionGroup):
                                 log_misbehavior(request.id, messages)
                                 raise
                     finally:
@@ -220,7 +253,9 @@ class PydanticExecutor:
         responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
         web = web_use(responses)
         telemetry.model_requests(usage.requests)
-        cost = billed_cost(result)  # includes OpenRouter's web tool fees
+        # Includes OpenRouter's web tool fees, and responses thrown away for
+        # thinking until the limit (billed as they arrived, see `Metered`).
+        cost = billed.cost or billed_cost(result)
         extra = embed.cost + vision.cost
         if extra:
             cost = (cost or 0) + extra
