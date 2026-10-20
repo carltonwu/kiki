@@ -7,6 +7,10 @@ the simulator send nothing. The exporters read the other standard OTEL_* variabl
 Railway sleeps this service once it has sent nothing for 10 minutes, so nothing
 exports on a timer: metrics leave only on flush(), which the API runs after each
 job, and the span and log batches send only when they hold something.
+
+The host's own metrics and spans are recorded through the functions at the end
+(`llm_call`, `tool_call`, ...): with export off each is a None check, and the SDK
+is never imported.
 """
 
 import asyncio
@@ -16,9 +20,11 @@ import math
 import os
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
 
-from opentelemetry import metrics
+from opentelemetry import metrics, trace
+from opentelemetry.trace import SpanKind, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 logger = logging.getLogger(__name__)
@@ -43,8 +49,12 @@ EXCLUDED_LOGGERS = (
     "openai",
 )
 JOB_PATHS = "/v1/"
+# Histogram buckets (docs/observability.md, "Cardinality rules").
+DURATION_BUCKETS = (0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120)
+COUNT_BUCKETS = (1, 2, 5, 10, 20, 50)
 
 _providers: tuple | None = None
+_recorder: "Recorder | None" = None
 _handler: logging.Handler | None = None
 _closing = False
 _flushing: asyncio.Task | None = None
@@ -77,11 +87,11 @@ def resource_attributes(env: Mapping[str, str] = os.environ) -> dict[str, str]:
 def configure() -> bool:
     """Starts export when the environment enables it. Call once logging is set up
     and before the app and its HTTP clients are created."""
-    global _providers, _handler, _closing
+    global _providers, _handler, _closing, _recorder
     if _providers is not None or not enabled():
         return _providers is not None
     # Imported here: a process with export off never loads the SDK.
-    from opentelemetry import _logs, propagate, trace
+    from opentelemetry import _logs, propagate
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -90,6 +100,7 @@ def configure() -> bool:
         HTTPXClientInstrumentor,
     )
     from opentelemetry.instrumentation.logging.handler import LoggingHandler
+    from opentelemetry.instrumentation.psycopg import PsycopgInstrumentor
     from opentelemetry.sdk._logs import LoggerProvider
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.metrics import MeterProvider
@@ -112,10 +123,14 @@ def configure() -> bool:
     reader = PeriodicExportingMetricReader(
         OTLPMetricExporter(timeout=timeout), export_interval_millis=math.inf
     )
-    # Request and response size histograms: series spent on nothing we read.
-    drop_sizes = View(instrument_name="http.server.*.body.size", aggregation=DropAggregation())
+    # Series spent on nothing we read: request and response size histograms, and
+    # database client metrics (made only if the database semconv is opted into).
+    drop = [
+        View(instrument_name=name, aggregation=DropAggregation())
+        for name in ("http.server.*.body.size", "db.client.*")
+    ]
     meter_provider = MeterProvider(
-        resource=resource, metric_readers=[reader], views=[drop_sizes], shutdown_on_exit=False
+        resource=resource, metric_readers=[reader], views=drop, shutdown_on_exit=False
     )
     logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
     logger_provider.add_log_record_processor(
@@ -139,8 +154,12 @@ def configure() -> bool:
             request_hook=redact_url,
             async_request_hook=async_redact_url,
         )
+    # Query spans with the SQL text; parameters stay out (capture_parameters is
+    # off, and no query inlines a value). InRequestOnly drops errors' messages.
+    PsycopgInstrumentor().instrument(tracer_provider=InRequestOnly.Provider(tracer_provider))
     _closing = False
     _providers = (tracer_provider, meter_provider, logger_provider)
+    _recorder = Recorder(meter_provider, tracer_provider)
     logger.info("OpenTelemetry export on service=%s", resource_attributes()["service.name"])
     return True
 
@@ -215,11 +234,11 @@ def shutdown() -> None:
     """Flushes and stops the exporters within SHUTDOWN_SECONDS in all. For process
     exit. Each provider stops on its own daemon thread, so a stalled one neither
     starves the others nor keeps the process alive past the deadline."""
-    global _providers, _closing
+    global _providers, _closing, _recorder
     _closing = True
     if _providers is None:
         return
-    providers, _providers = _providers, None
+    providers, _providers, _recorder = _providers, None, None
     if _handler is not None:
         logging.getLogger().removeHandler(_handler)
     deadline = time.monotonic() + SHUTDOWN_SECONDS
@@ -292,3 +311,237 @@ class FlushAfterJobs:
         finally:
             if scope["type"] == "http" and scope["path"].startswith(JOB_PATHS):
                 flush_soon()
+
+
+class Recorder:
+    """The host's instruments (docs/observability.md, "Metric catalog") and its
+    tracer. Made only once export is on."""
+
+    def __init__(self, meter_provider, tracer_provider) -> None:
+        meter = meter_provider.get_meter(SCOPE)
+        self.tracer = tracer_provider.get_tracer(SCOPE)
+
+        def histogram(name: str, unit: str, description: str, buckets=DURATION_BUCKETS):
+            return meter.create_histogram(
+                name,
+                unit=unit,
+                description=description,
+                explicit_bucket_boundaries_advisory=buckets,
+            )
+
+        counter = meter.create_counter
+        self.jobs = counter("kiki.agent.jobs", unit="{job}", description="Job requests answered")
+        self.job_duration = histogram("kiki.agent.job.duration", "s", "Time running a job")
+        self.jobs_rejected = counter(
+            "kiki.agent.jobs.rejected", unit="{job}", description="Job requests turned away"
+        )
+        self.model_requests = histogram(
+            "kiki.agent.job.model_requests",
+            "{request}",
+            "Model requests per reply or topic run",
+            COUNT_BUCKETS,
+        )
+        self.llm_calls = counter("kiki.llm.calls", unit="{call}", description="Model calls")
+        self.llm_cost = counter("kiki.llm.cost_usd", unit="{USD}", description="Billed cost")
+        self.llm_tokens = counter("kiki.llm.tokens", unit="{token}", description="Tokens billed")
+        self.llm_duration = histogram("kiki.llm.duration", "s", "Model call time")
+        self.image_attempts = counter(
+            "kiki.images.attempts", unit="{attempt}", description="Image model attempts"
+        )
+        self.image_fallback = counter(
+            "kiki.images.fallback", unit="{attempt}", description="Fallback model attempts"
+        )
+        self.image_duration = histogram("kiki.images.duration", "s", "Image model attempt time")
+        self.tool_calls = counter("kiki.tools.calls", unit="{call}", description="Tool calls")
+        self.tool_duration = histogram("kiki.tools.duration", "s", "Tool call time")
+        self.web_calls = counter(
+            "kiki.web.calls", unit="{call}", description="OpenRouter web searches and fetches"
+        )
+
+    @contextlib.contextmanager
+    def span(self, name: str, attributes: dict) -> Iterator[trace.Span]:
+        with quiet_span(self.tracer, name, attributes=attributes) as span:
+            yield span
+
+
+@contextlib.contextmanager
+def quiet_span(tracer, name: str, **options) -> Iterator[trace.Span]:
+    """A span that keeps a failure's type, never its message: provider errors can
+    quote prompts or credentials, Postgres's the values a query was given."""
+    with tracer.start_as_current_span(
+        name, record_exception=False, set_status_on_exception=False, **options
+    ) as span:
+        try:
+            yield span
+        except BaseException as error:
+            span.set_attribute("error.type", type(error).__qualname__)
+            span.set_status(StatusCode.ERROR)
+            raise
+
+
+class InRequestOnly(trace.Tracer):
+    """psycopg's tracer: quiet spans, and only inside a recorded one (a request's),
+    so `kiki-agent-host index` doesn't start a trace per query."""
+
+    def __init__(self, tracer: trace.Tracer) -> None:
+        self.tracer = tracer
+
+    def start_span(self, name, context=None, *args, **kwargs) -> trace.Span:
+        if not trace.get_current_span(context).is_recording():
+            return trace.INVALID_SPAN
+        return self.tracer.start_span(name, context, *args, **kwargs)
+
+    @contextlib.contextmanager
+    def start_as_current_span(
+        self, name, context=None, kind=SpanKind.INTERNAL, attributes=None, **_options
+    ) -> Iterator[trace.Span]:
+        if not trace.get_current_span(context).is_recording():
+            yield trace.INVALID_SPAN
+            return
+        with quiet_span(
+            self.tracer, name, context=context, kind=kind, attributes=attributes
+        ) as span:
+            yield span
+
+    class Provider(trace.TracerProvider):
+        def __init__(self, provider: trace.TracerProvider) -> None:
+            self.provider = provider
+
+        def get_tracer(self, *args, **kwargs) -> trace.Tracer:
+            return InRequestOnly(self.provider.get_tracer(*args, **kwargs))
+
+
+@dataclass
+class Call:
+    """One recorded call. The caller sets `outcome` where it differs from what
+    the recorder infers, and `bill`s a model call."""
+
+    outcome: str = "ok"
+    cost: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    span: trace.Span = field(default=trace.INVALID_SPAN, repr=False)
+
+    def bill(self, cost: float | None, input_tokens: int | None = 0, output_tokens=0) -> None:
+        self.cost = cost or 0.0
+        self.input_tokens, self.output_tokens = input_tokens or 0, output_tokens or 0
+
+
+def timed_out(error: BaseException) -> bool:
+    # A job's deadline cancels its task; openai's and httpx's timeouts aren't
+    # TimeoutErrors.
+    return isinstance(error, TimeoutError | asyncio.CancelledError) or (
+        "Timeout" in type(error).__name__
+    )
+
+
+@contextlib.contextmanager
+def llm_call(purpose: str, model: str, *, span: str = "") -> Iterator[Call]:
+    """One model call as kiki.llm.* (`purpose` and the model actually called) and a
+    span with its cost and tokens. An exception makes it an error or a timeout."""
+    call = Call()
+    if (recorder := _recorder) is None:
+        yield call
+        return
+    labels = {"purpose": purpose, "model": model}
+    started = time.monotonic()
+    with recorder.span(
+        span or f"llm {purpose}", {"kiki.purpose": purpose, "gen_ai.request.model": model}
+    ) as call.span:
+        try:
+            yield call
+        except BaseException as error:
+            call.outcome = "timeout" if timed_out(error) else "error"
+            raise
+        finally:
+            recorder.llm_calls.add(1, {**labels, "result": call.outcome})
+            recorder.llm_duration.record(time.monotonic() - started, labels)
+            if call.cost:
+                recorder.llm_cost.add(call.cost, labels)
+            for kind, tokens in (("input", call.input_tokens), ("output", call.output_tokens)):
+                if tokens:
+                    recorder.llm_tokens.add(tokens, {**labels, "type": kind})
+            call.span.set_attributes(
+                {
+                    "kiki.llm.result": call.outcome,
+                    "kiki.cost_usd": call.cost,
+                    "gen_ai.usage.input_tokens": call.input_tokens,
+                    "gen_ai.usage.output_tokens": call.output_tokens,
+                }
+            )
+
+
+@contextlib.contextmanager
+def image_attempt(
+    model: str, failed_as: Callable[[BaseException], str], *, fallback: bool = False
+) -> Iterator[Call]:
+    """One image model attempt: an `llm_call` (purpose image) and kiki.images.*.
+    `failed_as` names a failure's result (safety_blocked, refused or failed);
+    `fallback` marks the fallback model's attempt after a safety block."""
+    result = "drawn"
+    started = time.monotonic()
+    with llm_call("image", model, span="image attempt") as call:
+        try:
+            yield call
+        except BaseException as error:
+            result = failed_as(error)
+            raise
+        finally:
+            if (recorder := _recorder) is not None:
+                recorder.image_attempts.add(1, {"model": model, "result": result})
+                recorder.image_duration.record(time.monotonic() - started, {"model": model})
+                if fallback:
+                    recorder.image_fallback.add(
+                        1, {"result": "drawn" if result == "drawn" else "failed"}
+                    )
+                call.span.set_attribute("kiki.image.result", result)
+
+
+@contextlib.contextmanager
+def tool_call(tool: str) -> Iterator[Call]:
+    """One tool call as kiki.tools.* and a span. The caller sets the outcome; an
+    exception makes it an error. One turned away (budget_exhausted) never ran, so
+    it has no duration."""
+    call = Call()
+    if (recorder := _recorder) is None:
+        yield call
+        return
+    started = time.monotonic()
+    with recorder.span(f"execute_tool {tool}", {"gen_ai.tool.name": tool}) as call.span:
+        try:
+            yield call
+        except BaseException:
+            call.outcome = "error"
+            raise
+        finally:
+            recorder.tool_calls.add(1, {"tool": tool, "outcome": call.outcome})
+            if call.outcome != "budget_exhausted":
+                recorder.tool_duration.record(time.monotonic() - started, {"tool": tool})
+            call.span.set_attribute("kiki.tool.outcome", call.outcome)
+
+
+def job_answered(kind: str, outcome: str) -> None:
+    if _recorder is not None:
+        _recorder.jobs.add(1, {"kind": kind, "outcome": outcome})
+
+
+def job_ran(kind: str, seconds: float) -> None:
+    if _recorder is not None:
+        _recorder.job_duration.record(seconds, {"kind": kind})
+
+
+def job_rejected(reason: str) -> None:
+    if _recorder is not None:
+        _recorder.jobs_rejected.add(1, {"reason": reason})
+
+
+def model_requests(requests: int) -> None:
+    if _recorder is not None:
+        _recorder.model_requests.record(requests)
+
+
+def web_calls(searches: int, fetches: int) -> None:
+    if _recorder is not None:
+        for kind, calls in (("search", searches), ("fetch", fetches)):
+            if calls:
+                _recorder.web_calls.add(calls, {"kind": kind})

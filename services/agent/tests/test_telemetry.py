@@ -238,3 +238,39 @@ asyncio.run(main())
     assert process.wait(timeout=60) == 0
     elapsed = time.monotonic() - shutting_down
     assert elapsed < telemetry.SHUTDOWN_SECONDS + 1, elapsed
+
+
+def test_queries_are_traced_inside_a_request_without_their_values():
+    """Postgres quotes values in its errors, so a failed query keeps only its type."""
+    if not os.getenv("TEST_DATABASE_URL"):
+        pytest.skip("set TEST_DATABASE_URL for Postgres integration tests")
+    run(
+        """
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from kiki_agent_host import db
+
+spans = InMemorySpanExporter()
+trace.get_tracer_provider().add_span_processor(SimpleSpanProcessor(spans))
+
+async def main():
+    async with await db.connect(os.environ["TEST_DATABASE_URL"]) as connection:
+        await connection.execute("SELECT %s::text", ("outside-secret",))
+        with trace.get_tracer("test").start_as_current_span("job"):
+            await connection.execute("SELECT %s::text", ("inside-secret",))
+            try:
+                await connection.execute("SELECT %s::int", ("not-a-number-secret",))
+            except Exception as error:
+                assert "secret" in str(error)  # what the span must not keep
+
+asyncio.run(main())
+queries = [s for s in spans.get_finished_spans() if s.name == "SELECT"]
+assert [s.attributes["db.statement"] for s in queries] == ["SELECT %s::text", "SELECT %s::int"]
+assert queries[1].attributes["error.type"] == "InvalidTextRepresentation", queries[1].attributes
+for span in spans.get_finished_spans():
+    assert not span.events, span.events
+    assert "secret" not in str(span.status.description)
+    assert not any("secret" in str(v) for v in span.attributes.values()), span.attributes
+"""
+    )

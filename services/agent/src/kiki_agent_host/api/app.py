@@ -42,9 +42,6 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
     slots = asyncio.Semaphore(settings.max_concurrent_jobs)
     bearer = HTTPBearer(auto_error=False)
     telemetry.instrument_app(app)
-    jobs = telemetry.meter().create_counter(
-        "kiki.agent.jobs", unit="{job}", description="Job requests by kind and outcome"
-    )
 
     async def authenticate(
         credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
@@ -67,6 +64,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
         try:
             await asyncio.wait_for(slots.acquire(), timeout=0.1)
         except TimeoutError:
+            telemetry.job_rejected("busy")
             raise HTTPException(status_code=503, detail="agent host is busy") from None
         started = time.monotonic()
         try:
@@ -83,13 +81,14 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 (time.monotonic() - started) * 1000,
                 max_rss_mb(),
             )
-            jobs.add(1, {"kind": kind, "outcome": result.status})
+            telemetry.job_answered(kind, result.status)
             return JSONResponse(
                 status_code=202 if result.status == "running" else 200,
                 content=result.model_dump(mode="json"),
             )
         except RequestConflict:
             logger.warning("job input conflict job_id=%s kind=%s", request.id, kind)
+            telemetry.job_rejected("conflict")
             raise HTTPException(
                 status_code=409, detail="job ID already has different input"
             ) from None
@@ -104,7 +103,7 @@ def create_app(settings: Settings, executor: Executor | None = None) -> FastAPI:
                 type(error).__name__,
                 (time.monotonic() - started) * 1000,
             )
-            jobs.add(1, {"kind": kind, "outcome": "interrupted"})
+            telemetry.job_answered(kind, "interrupted")
             raise HTTPException(
                 status_code=503, detail="job interrupted; retry the same ID"
             ) from None
