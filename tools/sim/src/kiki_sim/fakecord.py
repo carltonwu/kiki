@@ -734,6 +734,7 @@ class Fakecord:
         n = next(w.ids)
         record = {"kind": "topic" if not body.get("tools") else "reply", "request": body}
         usage = {}
+        finish = None
         if pictures := image_parts(messages):
             record["kind"] = "vision"
             prompt = " ".join(content_text(m.get("content")) for m in messages)
@@ -754,6 +755,13 @@ class Fakecord:
             else:
                 text = describe(pictures, body.get("model"))
             message = {"role": "assistant", "content": text}
+            thinking = (body.get("reasoning") or {}).get("enabled") is not False
+            if thinking and any("[overthinks]" in (png_label(p) or "") for p in pictures):
+                # A reasoning model that thinks until `max_tokens` and writes nothing,
+                # as DeepSeek V4.1 Flash did on real photos; without thinking it answers.
+                record["kind"] = "vision_out_of_room"
+                message = {"role": "assistant", "content": None, "reasoning": "hmm " * 50}
+                finish = "length"
         elif record["kind"] == "topic" and (
             note := re.search(
                 r"couldn't be made: (.*?)\. Write the one short message",
@@ -830,7 +838,8 @@ class Fakecord:
             "choices": [
                 {
                     "index": 0,
-                    "finish_reason": "tool_calls" if message.get("tool_calls") else "stop",
+                    "finish_reason": finish
+                    or ("tool_calls" if message.get("tool_calls") else "stop"),
                     "logprobs": None,
                     "message": {"refusal": None, **message},
                 }

@@ -186,6 +186,12 @@ than for people (agent to agent).
   cropped letters and told the two images apart, for $0.0007. The default chat
   model `deepseek/deepseek-v4.1-flash-1017` accepts images but described text
   that wasn't there, so set a vision model rather than relying on the fallback.
+- **Thinking:** a reasoning vision model thinks inside `max_tokens`, so `look`
+  (`media/vision.py`) gives it `REASONING_TOKENS` on top of the answer's room.
+  If it still thinks until the limit and writes nothing (pydantic-ai's "token
+  limit exceeded before any response"), it's asked once more with thinking off;
+  only if that also comes back empty does Kiki get an error, worded so she says
+  she couldn't see it rather than guessing. A cut-off answer is marked as such.
 - **In the prompt:** Rust renders a message's images as
   `[image: cat.png; message 123]` or `[gallery of 3 images: a.png, b.png,
   linked image; message 123]`, so the model has the ID to pass. File names are
