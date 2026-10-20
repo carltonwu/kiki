@@ -8,6 +8,11 @@ Railway sleeps this service once it has sent nothing for 10 minutes, so nothing
 exports on a timer: metrics leave only on flush(), which the API runs after each
 job, and the span and log batches send only when they hold something.
 
+So each wake is a new process whose counters start again, and Prometheus's
+increase() ignores a series' first sample: a counter's attribute set first
+exports a zero, and its real value once that has landed (`Baselines`,
+`MetricFlush`).
+
 The host's own metrics and spans are recorded through the functions at the end
 (`llm_call`, `tool_call`, ...): with export off each is a None check, and the SDK
 is never imported.
@@ -58,6 +63,9 @@ COUNT_BUCKETS = (1, 2, 5, 10)
 # Distinct `model` label values per process. Admins configure any model, and
 # aliases resolve to new versioned IDs over time; later ones become "other".
 MAX_MODELS = 16
+# Between a new series' zero and its first real value: Mimir keeps samples by
+# the millisecond, and two at one would be one.
+POINT_GAP_SECONDS = 0.01
 
 _providers: tuple | None = None
 _recorder: "Recorder | None" = None
@@ -127,9 +135,8 @@ def configure() -> bool:
     tracer_provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(timeout=timeout)))
     # An infinite interval starts no export thread; flush() collects instead.
     # Cumulative temporality (the exporter's default) suits Grafana's Mimir.
-    reader = PeriodicExportingMetricReader(
-        OTLPMetricExporter(timeout=timeout), export_interval_millis=math.inf
-    )
+    exporter = Acknowledged(OTLPMetricExporter(timeout=timeout))
+    reader = PeriodicExportingMetricReader(exporter, export_interval_millis=math.inf)
     # Series spent on nothing we read: request and response size histograms, and
     # database client metrics (made only if the database semconv is opted into).
     drop = [
@@ -165,8 +172,9 @@ def configure() -> bool:
     # (InRequestOnly), and errors' messages.
     PsycopgInstrumentor().instrument(tracer_provider=InRequestOnly.Provider(tracer_provider))
     _closing = False
-    _providers = (tracer_provider, meter_provider, logger_provider)
     _recorder = Recorder(meter_provider, tracer_provider)
+    metric_flush = MetricFlush(meter_provider, exporter, _recorder.baselines)
+    _providers = (tracer_provider, metric_flush, logger_provider)
     logger.info("OpenTelemetry export on service=%s", resource_attributes()["service.name"])
     return True
 
@@ -320,6 +328,120 @@ class FlushAfterJobs:
                 flush_soon()
 
 
+class Baselines:
+    """Zero baselines for the host's counters. An attribute set's first point in
+    a process would hold its first job's value, and increase() and rate() ignore
+    a series' first sample (Grafana Cloud doesn't ingest created timestamps), so
+    the first job after every wake would go uncounted.
+
+    A counter's new attribute set (a key) is added 0 at once and its values held
+    back until `MetricFlush` has sent the zero. Histograms can't be baselined (no
+    SDK measurement makes a point with a count of 0): their first observation
+    per attribute set per process goes uncounted by increase().
+
+    Recording is on the event loop, releasing on a flush thread: the lock covers
+    both."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # Keys whose zero has gone out in a flush: their values go straight in.
+        self._exported: set = set()
+        # Keys given their zero and the total held back since.
+        self._pending: dict = {}
+
+    def add(self, counter, amount: float, attributes: Mapping[str, str]) -> None:
+        key = (counter.name, frozenset(attributes.items()))
+        with self._lock:
+            if key in self._exported:
+                counter.add(amount, attributes)
+            elif key in self._pending:
+                self._pending[key][2] += amount
+            else:
+                counter.add(0, attributes)
+                self._pending[key] = [counter, attributes, amount]
+
+    def pending(self) -> frozenset:
+        """Keys whose zeros a flush started now sends."""
+        with self._lock:
+            return frozenset(self._pending)
+
+    def release(self, keys: frozenset) -> None:
+        """Adds the held-back values of `keys`, whose zeros an export has sent."""
+        with self._lock:
+            for key in keys:
+                if (held := self._pending.pop(key, None)) is not None:
+                    counter, attributes, amount = held
+                    counter.add(amount, attributes)
+            self._exported.update(keys)
+
+
+class Acknowledged:
+    """A metric exporter that keeps whether its last export landed: the reader
+    discards the result, and a zero must land before its value is released."""
+
+    def __init__(self, exporter) -> None:
+        self.exporter = exporter
+        self.succeeded = False
+
+    def export(self, metrics_data, timeout_millis: float = 10_000, **kwargs):
+        from opentelemetry.sdk.metrics.export import MetricExportResult
+
+        self.succeeded = False
+        result = self.exporter.export(metrics_data, timeout_millis=timeout_millis, **kwargs)
+        self.succeeded = result is MetricExportResult.SUCCESS
+        return result
+
+    def __getattr__(self, name: str):
+        return getattr(self.exporter, name)
+
+
+class MetricFlush:
+    """The meter provider, flushed through the counters' baselines. Every metric
+    flush, a job's or shutdown()'s, comes here, one at a time.
+
+    A flush sends what was recorded, new series' zeros included. Once that
+    export has landed, it waits POINT_GAP_SECONDS, releases those series' held
+    back values and sends them, so only a flush with new series exports twice.
+    Nothing else collects meanwhile, so a value's point is always the gap or
+    more after its zero's. If the export fails, the values stay held back and
+    the next flush sends the zeros again. The lock is held across exports: the
+    reader runs one export at a time anyway."""
+
+    def __init__(self, provider, exporter: Acknowledged, baselines: "Baselines") -> None:
+        self.provider = provider
+        self.exporter = exporter
+        self.baselines = baselines
+        self._lock = threading.Lock()
+
+    def force_flush(self, timeout_millis: float) -> None:
+        with self._lock:
+            # Taken before collecting: these keys' zeros are in this export.
+            zeroed = self.baselines.pending()
+            if self._export(timeout_millis) and zeroed:
+                time.sleep(POINT_GAP_SECONDS)
+                self.baselines.release(zeroed)
+                self._export(timeout_millis)
+
+    def _export(self, timeout_millis: float) -> bool:
+        self.exporter.succeeded = False
+        self.provider.force_flush(timeout_millis)
+        return self.exporter.succeeded
+
+    def shutdown(self) -> None:
+        self.provider.shutdown()
+
+
+class Counter:
+    """A counter recorded through `Baselines`."""
+
+    def __init__(self, counter, baselines: Baselines) -> None:
+        self.counter = counter
+        self.baselines = baselines
+
+    def add(self, amount: float, attributes: Mapping[str, str] | None = None) -> None:
+        self.baselines.add(self.counter, amount, attributes or {})
+
+
 class Recorder:
     """The host's instruments (docs/observability.md, "Metric catalog") and its
     tracer. Made only once export is on."""
@@ -336,7 +458,12 @@ class Recorder:
                 explicit_bucket_boundaries_advisory=buckets,
             )
 
-        counter = meter.create_counter
+        self.baselines = Baselines()
+
+        def counter(name: str, unit: str, description: str) -> Counter:
+            created = meter.create_counter(name, unit=unit, description=description)
+            return Counter(created, self.baselines)
+
         self.jobs = counter("kiki.agent.jobs", unit="{job}", description="Job requests answered")
         self.job_duration = histogram("kiki.agent.job.duration", "s", "Time running a job")
         self.jobs_rejected = counter(

@@ -36,6 +36,49 @@ agent host (Python) ─OTLP────┘
   So the host's metric samples are sparse: a counter has a sample only after a
   job, and an instant query goes stale five minutes later. Query them over a
   range (`increase(kiki_agent_jobs_total[$__range])`, `last_over_time(…[1h])`).
+- **Zero baselines (agent host counters).** Every wake is a new process, so
+  every series starts again, and `increase()`/`rate()` ignore a series' first
+  sample (Grafana Cloud doesn't ingest OTLP start times as created timestamps).
+  Exported as is, the first job after each wake would go uncounted: its cost,
+  tokens, calls, tool calls and image attempts. So a counter's attribute set
+  that is new in the process is added 0 at once and its values held back
+  (`Baselines` in `telemetry.py`). Every metric flush, a job's or shutdown's,
+  goes through one coordinator (`MetricFlush`), one at a time: it sends what
+  was recorded, the new series' zeros included, and only once that export is
+  acknowledged (the OTLP response, which the SDK's reader otherwise discards)
+  waits 10 ms, adds the held-back values and flushes again. Nothing collects in
+  between, so a value's point is always at least 10 ms after its zero's (Mimir
+  keeps milliseconds; two points in one would be one). If the zeros' export
+  fails, the values stay held back and the next flush sends the zeros again;
+  if the values' export fails, the next flush carries them (cumulative). Only a
+  flush with new series flushes twice, in practice the first after a wake;
+  between jobs nothing is sent, as before. Shutdown does the same for values
+  recorded outside a job (`kiki-agent-host index`). Limits:
+  - **Histograms aren't baselined**: no SDK measurement makes a point with a
+    count of 0 (recording 0 would count an observation in the lowest bucket).
+    Their `_count`, `_sum` and buckets miss the first observation per
+    attribute set per wake under `increase()`. Count jobs, calls and cost with
+    the counters (`kiki_agent_jobs_total`, `kiki_llm_calls_total`,
+    `kiki_llm_cost_usd_total`, `kiki_llm_tokens_total`), not histogram counts;
+    use the histograms for distributions.
+  - **`increase()` on these series is an operational estimate**, not a total.
+    It extrapolates toward the window's edges, and the few samples a sleepy
+    series has make that coarse: a window holding only a wake's zero and one
+    value reads about 1.5× that value, and up to about 2.1× when the window
+    ends just short of the extrapolation threshold (1.1× the gap between the
+    samples); four samples read about 1.17×. The excess shrinks as the range
+    holds more samples. Before baselines such a window read 0. Exact billing
+    totals come from the database: `agent_runs.cost_usd`,
+    `classifications.jev_cost_usd`, `conversations.topic_cost_usd`,
+    `agent_image_jobs.cost_usd` and `guild_emojis.describe_cost_usd`.
+  - **A partly rejected export counts as acknowledged.** The SDK's OTLP
+    exporter reports success on HTTP 200 without looking at
+    `partial_success.rejected_data_points`. If Mimir rejected a zero but
+    accepted the rest (a series limit, say), its value is released anyway and
+    that series' first job goes uncounted, as before baselines. That is rare
+    enough not to justify replacing the exporter.
+  - **The ingester** isn't baselined. It runs always, so only the first event
+    of each attribute set after a deploy or restart goes uncounted.
 - **The ingester runs always**, so it exports normally: spans and logs in batches,
   metrics every 60 s. Its main flushes and stops the exporters on every exit path,
   all three in parallel within 5 s (3 s per export request), so a stalled one
