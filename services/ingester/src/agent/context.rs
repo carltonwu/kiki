@@ -276,6 +276,10 @@ impl Agent {
         });
         let mut messages = vec![Message::system(instructions)];
         for m in &history {
+            // The ingester's failure note isn't hers to imitate.
+            if m.author_id == self.bot_user_id && m.content == super::FAILURE_NOTE {
+                continue;
+            }
             // Consecutive messages of one side become one turn: some models
             // require user and assistant turns to alternate. Kiki's long replies
             // are several Discord messages.
@@ -1617,6 +1621,140 @@ pub(super) mod tests {
                 "Padam Padam — Kylie Minogue · Song",
                 "Only a description",
                 "Only a title"
+            ]
+        );
+        test.drop().await;
+    }
+
+    /// reply:404 (10-20) failed and left silence; now a failure note is posted.
+    /// Like a reply, it's marked delivering before the send, so a crash after
+    /// Discord accepted it fails the run at startup instead of requeueing it
+    /// (the host would return the same failure, and a second note would follow).
+    #[tokio::test]
+    async fn a_failure_note_is_not_posted_twice_after_a_crash() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::{Json, Router, extract::State, routing::post};
+
+        let Some(test) = crate::test_db::migrated("ingester_failure_note").await else {
+            return;
+        };
+        let db = test.db.clone();
+        // A Discord that accepts every send.
+        let sends = Arc::new(AtomicUsize::new(0));
+        let accept = |State(sends): State<Arc<AtomicUsize>>, Json(body): Json<Value>| async move {
+            let n = sends.fetch_add(1, Ordering::SeqCst) as i64;
+            let mut sent = message(
+                500 + n,
+                json!({"id": "1", "username": "Kiki", "bot": true}),
+                json!({}),
+                body["content"].as_str().unwrap_or_default(),
+                json!([]),
+            );
+            sent["guild_id"] = json!(GUILD.to_string());
+            Json(sent)
+        };
+        let app = Router::new()
+            .route("/api/v10/channels/{channel}/messages", post(accept))
+            .with_state(sends.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let alex = json!({"id": "101", "username": "alex"});
+        let ask = message(10, alex, json!({}), "help kiki where my meme at", json!([]));
+        store::upsert_messages(&db, GUILD, &[ask]).await.unwrap();
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO guilds (id, name) VALUES (9, 'Theatre');
+            INSERT INTO channels (id, guild_id, name, type) VALUES (2, 9, 'general', 0);
+            INSERT INTO conversations (id, guild_id, channel_id, started_by) VALUES (1, 9, 2, 101);
+            INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (10, 1, 'mention');
+            INSERT INTO agent_runs (id, conversation_id, trigger_message_ids, status)
+            VALUES (1, 1, '{10}', 'running'), (2, 1, '{10}', 'running');
+            "#,
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let mut agent = agent(db.clone());
+        agent.http = Arc::new(
+            twilight_http::Client::builder()
+                .proxy(address.to_string(), true)
+                .ratelimiter(None)
+                .build(),
+        );
+        let context = agent.context(1, &[10]).await.unwrap().unwrap();
+        let claim = crate::agent::Claim {
+            run_id: 1,
+            kind: "mention",
+            trace_context: None,
+            superseded_traces: Vec::new(),
+            conversation_id: 1,
+            channel_id: CHANNEL,
+            trigger_message_ids: vec![10],
+            created_at_ms: 0,
+            host_request: None,
+        };
+        let mut record = crate::agent::RunRecord::default();
+        agent.post_failure_note(&claim, &context, &mut record).await;
+        assert_eq!(sends.load(Ordering::SeqCst), 1);
+        assert_eq!(record.reply_message_ids, [500]);
+
+        // Asked again, she doesn't see the note as something she said.
+        let again = message(
+            600,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "kiki??",
+            json!([]),
+        );
+        store::upsert_messages(&db, GUILD, &[again]).await.unwrap();
+        sqlx::query(
+            "INSERT INTO conversation_messages (message_id, conversation_id, via) VALUES (600, 1, 'decide')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let context = agent.context(1, &[600]).await.unwrap().unwrap();
+        let prompt: Vec<&str> = context
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            prompt
+                .iter()
+                .any(|m| m.contains("help kiki where my meme at"))
+        );
+        assert!(
+            !prompt
+                .iter()
+                .any(|m| m.contains(crate::agent::FAILURE_NOTE))
+        );
+
+        // The ingester crashes here, before `finish`; then it starts again.
+        let (interrupted, requeued) = crate::agent::recover_runs(&db).await.unwrap();
+        assert_eq!((interrupted.len(), requeued), (1, 1));
+        type Run = (i64, String, Option<String>, Option<Vec<i64>>);
+        let runs: Vec<Run> = sqlx::query_as(
+            "SELECT id, status, error, reply_message_ids FROM agent_runs ORDER BY id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            runs,
+            [
+                // Failed, not requeued: no second note.
+                (
+                    1,
+                    "failed".into(),
+                    Some("interrupted".into()),
+                    Some(vec![500])
+                ),
+                // A run that hadn't started sending is still retried.
+                (2, "pending".into(), None, None),
             ]
         );
         test.drop().await;

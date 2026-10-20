@@ -599,7 +599,7 @@ class Fakecord:
                             "id": model,
                             "name": model,
                             "architecture": {"output_modalities": ["text"]},
-                            "supported_parameters": ["tools"],
+                            "supported_parameters": ["tools", "reasoning"],
                             "pricing": {"prompt": "0", "completion": "0"},
                         }
                         for model in STUB_MODELS

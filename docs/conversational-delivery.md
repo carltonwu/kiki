@@ -33,14 +33,22 @@ Server settings are editable through `/kiki config key:<name> value:<value>`:
 
 ## When a reply fails
 
-A reasoning chat model thinks inside `max_tokens`, so the host gives each request
-`REASONING_TOKENS` (2000) beyond `reply_max_tokens`. If a response is still all
-thinking and no text (reply:404 on 2026-10-20), pydantic-ai's `FallbackModel`
-sends the same request again with thinking off (`PydanticExecutor.chat_model`),
-so the run keeps its tool results. If the host job still fails, for this or
-any other reason, Rust posts `(couldn't answer that one, try again?)` in place of
-the reply (`Agent::post_failure_note`). The run is still recorded as failed, and
-nobody is left waiting in silence.
+A chat model that thinks does so inside `max_tokens`. For a model that
+OpenRouter's catalog lists with the `reasoning` parameter (or one it can't
+look up), each request's cap is `reply_max_tokens` + `REASONING_TOKENS` (2000),
+shared by thinking and answer: OpenRouter can't cap the visible answer on its
+own, so on this path `reply_max_tokens` doesn't strictly limit the answer.
+Other models get `reply_max_tokens` alone. If a response ends at the limit with
+only thinking (no text and no tool call; reply:404 on 2026-10-20), pydantic-ai's
+`FallbackModel` sends the same request again with thinking off and the plain
+`reply_max_tokens` (`PydanticExecutor.chat_model`), so the run keeps its tool
+results.
+
+If the host job still fails, for this or any other reason, Rust marks the run
+delivering and posts `(couldn't answer that one, try again?)` in place of the
+reply (`Agent::post_failure_note`). The run is still recorded as failed; a crash
+after the send fails it at startup rather than posting the note again. The note
+is left out of Kiki's history so she doesn't imitate it.
 
 ## Files and behavior
 

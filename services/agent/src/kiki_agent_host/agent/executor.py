@@ -50,6 +50,7 @@ from ..media.vision import (
     out_of_room,
     response_cost,
 )
+from ..openrouter import catalog
 from ..openrouter.chat import WebOpenRouterModel
 from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
@@ -104,15 +105,19 @@ def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> None:
 class Metered(WrapperModel):
     """A run's model, billing each response to the run's telemetry call as it
     arrives, with its web searches and fetches: a run that fails later (a usage
-    limit, a tool, the provider) still paid for the requests before."""
+    limit, a tool, the provider) still paid for the requests before.
+    `max_tokens`, if set, replaces the run's for this model's requests."""
 
-    def __init__(self, wrapped: Model, call: telemetry.Call):
+    def __init__(self, wrapped: Model, call: telemetry.Call, *, max_tokens: int | None = None):
         super().__init__(wrapped)
         self.call = call
+        self.max_tokens = max_tokens
 
     # Runs don't stream, so request_stream isn't metered.
-    async def request(self, *args, **kwargs) -> ModelResponse:
-        response = await super().request(*args, **kwargs)
+    async def request(self, messages, model_settings, model_request_parameters) -> ModelResponse:
+        if self.max_tokens is not None:
+            model_settings = {**(model_settings or {}), "max_tokens": self.max_tokens}
+        response = await super().request(messages, model_settings, model_request_parameters)
         usage = response.usage
         self.call.bill(response_cost(response), usage.input_tokens, usage.output_tokens)
         web = web_use([response])
@@ -162,14 +167,21 @@ class PydanticExecutor:
             name, provider=self.provider, settings={"openrouter_reasoning": {"enabled": False}}
         )
 
-    def chat_model(self, name: str, billed: telemetry.Call) -> Model:
-        """A run's model, each response billed to `billed`. If its thinking uses
-        every token and writes nothing (reply:404 on 10-20, after two read_images),
-        the same request goes again with thinking off, so the run keeps its tool
-        results instead of failing."""
+    async def thinks(self, name: str) -> bool:
+        return await catalog.reasons(name)
+
+    async def chat_model(self, name: str, billed: telemetry.Call, max_tokens: int) -> Model:
+        """A run's model, each response billed to `billed`, with `max_tokens`
+        (`reply_max_tokens`) per request. A model that thinks does so inside
+        `max_tokens`, so it gets `REASONING_TOKENS` more; if its thinking still
+        uses every token and leaves nothing to show or do (reply:404 on 10-20,
+        after two read_images), the same request goes again with thinking off and
+        the plain cap, so the run keeps its tool results instead of failing."""
+        if not await self.thinks(name):
+            return Metered(self.model(name), billed, max_tokens=max_tokens)
         return FallbackModel(
-            Metered(self.model(name), billed),
-            Metered(self.unthinking(name), billed),
+            Metered(self.model(name), billed, max_tokens=max_tokens + REASONING_TOKENS),
+            Metered(self.unthinking(name), billed, max_tokens=max_tokens),
             fallback_on=out_of_room,
         )
 
@@ -185,12 +197,10 @@ class PydanticExecutor:
         # its tools' calls are their own (guard.py).
         billed = telemetry.Call()
         options = {
-            "model": self.chat_model(request.model, billed),
+            "model": await self.chat_model(request.model, billed, request.max_output_tokens),
             "message_history": earlier,
             "model_settings": {
-                # `max_output_tokens` is the answer's room; a reasoning model thinks
-                # inside `max_tokens` too.
-                "max_tokens": request.max_output_tokens + REASONING_TOKENS,
+                "max_tokens": request.max_output_tokens,  # each model sets its own
                 "openrouter_usage": {"include": True},
             },
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),

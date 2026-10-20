@@ -79,12 +79,15 @@ async def test_a_reply_that_only_thinks_goes_again_without_thinking(database_url
 
     def unthinking(messages, info: AgentInfo) -> ModelResponse:
         unthinking_messages.append(messages)
+        unthinking_settings.append(info.model_settings)
         return ModelResponse(parts=[TextPart("on its way")], provider_details={"cost": 0.0005})
 
+    unthinking_settings = []
     result = await executor(database_url, thinking, unthinking).execute(job("reply"))
     assert result.text == "on its way"
-    # Thinking has room beyond the answer's.
+    # Thinking has room beyond the answer's; without thinking it's the plain cap.
     assert [s["max_tokens"] for s in thinking_settings] == [100 + REASONING_TOKENS] * 2
+    assert [s["max_tokens"] for s in unthinking_settings] == [100]
     # The same request went again: the tool's result is still there, not rerun.
     returns = [p for m in unthinking_messages[0] for p in m.parts if isinstance(p, ToolReturnPart)]
     assert [r.tool_name for r in returns] == ["find_emoji"]
@@ -98,6 +101,66 @@ async def test_a_topic_that_only_thinks_goes_again_without_thinking():
 
     e = executor("unused", lambda messages, info: thought_only(), unthinking)
     assert (await e.execute(job("topic"))).text == "memes"
+
+
+async def test_a_tool_call_that_ends_at_the_limit_is_acted_on(database_url):
+    """Complete tool arguments that finish exactly at the limit aren't thrown
+    away for an answer without the tool (review of #68: no drawing was queued)."""
+    calls = []
+
+    def thinking(messages, info: AgentInfo) -> ModelResponse:
+        returns = [p for m in messages for p in m.parts if isinstance(p, ToolReturnPart)]
+        if returns:
+            return ModelResponse(parts=[TextPart("done")])
+        call = ToolCallPart("find_emoji", {"name": "huh"}, tool_call_id="1")
+        return ModelResponse(parts=[ThinkingPart("hmm"), call], finish_reason="length")
+
+    def unthinking(messages, info: AgentInfo) -> ModelResponse:
+        calls.append(messages)
+        return ModelResponse(parts=[TextPart("without the tool")])
+
+    result = await executor(database_url, thinking, unthinking).execute(job("reply"))
+    assert result.text == "done"
+    assert calls == []
+
+
+async def test_a_model_that_doesnt_think_keeps_the_plain_cap(model_catalog):
+    model_catalog["test/model"] = frozenset({"tools", "max_tokens"})
+    seen = []
+
+    def plain(messages, info: AgentInfo) -> ModelResponse:
+        seen.append(info.model_settings["max_tokens"])
+        return ModelResponse(parts=[TextPart("memes")])
+
+    e = executor("unused", plain, lambda m, i: pytest.fail("no fallback without thinking"))
+    assert (await e.execute(job("topic"))).text == "memes"
+    assert seen == [100]
+
+
+async def test_the_catalog_says_which_models_think(model_catalog, monkeypatch):
+    from kiki_agent_host.openrouter import catalog
+
+    model_catalog |= {
+        "deepseek/deepseek-v4.1-flash-1017": frozenset({"tools", "reasoning"}),
+        "openai/gpt-4o-mini": frozenset({"tools"}),
+    }
+    assert await catalog.reasons("deepseek/deepseek-v4.1-flash-1017")
+    assert not await catalog.reasons("openai/gpt-4o-mini")
+    assert await catalog.reasons("new/unlisted-model")  # unknown: give it room
+
+    # Unreadable: every model gets room, and replies don't each wait on a retry.
+    fetches = []
+
+    async def down():
+        fetches.append(1)
+        raise catalog.httpx.ConnectError("down")
+
+    monkeypatch.setattr(catalog, "fetch", down)
+    monkeypatch.setattr(catalog, "_catalog", {})
+    monkeypatch.setattr(catalog, "_fetched_at", -float("inf"))
+    assert await catalog.reasons("openai/gpt-4o-mini")
+    assert await catalog.reasons("openai/gpt-4o-mini")
+    assert fetches == [1]
 
 
 async def test_no_answer_even_without_thinking_fails_the_job():

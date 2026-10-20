@@ -114,3 +114,20 @@ def recorded(monkeypatch):
     monkeypatch.setattr(telemetry, "_recorder", recorder)
     monkeypatch.setattr(telemetry, "_models", set())
     return Recorded(reader, spans, recorder)
+
+
+@pytest.fixture(autouse=True)
+def model_catalog(monkeypatch):
+    """OpenRouter's model catalog, empty (every model counts as thinking) unless a
+    test fills it: tests don't fetch the real one."""
+    from kiki_agent_host.openrouter import catalog
+
+    listed: dict[str, frozenset[str]] = {}
+
+    async def fetch():
+        return dict(listed)
+
+    monkeypatch.setattr(catalog, "fetch", fetch)
+    monkeypatch.setattr(catalog, "_catalog", {})
+    monkeypatch.setattr(catalog, "_fetched_at", -float("inf"))
+    return listed

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from pydantic_ai import Agent, capture_run_messages
 from pydantic_ai.exceptions import ModelAPIError, ModelHTTPError, UnexpectedModelBehavior
-from pydantic_ai.messages import ModelResponse, UserContent
+from pydantic_ai.messages import ModelResponse, TextPart, ThinkingPart, UserContent
 from pydantic_ai.models import Model
 from pydantic_ai.usage import UsageLimits
 
@@ -163,9 +163,13 @@ async def _look(
 
 
 def out_of_room(response: ModelResponse) -> bool:
-    """Whether the token limit hit before any text (pydantic-ai's "token limit
-    exceeded before any response"): all thinking, no answer."""
-    return response.finish_reason == "length" and not response.text
+    """Whether the token limit hit with nothing to show or do (pydantic-ai's
+    "token limit exceeded before any response"): only thinking, if anything. A
+    complete tool call that ends right at the limit still counts."""
+    return response.finish_reason == "length" and all(
+        isinstance(p, ThinkingPart) or (isinstance(p, TextPart) and not p.content)
+        for p in response.parts
+    )
 
 
 def bill(call: telemetry.Call, run) -> None:
