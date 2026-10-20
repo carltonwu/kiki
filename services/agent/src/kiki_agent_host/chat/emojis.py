@@ -355,9 +355,12 @@ TOKEN = re.compile(
     r"|(?<![\w:<])(?P<codes>(?::\w{2,32}:)+)(?![\w:])"
 )
 SHORTCODE = re.compile(r":(\w{2,32}):")
-# Longer replies aren't checked (Discord's messages are 2,000 characters; a reply
-# is a few). It bounds the scan, which runs in the event loop.
-MAX_CHECKED_CHARS = 20_000
+# A Discord ID has at most 20 digits; longer ones aren't parsed (Python refuses to
+# convert over 4,300 digits, which would fail the reply).
+MAX_ID_DIGITS = 20
+# Problems that get close-name suggestions and appear in a retry: the rest of a
+# reply full of bad emoji is still cut, without a fuzzy match per emoji.
+MAX_SUGGESTED = 10
 # A cut emoji's place, until `tidy` closes the gap around it.
 CUT = "\x00"
 GAP = re.compile(r"[ \t]*\x00(?:[ \t,]*\x00)*[ \t]*")
@@ -426,7 +429,7 @@ async def catalog(connection: AsyncConnection, guild_id: int) -> Catalog:
 
 def has_emoji(text: str) -> bool:
     """Whether `text` writes any emoji `check` would look at (protected or not)."""
-    return len(text) <= MAX_CHECKED_CHARS and TOKEN.search(text) is not None
+    return TOKEN.search(text) is not None
 
 
 @dataclass
@@ -446,8 +449,6 @@ def check(text: str, emojis: Catalog) -> Checked:
     catalog. A known name is rewritten as `<:name:id>` with its real ID and
     animated flag. Until the server's list is first synced, written-out custom
     emoji can't be checked and pass. Shortcodes never render either way."""
-    if len(text) > MAX_CHECKED_CHARS:
-        return Checked(text, text)
     problems: list[str] = []
 
     def custom(match: re.Match) -> str | None:
@@ -455,14 +456,15 @@ def check(text: str, emojis: Catalog) -> Checked:
         token, name, digits = match["custom"], match["name"], match["id"]
         if not emojis.synced:
             return token
-        row = emojis.by_id.get(int(digits)) if digits and int(digits) <= MAX_ID else None
+        emoji_id = int(digits) if 0 < len(digits) <= MAX_ID_DIGITS else None
+        row = emojis.by_id.get(emoji_id) if emoji_id and emoji_id <= MAX_ID else None
         if row is not None and not usable(row):
             why = "was removed from this server" if row["removed"] else "is unavailable here"
             problems.append(f"{token} {why}")
             return None
         row = row or (emojis.named(name) if name else None)
         if row is None:
-            problems.append(unknown(token, name, emojis))
+            problems.append(unknown(token, name, emojis, suggest=len(problems) < MAX_SUGGESTED))
             return None
         return written(row)
 
@@ -507,9 +509,10 @@ def check(text: str, emojis: Catalog) -> Checked:
     return Checked(result, tidy("".join(cut), had_message=has_message(text)), problems, fixed)
 
 
-def unknown(token: str, name: str, emojis: Catalog) -> str:
-    problem = f"{token}: this server has no custom emoji named {name or '(no name)'}"
-    if close := (emojis.close(name) if name else []):
+def unknown(token: str, name: str, emojis: Catalog, *, suggest: bool = True) -> str:
+    shown = token if len(token) <= 80 else f"{token[:77]}..."
+    problem = f"{shown}: this server has no custom emoji named {name or '(no name)'}"
+    if close := (emojis.close(name) if name and suggest else []):
         problem += f" (close names here: {' '.join(close)})"
     return problem
 

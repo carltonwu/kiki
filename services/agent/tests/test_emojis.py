@@ -662,9 +662,9 @@ def test_scans_stay_linear_on_hostile_input():
         started = time.monotonic()
         markdown.protected(hostile)
         assert time.monotonic() - started < 2, hostile[:10]
-    # The check itself skips anything longer than a reply can be.
-    huge = "[" * (emojis.MAX_CHECKED_CHARS + 1) + " <:salute:1>"
-    assert emojis.check(huge, SERVER).problems == []
+    # A reply of any length is checked.
+    huge = "[" * 50_000 + " <:salute:1>"
+    assert emojis.check(huge, SERVER).problems
 
 
 def test_messages_left_empty_between_separators_are_dropped():
@@ -706,3 +706,52 @@ def test_escaped_backticks_are_literal():
     assert emojis.check("\\``code :salute: `", SERVER).problems == []
     # Inside a span, backslashes are literal: this one doesn't escape the closer.
     assert emojis.check("`a\\` :salute:", SERVER).problems
+
+
+# Third review of PR #67 (GPT-6.1-Sol), one test per finding.
+
+
+async def test_an_id_too_long_for_int_is_invalid_not_a_crash(database_url, db):
+    """Finding 1: `int()` on 4,301 digits raised, which lost the reply."""
+    absurd = "<:huh:" + "9" * 4301 + ">"
+    checked = emojis.check(f"ok {absurd}", SERVER)
+    # Not a usable ID, so the name decides, as for <:huh:>: fixed to the real huh.
+    assert checked.problems == [] and checked.text == "ok <:huh:1085017182301339648>"
+    fake = "<:nothing:" + "9" * 4301 + ">"
+    checked = emojis.check(f"ok {fake}", SERVER)
+    assert checked.problems and checked.stripped == "ok"
+    assert len(checked.problems[0]) < 200
+    await add(db, 11, "huh", "a confused face")
+    text, _ = await run_turns(database_url, f"ok {fake}")
+    assert text == "ok"
+
+
+def test_an_emoji_right_after_a_link_is_checked():
+    """Finding 2: protection ran to the next whitespace, past the link."""
+    for text in [
+        "[x](https://example.com)<:fake:1>",
+        "https://example.com<:fake:1>",
+        "<https://example.com><:fake:1>",
+        "[x](https://example.com/a_(b))<:fake:1>",
+        "[x](https://example.com/a\\)b)<:fake:1>",
+    ]:
+        checked = emojis.check(text, SERVER)
+        assert len(checked.problems) == 1 and "<:fake:1>" not in checked.stripped, text
+    # The destination itself is still left alone.
+    text = "[x](https://example.com/a_(b)/:salute:)<:dstrike:700413229767327835>"
+    assert emojis.check(text, SERVER) == emojis.Checked(text, text)
+
+
+def test_long_replies_are_checked_and_stay_fast():
+    """Finding 3: replies over 20,000 characters skipped the check, and
+    delivery splits them, so a fake emoji got posted."""
+    import time
+
+    long = "word " * 10_000 + "<:fake:1>"
+    checked = emojis.check(long, SERVER)
+    assert checked.problems and "<:fake:1>" not in checked.stripped
+    many = " ".join(["<:fake:1>"] * 10_000 + ["ok"])
+    started = time.monotonic()
+    checked = emojis.check(many, SERVER)
+    assert time.monotonic() - started < 2
+    assert len(checked.problems) == 10_000 and checked.stripped == "ok"

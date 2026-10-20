@@ -10,17 +10,18 @@ closes at the next run of exactly the same length; a run with no match is
 literal text. A backslash before an opening backtick escapes it; inside a span,
 backslashes are literal, so one can't escape the closer.
 
-Links are protected conservatively rather than parsed: from a markdown link's
-`](` to the next whitespace (so a destination's parentheses, balanced or not,
-never matter), and bare or `<...>` URLs to theirs. A link's text in brackets is
-still checked, like any of Kiki's words.
+Links are protected without matching brackets: a markdown link's destination
+from `](` to its balanced closing parenthesis (CommonMark's rule; whitespace or
+`<` ends it too), and a bare URL up to whitespace or `<`, which a URL can't
+contain unescaped. So an emoji written right after a link is still checked. A
+link's text in brackets is still checked too, like any of Kiki's words.
 """
 
 import bisect
 import re
 
 FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})(.*)")
-LINK = re.compile(r"\]\(\S*|<https?://[^>\s]*>?|https?://\S+")
+URL = re.compile(r"<https?://[^>\s]*>?|https?://[^\s<]+")
 QUOTE_LINE = re.compile(r"^ *> .*$", re.MULTILINE)
 QUOTE_REST = re.compile(r"^ *>>> .*\Z", re.MULTILINE | re.DOTALL)
 BACKTICKS = re.compile(r"`+")
@@ -38,11 +39,33 @@ def protected(text: str) -> list[bool]:
     for start, end in free(text, mask):
         for span in inline_code(text, start, end):
             mark(*span)
-    for pattern in (LINK, QUOTE_LINE, QUOTE_REST):
+    for start, end in destinations(text):
+        if not mask[start]:
+            mark(start, end)
+    for pattern in (URL, QUOTE_LINE, QUOTE_REST):
         for match in pattern.finditer(text):
             if not mask[match.start()]:
                 mark(match.start(), match.end())
     return mask
+
+
+def destinations(text: str) -> list[tuple[int, int]]:
+    """Each markdown link destination, from its `](` through the parenthesis that
+    balances the opening one (or to whitespace or `<`, if none does). The search
+    resumes after each one, so the scan is linear."""
+    spans, at = [], text.find("](")
+    while at != -1:
+        depth, i = 1, at + 2
+        while i < len(text) and depth and not text[i].isspace() and text[i] != "<":
+            if text[i] == "\\":
+                i += 2  # an escaped character, like \) in a destination
+                continue
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        i = min(i, len(text))
+        spans.append((at, i))
+        at = text.find("](", i)
+    return spans
 
 
 def fences(text: str) -> list[tuple[int, int]]:

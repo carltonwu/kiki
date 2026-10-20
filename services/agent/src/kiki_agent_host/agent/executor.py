@@ -189,8 +189,7 @@ class PydanticExecutor:
                         memory=MemorySession(self.database_url),
                         request_limit=MAX_MODEL_REQUESTS,
                     )
-                    # Before indexing starts on this connection: the emoji tools'
-                    # prepare and the reply's check use it without waiting behind it.
+                    # The emoji tools' prepare reads it; the reply's check reads it again.
                     deps.emojis = await emojis.catalog(connection, scope.guild_id)
                     # Embedding is cheap: start while the model reads the prompt,
                     # rather than when it first searches.

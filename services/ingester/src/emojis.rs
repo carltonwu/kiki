@@ -49,6 +49,11 @@ pub async fn sync(
     snapshot_ms: Option<i64>,
 ) -> sqlx::Result<Option<Synced>> {
     let mut tx = db.begin().await?;
+    // Another sync of this guild holds the lock for one short statement; waiting
+    // longer means something is stuck, so fail this sync instead of hanging.
+    sqlx::query("SET LOCAL lock_timeout = '10s'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('guild_emojis:' || $1, 0))")
         .bind(guild_id.to_string())
         .execute(&mut *tx)

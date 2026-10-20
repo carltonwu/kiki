@@ -473,14 +473,14 @@ queries are an argument error returned to the model.
   (run together too, like `:a::b:`) against the catalog as it is when each
   answer arrives. It skips code (CommonMark fences and backtick runs, with
   escapes; `chat/markdown.py`), links and quotes, which aren't Kiki's own words.
-  Links are skipped conservatively, from a markdown link's `](` or a URL to the
-  next whitespace, rather than parsed: no destination can be misread, and every
-  scan stays linear. Replies over 20,000 characters aren't checked.
+  A markdown link's destination is skipped from `](` to its balanced closing
+  parenthesis, and a bare URL up to whitespace or `<` (which a URL can't
+  contain unescaped), so an emoji written right after a link is still checked.
+  Every scan is linear, so replies of any length are checked.
   - A known name is rewritten as Discord needs it: its real ID, the `a` for an
     animated emoji, and its exact name.
   - The catalog is read again for every answer that writes emoji, so one the
-    Gateway added or deleted mid-run counts. That read uses the memory session's
-    connection while indexing still holds the run's.
+    Gateway added or deleted mid-run counts.
   - An unusable emoji raises `ModelRetry`, naming close matches, while the run has
     an output retry and a model request left. A retry costs at least one request,
     more if the model searches first. `LastRequestAnswers` sends no function tools

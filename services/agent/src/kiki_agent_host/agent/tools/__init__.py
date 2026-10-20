@@ -57,14 +57,9 @@ reply_agent = Agent(
 
 async def current_catalog(deps: Deps) -> emoji_catalog.Catalog:
     """The server's emoji as of now. The Gateway may have added or deleted one
-    since the run started, and the emoji tools read the table too. Read on the
-    run's connection once indexing is done; until then, on the memory session's,
-    so it doesn't wait behind indexing."""
-    if deps.indexing is None or deps.indexing.done():
-        return await emoji_catalog.catalog(deps.connection, deps.scope.guild_id)
-    async with deps.memory.lock:
-        connection = await deps.memory.connect()
-        return await emoji_catalog.catalog(connection, deps.scope.guild_id)
+    since the run started, and the emoji tools read the table too. Indexing has
+    its own connection, so this doesn't wait behind it."""
+    return await emoji_catalog.catalog(deps.connection, deps.scope.guild_id)
 
 
 @reply_agent.output_validator
@@ -111,7 +106,12 @@ async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
         raise ModelRetry(
             "Your reply uses emoji Discord can't show, so they would be posted as text "
             "(or, as reactions, silently left out):\n- "
-            + "\n- ".join(checked.problems)
+            + "\n- ".join(checked.problems[: emoji_catalog.MAX_SUGGESTED])
+            + (
+                f"\n- and {len(checked.problems) - emoji_catalog.MAX_SUGGESTED} more"
+                if len(checked.problems) > emoji_catalog.MAX_SUGGESTED
+                else ""
+            )
             + f"\n{how} Then write your whole reply again."
         )
     logger.warning(
