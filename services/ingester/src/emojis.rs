@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 /// How long a sync waits for another sync of its guild. One holds the lock for
 /// a single short statement; waiting longer means something is stuck.
-const LOCK_TIMEOUT: &str = if cfg!(test) { "300ms" } else { "10s" };
+const LOCK_TIMEOUT: &str = if cfg!(test) { "2s" } else { "10s" };
 
 /// What a sync changed.
 #[derive(Debug, Default, FromRow, PartialEq)]
@@ -367,22 +367,28 @@ mod tests {
             return;
         };
         let db = test.db.clone();
+        // Advisory locks are database-wide, and other tests sync guild 1 in their
+        // own schemas: hold a guild only this test uses.
+        const GUILD: i64 = 9_100_001;
         let mut holder = db.begin().await.unwrap();
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('guild_emojis:' || $1, 0))")
-            .bind("1")
+            .bind(GUILD.to_string())
             .execute(&mut *holder)
             .await
             .unwrap();
         let started = std::time::Instant::now();
         let event = json!([{"id": "11", "name": "huh"}]);
-        sync_logged(db.clone(), 1, event.clone(), now_us()).await;
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        assert!(sync(&db, 1, &[], now_us()).await.is_err(), "still locked");
-        assert!(list(&db, 1).await.unwrap().is_empty());
+        sync_logged(db.clone(), GUILD, event.clone(), now_us()).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        assert!(
+            sync(&db, GUILD, &[], now_us()).await.is_err(),
+            "still locked"
+        );
+        assert!(list(&db, GUILD).await.unwrap().is_empty());
         holder.rollback().await.unwrap();
         // Once the lock is free, the next event syncs as usual.
-        sync_logged(db.clone(), 1, event, now_us()).await;
-        assert_eq!(list(&db, 1).await.unwrap().len(), 1);
+        sync_logged(db.clone(), GUILD, event, now_us()).await;
+        assert_eq!(list(&db, GUILD).await.unwrap().len(), 1);
         test.drop().await;
     }
 
