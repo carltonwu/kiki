@@ -19,6 +19,13 @@ logger = logging.getLogger(__name__)
 
 viewer = Agent()
 
+# A reasoning model's thinking counts against `max_tokens`. On a two-image
+# gallery DeepSeek V4.1 Flash thought for 400 to 1,100 tokens, so a cap sized
+# for the description alone ran out mid-thought (no text, so pydantic-ai raised
+# UnexpectedModelBehavior) or mid-description (cut off). `look` adds this much
+# on top of the answer's room.
+REASONING_TOKENS = 2000
+
 
 @dataclass
 class Vision:
@@ -50,9 +57,11 @@ async def look(
 ) -> str:
     """One vision model request; its billed cost is added to `vision.cost`.
     `think=False` turns off a reasoning model's thinking, for quick yes/no checks:
-    over several photos it can take longer than the answer is worth."""
+    over several photos it can take longer than the answer is worth.
+    `max_tokens` is the answer's room; thinking gets `REASONING_TOKENS` more."""
     vision.calls += 1
-    settings: dict = {"max_tokens": max_tokens, "openrouter_usage": {"include": True}}
+    budget = max_tokens + REASONING_TOKENS if think else max_tokens
+    settings: dict = {"max_tokens": budget, "openrouter_usage": {"include": True}}
     if not think:
         settings["openrouter_reasoning"] = {"enabled": False}
         settings["temperature"] = 0  # the same photos get the same verdicts
@@ -92,6 +101,10 @@ async def look(
     vision.cost += billed_cost(run) or 0.0
     if not run.output.strip():
         raise ImageRefused("The image model returned no description.")
+    if run.response.finish_reason == "length":
+        # Still worth reading, but Kiki shouldn't take it for the whole picture.
+        logger.info("vision answer cut off model=%s max_tokens=%d", vision.name, budget)
+        return run.output.strip() + "\n(The description was cut off here.)"
     return run.output.strip()
 
 
