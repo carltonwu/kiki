@@ -21,6 +21,10 @@
                  # request, and what the newest image model call got
       - thread: {from: photo, name: Thread, as: alex}   # a thread on a message
       - drop_gateway: {}
+      - expect: {issue: {title_contains: "provider_rejected", labels: [kiki-fault],
+                         body_contains: "…", body_lacks: "…"}, issues: 1}
+                 # the fault reporter's GitHub issues (it files within ~35 s)
+      - expect: {sql: "SELECT …", equals: 2, within_s: 40}
       - exec: "INSERT INTO guild_lingo …"   # SQL against the sim database
       - add_emoji: {name: bruh, id: 900000000000005009, description: "…"}
       - remove_emoji: bruh                  # in fakecord, with GUILD_EMOJIS_UPDATE
@@ -59,6 +63,9 @@ from . import stack
 from .observe import Observation, observe, poll, render
 
 EVENTUALLY_S = 5
+# The fault reporter's first pass after a fault: its 5 s debounce, or the 30 s
+# minimum gap after the pass at startup.
+FAULT_ISSUE_S = 40
 # OpenRouter server tools, by the agent host's `web` result field that counts them.
 WEB_TOOLS = {"web_search": "searches", "web_fetch": "fetches"}
 
@@ -195,6 +202,9 @@ class Run:
     def expect(self, step: int, args: dict) -> None:
         if "sql" in args:
             self.expect_sql(step, args)
+            return
+        if "issue" in args or "issues" in args:
+            self.expect_issues(step, args)
             return
         if "response_contains" in args:
             slash = self.slashes.get(args.get("of")) or self.last_slash
@@ -350,8 +360,35 @@ class Run:
             value = row[0] if row else None
             return str(value) == str(args.get("equals"))
 
-        if not poll(matches, EVENTUALLY_S):
+        if not poll(matches, float(args.get("within_s", EVENTUALLY_S))):
             self.fail(step, f"{args['sql']!r} is {value!r}, expected {args.get('equals')!r}")
+
+    def expect_issues(self, step: int, args: dict) -> None:
+        """fakecord's GitHub issues: one matching `issue` (`title_contains`,
+        `labels`, `body_contains`, `body_lacks`, `comments`), eventually, and
+        `issues`, how many there are."""
+        wanted = args.get("issue") or {}
+
+        def fits(issue: dict) -> bool:
+            title, body = issue["title"].lower(), issue["body"]
+            lacks = as_list(wanted.get("body_lacks"))
+            return (
+                all(str(n).lower() in title for n in as_list(wanted.get("title_contains")))
+                and all(label in issue["labels"] for label in as_list(wanted.get("labels")))
+                and all(str(n) in body for n in as_list(wanted.get("body_contains")))
+                and not any(str(n).lower() in body.lower() for n in lacks)
+                and len(issue["comments"]) == wanted.get("comments", len(issue["comments"]))
+            )
+
+        def issues() -> list[dict]:
+            return stack.control("state")["issues"]
+
+        if "issue" in args and not poll(lambda: any(fits(i) for i in issues()), FAULT_ISSUE_S):
+            shown = [{k: i[k] for k in ("title", "labels", "comments")} for i in issues()]
+            self.fail(step, f"no issue like {wanted}: {shown}")
+        if "issues" in args and len(issues()) != args["issues"]:
+            titles = [i["title"] for i in issues()]
+            self.fail(step, f"{len(titles)} issues, expected {args['issues']}: {titles}")
 
     def expect_llm(self, step: int, args: dict, o: Observation, label: str) -> None:
         records = [r for r in stack.control("state")["llm"] if r["kind"] == "reply"]

@@ -1,5 +1,6 @@
-"""fakecord: a fake Discord (Gateway + the REST calls Kiki makes) and a stub
-OpenRouter (Jev, chat completions, embeddings, models), in one aiohttp app.
+"""fakecord: a fake Discord (Gateway + the REST calls Kiki makes), a stub
+OpenRouter (Jev, chat completions, embeddings, models) and the GitHub issue
+calls of the fault reporter, in one aiohttp app.
 
 Run: python -m kiki_sim.fakecord --port 8090 --fixture fixtures/minimal.yaml
 The CLI drives it through `/_sim/…`; see docs/kiki-sim-hld.md.
@@ -100,6 +101,10 @@ class World:
         self.calls: list[dict] = []  # every Discord REST call
         self.unexpected: list[dict] = []
         self.llm: list[dict] = []  # every OpenRouter request, with what we answered
+        # The fault reporter's GitHub issues: {number, title, body, labels, state,
+        # state_reason, comments}.
+        self.issues: list[dict] = []
+        self.labels: set[str] = set()
         self.scripts: dict[str, list[dict]] = {"jev": [], "reply": []}
         self.answered: dict = {}  # the reply script entry that answered last
         self.guild_creates = 0
@@ -627,6 +632,10 @@ class Fakecord:
         if request.method == "POST" and path == "alpha/decisions":
             return web.json_response(self.jev(body))
         if request.method == "POST" and path == "v1/chat/completions":
+            if status := self.rejects(body):
+                return web.json_response(
+                    {"error": {"code": status, "message": "kiki-sim: rejected"}}, status=status
+                )
             answer = self.chat(body)
             if delay := self.world.llm[-1].get("delay_s"):
                 await asyncio.sleep(delay)
@@ -635,6 +644,22 @@ class Fakecord:
             return web.json_response(embeddings(body))
         self.world.unexpected.append({"method": request.method, "path": f"openrouter/{path}"})
         return web.json_response({"error": {"code": 404, "message": "kiki-sim"}}, status=404)
+
+    def rejects(self, body: dict) -> int | None:
+        """`reply: {status: 400}`: every reply request for that message is turned
+        down with this status, as a provider rejects a retired model."""
+        if not body.get("tools"):
+            return None
+        user = [m for m in body["messages"] if m["role"] == "user"]
+        trigger = trigger_line(content_text(user[-1]["content"])) if user else ""
+        for entry in self.world.scripts["reply"]:
+            if entry.get("status") and re.search(entry["match"], trigger, re.IGNORECASE | re.S):
+                entry["used"] = True
+                self.world.llm.append(
+                    {"kind": "rejected", "request": body, "status": entry["status"]}
+                )
+                return int(entry["status"])
+        return None
 
     def overthinks(self, text: str, body: dict) -> dict | None:
         """`reply: {overthinks: true}`: while thinking is on, the reply request is all
@@ -712,6 +737,50 @@ class Fakecord:
             return web.Response(body=png(m[1].replace("-", " ")), content_type="image/png")
         self.world.unexpected.append({"method": request.method, "path": f"fxtwitter/{path}"})
         return web.json_response({"code": 404, "message": "NOT_FOUND"}, status=404)
+
+    # --- stub GitHub (fault issues) ----------------------------------------
+
+    async def github(self, request: web.Request) -> web.StreamResponse:
+        """The issue calls of the ingester's fault reporter, on any repo: labels,
+        search (by a word of the body), create, get and comment."""
+        w = self.world
+        path = request.match_info["path"].rstrip("/")
+        body = await request.json() if request.can_read_body else {}
+        if not request.headers.get("Authorization", "").startswith("Bearer "):
+            return web.json_response({"message": "Requires authentication"}, status=401)
+        route = f"{request.method} {path}"
+        if re.fullmatch(r"POST repos/[\w.-]+/[\w.-]+/labels", route):
+            if body["name"] in w.labels:
+                return web.json_response({"message": "Validation Failed"}, status=422)
+            w.labels.add(body["name"])
+            return web.json_response(body, status=201)
+        if route == "GET search/issues":
+            fingerprint = request.query["q"].split()[-1]
+            found = [i for i in w.issues if fingerprint in i["body"]]
+            return web.json_response({"total_count": len(found), "items": found[::-1]})
+        if re.fullmatch(r"POST repos/[\w.-]+/[\w.-]+/issues", route):
+            issue = {
+                "number": len(w.issues) + 1,
+                "title": body["title"],
+                "body": body["body"],
+                "labels": body.get("labels") or [],
+                "state": "open",
+                "state_reason": None,
+                "comments": [],
+            }
+            w.issues.append(issue)
+            return web.json_response(issue, status=201)
+        if m := re.fullmatch(r"(GET|POST) repos/[\w.-]+/[\w.-]+/issues/(\d+)(/comments)?", route):
+            issue = next((i for i in w.issues if i["number"] == int(m[2])), None)
+            if issue is None:
+                return web.json_response({"message": "Not Found"}, status=404)
+            if m[1] == "GET" and not m[3]:
+                return web.json_response(issue)
+            if m[1] == "POST" and m[3]:
+                issue["comments"].append(body["body"])
+                return web.json_response({"id": len(issue["comments"])}, status=201)
+        w.unexpected.append({"method": request.method, "path": f"github/{path}"})
+        return web.json_response({"message": "Not Found"}, status=404)
 
     def jev(self, body: dict) -> dict:
         state = body["state"]
@@ -1122,6 +1191,7 @@ class Fakecord:
             "calls": w.calls,
             "unexpected": w.unexpected,
             "llm": w.llm,
+            "issues": w.issues,
             "unused_scripts": [
                 {"kind": kind, **{k: v for k, v in e.items() if k != "used"}}
                 for kind, entries in w.scripts.items()
@@ -1142,6 +1212,7 @@ class Fakecord:
         app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/reddit/{path:.*}", self.reddit)
         app.router.add_route("*", "/fxtwitter/{path:.*}", self.fxtwitter)
+        app.router.add_route("*", "/github/{path:.*}", self.github)
         app.router.add_route("*", "/_sim/{path:.*}", self.control)
         return app
 

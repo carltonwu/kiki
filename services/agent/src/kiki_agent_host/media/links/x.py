@@ -23,6 +23,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 from pydantic_ai.messages import UserContent
 
+from ... import faults
 from ...config import extra_media_hosts, fxtwitter_api
 from ..fetch import download
 from ..reading import INSTRUCTIONS
@@ -169,6 +170,7 @@ async def fetch(http: httpx.AsyncClient, id: str) -> dict:
                     raise Unreadable("The X post's data was too large to read.")
             status = response.status_code
     except httpx.HTTPError as error:
+        faults.degraded("read_link.x", "x.fetch", error=error)
         raise Unreadable(f"Couldn't reach the X reader ({type(error).__name__}).") from None
     try:
         data = json.loads(body)
@@ -184,6 +186,7 @@ async def fetch(http: httpx.AsyncClient, id: str) -> dict:
         if not isinstance(data.get("tweet"), dict):
             raise Unreadable("The X reader found no post with that ID.")
         return data["tweet"]
+    faults.degraded("read_link.x", "x.fetch", http_status=status)
     raise Unreadable(f"The X reader is unavailable right now (HTTP {status}).")
 
 

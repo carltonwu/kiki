@@ -76,19 +76,23 @@ impl Agent {
             transcript.join("\n"),
         );
         // Its cost is recorded where the host saves the result (topic_summaries).
-        let completion = self
-            .host
-            .execute(&JobRequest {
-                id: topic_job_id(conversation_id, through, settings.topic_sample_messages),
-                kind: "topic".into(),
-                scope: Scope::new(c.guild_id, c.channel_id, conversation_id),
-                model: self.config.topic_model.clone(),
-                messages: vec![Message::system(INSTRUCTIONS), Message::user(prompt)],
-                max_output_tokens: MAX_TOPIC_TOKENS,
-                people: roster.wire(),
-                image_model: None,
-            })
-            .await?;
+        let job = JobRequest {
+            id: topic_job_id(conversation_id, through, settings.topic_sample_messages),
+            kind: "topic".into(),
+            scope: Scope::new(c.guild_id, c.channel_id, conversation_id),
+            model: self.config.topic_model.clone(),
+            messages: vec![Message::system(INSTRUCTIONS), Message::user(prompt)],
+            max_output_tokens: MAX_TOPIC_TOKENS,
+            people: roster.wire(),
+            image_model: None,
+        };
+        let completion = match self.host.execute(&job).await {
+            Ok(completion) => completion,
+            Err(e) => {
+                self.host_fault(&e, "topic", &job.model, &job.id).await;
+                return Err(e);
+            }
+        };
         let Some(topic) = clean_topic(&completion.text) else {
             anyhow::bail!("agent host returned an empty topic");
         };

@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+base64 = "0.22.1"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
 opentelemetry = "0.33.1"
@@ -16,6 +17,9 @@ opentelemetry-appender-tracing = "0.33.1"
 # setup of the `reqwest` entry below: no native-tls, no aws-lc.
 opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs", "internal-logs"] }
 opentelemetry_sdk = "0.33.1"
+# RS256 for GitHub App tokens and SHA-256 for fault fingerprints, from the
+# ring that rustls already uses.
+ring = "0.17.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }

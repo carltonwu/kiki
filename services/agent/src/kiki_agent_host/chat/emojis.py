@@ -21,6 +21,7 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from pydantic_ai.messages import BinaryContent
 
+from .. import faults
 from ..config import cdn_base
 from ..media import fetch
 from ..openrouter.embeddings import EMBED_BATCH, Embedder
@@ -268,6 +269,7 @@ async def search(
             guild_id,
             type(error).__name__,
         )
+        faults.degraded("embeddings", "emojis.embed", error=error)
         vector, semantic = None, "off"
     cursor = connection.cursor(row_factory=dict_row)
     await cursor.execute(

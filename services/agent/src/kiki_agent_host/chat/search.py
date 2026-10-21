@@ -15,6 +15,7 @@ from typing import Literal
 from psycopg import AsyncConnection, errors
 from psycopg.rows import dict_row
 
+from .. import faults
 from ..openrouter.embeddings import Embedder
 from .attachments import images_in
 from .cards import shown_text
@@ -278,6 +279,7 @@ async def search(
             scope.conversation_id,
             type(error).__name__,
         )
+        faults.degraded("embeddings", "search.embed", error=error)
         vector, semantic = None, "off"
     params = {
         "guild": scope.guild_id,

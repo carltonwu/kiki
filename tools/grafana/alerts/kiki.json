@@ -15,7 +15,8 @@
     "run_pending_seconds": 120,
     "error_spike_count": 3,
     "postgres_memory_limit_bytes": 384000000,
-    "postgres_memory_ratio": 0.9
+    "postgres_memory_ratio": 0.9,
+    "fault_report_failures_per_hour": 3
   },
   "rules": [
     {
@@ -268,6 +269,45 @@
         "summary": "{{ printf \"%.0f\" $values.A.Value }} failed or expired agent run(s) and {{ printf \"%.0f\" $values.B.Value }} Discord send error(s) in 15 min.",
         "description": "More than ${error_spike_count} agent run failures plus Discord send errors in 15 minutes. Interrupted runs (a restart mid-delivery) are left out so deploys don't page. See the Kiki / Pipeline dashboard.",
         "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#dashboards-and-alerts"
+      }
+    },
+    {
+      "uid": "kiki-fault-reports-failing",
+      "title": "Kiki: fault issues not being filed",
+      "condition": "C",
+      "data": [
+        {
+          "refId": "A",
+          "relativeTimeRange": {"from": 3600, "to": 0},
+          "datasourceUid": "${prom}",
+          "model": {
+            "refId": "A",
+            "expr": "sum(increase(kiki_faults_reported_total{job=\"kiki/ingester\", action=\"failed\"}[1h] anchored)) or vector(0)",
+            "instant": true,
+            "range": false,
+            "intervalMs": 60000,
+            "maxDataPoints": 43200
+          }
+        },
+        {
+          "refId": "C",
+          "datasourceUid": "__expr__",
+          "model": {
+            "refId": "C",
+            "type": "threshold",
+            "expression": "A",
+            "conditions": [{"evaluator": {"type": "gt", "params": ["${fault_report_failures_per_hour}"]}}]
+          }
+        }
+      ],
+      "noDataState": "OK",
+      "execErrState": "Error",
+      "for": "10m",
+      "labels": {"service": "kiki", "severity": "warning"},
+      "annotations": {
+        "summary": "The fault reporter failed {{ printf \"%.0f\" $values.A.Value }} time(s) in the last hour.",
+        "description": "kiki_faults_reported_total{action=\"failed\"}: GitHub refused or failed the fault reporter's requests more than ${fault_report_failures_per_hour} times in an hour, so unexpected errors aren't becoming issues. A refused credential (401/403) turns reporting off until restart, and counts as a failure every minute while faults wait: check the ingester's \"GitHub refused the fault reporter's credential\" log, then rotate GITHUB_TOKEN or the App key. Faults wait in fault_events meanwhile (30 days).",
+        "runbook_url": "https://github.com/carltonwu/kiki/blob/main/docs/observability.md#fault-issues"
       }
     },
     {

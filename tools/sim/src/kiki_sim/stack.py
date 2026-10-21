@@ -386,6 +386,12 @@ class Config:
             "DISCORD_GATEWAY_URL": f"ws://127.0.0.1:{self.ports.fakecord}/gateway",
             "AGENT_HOST_URL": f"http://127.0.0.1:{self.ports.host}",
             "AGENT_HOST_TOKEN": HOST_TOKEN,
+            # The fault reporter files to fakecord's GitHub, in live mode too.
+            "GITHUB_API_URL": f"http://127.0.0.1:{self.ports.fakecord}/github",
+            "GITHUB_TOKEN": "sim-github-token",
+            "GITHUB_ISSUES_REPO": "kiki-sim/kiki",
+            # Both services' environment: telemetry_env's, else neither sets one.
+            "FAULT_REPORT_ENVIRONMENT": telemetry_env().get("RAILWAY_ENVIRONMENT_NAME", "local"),
         }
         if self.live:
             values["OPENROUTER_DECISION_API_KEY"] = live_keys()["OPENROUTER_DECISION_API_KEY"]

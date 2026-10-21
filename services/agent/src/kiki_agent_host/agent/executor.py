@@ -24,7 +24,7 @@ from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.usage import UsageLimits
 
-from .. import db, telemetry
+from .. import db, faults, telemetry
 from ..chat import emojis
 from ..chat.scope import Roster, Scope
 from ..config import cdn_base
@@ -92,10 +92,10 @@ MIN_IMAGE_SECONDS = 20
 topic_agent = Agent()
 
 
-def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> None:
+def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> str | None:
     """Why a run gave up on the model, without what it said (the error's message
     can quote it): each rejected tool call's tool and invalid fields, and how the
-    last response ended."""
+    last response ended. Returns how it ended, for the fault."""
     retries = [
         f"{part.tool_name}:"
         + (
@@ -115,6 +115,7 @@ def log_misbehavior(job_id: str, messages: list[ModelMessage]) -> None:
         last.finish_reason if last else "-",
         ",".join(p.part_kind for p in last.parts) if last else "-",
     )
+    return last.finish_reason if last else None
 
 
 class CutShort(Exception):
@@ -294,7 +295,10 @@ class PydanticExecutor:
         deps = None
         try:
             if request.kind == "topic":
-                with telemetry.llm_call("topic", request.model, call=billed):
+                with (
+                    faults.stage("topic_agent.run"),
+                    telemetry.llm_call("topic", request.model, call=billed),
+                ):
                     result = await topic_agent.run(prompt, **options)
             else:
                 async with await db.connect(self.database_url) as connection:
@@ -321,6 +325,7 @@ class PydanticExecutor:
                     deps.indexing = asyncio.create_task(index_guild(deps))
                     try:
                         with (
+                            faults.stage("reply_agent.run"),
                             telemetry.llm_call("reply", request.model, call=billed),
                             capture_run_messages() as messages,
                         ):
@@ -328,8 +333,9 @@ class PydanticExecutor:
                                 result = await reply_agent.run(
                                     prompt, deps=deps, capabilities=self.web_tools, **options
                                 )
-                            except (UnexpectedModelBehavior, FallbackExceptionGroup):
-                                log_misbehavior(request.id, messages)
+                            except (UnexpectedModelBehavior, FallbackExceptionGroup) as e:
+                                ended = log_misbehavior(request.id, messages)
+                                faults.annotate(e, finish_reason=ended)
                                 raise
                     finally:
                         await finish(deps.indexing)
@@ -474,28 +480,33 @@ class PydanticExecutor:
                     purpose=plan.prompt,
                     seconds=drawing.REFERENCES_SECONDS,
                 )
-                found, shared = await gather.everything(plan)
+                with faults.stage("draw.references"):
+                    found, shared = await gather.everything(plan)
                 # Recorded with a failure too: what the server's model was asked for.
                 prompt, references, _ = drawing.compose(
                     plan, found, shared, max_references=reference_limit(request.image_model)
                 )
                 try:
-                    (
-                        data,
-                        mime_type,
-                        image_cost,
-                        drew_with,
-                        prompt,
-                        references,
-                    ) = await self.generate(request, found, shared)
+                    with faults.stage("draw.generate"):
+                        (
+                            data,
+                            mime_type,
+                            image_cost,
+                            drew_with,
+                            prompt,
+                            references,
+                        ) = await self.generate(request, found, shared)
                 except ImageRefused as e:
                     error, reason = "refused", str(e)
                 except ValueError as e:
                     error, reason = "failed", str(e)
+                    drawing_failed(e)
                 except APIStatusError as e:
                     # Other 4xx are bad requests: retrying them won't help either.
                     kind = "refused" if 400 <= e.status_code < 500 else "failed"
                     error, reason = kind, f"the image model returned HTTP {e.status_code}"
+                    if kind == "failed":
+                        drawing_failed(e, http_status=e.status_code)
                     logger.warning(
                         "drawing rejected job_id=%s status=%d code=%s",
                         request.id,
@@ -506,6 +517,7 @@ class PydanticExecutor:
                     error, reason = "failed", "the image model took too long"
                 except APIError as e:
                     error, reason = "failed", f"the image model failed ({type(e).__name__})"
+                    drawing_failed(e)
                 latency_ms = int((time.monotonic() - started) * 1000)
                 if error is None:
                     image = Image(
@@ -601,6 +613,17 @@ class PydanticExecutor:
         except OperationalError as e:
             raise TransientError(type(e).__name__) from e
         return DescribeEmojisResult(**counts)
+
+
+def drawing_failed(error: BaseException, *, http_status: int | None = None) -> None:
+    """A drawing that failed for something other than time or a refusal, as a
+    fault (the image model is the job's: `api/jobs.py`)."""
+    faults.note(
+        faults.DRAWING_FAILED,
+        error_type=type(error).__name__,
+        stage="draw.generate",
+        http_status=http_status,
+    )
 
 
 def attempt_result(error: BaseException) -> str:

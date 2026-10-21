@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable
 
 from psycopg.types.json import Jsonb
 
-from .. import db, telemetry
+from .. import db, faults, telemetry
 from ..contracts import ImageJobRequest, ImageJobResult, JobRequest, JobResponse, JobResult
 from ..deadline import run_deadline
 from ..executor import Executor, TransientError
@@ -109,6 +109,12 @@ async def durable(
 
         started = time.monotonic()
         work = None if left is None else left - JOB_MARGIN_SECONDS
+        # For the faults this attempt notes: an attempt a retry repeats saves none.
+        model = getattr(request, "model", None) or getattr(request, "image_model", "")
+        noted: list[faults.Fault] = []
+
+        async def save_faults() -> None:
+            await faults.save(connection, noted, job_kind=kind, run_id=request.id, model=model)
 
         def out_of_time() -> bool:
             """Whether the job's work time is used up, rather than some step's."""
@@ -119,7 +125,7 @@ async def durable(
                 raise TimeoutError
             # Cancels the work at its deadline; saving the result is outside it.
             async with asyncio.timeout(work):
-                with run_deadline(work):
+                with run_deadline(work), faults.collecting() as noted:
                     result = await execute()
         except TransientError:
             raise  # not persisted: a retry of the same ID runs it again
@@ -144,16 +150,21 @@ async def durable(
                 "WHERE id = %s",
                 (TIMED_OUT, request.id),
             )
+            await save_faults()  # what failed on the way, not the timeout itself
             return JobResponse(id=request.id, status="failed", error=TIMED_OUT)
         except Exception as error:  # noqa: BLE001 - isolate framework failures without leaking payloads
             # Provider exceptions can contain credentials or private prompts.
+            fault = faults.classify(error)
             logger.error(
-                "executor failed job_id=%s kind=%s channel_id=%s conversation_id=%s error_type=%s",
+                "executor failed job_id=%s kind=%s channel_id=%s conversation_id=%s error_type=%s "
+                "fault=%s stage=%s",
                 request.id,
                 kind,
                 request.scope.channel_id,
                 request.scope.conversation_id,
                 type(error).__name__,
+                fault.kind,
+                fault.stage or "-",
             )
             error = "executor failed"
             await connection.execute(
@@ -161,6 +172,8 @@ async def durable(
                 "WHERE id = %s",
                 (error, request.id),
             )
+            noted.append(fault)
+            await save_faults()
             return JobResponse(id=request.id, status="failed", error=error)
         finally:
             # Each attempt that ran the job: a retry answered from the saved
@@ -172,4 +185,5 @@ async def durable(
             "updated_at = now() WHERE id = %s",
             (Jsonb(result.model_dump(mode="json")), request.id),
         )
+        await save_faults()
         return JobResponse(id=request.id, status="completed", result=result)

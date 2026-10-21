@@ -8,7 +8,12 @@ a tool's own deadline is cut to what the run has left after keeping
 that left doesn't run. So a slow run still answers with what it has instead of
 hitting the job timeout and saying nothing. Pydantic AI's own per-tool `timeout`
 isn't used: it turns a timeout into a retry prompt, which spends the tool's
-retries, and running out of those fails the whole reply."""
+retries, and running out of those fails the whole reply.
+
+A tool that raises something else (a bug) is `crashed`: the model is told the
+tool is unavailable, so the reply still happens, and the crash is a fault
+(`faults.TOOL_CRASHED`) for a GitHub issue. Database and provider errors still
+fail the job, which Rust retries (`executor.TransientError`)."""
 
 import asyncio
 import contextlib
@@ -17,10 +22,13 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
+from psycopg import OperationalError
 from pydantic_ai import RunContext
+from pydantic_ai.exceptions import ModelAPIError
 
-from .. import telemetry
+from .. import faults, telemetry
 from ..deadline import run_deadline, time_left
+from ..executor import TransientError
 from ..media.vision import ImageRefused
 from .deps import Deps
 
@@ -35,6 +43,7 @@ ANSWER_RESERVE_SECONDS = 45
 # Below this a tool isn't worth starting.
 MIN_TOOL_SECONDS = 1.0
 OUT_OF_TIME = "Out of time for lookups. Answer now with what you have."
+CRASHED = "That tool is unavailable right now. Answer without it."
 
 
 def out_of_lookup_time() -> bool:
@@ -114,6 +123,19 @@ async def guarded(
         except ValueError as e:
             call.outcome = "invalid_arguments"
             result = {"error": str(e)}
+        except (OperationalError, ModelAPIError, TransientError):
+            raise  # transient: the job is retried
+        except Exception as e:  # noqa: BLE001 - a broken tool mustn't cost the reply
+            call.outcome = "crashed"
+            call.failed(e)
+            logger.error(
+                "tool crashed job_id=%s tool=%s error_type=%s",
+                deps.job_id,
+                name,
+                type(e).__name__,
+            )
+            faults.note(faults.TOOL_CRASHED, error_type=type(e).__name__, tool=name)
+            result = {"error": CRASHED}
         if call.outcome == "ok" and "error" in result:
             call.outcome = "error"
     hits = next(

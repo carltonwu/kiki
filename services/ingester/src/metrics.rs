@@ -69,6 +69,8 @@ struct Instruments {
     reactions: Counter<u64>,
     rest_retries: Counter<u64>,
     reply_latency: Histogram<f64>,
+    faults_recorded: Counter<u64>,
+    faults_reported: Counter<u64>,
 }
 
 static INSTRUMENTS: LazyLock<Instruments> = LazyLock::new(|| {
@@ -130,6 +132,12 @@ static INSTRUMENTS: LazyLock<Instruments> = LazyLock::new(|| {
             .with_unit("s")
             .with_description("Trigger message created to Kiki's first reply sent")
             .with_boundaries(REPLY_LATENCY_BUCKETS.to_vec())
+            .build(),
+        faults_recorded: counter("kiki.faults.recorded", "{fault}")
+            .with_description("Unexpected failures the fault reporter took in, both services'")
+            .build(),
+        faults_reported: counter("kiki.faults.reported", "{fault}")
+            .with_description("What the fault reporter did with a fingerprint's new faults")
             .build(),
     }
 });
@@ -489,6 +497,59 @@ pub fn rest_retry(reason: &'static str) {
 
 pub fn reply_latency(latency: Duration) {
     m().reply_latency.record(latency.as_secs_f64(), &[]);
+}
+
+/// Fault kinds both services record (`faults::KINDS`); the rest count as `other`.
+pub fn fault_recorded(service: &str, kind: &str) {
+    let service = if service == "agent" {
+        "agent"
+    } else {
+        "ingester"
+    };
+    let kind = crate::faults::KINDS
+        .iter()
+        .find(|k| **k == kind)
+        .copied()
+        .unwrap_or("other");
+    m().faults_recorded.add(
+        1,
+        &[
+            KeyValue::new("service", service),
+            KeyValue::new("kind", kind),
+        ],
+    );
+}
+
+/// What the fault reporter did with one fingerprint's new faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultAction {
+    /// Opened an issue (a regression's too).
+    Created,
+    /// Counted into an open issue, for its next comment.
+    Counted,
+    Commented,
+    /// Its issue was closed as not planned.
+    Muted,
+    /// Below the rate a quiet fallback is filed at, or from another environment.
+    Dropped,
+    /// Over the new-issue limit: left for a later pass.
+    Deferred,
+    /// GitHub failed; left for a later pass.
+    Failed,
+}
+
+pub fn fault_reported(action: FaultAction) {
+    let action = match action {
+        FaultAction::Created => "created",
+        FaultAction::Counted => "counted",
+        FaultAction::Commented => "commented",
+        FaultAction::Muted => "muted",
+        FaultAction::Dropped => "dropped",
+        FaultAction::Deferred => "deferred",
+        FaultAction::Failed => "failed",
+    };
+    m().faults_reported
+        .add(1, &[KeyValue::new("action", action)]);
 }
 
 /// When Discord created a message, from its snowflake ID, in Unix ms.

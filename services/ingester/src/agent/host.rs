@@ -203,7 +203,13 @@ impl Host {
                 .cost
                 .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
         {
-            bail!("agent host returned an invalid result");
+            return Err(Protocol::new(
+                "host.result",
+                "invalid_result",
+                None,
+                "agent host returned an invalid result",
+            )
+            .into());
         }
         Ok(result)
     }
@@ -222,7 +228,13 @@ impl Host {
                 .cost
                 .is_some_and(|cost| !cost.is_finite() || cost < 0.0)
         {
-            bail!("agent host returned an invalid image result");
+            return Err(Protocol::new(
+                "host.result",
+                "invalid_result",
+                None,
+                "agent host returned an invalid image result",
+            )
+            .into());
         }
         Ok(result)
     }
@@ -307,11 +319,24 @@ impl Host {
                 Ok(Err(("http", Some(response.status().as_u16()))))
             }
             Ok(response) if response.status().is_success() => Ok(Ok(response)),
-            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => {
-                bail!("agent host has no framework executor configured")
-            }
+            Ok(response) if response.status() == StatusCode::NOT_IMPLEMENTED => Err(Protocol::new(
+                "host.request",
+                "no_executor",
+                Some(501),
+                "agent host has no framework executor configured",
+            )
+            .into()),
             // Do not log bodies: they may contain prompts or secrets.
-            Ok(response) => bail!("agent host returned HTTP {}", response.status()),
+            Ok(response) => {
+                let status = response.status();
+                Err(Protocol::new(
+                    "host.request",
+                    "bad_status",
+                    Some(status.as_u16()),
+                    format!("agent host returned HTTP {status}"),
+                )
+                .into())
+            }
         }
     }
 
@@ -331,17 +356,37 @@ impl Host {
                 Err(retry) => retry,
                 Ok(response) => {
                     let status = response.status();
-                    let response: JobResponse<T> = response
-                        .json()
-                        .await
-                        .context("parsing agent host response")?;
+                    let response: JobResponse<T> = response.json().await.map_err(|e| {
+                        Protocol::new(
+                            "host.response",
+                            "unparsable",
+                            None,
+                            format!("parsing agent host response: {e}"),
+                        )
+                    })?;
                     if response.id != id {
-                        bail!("agent host returned a different job ID");
+                        return Err(Protocol::new(
+                            "host.response",
+                            "wrong_id",
+                            None,
+                            "agent host returned a different job ID",
+                        )
+                        .into());
                     }
                     match response.status {
                         JobStatus::Completed => {
-                            return response.result.context("host completed without result");
+                            return response.result.ok_or_else(|| {
+                                Protocol::new(
+                                    "host.response",
+                                    "no_result",
+                                    None,
+                                    "host completed without result",
+                                )
+                                .into()
+                            });
                         }
+                        // Not a protocol fault: the host filed its own failure,
+                        // and a timeout is expected.
                         JobStatus::Failed => bail!(
                             "agent host job failed: {}",
                             response.error.as_deref().unwrap_or("unknown error")
@@ -371,6 +416,63 @@ impl Host {
         }
     }
 }
+
+/// The agent host answered outside its contract: a fault for an issue
+/// (`faults::HOST_PROTOCOL`), unlike a job that failed, which the host files
+/// itself. `message` is for logs; the fault keeps the codes only.
+#[derive(Debug)]
+pub(crate) struct Protocol {
+    pub stage: &'static str,
+    pub error_type: &'static str,
+    pub http_status: Option<u16>,
+    message: String,
+}
+
+impl Protocol {
+    fn new(
+        stage: &'static str,
+        error_type: &'static str,
+        http_status: Option<u16>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            error_type,
+            http_status,
+            message: message.into(),
+        }
+    }
+
+    /// The protocol fault in `error`'s chain, if it is one.
+    pub fn of(error: &anyhow::Error) -> Option<&Self> {
+        error.chain().find_map(|e| e.downcast_ref::<Self>())
+    }
+
+    pub fn fault(
+        &self,
+        job_kind: &'static str,
+        model: Option<String>,
+        run_id: Option<String>,
+    ) -> crate::faults::Fault {
+        crate::faults::Fault {
+            kind: crate::faults::HOST_PROTOCOL,
+            job_kind: Some(job_kind),
+            error_type: Some(self.error_type),
+            stage: Some(self.stage),
+            http_status: self.http_status.map(i32::from),
+            model,
+            run_id,
+        }
+    }
+}
+
+impl std::fmt::Display for Protocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Protocol {}
 
 fn retryable(status: StatusCode) -> bool {
     matches!(
@@ -581,6 +683,27 @@ mod tests {
             .unwrap();
         server.abort();
         assert!(error.to_string().contains("no framework executor"));
+        let protocol = Protocol::of(&error).unwrap();
+        assert_eq!(
+            (protocol.stage, protocol.error_type, protocol.http_status),
+            ("host.request", "no_executor", Some(501))
+        );
+    }
+
+    #[tokio::test]
+    async fn answers_outside_the_contract_are_protocol_faults() {
+        let wrong_id = || async { Json(json!({ "id": "reply:other", "status": "completed" })) };
+        let (url, server) = server(Router::new().route("/v1/jobs", post(wrong_id))).await;
+        let host = host(url, Duration::from_secs(1));
+        let error = host.execute(&job()).await.err().unwrap();
+        let protocol = Protocol::of(&error).unwrap();
+        assert_eq!(
+            (protocol.stage, protocol.error_type),
+            ("host.response", "wrong_id")
+        );
+        let fault = protocol.fault("reply", Some("test/model".into()), Some("reply:1".into()));
+        assert_eq!(fault.kind, crate::faults::HOST_PROTOCOL);
+        server.abort();
     }
 
     #[tokio::test]
