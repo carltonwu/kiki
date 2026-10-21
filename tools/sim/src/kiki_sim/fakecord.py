@@ -1157,22 +1157,33 @@ class Fakecord:
         options = [
             {"name": k, "type": 3, "value": v} for k, v in (body.get("options") or {}).items()
         ]
-        payload = {
-            "id": id,
-            "application_id": w.application_id,
-            "type": 2,
-            "token": token,
-            "version": 1,
-            "guild_id": w.guild["id"],
-            "channel_id": c["id"],
-            "member": {**w.member_payload(m), "user": m["user"]},
-            "data": {
+        if "modal" in body:
+            # A submitted modal: each field a text input in a label, as Discord sends them.
+            data = {
+                "custom_id": body["modal"],
+                "components": [
+                    {"type": 18, "component": {"type": 4, "custom_id": k, "value": v}}
+                    for k, v in (body.get("fields") or {}).items()
+                ],
+            }
+        else:
+            data = {
                 "id": "900000000000009000",
                 "name": "kiki",
                 "type": 1,
                 "options": [{"name": body["command"], "type": 1, "options": options}],
                 "resolved": {"users": {m["user"]["id"]: m["user"]}},
-            },
+            }
+        payload = {
+            "id": id,
+            "application_id": w.application_id,
+            "type": 5 if "modal" in body else 2,
+            "token": token,
+            "version": 1,
+            "guild_id": w.guild["id"],
+            "channel_id": c["id"],
+            "member": {**w.member_payload(m), "user": m["user"]},
+            "data": data,
         }
         w.interactions.append({"interaction_id": id, "kind": "sent", "token": token})
         await self.dispatch("INTERACTION_CREATE", payload)

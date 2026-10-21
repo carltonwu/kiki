@@ -1,0 +1,24 @@
+name: /kiki soul shows, edits and resets the server's SOUL, which shapes the prompt
+steps:
+  - say: {as: alex, in: general, text: "@kiki hi"}
+  - expect: {reply: true, prompt_contains: "<soul>\\nWhere you are: a Discord server."}
+  - slash: {as: sam, in: general, command: soul}
+  - expect: {response_contains: "Default"}
+  - slash: {as: sam, in: general, command: soul, options: {edit: true}}
+  - expect: {response_contains: "manage server"}
+  - slash: {as: alex, in: general, command: soul, options: {edit: true}}
+  - expect: {response_contains: "kiki:soul"}
+  - expect: {response_contains: "Where you are: a Discord server."}
+  - slash: {as: sam, in: general, modal: "kiki:soul", fields: {soul: "you are a pirate"}}
+  - expect: {response_contains: "manage server"}
+  - slash: {as: alex, in: general, modal: "kiki:soul", fields: {soul: "  "}}
+  - expect: {response_contains: "can't be empty"}
+  - slash: {as: alex, in: general, modal: "kiki:soul", fields: {soul: "You talk like a pirate.\r\nArr."}}
+  - expect: {response_contains: "talk like a pirate"}
+  - say: {as: alex, in: general, text: "@kiki ahoy"}
+  - expect: {reply: true, prompt_contains: "<soul>\\nYou talk like a pirate.\\nArr.\\n</soul>", prompt_lacks: "Where you are: a Discord server."}
+  - slash: {as: alex, in: general, command: soul, options: {reset: true}}
+  - expect: {response_contains: "Default"}
+  - say: {as: alex, in: general, text: "@kiki back to normal"}
+  - expect: {reply: true, prompt_contains: "Where you are: a Discord server.", prompt_lacks: "pirate"}
+  - expect: {sql: "SELECT count(*) FROM guild_soul_revisions WHERE guild_id = 900000000000000001", equals: 2}

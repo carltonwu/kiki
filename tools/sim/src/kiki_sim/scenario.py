@@ -13,6 +13,8 @@
       - delete: {of: hi}
       - slash: {as: alex, in: general, command: config,
                 options: {key: chat_model, value: sim/other}}
+      - slash: {as: alex, in: general, modal: "kiki:soul",       # submit a modal
+                fields: {soul: "…"}}   # a modal Kiki opens is the slash's response
       - expect: {of: hi, outcome: new, reply: true, text_contains: "hello"}
       - expect: {attachments: 1, attachment_type: image/png}   # files on the replies
       - expect: {followup: {status: done, attachments: 1, text_contains: "…"},
@@ -177,19 +179,20 @@ class Run:
         return self.observed[message["id"]]
 
     def slash(self, args: dict) -> dict:
-        sent = stack.control(
-            "interactions",
-            {
-                "as": args["as"],
-                "in": args["in"],
-                "command": args["command"],
-                "options": args.get("options") or {},
-            },
-        )
+        if "modal" in args:
+            body = {"modal": args["modal"], "fields": args.get("fields") or {}}
+        else:
+            body = {"command": args["command"], "options": args.get("options") or {}}
+        sent = stack.control("interactions", {"as": args["as"], "in": args["in"], **body})
 
         def response():
             for i in stack.control("state")["interactions"]:
-                if i["interaction_id"] == sent["id"] and i["kind"] == "response":
+                if i["interaction_id"] != sent["id"]:
+                    continue
+                # A modal is answered in the first callback instead.
+                if i["kind"] == "response" or (
+                    i["kind"] == "callback" and (i["body"] or {}).get("type") == 9
+                ):
                     return i["body"]
             return None
 

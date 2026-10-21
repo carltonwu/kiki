@@ -24,7 +24,10 @@ use tracing::{info, warn};
 use twilight_http::Client;
 use twilight_model::{
     application::command::CommandType,
-    channel::message::{AllowedMentions, Embed, MessageFlags},
+    channel::message::{
+        AllowedMentions, Component, Embed, MessageFlags,
+        component::{Label, TextInput, TextInputStyle},
+    },
     guild::Permissions,
     http::interaction::{InteractionResponse, InteractionResponseData, InteractionResponseType},
     id::{
@@ -48,9 +51,14 @@ use crate::{
     conversation, emojis, guild_settings,
     rest::get_json,
     router::unix_millis,
+    soul,
 };
 
 const APPLICATION_COMMAND: u64 = 2;
+const MODAL_SUBMIT: u64 = 5;
+/// The `/kiki soul edit:true` modal and its one text input.
+const SOUL_MODAL: &str = "kiki:soul";
+const SOUL_INPUT: &str = "soul";
 const COLOR: u32 = 0xF4_72_B6;
 const ERROR_COLOR: u32 = 0xED_42_45;
 /// Embed limits (Discord rejects the whole message past any of them).
@@ -187,6 +195,8 @@ struct Invocation<'a> {
     options: &'a Value,
     /// `data.resolved`: users and members referenced by options.
     resolved: &'a Value,
+    /// The text from a submitted SOUL modal.
+    submitted: Option<&'a str>,
 }
 
 impl<'a> Invocation<'a> {
@@ -251,15 +261,19 @@ impl Commands {
     /// Discord drops interactions not acknowledged within 3 seconds, and the
     /// stats queries can take longer on a cold database.
     pub fn spawn_handle(self: &Arc<Self>, interaction: Value) {
-        if interaction["type"].as_u64() != Some(APPLICATION_COMMAND)
-            || interaction["data"]["name"].as_str() != Some("kiki")
-        {
+        let ours = match interaction["type"].as_u64() {
+            Some(APPLICATION_COMMAND) => interaction["data"]["name"] == "kiki",
+            Some(MODAL_SUBMIT) => interaction["data"]["custom_id"] == SOUL_MODAL,
+            _ => false,
+        };
+        if !ours {
             return;
         }
         let commands = self.clone();
         tokio::spawn(async move {
             let subcommand = interaction["data"]["options"][0]["name"]
                 .as_str()
+                .or(interaction["data"]["custom_id"].as_str())
                 .unwrap_or_default()
                 .to_owned();
             if let Err(e) = commands.handle(&interaction).await {
@@ -280,6 +294,32 @@ impl Commands {
             .as_str()
             .context("interaction has no token")?;
         let client = self.http.interaction(self.application_id);
+        let subcommand = &interaction["data"]["options"][0];
+        let guild_id = snowflake(&interaction["guild_id"]);
+        let submitted = (interaction["type"].as_u64() == Some(MODAL_SUBMIT))
+            .then(|| modal_value(&interaction["data"]["components"], SOUL_INPUT))
+            .flatten();
+        let invocation = guild_id.map(|guild_id| Invocation {
+            guild_id,
+            member: &interaction["member"],
+            subcommand: match submitted {
+                Some(_) => "soul",
+                None => subcommand["name"].as_str().unwrap_or_default(),
+            },
+            options: &subcommand["options"],
+            resolved: &interaction["data"]["resolved"],
+            submitted,
+        });
+        // A modal has to be the first response, so it can't follow a deferral.
+        if let Some(invocation) = &invocation
+            && let Some(modal) = self.soul_editor(invocation).await?
+        {
+            client
+                .create_response(Id::new(id as u64), token, &modal)
+                .await
+                .context("opening the SOUL editor")?;
+            return Ok(());
+        }
         let deferred = InteractionResponse {
             kind: InteractionResponseType::DeferredChannelMessageWithSource,
             data: Some(InteractionResponseData {
@@ -292,36 +332,26 @@ impl Commands {
             .await
             .context("deferring interaction response")?;
 
-        let subcommand = &interaction["data"]["options"][0];
-        let embeds = match snowflake(&interaction["guild_id"]) {
+        let embeds = match invocation {
             None => vec![error_embed("`/kiki` only works in a server.")],
-            Some(guild_id) => {
-                let invocation = Invocation {
-                    guild_id,
-                    member: &interaction["member"],
-                    subcommand: subcommand["name"].as_str().unwrap_or_default(),
-                    options: &subcommand["options"],
-                    resolved: &interaction["data"]["resolved"],
-                };
-                match self.run(&invocation).await {
-                    Ok(embeds) => embeds,
-                    Err(e) => match e.downcast_ref::<UserError>() {
-                        Some(e) => vec![error_embed(&e.0)],
-                        None => {
-                            warn!(
-                                subcommand = invocation.subcommand,
-                                guild_id = invocation.guild_id,
-                                interaction_id = interaction["id"].as_str(),
-                                error = format!("{e:#}"),
-                                "slash command failed"
-                            );
-                            vec![error_embed(
-                                "Something went wrong. The ingester logs have the details.",
-                            )]
-                        }
-                    },
-                }
-            }
+            Some(invocation) => match self.run(&invocation).await {
+                Ok(embeds) => embeds,
+                Err(e) => match e.downcast_ref::<UserError>() {
+                    Some(e) => vec![error_embed(&e.0)],
+                    None => {
+                        warn!(
+                            subcommand = invocation.subcommand,
+                            guild_id = invocation.guild_id,
+                            interaction_id = interaction["id"].as_str(),
+                            error = format!("{e:#}"),
+                            "slash command failed"
+                        );
+                        vec![error_embed(
+                            "Something went wrong. The ingester logs have the details.",
+                        )]
+                    }
+                },
+            },
         };
         let no_pings = AllowedMentions::default();
         client
@@ -343,6 +373,7 @@ impl Commands {
             "users" => self.users(invocation).await?,
             "whois" => self.whois(invocation).await?,
             "emojis" => self.emojis(invocation).await?,
+            "soul" => self.soul(invocation).await?,
             other => error_embed(&format!("Unknown subcommand `{other}`.")),
         };
         Ok(vec![embed])
@@ -787,6 +818,53 @@ impl Commands {
             key,
             &global,
         ))
+    }
+
+    /// `/kiki soul edit:true` from someone who may edit: a modal holding the
+    /// current SOUL. `None` for anything else, which is answered as usual.
+    async fn soul_editor(
+        &self,
+        invocation: &Invocation<'_>,
+    ) -> anyhow::Result<Option<InteractionResponse>> {
+        let edit = invocation.subcommand == "soul"
+            && invocation.submitted.is_none()
+            && invocation.option("edit").and_then(Value::as_bool) == Some(true);
+        if !edit || soul_change(invocation).is_err() {
+            return Ok(None);
+        }
+        let current = soul::get(&self.db, invocation.guild_id).await?;
+        Ok(Some(soul_modal(&current.text)))
+    }
+
+    /// `/kiki soul`: shows this server's SOUL; `reset:true` returns it to the
+    /// default, and a submitted editor saves it.
+    async fn soul(&self, invocation: &Invocation<'_>) -> anyhow::Result<Embed> {
+        if let Some((actor, text)) = soul_change(invocation)? {
+            soul::set(&self.db, invocation.guild_id, text.as_deref(), actor).await?;
+            info!(
+                guild_id = invocation.guild_id,
+                actor,
+                reset = text.is_none(),
+                "server SOUL changed"
+            );
+        }
+        let current = soul::get(&self.db, invocation.guild_id).await?;
+        let source = match current.set {
+            None => "Default. `/kiki soul edit:true` writes this server's own.".to_owned(),
+            Some((by, at)) => {
+                let by = by.map(|id| format!(" by <@{id}>")).unwrap_or_default();
+                format!(
+                    "Set{by} <t:{at}:R>. `edit:true` changes it; `reset:true` returns to the default."
+                )
+            }
+        };
+        Ok(EmbedBuilder::new()
+            .color(COLOR)
+            .title("SOUL.md")
+            .description(code_block(&current.text))
+            .field(EmbedFieldBuilder::new("Source", source))
+            .timestamp(now())
+            .build())
     }
 
     /// Channel settings may only name channels and threads of this server.
@@ -1254,6 +1332,71 @@ fn require_manage_server(invocation: &Invocation<'_>, action: &str) -> Result<i6
         .ok_or_else(|| UserError("Couldn't identify who is changing the setting.".into()))
 }
 
+/// A requested SOUL change: who, and the new text (`None` resets). `Ok(None)`
+/// for viewing, which anyone who can run `/kiki` may do.
+fn soul_change(invocation: &Invocation<'_>) -> Result<Option<(i64, Option<String>)>, UserError> {
+    let flag = |name| invocation.option(name).and_then(Value::as_bool) == Some(true);
+    let (edit, reset) = (flag("edit"), flag("reset"));
+    if invocation.submitted.is_none() && !edit && !reset {
+        return Ok(None);
+    }
+    if edit && reset {
+        return Err(UserError("Use either edit or reset, not both.".into()));
+    }
+    let actor = require_manage_server(invocation, "change Kiki's SOUL")?;
+    let text = match invocation.submitted {
+        Some(text) => Some(soul::validate(text).map_err(UserError)?),
+        None => None,
+    };
+    Ok(Some((actor, text)))
+}
+
+fn soul_modal(current: &str) -> InteractionResponse {
+    #[allow(deprecated)] // `label` moved to the Label component that wraps it.
+    let input = TextInput {
+        id: None,
+        custom_id: SOUL_INPUT.into(),
+        label: None,
+        max_length: Some(soul::MAX_CHARS as u16),
+        min_length: Some(1),
+        placeholder: None,
+        required: Some(true),
+        style: TextInputStyle::Paragraph,
+        value: Some(current.into()),
+    };
+    InteractionResponse {
+        kind: InteractionResponseType::Modal,
+        data: Some(InteractionResponseData {
+            custom_id: Some(SOUL_MODAL.into()),
+            title: Some("Kiki's SOUL for this server".into()),
+            components: Some(vec![Component::Label(Label {
+                id: None,
+                label: "SOUL.md".into(),
+                description: Some("Who Kiki is here: voice, stance, the room she's in.".into()),
+                component: Box::new(Component::TextInput(input)),
+            })]),
+            ..Default::default()
+        }),
+    }
+}
+
+/// A submitted modal's value for one input, wherever it's nested: in a Label's
+/// `component` or an action row's `components`.
+fn modal_value<'a>(component: &'a Value, custom_id: &str) -> Option<&'a str> {
+    if let Some(list) = component.as_array() {
+        return list.iter().find_map(|c| modal_value(c, custom_id));
+    }
+    if component["custom_id"] == custom_id
+        && let Some(value) = component["value"].as_str()
+    {
+        return Some(value);
+    }
+    component
+        .get("component")
+        .and_then(|c| modal_value(c, custom_id))
+        .or_else(|| modal_value(component.get("components")?, custom_id))
+}
+
 type ConfigChange<'a> = (i64, &'a str, Option<Value>);
 
 fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<'a>>, UserError> {
@@ -1486,6 +1629,17 @@ fn definition() -> CommandBuilder {
                 .option(BooleanBuilder::new(
                     "redescribe",
                     "Resync and describe every emoji again (costs more)",
+                )),
+        )
+        .option(
+            SubCommandBuilder::new("soul", "Who Kiki is in this server: view, edit or reset")
+                .option(BooleanBuilder::new(
+                    "edit",
+                    "Open an editor with the current SOUL",
+                ))
+                .option(BooleanBuilder::new(
+                    "reset",
+                    "Go back to the default SOUL (earlier versions are kept)",
                 )),
         )
         .option(
@@ -1909,6 +2063,7 @@ mod tests {
                 subcommand: "config",
                 options,
                 resolved: &Value::Null,
+                submitted: None,
             }
         }
         let denied = json!({"user": {"id": "42"}, "permissions": "0"});
@@ -1961,6 +2116,69 @@ mod tests {
         ] {
             assert!(config_change(&invoke(&allowed, &options)).is_err());
         }
+    }
+
+    #[test]
+    fn soul_changes_require_manage_server_and_validate() {
+        use super::{Invocation, Permissions, soul_change};
+        use serde_json::{Value, json};
+        fn invoke<'a>(
+            member: &'a Value,
+            options: &'a Value,
+            submitted: Option<&'a str>,
+        ) -> Invocation<'a> {
+            Invocation {
+                guild_id: 1,
+                member,
+                subcommand: "soul",
+                options,
+                resolved: &Value::Null,
+                submitted,
+            }
+        }
+        let denied = json!({"user": {"id": "42"}, "permissions": "0"});
+        let allowed = json!({"user": {"id": "42"}, "permissions": Permissions::MANAGE_GUILD.bits().to_string()});
+        let none = json!([]);
+        let edit = json!([{"name": "edit", "value": true}]);
+        let reset = json!([{"name": "reset", "value": true}]);
+        let both = json!([{"name": "edit", "value": true}, {"name": "reset", "value": true}]);
+
+        assert_eq!(soul_change(&invoke(&denied, &none, None)).unwrap(), None);
+        assert!(soul_change(&invoke(&denied, &edit, None)).is_err());
+        assert!(soul_change(&invoke(&denied, &reset, None)).is_err());
+        assert!(soul_change(&invoke(&denied, &none, Some("hi"))).is_err());
+        assert!(soul_change(&invoke(&allowed, &both, None)).is_err());
+        assert_eq!(
+            soul_change(&invoke(&allowed, &reset, None)).unwrap(),
+            Some((42, None))
+        );
+        assert_eq!(
+            soul_change(&invoke(&allowed, &none, Some(" be a pirate\r\n"))).unwrap(),
+            Some((42, Some("be a pirate".into())))
+        );
+        assert!(soul_change(&invoke(&allowed, &none, Some("  "))).is_err());
+    }
+
+    #[test]
+    fn soul_modal_round_trips() {
+        use super::{SOUL_INPUT, SOUL_MODAL, modal_value, soul_modal};
+        use serde_json::json;
+        let modal = serde_json::to_value(soul_modal("be nice")).unwrap();
+        assert_eq!(modal["type"], 9);
+        assert_eq!(modal["data"]["custom_id"], SOUL_MODAL);
+        let label = &modal["data"]["components"][0];
+        assert_eq!(label["type"], 18);
+        assert_eq!(label["component"]["custom_id"], SOUL_INPUT);
+        assert_eq!(label["component"]["value"], "be nice");
+
+        // Submissions nest the input in a label, or in an action row.
+        let label =
+            json!([{"type": 18, "component": {"type": 4, "custom_id": "soul", "value": "a"}}]);
+        let row =
+            json!([{"type": 1, "components": [{"type": 4, "custom_id": "soul", "value": "b"}]}]);
+        assert_eq!(modal_value(&label, SOUL_INPUT), Some("a"));
+        assert_eq!(modal_value(&row, SOUL_INPUT), Some("b"));
+        assert_eq!(modal_value(&row, "other"), None);
     }
 
     #[test]

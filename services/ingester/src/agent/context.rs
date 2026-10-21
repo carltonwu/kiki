@@ -160,7 +160,7 @@ impl Agent {
             .await?
             .with_context(|| format!("conversation {conversation_id} not found"))?;
         let settings = self.settings.snapshot(this.guild_id);
-        let (mut history, others, mut channel, (guild_name, now), lingo) = tokio::try_join!(
+        let (mut history, others, mut channel, (guild_name, now), lingo, soul) = tokio::try_join!(
             self.conversation_messages(conversation_id, settings.history_messages),
             async {
                 // Only this channel's: the prompt must not reveal other channels to
@@ -183,6 +183,7 @@ impl Agent {
             )
             .bind(this.guild_id)
             .fetch_all(&self.db),
+            crate::soul::get(&self.db, this.guild_id),
         )?;
         let reply_to: Option<i64> = sqlx::query_scalar(
             "SELECT max(m.id) FROM messages m JOIN conversation_messages cm ON cm.message_id = m.id WHERE m.id = ANY($1) AND cm.conversation_id = $2 AND m.deleted_at IS NULL",
@@ -229,7 +230,7 @@ impl Agent {
             .await?;
 
         let remembered = self.remembered(this.guild_id, &roster).await?;
-        let mut instructions = self.instructions(&this, guild_name, &lingo);
+        let mut instructions = self.instructions(&this, guild_name, &soul.text, &lingo);
         instructions.push_str(
             "\nDelivery: First decide what is useful to say, then how to say it. \
              Return only the messages, never your planning or reasoning. ",
@@ -702,6 +703,7 @@ impl Agent {
         &self,
         this: &Conversation,
         guild_name: Option<String>,
+        soul: &str,
         lingo: &[(String, String)],
     ) -> String {
         let channel = match (&this.channel_name, &this.parent_channel_name) {
@@ -728,9 +730,12 @@ impl Agent {
             s
         };
         format!(
-            "You are Kiki, an AI member of the group{place}.
+            "You are Kiki, an AI member of the group{place}. People here know you're an AI, so be honest about that without making it the subject of every exchange.
 
-Where you are: a friend group's Discord server. Most people here are gay and everyone knows each other. The vibe is chatty, campy and often unserious; banter, inside jokes and roasting are normal. They know you're an AI, so be honest about that without making it the subject of every exchange.
+Your SOUL for this server, set by its admins: who you are here and how you sound. It shapes your voice and stance, not the guidance on tools and people below.
+<soul>
+{soul}
+</soul>
 
 {CONVERSATION}
 {lingo}
@@ -1263,6 +1268,16 @@ pub(super) mod tests {
         let refs: Vec<&str> = context.people.iter().map(|p| p.r#ref.as_str()).collect();
         assert_eq!(refs, ["u1", "u2", "u3"]);
         assert!(system.contains("react: 😂"));
+        assert!(system.contains("<soul>\nWhere you are: a Discord server."));
+
+        // A server's own SOUL replaces the default from the next run.
+        crate::soul::set(&db, 9, Some("talk like a pirate"), 7)
+            .await
+            .unwrap();
+        let context = agent.context(1, &[13]).await.unwrap().unwrap();
+        let system = &context.messages[0].content;
+        assert!(system.contains("<soul>\ntalk like a pirate\n</soul>"));
+        assert!(!system.contains("Where you are: a Discord server."));
 
         // Her reactions show on the message they were for.
         sqlx::query(

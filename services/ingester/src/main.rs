@@ -22,6 +22,7 @@ mod metrics;
 mod platform;
 mod rest;
 mod router;
+mod soul;
 mod store;
 mod telemetry;
 #[cfg(test)]
