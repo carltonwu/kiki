@@ -130,6 +130,7 @@ it to other roles under Server Settings → Integrations → Kiki.
 | `/kiki config [key] [value] [reset]` | View effective server settings, their source and bounds. Use `key` + `value` to edit or `key` + `reset:true` to inherit the current default. Writes require Manage Server. |
 | `/kiki users [period] [sort]` | Top 20 active people by cost (default), messages or conversations. Period: `24h`, `7d` (default) or `all`. Shows total messages, messages with Kiki, conversations and attributed LLM cost. |
 | `/kiki emojis [resync] [redescribe]` | The server's custom emoji with Kiki's description of each. `resync:true` copies the list from Discord, marks deleted emoji removed, and has a vision model describe new ones; `redescribe:true` also replaces existing descriptions. Resyncing requires Manage Server. |
+| `/kiki soul [edit] [reset]` | This server's SOUL: who Kiki is here (voice, stance, the room she's in), after [OpenClaw's SOUL.md](https://docs.openclaw.ai/concepts/soul). `edit:true` opens an editor holding the current text (up to 4000 characters); `reset:true` returns to the built-in default. Every version is kept in `guild_soul_revisions`. Edits require Manage Server. See [docs/soul.md](docs/soul.md). |
 | `/kiki whois <user>` | Up to 15 recently seen names (nickname, display name, username), first/last seen, join and message dates, plus messages, conversations and attributed cost over 24 h, 7 d and all time. |
 
 Per-person cost splits the cost of a reply and its drawings across the triggering

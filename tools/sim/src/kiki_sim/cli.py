@@ -196,7 +196,8 @@ def cmd_slash(args) -> None:
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         for i in stack.control("state")["interactions"]:
-            if i["interaction_id"] == sent["id"] and i["kind"] == "response":
+            modal = i["kind"] == "callback" and (i["body"] or {}).get("type") == 9
+            if i["interaction_id"] == sent["id"] and (i["kind"] == "response" or modal):
                 print(json.dumps(i["body"], indent=2, ensure_ascii=False))
                 return
         time.sleep(0.2)
