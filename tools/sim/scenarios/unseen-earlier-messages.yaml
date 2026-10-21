@@ -1,0 +1,20 @@
+name: a new conversation about "this conversation" says the earlier messages exist and how to read them
+steps:
+  # Sam's story is two hours old: past the background window, so a request after
+  # the quiet spell starts a conversation that doesn't show it.
+  - send: {as: sam, in: general, text: "funniest thing happened to me in pubg", age_s: 7500}
+  - send: {as: sam, in: general, text: "my teammate spent the whole match arguing about religion on open mic", age_s: 7400}
+  - say: {as: alex, in: general, text: "kiki, draw this conversation inside of pubg"}
+    reply:
+      tools:
+        - {name: channel_history, args: {limit: 10}}
+      text: "on it: {result}"
+  - expect:
+      run: done
+      reply: true
+      tool_called: channel_history
+      prompt_contains:
+        - "it almost always means those earlier messages, not the request itself"
+        - "Earlier messages in this channel aren't shown here; the latest was 2 h ago (2 in the last day)."
+        - "read them with channel_history (before: "
+      tool_result_contains: "arguing about religion on open mic"

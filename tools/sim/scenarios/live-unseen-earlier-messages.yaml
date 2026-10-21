@@ -1,0 +1,10 @@
+name: real models read the earlier messages a new conversation points at before answering
+# Needs `kiki-sim up --live`. Read the transcript: the reply should be about Sam's
+# PUBG teammate, not about Alex's request.
+live: only
+steps:
+  - send: {as: sam, in: general, text: "funniest thing happened to me in pubg", age_s: 7500}
+  - send: {as: sam, in: general, text: "my teammate was a 40 year old guy who spent the whole match arguing about religion on open mic", age_s: 7400}
+  - send: {as: sam, in: general, text: "he left mid game when i said i was an atheist lmao", age_s: 7300}
+  - say: {as: alex, in: general, text: "kiki, roast this conversation"}
+  - expect: {run: done, reply: true, tool_called: channel_history}
