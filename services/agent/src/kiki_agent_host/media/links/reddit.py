@@ -26,6 +26,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from pydantic_ai.messages import BinaryContent, UserContent
 
+from ... import faults
 from ...config import extra_media_hosts, reddit_base, reddit_credentials
 from ..fetch import download
 from ..reading import INSTRUCTIONS
@@ -116,6 +117,7 @@ async def read(deps, url: str, question: str | None = None) -> dict:
 
         status, data = await fetch(http, *ids)
         if status != 200:
+            faults.degraded("read_link.reddit", "reddit.fetch", http_status=status)
             return {"error": failure(status, data)}
         try:
             result, images = parse(data, ids[1])
@@ -199,6 +201,7 @@ async def get_json(
             status = response.status_code
     except httpx.HTTPError as error:
         logger.warning("reddit request failed error_type=%s", type(error).__name__)
+        faults.degraded("read_link.reddit", "reddit.fetch", error=error)
         return 0, None
     try:
         return status, json.loads(body)

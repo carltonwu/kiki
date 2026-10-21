@@ -20,7 +20,7 @@ from pydantic_ai.usage import RequestUsage
 from kiki_agent_host import telemetry
 from kiki_agent_host.agent import executor as agent_executor
 from kiki_agent_host.agent.executor import PydanticExecutor
-from kiki_agent_host.agent.guard import Budget, guarded
+from kiki_agent_host.agent.guard import CRASHED, Budget, guarded
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest
 from kiki_agent_host.media import generation
 from kiki_agent_host.media.vision import ImageRefused, Vision, look
@@ -259,8 +259,7 @@ async def test_every_tool_outcome_is_counted(recorded):
     await guarded(ctx, "read_image", refused, budget=None)
     await guarded(ctx, "find_emoji", invalid, budget=None)
     await guarded(ctx, "channel_history", told, budget=None)
-    with pytest.raises(RuntimeError):
-        await guarded(ctx, "recall", broken, budget=None)
+    assert await guarded(ctx, "recall", broken, budget=None) == {"error": CRASHED}
 
     calls = {
         ("search_messages", "ok"),
@@ -269,7 +268,7 @@ async def test_every_tool_outcome_is_counted(recorded):
         ("read_image", "refused"),
         ("find_emoji", "invalid_arguments"),
         ("channel_history", "error"),
-        ("recall", "error"),
+        ("recall", "crashed"),
     }
     for tool, outcome in calls:
         assert recorded.value("kiki.tools.calls", tool=tool, outcome=outcome) == 1, (tool, outcome)

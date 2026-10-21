@@ -275,10 +275,11 @@ minute). Parameters are the file's `params`, overridable with `--param`:
 | Stuck agent runs (`kiki-runs-stuck`) | `kiki_agent_runs_stuck` > 0 | 10m | OK |
 | Daily LLM spend (`kiki-daily-llm-spend`) | spend over a rolling 24 h above `daily_llm_spend_usd` (**$5**) | 5m | OK |
 | Run failures or Discord send errors (`kiki-error-spike`) | failed + expired runs plus send errors in 15 min above `error_spike_count` (3); interrupted runs (deploys) excluded | 5m | OK |
+| Fault issues not being filed (`kiki-fault-reports-failing`) | more than `fault_report_failures_per_hour` (3) failed reporter passes in an hour (`kiki_faults_reported_total{action="failed"}`): a refused credential, or GitHub down (see Fault issues) | 10m | OK |
 | Postgres memory near limit (`kiki-postgres-memory`) | Railway memory of `postgres` above `postgres_memory_ratio` (0.9) of `postgres_memory_limit_bytes` (384 MB) | 10m | OK: Railway metrics are optional |
 
 The rules that read counters with `increase(… anchored)` (reconnect storm,
-daily spend, error spike) go to Error on a query error, after their pending
+daily spend, error spike, fault issues) go to Error on a query error, after their pending
 period, so they notify if the modifier ever stops parsing instead of staying OK
 for good; the others keep the last state (`KeepLast`). All carry
 `service=kiki`. There is deliberately no "no Gateway events" rule: Kiki's intents
@@ -304,6 +305,101 @@ a service account token (admin/admin, Administration → Service accounts, role
 Editor), then `GRAFANA_URL=http://localhost:3000 GRAFANA_SA_TOKEN=… tools/grafana/apply`.
 Feed it with the simulator, `KIKI_SIM_OTEL_ENDPOINT=http://localhost:4318` set
 on both `kiki-sim up` and `kiki-sim test` (the tests restart services).
+
+## Fault issues
+
+Unexpected failures open GitHub issues on `GITHUB_ISSUES_REPO`, one per kind of
+failure, labelled `kiki-fault`, `bug` and `service:agent` or `service:ingester`.
+Expected ones don't: timeouts, rate limits, refused drawings, retried transient
+errors, Discord's own failures (those are the alerts above).
+
+| Kind | Service | When |
+|---|---|---|
+| `executor_failed` | agent | a job failed with an exception nothing else classifies (a bug) |
+| `model_misbehaved` | agent | the model's output broke the run: invalid tool calls past their retries, no output |
+| `provider_rejected` | agent | the provider turned a request down with a 4xx other than 429 (a retired model, a bad request) |
+| `tool_crashed` | agent | a tool raised something it doesn't handle. The model is told the tool is unavailable and still answers (tool outcome `crashed`) |
+| `drawing_failed` | agent | a drawing failed for something other than time or a refusal |
+| `tool_degraded` | agent | a tool fell back quietly (lexical instead of semantic search, an unreadable link); filed only at 5 or more an hour |
+| `host_protocol` | ingester | the agent host answered outside its contract: 501, an unexpected status, an unparsable or mismatched answer |
+| `task_panicked` | ingester | a conversation's agent task panicked |
+
+**Privacy.** The repository may be public, so a fault holds structured fields
+only: kind, error class (`ValidationError`), stage (`host.response`), HTTP
+status, model, tool, finish reason, job kind, commit, environment, trace ID and
+host job ID (`reply:42`). Never a prompt, message text, an exception's message,
+an HTTP body, or a Discord name or ID. The reporter also strips every field to
+`[A-Za-z0-9_.:/-]` (100 characters) before it goes in an issue. The trace ID
+finds the full story in Tempo and the logs.
+
+**How.** Both services insert rows into `fault_events` (the agent host at the
+end of a job, except one retried as transient; at most 20 a job) and notify
+`fault_event`. The leader's reporter groups unreported events by fingerprint:
+the first 16 hex digits of the SHA-256 of `service|kind|error type|stage|HTTP
+status|tool`. The model isn't in it, so one bug seen with three models is one
+issue. `fault_issues` maps a fingerprint to its issue. For each group:
+
+- **No issue yet:** it searches the repo for an issue whose body has the
+  fingerprint (one filed before the table was lost) and adopts it; else it opens
+  one. At most 5 new issues an hour; the rest wait (`deferred`).
+- **Open issue:** the events are counted, and a comment ("Seen 12 more since …
+  (40 in all). Latest: …") goes up at most every 6 hours.
+- **Closed as not planned (or duplicate):** muted. Counted, never commented. To
+  hear about it again, reopen it.
+- **Closed otherwise (fixed):** a regression. A new issue, "Regression: …",
+  links the old one.
+- **Deleted:** filed again.
+
+A pass runs 5 s after a notification (so a failing job's faults go together),
+at most every 30 s, and every 60 s regardless. GitHub errors back off from 1 to
+30 minutes, honouring `Retry-After`. A refused credential (401, or a 403 other
+than a rate limit) stops all calls until restart; each pass with events waiting
+counts as `failed`, so `kiki-fault-reports-failing` fires. Events are deleted
+after 30 days, reported or not. `kiki.faults.recorded` counts events as the
+reporter takes them in; `kiki.faults.reported` counts what it did per
+fingerprint.
+
+| Variable | Value |
+|---|---|
+| `GITHUB_TOKEN` | secret: a fine-grained personal access token (below). Unset with no App: faults are kept 30 days but nothing is filed |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_PRIVATE_KEY` | secret: a GitHub App instead (below). The key is the PEM, the PEM with `\n` escapes, or its base64. `GITHUB_TOKEN` wins when both are set |
+| `GITHUB_ISSUES_REPO` | `owner/name`, `carltonwu/kiki` by default |
+| `GITHUB_API_URL` | `https://api.github.com` by default (the simulator points it at its fake) |
+| `FAULT_REPORT_ENVIRONMENT` | the Railway environment whose faults are filed, `production` by default. Others' are dropped, so a staging or PR environment files nothing |
+| `FAULT_REPORTS=off` | kill switch: nothing is filed (old events are still deleted) |
+
+**Credential: a fine-grained token** (simplest; it acts as you, so issues show
+your name):
+
+1. GitHub → Settings → Developer settings → Personal access tokens →
+   Fine-grained tokens → Generate new token.
+2. Name it `kiki-faults`, pick an expiry (a year at most; note the date),
+   resource owner the repo's owner (an organization may have to approve it).
+3. Repository access: Only select repositories → `carltonwu/kiki`.
+4. Permissions → Repository permissions → **Issues: Read and write**
+   (Metadata: Read-only is added by itself). Nothing else.
+5. Generate, copy it once, and set it on the ingester without echoing it:
+   `railway variable set --service ingester GITHUB_TOKEN --stdin`, paste it,
+   then Ctrl-D.
+
+**Credential: a GitHub App** (issues by `kiki-faults[bot]`, nothing expires):
+
+1. GitHub → Settings (yours or the organization's) → Developer settings →
+   GitHub Apps → New GitHub App. Name `kiki-faults`, any homepage URL, Webhook:
+   untick Active.
+2. Repository permissions → **Issues: Read and write**. Nothing else. Where
+   can it be installed: Only on this account.
+3. Create, note the **App ID**, then Generate a private key (a `.pem` downloads).
+4. Install App → only `carltonwu/kiki`. The **installation ID** is the number at
+   the end of the installation's URL (`…/settings/installations/<id>`).
+5. Set the three: `railway variable set --service ingester GITHUB_APP_ID=… GITHUB_APP_INSTALLATION_ID=…`,
+   then `base64 -w0 kiki-faults.pem | railway variable set --service ingester GITHUB_APP_PRIVATE_KEY --stdin`.
+   Delete the downloaded `.pem` afterwards (GitHub can make another).
+
+Either way the leader logs `fault reporter started` with the repo (none without a
+credential), and a refused credential logs a warning and fires the alert. To
+rotate, set the new value (setting a variable redeploys); to stop, delete it or
+set `FAULT_REPORTS=off`.
 
 ## Cardinality rules
 
@@ -430,6 +526,8 @@ way still shows as an `interrupted` job.
 | `kiki.reply.latency` | histogram | `s` | | `kiki_reply_latency_seconds_*` — **live** |
 | `kiki.leader.held` | gauge | | | `kiki_leader_held` — **live** |
 | `kiki.db.pool.connections` | gauge | `{connection}` | `state=used\|idle` | `kiki_db_pool_connections` — **live** |
+| `kiki.faults.recorded` | counter | `{fault}` | `service=agent\|ingester`, `kind` (the 8 in Fault issues) | `kiki_faults_recorded_total` |
+| `kiki.faults.reported` | counter | `{fault}` | `action=created\|counted\|commented\|muted\|dropped\|deferred\|failed` | `kiki_faults_reported_total` |
 
 `kiki.reply.latency` (trigger message created → first reply sent) is the
 headline SLO: from the Discord creation time of the message the reply answers
@@ -489,7 +587,7 @@ a new trace.
 | `kiki.images.attempts` | counter | `{attempt}` | `model`, `result=drawn\|safety_blocked\|refused\|failed` | `kiki_images_attempts_total` — **live** |
 | `kiki.images.fallback` | counter | `{attempt}` | `result=drawn\|failed` | `kiki_images_fallback_total` — **live** |
 | `kiki.images.duration` | histogram | `s` | `model` | `kiki_images_duration_seconds_*` — **live** |
-| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|budget_exhausted\|out_of_time` | `kiki_tools_calls_total` — **live** |
+| `kiki.tools.calls` | counter | `{call}` | `tool`, `outcome=ok\|error\|timeout\|refused\|invalid_arguments\|crashed\|budget_exhausted\|out_of_time` | `kiki_tools_calls_total` — **live** |
 | `kiki.tools.duration` | histogram | `s` | `tool` | `kiki_tools_duration_seconds_*` — **live** |
 | `kiki.web.calls` | counter | `{call}` | `kind=search\|fetch` | `kiki_web_calls_total` — **live** |
 

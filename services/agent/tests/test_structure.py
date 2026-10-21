@@ -20,11 +20,21 @@ ALLOWED = {
     "telemetry": [],  # observability: every part may record to it
     "contracts": [],
     "deadline": [],  # a job's deadline: tools and model calls cut their timeouts to it
+    "faults": [],  # unexpected failures, for GitHub issues: every part may note one
     "executor": ["contracts"],
     "prompt": ["contracts"],
     "openrouter": ["openrouter", "config", "telemetry"],
     "media.fetch": ["config", "telemetry"],
-    "chat": ["chat", "config", "db", "contracts", "openrouter", "media.fetch", "telemetry"],
+    "chat": [
+        "chat",
+        "config",
+        "db",
+        "contracts",
+        "openrouter",
+        "media.fetch",
+        "telemetry",
+        "faults",
+    ],
     "media": [
         "media",
         "chat",
@@ -35,6 +45,7 @@ ALLOWED = {
         "openrouter",
         "telemetry",
         "deadline",
+        "faults",
     ],
     "agent": [
         "agent",
@@ -48,8 +59,19 @@ ALLOWED = {
         "prompt",
         "telemetry",
         "deadline",
+        "faults",
     ],
-    "api": ["api", "", "config", "contracts", "executor", "db", "telemetry", "deadline"],
+    "api": [
+        "api",
+        "",
+        "config",
+        "contracts",
+        "executor",
+        "db",
+        "telemetry",
+        "deadline",
+        "faults",
+    ],
     "__main__": ["logs", "telemetry"],
 }
 PLATFORM_WORDS = ("discord", "guild")

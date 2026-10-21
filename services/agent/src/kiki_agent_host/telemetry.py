@@ -598,6 +598,11 @@ class Call:
         self.input_tokens += input_tokens or 0
         self.output_tokens += output_tokens or 0
 
+    def failed(self, error: BaseException) -> None:
+        """Marks the span failed by `error`, for one caught and answered."""
+        self.span.set_attribute("error.type", type(error).__qualname__)
+        self.span.set_status(StatusCode.ERROR)
+
 
 def model_label(model: str) -> str:
     """`model` as a metric label: the first MAX_MODELS distinct IDs keep their

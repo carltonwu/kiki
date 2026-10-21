@@ -98,6 +98,16 @@ export default defineRailway(() => {
       // Secret, optional: a project token for this environment, so the platform
       // poller can report the services' Railway CPU, memory, network and disk.
       RAILWAY_METRICS_TOKEN: preserve(),
+      // Fault issues (docs/observability.md, "Fault issues"). Secrets, optional:
+      // a fine-grained token with Issues read and write on the repo, or a
+      // GitHub App's three. Unset, faults are kept but nothing is filed.
+      GITHUB_TOKEN: preserve(),
+      GITHUB_APP_ID: preserve(),
+      GITHUB_APP_INSTALLATION_ID: preserve(),
+      GITHUB_APP_PRIVATE_KEY: preserve(),
+      GITHUB_ISSUES_REPO: "carltonwu/kiki",
+      // Only this environment's faults are filed; FAULT_REPORTS=off stops filing.
+      FAULT_REPORT_ENVIRONMENT: "production",
       ...telemetry,
       OTEL_SERVICE_NAME: "ingester",
     },

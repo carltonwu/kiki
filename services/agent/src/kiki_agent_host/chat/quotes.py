@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 
+from .. import faults
 from ..openrouter.embeddings import Embedder
 from .scope import MENTION, NO_ROSTER, PEOPLES, REF, USER_ID, Roster, Scope, speakers
 from .search import (
@@ -379,6 +380,7 @@ async def ranked(
             scope.channel_id,
             type(error).__name__,
         )
+        faults.degraded("embeddings", "quotes.embed", error=error)
         vector = None
     by_id = {r["id"]: r for r in rows}
     params = {

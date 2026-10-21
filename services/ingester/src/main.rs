@@ -12,6 +12,7 @@ mod commands;
 mod config;
 mod conversation;
 mod emojis;
+mod faults;
 mod gateway;
 mod guild_settings;
 mod health;
@@ -105,6 +106,8 @@ async fn run(config: Config) -> anyhow::Result<()> {
 
     // Leader only, so one instance reports the platform's metrics.
     let poller = tokio::spawn(platform::run(pool.clone(), shutdown_rx.clone()));
+    // Leader only, so one instance files each fault.
+    let reporter = tokio::spawn(faults::reporter::run(pool.clone(), shutdown_rx.clone()));
     let mut ingest = tokio::spawn(ingest(
         pool,
         discord,
@@ -124,6 +127,9 @@ async fn run(config: Config) -> anyhow::Result<()> {
     // Stop the poller (its gauges go silent with it) while still the leader.
     poller.abort();
     let _ = poller.await;
+    // Events it hadn't filed wait in the table for the next leader.
+    reporter.abort();
+    let _ = reporter.await;
     // Only now may the next instance connect to the Gateway.
     leader.release().await;
     leader_held.record(0, &[]);

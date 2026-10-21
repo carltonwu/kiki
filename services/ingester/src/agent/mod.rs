@@ -35,6 +35,7 @@ use twilight_http::Client;
 use crate::{
     chat::Usage,
     config::AgentConfig,
+    faults::{self, Fault},
     metrics::{self, RunStatus},
     telemetry,
 };
@@ -177,6 +178,15 @@ impl Agent {
                         Ok((id, _)) => *id,
                         Err(e) => {
                             warn!(conversation_id = workers.by_task.get(&e.id()), error = %e, "agent task panicked");
+                            if e.is_panic() {
+                                faults::record(&self.db, Fault {
+                                    kind: faults::TASK_PANICKED,
+                                    error_type: Some("panic"),
+                                    stage: Some("agent.worker"),
+                                    ..Fault::default()
+                                })
+                                .await;
+                            }
                             e.id()
                         }
                     };
@@ -459,6 +469,8 @@ impl Agent {
         let result = match self.host.execute(&request).await {
             Ok(result) => result,
             Err(e) => {
+                self.host_fault(&e, "reply", &request.model, &request.id)
+                    .await;
                 self.post_failure_note(claim, &context, record).await;
                 return Err(e);
             }
@@ -514,6 +526,20 @@ impl Agent {
     /// Someone was waiting on this reply and the host couldn't write one (the
     /// model failed, or the host is down): say so, rather than leave silence.
     /// The run still fails; a note that can't be sent is only logged.
+    /// Records `error` as a fault if the host answered outside its contract.
+    async fn host_fault(
+        &self,
+        error: &anyhow::Error,
+        job_kind: &'static str,
+        model: &str,
+        run_id: &str,
+    ) {
+        if let Some(protocol) = host::Protocol::of(error) {
+            let fault = protocol.fault(job_kind, Some(model.to_owned()), Some(run_id.to_owned()));
+            faults::record(&self.db, fault).await;
+        }
+    }
+
     async fn post_failure_note(
         &self,
         claim: &Claim,

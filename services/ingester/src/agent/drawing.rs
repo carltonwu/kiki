@@ -308,7 +308,11 @@ impl Agent {
                     (text, None, r.cost, Some(reason))
                 }
             },
-            Err(e) => (FALLBACK.to_owned(), None, None, Some(format!("{e:#}"))),
+            Err(e) => {
+                self.host_fault(&e, "image", &job.request.image_model, &job.request.id)
+                    .await;
+                (FALLBACK.to_owned(), None, None, Some(format!("{e:#}")))
+            }
         };
         let attachments = match &image {
             Some(image) => {

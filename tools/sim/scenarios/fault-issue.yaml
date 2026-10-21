@@ -1,0 +1,26 @@
+name: a provider rejection opens one GitHub issue, and the next is counted into it
+# The stub answers both replies' requests with HTTP 400, as OpenRouter does for a
+# retired model. The agent host saves a provider_rejected fault, and the leader's
+# reporter files it to fakecord's GitHub: structured fields only, never the
+# message. The second rejection has the same fingerprint, so it goes into the
+# same issue (a comment waits 6 hours) instead of a second one.
+steps:
+  - say: {as: alex, in: general, text: "kiki what's the weather on the moon"}
+    reply: {status: 400}
+  - expect: {run: failed}
+  - expect:
+      issue:
+        title_contains: "provider_rejected: ModelHTTPError"
+        labels: [kiki-fault, bug, "service:agent"]
+        body_contains: ["| HTTP status | `400` |", "| Job kind | `reply` |", "`sim/chat`"]
+        body_lacks: ["weather", "moon", "alex", "kiki-sim: rejected"]
+        comments: 0
+      issues: 1
+  - say: {as: sam, in: general, text: "kiki and on mars?"}
+    reply: {status: 400}
+  - expect: {run: failed}
+  - expect:
+      sql: "SELECT count(*) FROM fault_events WHERE kind = 'provider_rejected' AND reported_at IS NOT NULL"
+      equals: 2
+      within_s: 40
+  - expect: {issues: 1}
