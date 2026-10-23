@@ -17,6 +17,8 @@ class Settings:
     openrouter_api_key: str = ""
     openrouter_vision_model: str = ""
     openrouter_image_fallback_model: str = DEFAULT_IMAGE_FALLBACK_MODEL
+    # Chat models named `refuseless/<id>` (refuseless/chat.py); unset, they fail.
+    refuseless_api_token: str = ""
     # Refreshes expired Discord attachment links (reference images; `media.fetch.refresh`).
     discord_bot_token: str = ""
 
@@ -38,6 +40,7 @@ class Settings:
             openrouter_image_fallback_model=os.getenv(
                 "OPENROUTER_IMAGE_FALLBACK_MODEL", DEFAULT_IMAGE_FALLBACK_MODEL
             ).strip(),
+            refuseless_api_token=os.getenv("REFUSELESS_API_TOKEN", "").strip(),
             discord_bot_token=os.getenv("DISCORD_BOT_TOKEN", "").strip(),
         )
 
@@ -45,6 +48,12 @@ class Settings:
 def openrouter_base() -> str:
     """OpenRouter's API root; `OPENROUTER_BASE_URL` points at the local simulator."""
     return (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api").rstrip("/")
+
+
+def refuseless_base() -> str:
+    """Refuseless's OpenAI-compatible API root, `/v1` included; `REFUSELESS_BASE_URL`
+    points at the local simulator."""
+    return (os.getenv("REFUSELESS_BASE_URL") or "https://api.refuseless.com/v1").rstrip("/")
 
 
 def discord_api() -> str:

@@ -50,7 +50,8 @@ paging cursor (channel_history).
 `web: [{search: q, source: url}, {fetch: url}]` stands in for OpenRouter's server
 tools; `expect: {tool_called: web_search}` reads the agent host's saved result, and
 other tools its log, so `tool_called` also holds in live mode; `tools_offered:
-openrouter:web_fetch` checks the last reply request (stub mode).
+openrouter:web_fetch` checks the last reply request (stub mode), and `provider:
+refuseless, model: sim-chat` where it went, with what model ID (stub mode).
 """
 
 import json
@@ -272,6 +273,7 @@ class Run:
         if (
             "tool_called" in args
             or "tools_offered" in args
+            or "provider" in args
             or "tool_result_contains" in args
             or any(k in args for k in ("prompt_contains", "prompt_lacks"))
         ):
@@ -408,6 +410,11 @@ class Run:
         for kind in as_list(args.get("tools_offered")):
             if kind not in offered:
                 self.fail(step, f"{label}: the last reply request didn't offer {kind}")
+        if "provider" in args:
+            last = records[-1] if records else {}
+            got = (last.get("provider") or "openrouter", last.get("request", {}).get("model"))
+            if got != (args["provider"], args.get("model", got[1])):
+                self.fail(step, f"{label}: the last reply request went to {got}")
         for needle in as_list(args.get("tool_result_contains")):
             results = " ".join(" ".join(r.get("tool_results", [])) for r in records)
             if str(needle).lower() not in results.lower():

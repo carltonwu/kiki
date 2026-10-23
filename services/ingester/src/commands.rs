@@ -1432,22 +1432,50 @@ fn config_change<'a>(invocation: &Invocation<'a>) -> Result<Option<ConfigChange<
     Ok(Some((actor, key, value)))
 }
 
+/// Chat models named `refuseless/<id>` run on Refuseless rather than OpenRouter
+/// (the agent host's `refuseless/chat.py`).
+const REFUSELESS: &str = "refuseless/";
+
 async fn check_catalog_model(key: &str, model: &str) -> anyhow::Result<()> {
+    if key == "chat_model"
+        && let Some(id) = model.strip_prefix(REFUSELESS)
+    {
+        let url = format!("{}/models", crate::config::refuseless_base());
+        validate_refuseless_model(&fetch_catalog(&url, "Refuseless").await?, id)?;
+        return Ok(());
+    }
     // Image models are served by OpenRouter's Images API, which has its own catalog.
     let path = if key == "image_model" {
         "v1/images/models"
     } else {
         "v1/models"
     };
-    let catalog: Value = reqwest::Client::new()
-                    .get(format!("{}/{path}", crate::config::openrouter_base()))
-                    .timeout(Duration::from_secs(10))
-                    .send().await
-                    .and_then(reqwest::Response::error_for_status)
-                    .map_err(|_| UserError("Couldn't check OpenRouter's model catalog. Try again; your setting has not changed.".into()))?
-                    .json().await
-                    .map_err(|_| UserError("Couldn't read OpenRouter's model catalog. Try again; your setting has not changed.".into()))?;
-    validate_catalog_model(&catalog, key, model)?;
+    let url = format!("{}/{path}", crate::config::openrouter_base());
+    validate_catalog_model(&fetch_catalog(&url, "OpenRouter").await?, key, model)?;
+    Ok(())
+}
+
+async fn fetch_catalog(url: &str, provider: &str) -> Result<Value, UserError> {
+    reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send().await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|_| UserError(format!("Couldn't check {provider}'s model catalog. Try again; your setting has not changed.")))?
+        .json().await
+        .map_err(|_| UserError(format!("Couldn't read {provider}'s model catalog. Try again; your setting has not changed.")))
+}
+
+/// Refuseless's catalog lists IDs only; every model it serves takes tools.
+fn validate_refuseless_model(catalog: &Value, id: &str) -> Result<(), UserError> {
+    let models = catalog["data"].as_array().ok_or_else(|| {
+        UserError("Couldn't read Refuseless's model catalog. Your setting has not changed.".into())
+    })?;
+    if !models.iter().any(|entry| entry["id"].as_str() == Some(id)) {
+        return Err(UserError(
+            "That model ID isn't in Refuseless's catalog. Check the ID and try again.".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -2278,5 +2306,16 @@ mod tests {
         for model in ["test/unknown", "test/chat"] {
             assert!(validate_catalog_model(&catalog, "image_model", model).is_err());
         }
+    }
+
+    #[test]
+    fn refuseless_catalog_checks_the_id_without_its_prefix() {
+        use super::validate_refuseless_model;
+        use serde_json::json;
+        let catalog =
+            json!({"object": "list", "data": [{"id": "deepseek-v4.1-flash-abliterated"}]});
+        assert!(validate_refuseless_model(&catalog, "deepseek-v4.1-flash-abliterated").is_ok());
+        assert!(validate_refuseless_model(&catalog, "glm-9").is_err());
+        assert!(validate_refuseless_model(&json!({}), "deepseek-v4.1-flash-abliterated").is_err());
     }
 }
