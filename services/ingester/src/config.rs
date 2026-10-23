@@ -191,6 +191,14 @@ pub fn openrouter_base() -> String {
         .unwrap_or_else(|| "https://openrouter.ai/api".into())
 }
 
+/// `REFUSELESS_BASE_URL`: Refuseless's OpenAI-compatible API root, `/v1` included,
+/// for `refuseless/` chat models. Overridden only by the local simulator.
+pub fn refuseless_base() -> String {
+    optional_env("REFUSELESS_BASE_URL")
+        .map(|url| url.trim_end_matches('/').to_owned())
+        .unwrap_or_else(|| "https://api.refuseless.com/v1".into())
+}
+
 fn optional_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

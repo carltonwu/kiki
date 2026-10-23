@@ -52,7 +52,7 @@ macro_rules! settings {
 }
 
 settings! { r, a;
-    chat_model: String = a.chat_model.clone(), Kind::Model, "OpenRouter text model with tools";
+    chat_model: String = a.chat_model.clone(), Kind::Model, "OpenRouter text model with tools, or refuseless/<id>";
     image_generation: bool = true, Kind::Bool, "Let Kiki draw images and attach them to replies";
     image_model: String = a.image_model.clone(), Kind::Model, "OpenRouter model that outputs images";
     keywords: Vec<String> = r.keywords.clone(), Kind::Keywords, "Comma-separated trigger words; empty disables";

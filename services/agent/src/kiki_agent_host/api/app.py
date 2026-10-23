@@ -185,6 +185,7 @@ def application() -> FastAPI:
             settings.openrouter_vision_model,
             settings.discord_bot_token,
             image_fallback_model=settings.openrouter_image_fallback_model,
+            refuseless_api_token=settings.refuseless_api_token,
         )
     logger.info(
         "agent host ready startup_ms=%d rss_mb=%d executor_configured=%s "

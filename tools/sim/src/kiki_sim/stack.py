@@ -63,7 +63,7 @@ KEEP = [
 ]
 LIVE_KEYS = ["OPENROUTER_CHAT_API_KEY", "OPENROUTER_DECISION_API_KEY"]
 # Optional in live mode; without it, images go to the chat model.
-LIVE_OPTIONAL = ["OPENROUTER_VISION_MODEL"]
+LIVE_OPTIONAL = ["OPENROUTER_VISION_MODEL", "REFUSELESS_API_TOKEN"]
 
 
 class SimError(Exception):
@@ -398,6 +398,7 @@ class Config:
         else:
             values |= {
                 "OPENROUTER_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/openrouter",
+                "REFUSELESS_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/refuseless/v1",
                 "OPENROUTER_DECISION_API_KEY": "sim-key",
                 "OPENROUTER_CHAT_MODEL": "sim/chat",
                 "OPENROUTER_IMAGE_MODEL": "sim/image",
@@ -425,12 +426,15 @@ class Config:
         if self.live:
             keys = live_keys()
             values["OPENROUTER_CHAT_API_KEY"] = keys["OPENROUTER_CHAT_API_KEY"]
-            if "OPENROUTER_VISION_MODEL" in keys:
-                values["OPENROUTER_VISION_MODEL"] = keys["OPENROUTER_VISION_MODEL"]
+            for key in LIVE_OPTIONAL:
+                if key in keys:
+                    values[key] = keys[key]
         else:
             values |= {
                 "OPENROUTER_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/openrouter",
                 "OPENROUTER_CHAT_API_KEY": "sim-key",
+                "REFUSELESS_BASE_URL": f"http://127.0.0.1:{self.ports.fakecord}/refuseless/v1",
+                "REFUSELESS_API_TOKEN": "sim-key",
                 "OPENROUTER_VISION_MODEL": "sim/vision",
                 "OPENROUTER_IMAGE_FALLBACK_MODEL": "sim/image-fallback",
             }

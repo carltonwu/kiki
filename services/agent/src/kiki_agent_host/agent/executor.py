@@ -57,6 +57,7 @@ from ..openrouter.client import openrouter_client
 from ..openrouter.embeddings import Embedder
 from ..openrouter.images import OpenRouterImageModel, aspect_ratio_for, reference_limit
 from ..prompt import history
+from ..refuseless.chat import is_refuseless, refuseless_model, refuseless_provider
 from .deps import Deps, MemorySession
 from .tools import reply_agent
 from .tools.messages import finish, index_guild
@@ -198,6 +199,7 @@ class PydanticExecutor:
         discord_token: str = "",
         *,
         image_fallback_model: str = "",
+        refuseless_api_token: str = "",
     ):
         self.database_url = database_url
         # Draws what the server's image model's safety filter blocks; "" for none.
@@ -210,6 +212,10 @@ class PydanticExecutor:
             self.provider = OpenRouterProvider(openai_client=openrouter_client(api_key))
         else:
             self.provider = OpenRouterProvider(api_key=api_key)
+        # For `refuseless/` chat models; without a token they fail.
+        self.refuseless = (
+            refuseless_provider(refuseless_api_token) if refuseless_api_token else None
+        )
         # Fail fast inside a tool's deadline: a slow embedding degrades to "partial"
         # indexing and lexical search instead of losing the whole call.
         self.embeddings = openrouter_client(
@@ -219,6 +225,8 @@ class PydanticExecutor:
         self.images = openrouter_client(api_key, timeout=IMAGE_TIMEOUT_SECONDS, max_retries=0)
 
     def model(self, name: str) -> Model:
+        if is_refuseless(name):
+            return refuseless_model(name, self.refuseless_provider())
         return WebOpenRouterModel(name, provider=self.provider)
 
     def unthinking(self, name: str) -> Model:
@@ -226,6 +234,11 @@ class PydanticExecutor:
         return WebOpenRouterModel(
             name, provider=self.provider, settings={"openrouter_reasoning": {"enabled": False}}
         )
+
+    def refuseless_provider(self):
+        if self.refuseless is None:
+            raise ValueError("a refuseless/ chat model needs REFUSELESS_API_TOKEN")
+        return self.refuseless
 
     def warm(self) -> None:
         """At startup (api.app): which chat models think, fetched in the background
@@ -237,6 +250,11 @@ class PydanticExecutor:
         await catalog.stop()
 
     async def thinks(self, name: str) -> bool:
+        # Refuseless's models think without spending the answer's tokens, and
+        # turning it off breaks them (DeepSeek writes its thinking as the answer;
+        # GLM refuses): no thinking room or twin without thinking.
+        if is_refuseless(name):
+            return False
         return catalog.reasons(name)  # the copy at hand: replies don't wait on it
 
     async def chat_model(
@@ -288,7 +306,9 @@ class PydanticExecutor:
             },
             "usage_limits": UsageLimits(request_limit=MAX_MODEL_REQUESTS),
         }
-        if request.kind == "reply":
+        # Refuseless has no web server tools.
+        web_tools = () if is_refuseless(request.model) else self.web_tools
+        if request.kind == "reply" and not is_refuseless(request.model):
             options["model_settings"]["extra_body"] = {"max_tool_calls": MAX_WEB_STEPS}
         embed = Embedder(self.embeddings)
         vision = self.vision(request.model)
@@ -331,7 +351,7 @@ class PydanticExecutor:
                         ):
                             try:
                                 result = await reply_agent.run(
-                                    prompt, deps=deps, capabilities=self.web_tools, **options
+                                    prompt, deps=deps, capabilities=web_tools, **options
                                 )
                             except (UnexpectedModelBehavior, FallbackExceptionGroup) as e:
                                 ended = log_misbehavior(request.id, messages)

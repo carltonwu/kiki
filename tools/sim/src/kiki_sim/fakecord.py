@@ -33,6 +33,8 @@ GUILD_EMOJIS_AND_STICKERS = 1 << 3  # Gateway intent: GUILD_EMOJIS_UPDATE
 MENTION_TOKEN = re.compile(r"(?<![\w<])@([a-z0-9_.]+)", re.IGNORECASE)
 STUB_MODELS = ["sim/chat", "sim/other"]
 STUB_IMAGE_MODELS = ["sim/image"]
+# Refuseless's IDs have no provider part; Kiki names them `refuseless/<id>`.
+STUB_REFUSELESS_MODELS = ["sim-chat"]
 
 
 def iso(ms: int) -> str:
@@ -596,6 +598,8 @@ class Fakecord:
     async def openrouter(self, request: web.Request) -> web.StreamResponse:
         path = request.match_info["path"].rstrip("/")
         body = await request.json() if request.can_read_body else None
+        if request.path.startswith("/refuseless/"):
+            return await self.refuseless(request.method, path, body)
         if request.method == "GET" and path == "v1/models":
             return web.json_response(
                 {
@@ -643,6 +647,24 @@ class Fakecord:
         if request.method == "POST" and path == "v1/embeddings":
             return web.json_response(embeddings(body))
         self.world.unexpected.append({"method": request.method, "path": f"openrouter/{path}"})
+        return web.json_response({"error": {"code": 404, "message": "kiki-sim"}}, status=404)
+
+    async def refuseless(self, method: str, path: str, body: dict | None) -> web.Response:
+        """Refuseless's OpenAI-compatible API (`refuseless/` chat models): its
+        catalog lists IDs only, and chat answers like OpenRouter's stub, the
+        request recorded with `provider: refuseless`."""
+        if method == "GET" and path == "v1/models":
+            return web.json_response(
+                {
+                    "object": "list",
+                    "data": [{"id": m, "object": "model"} for m in STUB_REFUSELESS_MODELS],
+                }
+            )
+        if method == "POST" and path == "v1/chat/completions":
+            answer = self.chat(body)
+            self.world.llm[-1]["provider"] = "refuseless"
+            return web.json_response(answer)
+        self.world.unexpected.append({"method": method, "path": f"refuseless/{path}"})
         return web.json_response({"error": {"code": 404, "message": "kiki-sim"}}, status=404)
 
     def rejects(self, body: dict) -> int | None:
@@ -1220,6 +1242,7 @@ class Fakecord:
         app.router.add_get("/gateway/", self.gateway)
         app.router.add_route("*", "/api/v10/{path:.*}", self.rest)
         app.router.add_route("*", "/openrouter/{path:.*}", self.openrouter)
+        app.router.add_route("*", "/refuseless/{path:.*}", self.openrouter)
         app.router.add_route("*", "/cdn/{path:.*}", self.cdn)
         app.router.add_route("*", "/reddit/{path:.*}", self.reddit)
         app.router.add_route("*", "/fxtwitter/{path:.*}", self.fxtwitter)

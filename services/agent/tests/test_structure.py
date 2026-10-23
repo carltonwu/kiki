@@ -24,6 +24,7 @@ ALLOWED = {
     "executor": ["contracts"],
     "prompt": ["contracts"],
     "openrouter": ["openrouter", "config", "telemetry"],
+    "refuseless": ["config"],
     "media.fetch": ["config", "telemetry"],
     "chat": [
         "chat",
@@ -52,6 +53,7 @@ ALLOWED = {
         "chat",
         "media",
         "openrouter",
+        "refuseless",
         "config",
         "db",
         "contracts",

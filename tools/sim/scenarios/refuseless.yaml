@@ -1,0 +1,22 @@
+name: a server's refuseless/ chat model replies through Refuseless, without web tools
+steps:
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, value: refuseless/missing}}
+  - expect: {response_contains: "isn't in Refuseless's catalog"}
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, value: refuseless/sim-chat}}
+  - expect: {response_contains: "refuseless/sim-chat"}
+  - say: {as: alex, in: general, text: "@kiki hi"}
+    reply: {text: "hey from refuseless"}
+  - expect:
+      reply: true
+      text_contains: "hey from refuseless"
+      provider: refuseless
+      model: sim-chat
+  - expect: {sql: "SELECT model FROM agent_runs ORDER BY id DESC LIMIT 1", equals: refuseless/sim-chat}
+  # Back on OpenRouter after a reset, with its web tools.
+  - slash: {as: alex, in: general, command: config, options: {key: chat_model, reset: true}}
+  - say: {as: alex, in: general, text: "@kiki hello again"}
+  - expect:
+      reply: true
+      provider: openrouter
+      model: sim/chat
+      tools_offered: [openrouter:web_search, openrouter:web_fetch]

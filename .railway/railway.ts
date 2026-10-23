@@ -43,6 +43,9 @@ export default defineRailway(() => {
       AGENT_HOST_JOB_TIMEOUT_SECS: "120",
       // Chat and embeddings via OpenRouter; without it the host returns 501.
       OPENROUTER_CHAT_API_KEY: preserve(),
+      // For servers whose chat_model is refuseless/<id>; set by tools/railway-sync-env.
+      REFUSELESS_API_TOKEN: preserve(),
+      REFUSELESS_BASE_URL: preserve(),
       // read_image's model; unset falls back to the chat model.
       OPENROUTER_VISION_MODEL: "deepseek/deepseek-v4.1-flash-1017",
       // Draws what the server's image model's safety filter blocks; "" turns it off.
