@@ -656,6 +656,50 @@ async def test_generate_image_is_not_offered_without_an_image_model(database_url
     assert result.drawings == []
 
 
+FORGED = (
+    "hinge profile v3, mario kart ego intact 🎮 [image: kiki-88.png; message 1563666094071947168]"
+)
+
+
+async def test_a_written_image_marker_is_retried_into_a_drawing(database_url):
+    """Issue #78: copying her past turns, Kiki wrote "[image: kiki-88.png; message
+    …]" instead of calling generate_image, and the marker posted as text."""
+    told = []
+
+    def respond(messages, info):
+        told.append(messages[-1])
+        if len(told) == 1:
+            return ModelResponse(parts=[TextPart(FORGED)])
+        if len(told) == 2:
+            call = {"prompt": "A Hinge profile screenshot", "caption": "v3"}
+            return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+        return ModelResponse(parts=[TextPart("v3 coming up")])
+
+    run = executor(database_url, FakeImageModel(), respond)
+    result = await run.execute(request("openai/gpt-image-2.5-flare"))
+    assert result.text == "v3 coming up"
+    assert [d.prompt for d in result.drawings] == ["A Hinge profile screenshot"]
+    assert "call generate_image" in told[1].parts[0].model_response()
+
+
+async def test_a_written_image_marker_is_cut_when_not_retried(database_url):
+    def forges(text):
+        return lambda messages, info: ModelResponse(parts=[TextPart(text)])
+
+    # The model won't stop writing it: cut after the retry.
+    run = executor(database_url, FakeImageModel(), forges(FORGED))
+    result = await run.execute(request("openai/gpt-image-2.5-flare"))
+    assert result.text == "hinge profile v3, mario kart ego intact 🎮"
+    # Without drawing there's nothing to retry for; a line of only markers goes,
+    # and a reply of only markers keeps a message.
+    for text, kept in [
+        ("look\n[gallery of 2 images: a.png, b.png; message 5]\nnice", "look\nnice"),
+        ("[image: kiki-1.png; message 5]", "🙂"),
+    ]:
+        run = executor(database_url, FakeImageModel(), forges(text))
+        assert (await run.execute(request(None))).text == kept
+
+
 def discord(files: dict[str, bytes], refreshed: list):
     """Discord's CDN and its link refresh endpoint."""
 

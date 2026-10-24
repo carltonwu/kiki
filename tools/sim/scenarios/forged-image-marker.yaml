@@ -1,0 +1,24 @@
+name: An image marker Kiki writes herself is never posted (issue #78)
+steps:
+  # Production reply:581: copying her past turns, she wrote the marker of a
+  # drawing that was never made instead of calling generate_image. She's sent back
+  # once; a model that writes it again has it cut, and nothing is drawn.
+  - say:
+      as: alex
+      in: general
+      text: "kiki draw me a hinge profile"
+      reply: {text: "hinge profile v3, mario kart ego intact 🎮 [image: kiki-88.png; message 1563666094071947168]"}
+  - expect:
+      run: done
+      reply: true
+      text_contains: "hinge profile v3, mario kart ego intact 🎮"
+      text_lacks: "\\[image|kiki-88"
+      prompt_contains: "never write one yourself"
+      followup: {count: 0}
+  # Sent back once, then fixed: the retry's answer is posted.
+  - say:
+      as: alex
+      in: general
+      text: "kiki draw it again"
+      reply: {text: "here [gallery of 2 images: a.png, b.png; message 5]", retry: "sorry, no picture this time"}
+  - expect: {run: done, reply: true, text_contains: "sorry, no picture this time", text_lacks: "gallery"}

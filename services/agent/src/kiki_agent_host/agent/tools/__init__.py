@@ -2,6 +2,7 @@
 module with a `toolset`, added to `TOOLSETS`; the model decides when to use it."""
 
 import logging
+import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -17,6 +18,11 @@ from ..guard import out_of_lookup_time, time_for_another_turn
 from . import drawing, emojis, links, memory, messages, reading
 
 logger = logging.getLogger(__name__)
+
+# How the chat shows a message's images (Rust `people.rs`). Kiki's own drawings
+# show this way in her past turns, so she sometimes writes one as if that posted
+# a picture (issue #78).
+IMAGE_MARKER = re.compile(r" ?\[(?:image|gallery of [0-9]+ images): [^\[\]\n]*; message [0-9]+\]")
 
 TOOLSETS = [
     messages.toolset,
@@ -125,3 +131,44 @@ async def check_emojis(ctx: RunContext[Deps], text: str) -> str:
         emoji_catalog.STAND_IN in checked.stripped and emoji_catalog.STAND_IN not in text,
     )
     return checked.stripped
+
+
+@reply_agent.output_validator
+async def check_image_markers(ctx: RunContext[Deps], text: str) -> str:
+    """Kiki mustn't write the chat's image markers herself: one posts as text and
+    draws nothing. Without a queued drawing, the model gets a retry, on the same
+    terms as `check_emojis`, to call generate_image instead. Otherwise, or with
+    drawing off, the markers are cut; a reply left empty gets `emojis.STAND_IN`."""
+    if ctx.partial_output or not IMAGE_MARKER.search(text):
+        return text
+    deps = ctx.deps
+    requests_left = deps.request_limit - ctx.usage.requests
+    if (
+        deps.image_model
+        and not deps.drawings
+        and not ctx.last_attempt
+        and requests_left > 0
+        and time_for_another_turn()
+    ):
+        logger.info(
+            "reply image marker rejected job_id=%s attempt=%d requests_left=%d",
+            deps.job_id,
+            ctx.retry,
+            requests_left,
+        )
+        raise ModelRetry(
+            'Your reply contains an image marker like "[image: kiki-1.png; message 123]". '
+            "The chat adds those to show images that were really posted; writing one posts "
+            "only the text, and no picture. To send a picture, call generate_image. Then "
+            "write your whole reply again without any marker."
+        )
+    logger.warning("reply image marker cut job_id=%s drawings=%d", deps.job_id, len(deps.drawings))
+    # A line that held only markers goes; other lines are kept verbatim.
+    lines = []
+    for line in text.split("\n"):
+        if IMAGE_MARKER.search(line):
+            line = IMAGE_MARKER.sub("", line).rstrip()
+            if not line.strip():
+                continue
+        lines.append(line)
+    return "\n".join(lines).strip() or emoji_catalog.STAND_IN
