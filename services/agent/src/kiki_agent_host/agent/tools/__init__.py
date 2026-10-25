@@ -24,6 +24,29 @@ logger = logging.getLogger(__name__)
 # a picture (issue #78).
 IMAGE_MARKER = re.compile(r" ?\[(?:image|gallery of [0-9]+ images): [^\[\]\n]*; message [0-9]+\]")
 
+# A reply telling them a picture is on its way, as Kiki words it ("on the easel",
+# "painting now", "give it 30 sec"). Without a generate_image call that's a promise
+# nothing keeps: in prod over a dozen of her heads-ups came with no call, and
+# people asked "wheres the mewing image?". Broad on purpose: a false hit costs one
+# retry, in which she writes her reply again.
+PROMISED_PICTURE = re.compile(
+    r"\b(?:on|off) the easel\b"
+    r"|\b(?:in|out of|fresh out(?: of)?) the (?:oven|kiln|fryer)\b"
+    r"|\b(?:it'?s|now|currently|still|already|getting|pic'?s|picture'?s|one'?s)"
+    r" (?:re)?(?:rendering|cooking|drawing|painting|loading|baking|generating|coming"
+    r"|on (?:its|it's|the) way|queued)\b"
+    r"|\b(?:(?:re)?(?:render|draw|paint|cook|build|load|generat|swapp|redo|work|putt|edit|mak"
+    r"|doing)(?:ing)?|on) (?:it |that |this |one |him |her |them |you )?"
+    r"(?:now|rn|right now|as we speak)\b"
+    r"|\bqueued\b|\b(?:incoming|coming (?:up|right up|in hot|your way)|on (?:its|it's) way)\b"
+    r"|\b(?:landing|dropping|lands?|drops?|up|here|there|ready|done) (?:in|within)"
+    r" (?:a (?:sec|second|minute|moment|bit)|~?[0-9]+ ?(?:s|sec|secs|seconds|min)\b|like|about"
+    r"|half|thirty|a few)\b"
+    r"|\b(?:one|a|in a|just a) sec\b|\bgive it (?:a|like|about|~?[0-9]+|half|thirty)\b|\bgimme a\b"
+    r"|\b(?:half a minute|thirty seconds|~[0-9]+ ?s\b|[0-9]+ ?(?:sec|secs|seconds)\b)",
+    re.IGNORECASE,
+)
+
 TOOLSETS = [
     messages.toolset,
     reading.toolset,
@@ -172,3 +195,37 @@ async def check_image_markers(ctx: RunContext[Deps], text: str) -> str:
                 continue
         lines.append(line)
     return "\n".join(lines).strip() or emoji_catalog.STAND_IN
+
+
+@reply_agent.output_validator
+async def check_promised_picture(ctx: RunContext[Deps], text: str) -> str:
+    """A reply that says a picture is coming must have queued one. Without a
+    drawing, the model gets one retry (with two requests left: the call and the
+    reply) to call generate_image or take the promise back. Its second answer
+    stands either way."""
+    deps = ctx.deps
+    if (
+        ctx.partial_output
+        or not deps.image_model
+        or deps.drawings
+        or deps.promise_checked
+        or not PROMISED_PICTURE.search(text)
+    ):
+        return text
+    deps.promise_checked = True
+    requests_left = deps.request_limit - ctx.usage.requests
+    if ctx.last_attempt or requests_left < 2 or not time_for_another_turn():
+        logger.warning("reply promised picture kept job_id=%s", deps.job_id)
+        return text
+    logger.info(
+        "reply promised picture rejected job_id=%s attempt=%d requests_left=%d",
+        deps.job_id,
+        ctx.retry,
+        requests_left,
+    )
+    raise ModelRetry(
+        "Your reply sounds like a picture is on its way, but nothing is queued: you haven't "
+        "called generate_image in this turn, and words alone draw nothing, so they'd wait for "
+        "a picture that never comes. If you mean to send one, call generate_image now, then "
+        "write your reply. If your reply wasn't promising a picture, write it again as it was."
+    )

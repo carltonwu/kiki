@@ -119,7 +119,9 @@ REFERENCES_ONLY = (
 )
 SHARED = (
     "{span} {verb} what they shared with the request (a photo, meme or template): "
-    "use {pronoun} as the request describes, like the scene, layout or people to recreate."
+    "use {pronoun} as the request describes, like the scene, layout, pose or expression "
+    "to copy. A subject named above who takes someone's place in {pronoun} keeps that "
+    "person's pose, expression and framing but has the subject's own face."
 )
 EDIT = (
     "Reference image 1 is the photo to edit: change only what's described above and "
@@ -851,7 +853,11 @@ def compose(
             span = f"image {first}" if first == last else f"images {first}-{last}"
             line += f", shown in reference {span}"
             keep = PERSON_LOOK if f.subject.user_id or f.subject.kiki else THING_LOOK
-            details.append(f"Keep {name}'s {keep} the same; don't change {name}'s identity.")
+            details.append(
+                f"Keep {name}'s {keep} the same, except where the request above changes "
+                f"them (like a different skin tone, hair or age): follow the request there "
+                f"and keep {name} recognizable otherwise."
+            )
         if details:
             line += ": " + " ".join(details)
         lines.append(line)

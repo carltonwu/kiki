@@ -1256,7 +1256,7 @@
                   }
                 ],
                 "default": null,
-                "description": "Messages whose images the picture is made from but that don't\nshow a subject: the photo, meme, template or post to redraw or work\nfrom, by message ID (123, or 123:2 for only its 2nd image, numbered\nas read_image and read_link number them), Discord link, or the\npost's link (an X or Reddit post shared here). The images the newest\nmessages carry, reply to or link go in anyway; name it here when\nit's from earlier in the chat, like a tweet asked about a few\nmessages ago, or to send only one of a post's images."
+                "description": "Messages whose images the picture is made from but that don't\nshow a subject: the photo, meme, template or post to redraw or work\nfrom, by message ID (123, or 123:2 for only its 2nd image, numbered\nas read_image and read_link number them), Discord link, or the\npost's link (an X or Reddit post shared here). The images the newest\nmessages carry, reply to or link go in anyway; name it here when\nit's from earlier in the chat, like a tweet asked about a few\nmessages ago, or to send only one of a post's images. A pose,\nexpression or outfit to copy goes here too: when a follow-up asks\nfor the same with someone else (\"now do Eden\", \"his turn\"), pass\nthe earlier request's image again, or the image model only gets\nyour words for it."
               },
               "style": {
                 "anyOf": [

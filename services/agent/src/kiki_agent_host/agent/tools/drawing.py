@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 MAX_IMAGES = 2  # pictures one reply may queue
+# Seen in prod: four asked for, two queued, and Kiki said "all four queued".
+TOO_MANY = (
+    f"Not queued: at most {MAX_IMAGES} pictures per reply, and {MAX_IMAGES} already are. "
+    f"Only those {MAX_IMAGES} are coming: say so, and that they can ask for the rest next."
+)
 RECENT_MESSAGES = 200  # the channel's latest messages, for who's been around
 MENTION_NAME = re.compile(r"^<@!?[0-9]+>$")
 # A message ID (a snowflake) in a subject's name, and the clause around it.
@@ -201,13 +206,17 @@ async def generate_image(
             post's link (an X or Reddit post shared here). The images the newest
             messages carry, reply to or link go in anyway; name it here when
             it's from earlier in the chat, like a tweet asked about a few
-            messages ago, or to send only one of a post's images.
+            messages ago, or to send only one of a post's images. A pose,
+            expression or outfit to copy goes here too: when a follow-up asks
+            for the same with someone else ("now do Eden", "his turn"), pass
+            the earlier request's image again, or the image model only gets
+            your words for it.
     """
 
     async def work():
         deps = ctx.deps
         if len(deps.drawings) >= MAX_IMAGES:
-            return {"error": f"At most {MAX_IMAGES} pictures per reply."}
+            return {"error": TOO_MANY}
         pictured = []
         for s in subjects or []:
             user_id = None
@@ -281,7 +290,7 @@ async def generate_image(
         )
         # Checked again after the awaits above: parallel calls each passed the first.
         if len(deps.drawings) >= MAX_IMAGES:
-            return {"error": f"At most {MAX_IMAGES} pictures per reply."}
+            return {"error": TOO_MANY}
         deps.drawings.append(drawing)
         logger.info(
             "drawing queued job_id=%s subjects=%d photos=%d shared=%d styled=%s",

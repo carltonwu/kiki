@@ -1,0 +1,23 @@
+name: A reply promising a picture it never queued is sent back once
+steps:
+  # Production reply:606 ("painting now") and reply:602 ("loading now") promised a
+  # picture without calling generate_image, so nothing came. She's sent back once
+  # to call it or take the promise back.
+  - say:
+      as: alex
+      in: general
+      text: "kiki make ethan do this mewing face"
+      reply: {text: "Ethan's mewing era is on the easel 🎨", retry: "can't draw that one rn, sorry"}
+  - expect:
+      run: done
+      reply: true
+      text_contains: "can't draw that one rn, sorry"
+      text_lacks: "easel"
+      followup: {count: 0}
+  # A reply that wasn't promising a picture stands when she writes it again.
+  - say:
+      as: alex
+      in: general
+      text: "kiki did you see the game"
+      reply: {text: "one sec, still catching up"}
+  - expect: {run: done, reply: true, text_contains: "one sec, still catching up"}

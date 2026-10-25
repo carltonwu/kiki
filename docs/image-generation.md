@@ -29,6 +29,13 @@ Rust: reply job (+ image_model) ─▶ host: chat model calls generate_image(pro
   time a plain reply takes. If the model gives no ack at all (`NO_REPLY`, no
   reaction), the pending emoji stays on the request until the picture is posted;
   there's no canned ack text.
+- **A promised picture must be queued.** In prod over a dozen replies said "on the
+  easel", "painting now" or "give it 30 sec" without calling `generate_image`, and
+  people asked where the picture was. An output check (`check_promised_picture`)
+  sends such a reply back once, when two requests are left, to call the tool or
+  take the promise back; its second answer stands. The pattern is broad: a false
+  hit costs one retry. A `generate_image` call past the 2-picture limit tells her
+  only 2 are coming (she once said "all four queued").
 - **Async split** (option 1 of #23): the drawing is a durable job like replies.
   The reply's result carries `drawings`; Rust saves each as an `agent_image_jobs`
   row (`pending`) before posting anything, then draws it on its own task after the
@@ -182,7 +189,10 @@ template): use it as the request describes". In prod, "edit this meme" sent as a
 reply to the meme, a linked photo of a pet, and a photo attached to the request
 all failed to reach the image model, because the drawing used only the photos
 Kiki remembered to name. A given photo that the history search finds again isn't
-checked or sent twice. Shared images and `photos` include link previews' images
+checked or sent twice. A forwarded message's images count as its own: storing a forward lifts its
+snapshot's content, attachments and embeds to the top level (migration 0036), so
+a forwarded photo shows with an image marker and can be drawn from (in prod Kiki
+answered one with "i can't even peek at what you sent"). Shared images and `photos` include link previews' images
 (a tweet's photo), which the history search skips: in prod, "replace Sneaky with
 Reece" about a pasted tweet would have been drawn without the tweet's photo.
 A given message's images are its attachments, then its linked post's photos from
@@ -217,12 +227,25 @@ not illustrated, painted or rendered.
 
 Who and what is in it:
 - Ethan, shown in reference images 1-2: Keep Ethan's face, facial features, hair, skin
-  tone and build the same; don't change Ethan's identity.
+  tone and build the same, except where the request above changes them (like a
+  different skin tone, hair or age): follow the request there and keep Ethan
+  recognizable otherwise.
 - Nougie, shown in reference images 3-5: traumagotchi's dog. Keep Nougie's look (for an
-  animal: breed, size, coat colors and markings) the same; don't change Nougie's identity.
+  animal: breed, size, coat colors and markings) the same, except where …
 Use the subjects' reference images only for how they look, not for their backgrounds,
 lighting, clothing or framing: make the new picture described above.
+
+Reference image 6 is what they shared with the request (a photo, meme or template):
+use it as the request describes, like the scene, layout, pose or expression to copy.
+A subject named above who takes someone's place in it keeps that person's pose,
+expression and framing but has the subject's own face.
 ```
+
+The identity line yields to the request: it used to say "don't change Ethan's
+identity" with skin tone in the list, so in prod "Eden if he was white / Black"
+came out as two identical pictures of Eden as he is. The shared line names pose
+and expression: "make Ethan do this mewing face" sends a stranger's face as the
+pose to copy, not as a likeness.
 
 An edit (`edit: true`) uses the guide's edit phrasing instead: reference image 1 is
 the photo to edit; change only what's described and keep everything else (faces,
