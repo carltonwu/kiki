@@ -271,10 +271,12 @@ impl Agent {
                 "You can make pictures with generate_image when someone asks for one or one would clearly land better than words. Only that call makes one. \
                  The picture takes about half a minute and is posted after your reply, as its own message replying to them, with the caption you give it. \
                  So your reply is the heads-up: it tells them a picture is coming, in your own words for this moment and this person (or just a reaction, when that says it). \
+                 Say it's coming only once generate_image has queued it in this turn: words alone draw nothing, and they'd wait for a picture that never comes. \
                  Vary it like a person would; don't fall back on a stock phrase or the same emoji each time, and don't describe the picture as if it's already posted. \
                  Name the people, pets and things whose real look matters as its subjects: the drawing step finds their photos here and shows them to the image model. \
                  Asking to swap someone into a shared photo, meme or post (\"replace X with Y in that tweet\", \"put me in this\") usually means that picture redrawn with them, not its text reworded: read_image it, then draw it with them as a subject (the images shared with the request go to the image model too), unless it would sexualize or humiliate a real person. \
                  When that picture is from earlier in the chat rather than what the newest messages reply to or link (a follow-up like \"no, do it\" or \"the first one\"), pass its message in shared, as 123:2 for only its 2nd image; a subject's photos are only photos of them. \
+                 The same goes for a pose or expression to copy: \"now do Eden\" after \"make Ethan do this face\" passes that face's message in shared again. \
                  Pictures are candid, photorealistic phone photos unless they asked for a style or the joke needs one. \
                  Write the picture's prompt literally, for a model that hasn't seen the chat: what kind of image, then the scene, framing and light as concrete details, and any text in quotes. ",
             );
@@ -1164,6 +1166,54 @@ pub(super) mod tests {
         );
         assert_eq!(rows[1].images.len(), 10, "read_image reads at most 10");
         assert_eq!(rows[1].images.last().unwrap(), "9.png");
+
+        test.drop().await;
+    }
+
+    /// A forward's text and images are its snapshot's (migration 0036): in prod
+    /// a forwarded photo showed as an empty message.
+    #[tokio::test]
+    async fn forwarded_messages_show_the_forwarded_text_and_images() {
+        let Some(test) = crate::test_db::migrated("ingester_test").await else {
+            return;
+        };
+        let db = test.db.clone();
+        let mut forward = message(
+            22,
+            json!({"id": "101", "username": "alex"}),
+            json!({}),
+            "",
+            json!([]),
+        );
+        forward["message_reference"] = json!({"type": 1, "channel_id": "9", "message_id": "8"});
+        forward["message_snapshots"] = json!([{"message": {
+            "content": "mewing tutorial",
+            "attachments": [{"id": "30", "filename": "IMG_2450.png", "content_type": "image/jpeg",
+                             "url": "https://cdn.discordapp.com/attachments/2/30/IMG_2450.png"}],
+            "embeds": [],
+        }}]);
+        store::upsert_messages(&db, GUILD, &[forward])
+            .await
+            .unwrap();
+        // A partial update with empty lists keeps them.
+        let update = json!({"id": "22", "content": "", "attachments": [], "embeds": []});
+        assert!(store::update_message(&db, &update).await.unwrap());
+
+        let rows: Vec<super::StoredMessage> = sqlx::query_as(&format!(
+            "SELECT {} FROM messages m ORDER BY m.id",
+            super::MESSAGE_COLUMNS
+        ))
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(rows[0].images, ["IMG_2450.png"]);
+        let (content, kept): (String, bool) =
+            sqlx::query_as("SELECT content, raw ? 'message_snapshots' FROM messages")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(content, "mewing tutorial");
+        assert!(kept);
 
         test.drop().await;
     }

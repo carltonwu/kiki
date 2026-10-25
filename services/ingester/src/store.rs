@@ -2,7 +2,9 @@
 //! catch-up and live Gateway events can deliver the same object in any order.
 //!
 //! Discord objects are passed through as JSON and mapped to columns in SQL, so the
-//! `raw` column keeps exactly what Discord sent.
+//! `raw` column keeps what Discord sent. The one change: a forward's content,
+//! attachments and embeds are lifted from its snapshot (`lift_forward`, migration
+//! 0036), so its text and images read like a message's own.
 
 use serde_json::Value;
 use sqlx::{PgExecutor, PgPool, types::Json};
@@ -36,7 +38,7 @@ pub async fn upsert_messages(
                (m->>'timestamp')::timestamptz,
                (m->>'edited_timestamp')::timestamptz,
                m
-        FROM jsonb_array_elements($2) AS m
+        FROM jsonb_array_elements($2) AS sent, lift_forward(sent) AS m
         ON CONFLICT (id) DO UPDATE SET
             author_name = EXCLUDED.author_name,
             content     = EXCLUDED.content,
@@ -61,9 +63,10 @@ pub async fn update_message(db: &PgPool, update: &Value) -> sqlx::Result<bool> {
     let result = sqlx::query(
         r#"
         UPDATE messages SET
-            content   = coalesce($1->>'content', content),
+            content   = CASE WHEN $1 ? 'content' THEN coalesce(lift_forward(raw || $1)->>'content', '')
+                             ELSE content END,
             edited_at = coalesce(($1->>'edited_timestamp')::timestamptz, edited_at),
-            raw       = raw || $1
+            raw       = lift_forward(raw || $1)
         WHERE id = ($1->>'id')::bigint
         "#,
     )

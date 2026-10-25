@@ -22,6 +22,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import FunctionModel
 
 from kiki_agent_host.agent.executor import PydanticExecutor
+from kiki_agent_host.agent.tools import PROMISED_PICTURE
 from kiki_agent_host.agent.tools.drawing import MAX_IMAGES
 from kiki_agent_host.contracts import Drawing, ImageJobRequest, JobRequest, Subject
 from kiki_agent_host.media import drawing, fetch, generation
@@ -210,7 +211,7 @@ def test_compose_numbers_references_and_defaults_to_a_phone_photo():
     # Each reference by number and role, with what must stay the same.
     assert (
         "- Ethan, shown in reference image 1: Keep Ethan's face, facial features, hair, "
-        "skin tone and build the same; don't change Ethan's identity." in prompt
+        "skin tone and build the same, except where the request above changes them" in prompt
     )
     assert (
         "- Nougie, shown in reference images 2-3: traumagotchi's dog. Keep Nougie's look "
@@ -698,6 +699,63 @@ async def test_a_written_image_marker_is_cut_when_not_retried(database_url):
     ]:
         run = executor(database_url, FakeImageModel(), forges(text))
         assert (await run.execute(request(None))).text == kept
+
+
+async def test_a_promised_picture_is_retried_into_a_drawing(database_url):
+    """Production reply:606 said "painting now" and reply:602 "loading now" without
+    calling generate_image, so nothing came."""
+    told = []
+
+    def respond(messages, info):
+        told.append(messages[-1])
+        if len(told) == 1:
+            return ModelResponse(parts=[TextPart("Ethan's mewing era, loading now")])
+        if len(told) == 2:
+            call = {"prompt": "A selfie of Ethan mewing", "shared": []}
+            return ModelResponse(parts=[ToolCallPart("generate_image", call, tool_call_id="1")])
+        return ModelResponse(parts=[TextPart("Ethan's mewing era, loading now")])
+
+    run = executor(database_url, FakeImageModel(), respond)
+    result = await run.execute(request("openai/gpt-image-2.5-flare"))
+    assert result.text == "Ethan's mewing era, loading now"
+    assert [d.prompt for d in result.drawings] == ["A selfie of Ethan mewing"]
+    assert "call generate_image now" in told[1].parts[0].model_response()
+
+
+async def test_a_reply_is_checked_for_a_promised_picture_once(database_url):
+    def says(text):
+        return lambda messages, info: ModelResponse(parts=[TextPart(text)])
+
+    # Not a picture after all ("one sec"): sent back once, then it stands.
+    run = executor(database_url, FakeImageModel(), says("ok one sec, checking"))
+    result = await run.execute(request("openai/gpt-image-2.5-flare"))
+    assert result.text == "ok one sec, checking" and result.drawings == []
+    # Without drawing, or without a promise, there's nothing to check.
+    for model, text in [(None, "it's on the easel"), ("openai/gpt-image-2.5-flare", "lol same")]:
+        told = []
+
+        def respond(messages, info, text=text, told=told):
+            told.append(messages)
+            return ModelResponse(parts=[TextPart(text)])
+
+        run = executor(database_url, FakeImageModel(), respond)
+        assert (await run.execute(request(model))).text == text
+        assert len(told) == 1
+    for promise in [
+        "ok it's on the easel — four girlies and a rottweiler",
+        "oh we're doing a fake ad. sure — painting now",
+        "picture's on its way for real this time",
+        "anytime babe. it'll be up in a sec",
+        "give it like 30 secs",
+        "all four queued",
+    ]:
+        assert PROMISED_PICTURE.search(promise), promise
+    for chat in [
+        "I missed the fraud part, it came up in 2025",
+        "main is coming back as the default branch name",
+        "do the 50 that are due today",
+    ]:
+        assert not PROMISED_PICTURE.search(chat), chat
 
 
 def discord(files: dict[str, bytes], refreshed: list):

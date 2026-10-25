@@ -57,6 +57,9 @@ class Deps:
     spent: Counter[str] = field(default_factory=Counter)
     indexing: asyncio.Task[Semantic] | None = None
     drawings: list[Drawing] = field(default_factory=list)
+    # The reply was checked once for a picture it promised without queuing one
+    # (`tools.check_promised_picture`).
+    promise_checked: bool = False
     # The server's custom emoji, loaded once per run: the reply's emoji are checked
     # against them (`tools.check_emojis`).
     emojis: Catalog = field(default_factory=lambda: Catalog({}, {}))
