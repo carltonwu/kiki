@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Deploy images to Kiki's Dokploy applications, one at a time, and wait for each
+to be running the new image and healthy before starting the next.
+
+    tools/dokploy/deploy ingester=ghcr.io/carltonwu/kiki-ingester:<sha> \\
+                         agent=ghcr.io/carltonwu/kiki-agent:<sha>
+
+Order matters: the ingester runs migrations on start (MIGRATE_ON_START), so it
+goes first and the agent only starts once the schema is current. Applications are
+found by name in the Dokploy project and environment below.
+
+Environment: DOKPLOY_URL, DOKPLOY_API_KEY, and, when Dokploy is behind
+Cloudflare Access, CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (a service
+token). Stdlib only, so CI needs no setup. See docs/self-hosting.md.
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROJECT = os.environ.get("DOKPLOY_PROJECT", "kiki")
+ENVIRONMENT = os.environ.get("DOKPLOY_ENVIRONMENT", "production")
+# Dokploy queues the deploy (pull, then `docker service update`).
+DEPLOY_TIMEOUT = 600
+# Then Swarm starts the new task, waits for its HEALTHCHECK (start period 60s),
+# and stops the old one.
+HEALTHY_TIMEOUT = 300
+POLL = 5
+
+
+class Dokploy:
+    def __init__(self) -> None:
+        self.url = os.environ["DOKPLOY_URL"].rstrip("/")
+        self.headers = {"x-api-key": os.environ["DOKPLOY_API_KEY"], "Content-Type": "application/json"}
+        if os.environ.get("CF_ACCESS_CLIENT_ID"):
+            self.headers["CF-Access-Client-Id"] = os.environ["CF_ACCESS_CLIENT_ID"]
+            self.headers["CF-Access-Client-Secret"] = os.environ["CF_ACCESS_CLIENT_SECRET"]
+
+    def call(self, procedure: str, body: dict | None = None, **query: str):
+        url = f"{self.url}/api/{procedure}"
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(url, data=data, headers=self.headers, method="POST" if data else "GET")
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                text = response.read().decode()
+        except urllib.error.HTTPError as e:
+            sys.exit(f"{procedure}: HTTP {e.code}: {e.read().decode()[:500]}")
+        if text.lstrip().startswith("<"):
+            # Cloudflare Access's login page instead of the API.
+            sys.exit(f"{procedure}: got HTML, not JSON; check the Cloudflare Access service token")
+        return json.loads(text) if text else None
+
+
+def find_applications(dokploy: Dokploy) -> dict[str, dict]:
+    for project in dokploy.call("project.all"):
+        if project["name"] != PROJECT:
+            continue
+        for environment in project.get("environments", []):
+            if environment["name"] == ENVIRONMENT:
+                return {app["name"]: app for app in environment.get("applications", [])}
+    sys.exit(f"no Dokploy environment {PROJECT}/{ENVIRONMENT}")
+
+
+def latest_deployment(dokploy: Dokploy, application_id: str) -> dict | None:
+    deployments = dokploy.call("deployment.all", applicationId=application_id)
+    return max(deployments, key=lambda d: d["createdAt"], default=None)
+
+
+def healthy_with(dokploy: Dokploy, app_name: str, image: str) -> tuple[bool, str]:
+    """Whether a running container of the app has the image and passes its check."""
+    containers = dokploy.call("docker.getContainersByAppNameMatch", appName=app_name)
+    seen = []
+    for container in containers:
+        if container["state"] != "running":
+            continue
+        inspect = dokploy.call("docker.getConfig", containerId=container["containerId"])
+        running = inspect["Config"]["Image"].split("@")[0]
+        health = (inspect["State"].get("Health") or {}).get("Status", "none")
+        seen.append(f"{running} ({health})")
+        if running == image and health == "healthy":
+            return True, ""
+    return False, ", ".join(seen) or "no running container"
+
+
+def deploy(dokploy: Dokploy, app: dict, image: str) -> None:
+    name, application_id = app["name"], app["applicationId"]
+    before = latest_deployment(dokploy, application_id)
+    dokploy.call("application.update", {"applicationId": application_id, "dockerImage": image})
+    sha = image.rsplit(":", 1)[-1][:12]
+    dokploy.call("application.deploy", {"applicationId": application_id, "title": f"CI {sha}"})
+    print(f"{name}: deploying {image}", flush=True)
+
+    deadline = time.monotonic() + DEPLOY_TIMEOUT
+    while True:
+        time.sleep(POLL)
+        current = latest_deployment(dokploy, application_id)
+        new = current and (before is None or current["deploymentId"] != before["deploymentId"])
+        if new and current["status"] == "done":
+            break
+        if new and current["status"] == "error":
+            log = dokploy.call("deployment.readLogs", deploymentId=current["deploymentId"], tail="40")
+            sys.exit(f"{name}: Dokploy deployment failed\n{log}")
+        if time.monotonic() > deadline:
+            sys.exit(f"{name}: Dokploy deployment didn't finish in {DEPLOY_TIMEOUT}s")
+
+    print(f"{name}: service updated; waiting for a healthy task", flush=True)
+    deadline = time.monotonic() + HEALTHY_TIMEOUT
+    while True:
+        ok, seen = healthy_with(dokploy, app["appName"], image)
+        if ok:
+            print(f"{name}: healthy on {sha}", flush=True)
+            return
+        if time.monotonic() > deadline:
+            sys.exit(
+                f"{name}: not healthy on {image} after {HEALTHY_TIMEOUT}s (running: {seen}). "
+                "Swarm rolls back on a failed health check; see the app's logs in Dokploy."
+            )
+        time.sleep(POLL)
+
+
+def main() -> None:
+    targets = [arg.split("=", 1) for arg in sys.argv[1:]]
+    if not targets or any(len(t) != 2 for t in targets):
+        sys.exit(__doc__)
+    dokploy = Dokploy()
+    apps = find_applications(dokploy)
+    for name, image in targets:
+        if name not in apps:
+            sys.exit(f"no application {name!r} in {PROJECT}/{ENVIRONMENT} (have: {', '.join(apps)})")
+        deploy(dokploy, apps[name], image)
+
+
+if __name__ == "__main__":
+    main()

@@ -42,6 +42,18 @@ def test_resource_describes_the_railway_deployment():
     }
 
 
+def test_resource_prefers_the_image_version_when_self_hosted():
+    attributes = telemetry.resource_attributes(
+        {
+            "KIKI_ENVIRONMENT": "production",
+            "KIKI_VERSION": "def456",
+            "RAILWAY_GIT_COMMIT_SHA": "abc123",
+        }
+    )
+    assert attributes["deployment.environment.name"] == "production"
+    assert attributes["service.version"] == "def456"
+
+
 async def test_without_an_endpoint_everything_is_a_safe_no_op(monkeypatch):
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     assert not telemetry.configure()

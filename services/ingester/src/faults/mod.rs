@@ -128,14 +128,16 @@ pub async fn record(db: &PgPool, fault: Fault) {
     }
 }
 
-/// The deployed commit, as Railway names it.
+/// The deployed commit: `KIKI_VERSION`, baked into the image by CI, or Railway's.
 pub fn version() -> Option<String> {
-    env("RAILWAY_GIT_COMMIT_SHA")
+    env("KIKI_VERSION").or_else(|| env("RAILWAY_GIT_COMMIT_SHA"))
 }
 
-/// The Railway environment, `local` outside Railway (as the agent host's).
+/// The deployment environment, `local` when unset (as the agent host's).
 pub fn environment() -> String {
-    env("RAILWAY_ENVIRONMENT_NAME").unwrap_or_else(|| "local".into())
+    env("KIKI_ENVIRONMENT")
+        .or_else(|| env("RAILWAY_ENVIRONMENT_NAME"))
+        .unwrap_or_else(|| "local".into())
 }
 
 fn env(name: &str) -> Option<String> {

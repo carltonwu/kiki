@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Kiki's Dokploy setup as code: Postgres, the ingester and agent apps, and their
+environment variables. Replaces .railway/railway.ts and tools/railway-sync-env.
+
+    tools/dokploy/apply                  # dry run: show what would change
+    tools/dokploy/apply --apply          # create what's missing, write env, redeploy
+    tools/dokploy/apply --from-railway   # take secrets from Railway's variables
+                                         # instead of .env (the one-time move)
+
+Settings that aren't secret live below and are reviewed like code. Secrets come
+from the local .env (as tools/railway-sync-env did) and are never printed.
+DATABASE_URL and AGENT_HOST_URL are derived from what Dokploy created, and
+AGENT_HOST_TOKEN is generated once and kept. Values shared by both services are
+environment-level variables, referenced as ${{environment.NAME}}.
+
+Writing env replaces what's in Dokploy's UI for these apps: change it here (or in
+.env) instead. Images are set by CI (tools/dokploy/deploy), not here.
+
+Environment: DOKPLOY_URL (the LAN address works: http://192.168.1.38:3000) and
+DOKPLOY_API_KEY, plus CF_ACCESS_CLIENT_ID/SECRET through Cloudflare Access.
+See docs/self-hosting.md.
+"""
+
+import argparse
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import secrets
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[2]
+_loader = importlib.machinery.SourceFileLoader("dokploy_deploy", str(Path(__file__).with_name("deploy")))
+_spec = importlib.util.spec_from_loader("dokploy_deploy", _loader)
+_deploy = importlib.util.module_from_spec(_spec)
+_loader.exec_module(_deploy)
+Dokploy, PROJECT, ENVIRONMENT = _deploy.Dokploy, _deploy.PROJECT, _deploy.ENVIRONMENT
+
+SECONDS = 1_000_000_000  # Swarm durations are nanoseconds
+MB = 1024 * 1024
+
+POSTGRES = {
+    "name": "postgres",
+    "appName": "kiki-postgres",
+    "databaseName": "kiki",
+    "databaseUser": "kiki",
+    # Postgres 18 + pgvector, as on Railway and in CI.
+    "dockerImage": "pgvector/pgvector:pg18-trixie",
+    # Dokploy mounts its volume at /var/lib/postgresql/data; Postgres 18's image
+    # otherwise keeps data in /var/lib/postgresql/18/docker, outside the volume.
+    "env": "PGDATA=/var/lib/postgresql/data",
+    "memoryLimit": str(1024 * MB),
+}
+
+# Both apps: start the new task first, wait for its HEALTHCHECK, then stop the
+# old one (the ingester's leader lock hands over, as on Railway). A task that
+# never turns healthy rolls back to the previous image.
+SWARM = {
+    "updateConfigSwarm": {
+        "Parallelism": 1,
+        "Order": "start-first",
+        "FailureAction": "rollback",
+        "Monitor": 30 * SECONDS,
+        "Delay": 0,
+    },
+    "rollbackConfigSwarm": {"Parallelism": 1, "Order": "start-first", "FailureAction": "pause"},
+    "restartPolicySwarm": {"Condition": "any", "Delay": 5 * SECONDS, "MaxAttempts": 0},
+    # SIGTERM to SIGKILL, so the ingester can save its Gateway session and
+    # release the leader lock (Railway's drainingSeconds).
+    "stopGracePeriodSwarm": 30 * SECONDS,
+    "replicas": 1,
+}
+
+OTEL = {
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://otlp-gateway-prod-us-east-2.grafana.net/otlp",
+    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/protobuf",
+}
+
+# Environment-level, shared by both apps.
+SHARED_PLAIN = {"KIKI_ENVIRONMENT": "production", **OTEL}
+SHARED_SECRET = ["AGENT_HOST_TOKEN", "DISCORD_BOT_TOKEN", "OTEL_EXPORTER_OTLP_HEADERS"]
+
+APPS = {
+    "ingester": {
+        "appName": "kiki-ingester",
+        "memoryLimit": str(512 * MB),
+        "plain": {
+            "MIGRATE_ON_START": "true",
+            "LOG_FORMAT": "json",
+            "RUST_LOG": "info,sqlx=warn,twilight_http_ratelimiting=warn",
+            "OPENROUTER_DECISION_MODEL": "~typesafe/jev-latest",
+            "OPENROUTER_CHAT_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "OPENROUTER_IMAGE_MODEL": "openai/gpt-image-2.5-flare",
+            "OPENROUTER_EMOJI_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "DISCORD_GUILD_IDS": "1358240830887952575,348273727298863104",
+            "GITHUB_ISSUES_REPO": "carltonwu/kiki",
+            "FAULT_REPORT_ENVIRONMENT": "production",
+            "OTEL_SERVICE_NAME": "ingester",
+        },
+        "shared": ["DATABASE_URL", "AGENT_HOST_URL", *SHARED_SECRET, *SHARED_PLAIN],
+        # Optional secrets: set only when the source has them.
+        "secret": [
+            "OPENROUTER_DECISION_API_KEY",
+            "GITHUB_TOKEN",
+            "GITHUB_APP_ID",
+            "GITHUB_APP_INSTALLATION_ID",
+            "GITHUB_APP_PRIVATE_KEY",
+        ],
+        # Tunables .env may override (tools/railway-sync-env's list).
+        "tunable": [
+            "AGENT_HISTORY_MESSAGES",
+            "AGENT_HOST_TIMEOUT_MS",
+            "AGENT_RUN_MAX_AGE_SECS",
+            "DISCORD_GUILD_IDS",
+            "JEV_MIN_CONFIDENCE",
+            "JEV_TIMEOUT_MS",
+            "MAX_ACTIVE_CONVERSATIONS",
+            "OPENROUTER_CHAT_MODEL",
+            "OPENROUTER_DECISION_MODEL",
+            "OPENROUTER_EMOJI_MODEL",
+            "OPENROUTER_IMAGE_MODEL",
+            "OPENROUTER_TOPIC_MODEL",
+            "POOL_DEBOUNCE_MS",
+            "POOL_MAX_MESSAGES",
+            "POOL_MAX_WAIT_MS",
+            "ROUTE_ACTIVE_WINDOW_SECS",
+            "ROUTE_KEYWORDS",
+            "ROUTE_MAX_MESSAGE_AGE_MS",
+            "ROUTE_PENDING_EMOJI",
+            "RUST_LOG",
+            "TOPIC_EVERY_MESSAGES",
+        ],
+    },
+    "agent": {
+        "appName": "kiki-agent",
+        "memoryLimit": str(1024 * MB),
+        "plain": {
+            "PORT": "8081",
+            "LOG_FORMAT": "json",
+            "AGENT_HOST_MAX_CONCURRENT_JOBS": "2",
+            "AGENT_HOST_JOB_TIMEOUT_SECS": "120",
+            "OPENROUTER_VISION_MODEL": "deepseek/deepseek-v4.1-flash-1017",
+            "OPENROUTER_IMAGE_FALLBACK_MODEL": "qwen/qwen-image-2.1-turbo",
+            "OTEL_SERVICE_NAME": "agent",
+        },
+        "shared": ["DATABASE_URL", *SHARED_SECRET, *SHARED_PLAIN],
+        "secret": ["OPENROUTER_CHAT_API_KEY", "REDDIT_CLIENT_ID", "REDDIT_CLIENT_SECRET"],
+        "tunable": [
+            "AGENT_HOST_JOB_TIMEOUT_SECS",
+            "AGENT_HOST_MAX_CONCURRENT_JOBS",
+            "LOG_LEVEL",
+            "OPENROUTER_IMAGE_FALLBACK_MODEL",
+            "OPENROUTER_VISION_MODEL",
+        ],
+    },
+}
+# Deploy order: the ingester migrates, so it goes first.
+ORDER = ["ingester", "agent"]
+PLACEHOLDER_IMAGE = "ghcr.io/carltonwu/kiki-{name}:main"
+
+
+def parse_env(text: str) -> dict[str, str]:
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.removeprefix("export ").partition("=")
+        if not sep:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def render_env(values: dict[str, str]) -> str:
+    def quote(v: str) -> str:
+        # Multi-line values (a GitHub App's private key) need quotes.
+        return json.dumps(v) if "\n" in v or v != v.strip() else v
+
+    return "".join(f"{k}={quote(v)}\n" for k, v in sorted(values.items()))
+
+
+def otlp_headers(source: dict[str, str]) -> str | None:
+    if source.get("OTEL_EXPORTER_OTLP_HEADERS"):
+        return source["OTEL_EXPORTER_OTLP_HEADERS"]
+    instance, token = source.get("GRAFANA_CLOUD_ID"), source.get("GRAFANA_APP_TOKEN")
+    if not instance or not token:
+        return None
+    return "Authorization=Basic%20" + base64.b64encode(f"{instance}:{token}".encode()).decode()
+
+
+def from_railway() -> dict[str, dict[str, str]]:
+    """Each Railway service's resolved variables, by Dokploy app name."""
+    out = {}
+    for service in ORDER:
+        result = subprocess.run(
+            ["railway", "variable", "list", "--service", service, "--json"],
+            capture_output=True,
+            text=True,
+            # The Railway-linked checkout; worktrees aren't linked.
+            cwd=os.environ.get("RAILWAY_DIR", REPO),
+        )
+        if result.returncode != 0:
+            sys.exit(f"railway variable list --service {service} failed: {result.stderr.strip()}")
+        out[service] = json.loads(result.stdout)
+    return out
+
+
+class Plan:
+    def __init__(self, apply: bool) -> None:
+        self.apply = apply
+        self.changed_apps: set[str] = set()
+
+    def note(self, verb: str, what: str) -> None:
+        print(f"  {verb:<7} {what}")
+
+
+def diff(plan: Plan, label: str, current: dict[str, str], wanted: dict[str, str], secret: set[str]) -> bool:
+    changed = False
+    for key in sorted(current.keys() | wanted.keys()):
+        old, new = current.get(key), wanted.get(key)
+        if old == new:
+            continue
+        changed = True
+        if new is None:
+            plan.note("remove", f"{label}.{key}")
+        else:
+            shown = "<secret>" if key in secret else repr(new)
+            plan.note("add" if old is None else "change", f"{label}.{key} = {shown}")
+    return changed
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true", help="make the changes and redeploy changed apps")
+    parser.add_argument("--file", type=Path, default=REPO / ".env", help="dotenv with the secrets")
+    parser.add_argument("--from-railway", action="store_true", help="read secrets from Railway instead")
+    parser.add_argument("--no-redeploy", action="store_true", help="write env without redeploying")
+    args = parser.parse_args()
+    plan = Plan(args.apply)
+    dokploy = Dokploy()
+
+    # Where secrets and tunables come from, per app.
+    if args.from_railway:
+        sources = from_railway()
+    else:
+        local = parse_env(args.file.read_text())
+        sources = {name: local for name in ORDER}
+
+    environment = find_environment(dokploy)
+
+    # --- Postgres
+    postgres = next((p for p in environment.get("postgres", []) if p["name"] == POSTGRES["name"]), None)
+    if postgres is None:
+        plan.note("create", f"postgres {POSTGRES['appName']} ({POSTGRES['dockerImage']})")
+        if args.apply:
+            fields = {k: POSTGRES[k] for k in ("name", "appName", "databaseName", "databaseUser", "dockerImage")}
+            dokploy.call(
+                "postgres.create",
+                {**fields, "databasePassword": secrets.token_urlsafe(24), "environmentId": environment["environmentId"]},
+            )
+            environment = find_environment(dokploy)
+            postgres = next(p for p in environment["postgres"] if p["name"] == POSTGRES["name"])
+    if postgres is not None:
+        postgres = dokploy.call("postgres.one", postgresId=postgres["postgresId"])
+        wanted = {k: POSTGRES[k] for k in ("dockerImage", "env", "memoryLimit")}
+        current = {k: postgres.get(k) for k in wanted}
+        if current != wanted:
+            plan.note("update", f"postgres {', '.join(k for k in wanted if current[k] != wanted[k])}")
+            if args.apply:
+                dokploy.call("postgres.update", {"postgresId": postgres["postgresId"], **wanted})
+        if postgres.get("applicationStatus") != "done" or current != wanted:
+            plan.note("deploy", "postgres")
+            if args.apply:
+                dokploy.call("postgres.deploy", {"postgresId": postgres["postgresId"]})
+
+    # --- Apps
+    apps = {a["name"]: a for a in environment.get("applications", [])}
+    for name in ORDER:
+        spec = APPS[name]
+        if name not in apps:
+            plan.note("create", f"app {name}")
+            if args.apply:
+                dokploy.call(
+                    "application.create",
+                    {"name": name, "appName": spec["appName"], "environmentId": environment["environmentId"]},
+                )
+                apps = {a["name"]: a for a in find_environment(dokploy).get("applications", [])}
+        if name not in apps:
+            continue
+        app = dokploy.call("application.one", applicationId=apps[name]["applicationId"])
+        apps[name] = app
+        wanted = {"sourceType": "docker", "memoryLimit": spec["memoryLimit"], **SWARM}
+        if not app.get("dockerImage"):
+            wanted["dockerImage"] = PLACEHOLDER_IMAGE.format(name=name)
+        stale = [k for k, v in wanted.items() if app.get(k) != v]
+        if stale:
+            plan.note("update", f"app {name}: {', '.join(stale)}")
+            if args.apply:
+                dokploy.call("application.update", {"applicationId": app["applicationId"], **wanted})
+                plan.changed_apps.add(name)
+
+    # --- Environment-level variables
+    current_shared = parse_env(environment.get("env") or "")
+    shared = dict(SHARED_PLAIN)
+    shared["AGENT_HOST_TOKEN"] = current_shared.get("AGENT_HOST_TOKEN") or secrets.token_urlsafe(32)
+    ingester_source = sources["ingester"]
+    for key in ("DISCORD_BOT_TOKEN",):
+        value = ingester_source.get(key) or current_shared.get(key)
+        if value:
+            shared[key] = value
+        else:
+            print(f"  missing {key}: set it in {args.file.name} (required)")
+    if headers := otlp_headers(ingester_source) or current_shared.get("OTEL_EXPORTER_OTLP_HEADERS"):
+        shared["OTEL_EXPORTER_OTLP_HEADERS"] = headers
+    if postgres is not None:
+        shared["DATABASE_URL"] = (
+            f"postgres://{postgres['databaseUser']}:{postgres['databasePassword']}"
+            f"@{postgres['appName']}:5432/{postgres['databaseName']}"
+        )
+    if "agent" in apps and apps["agent"].get("appName"):
+        shared["AGENT_HOST_URL"] = f"http://{apps['agent']['appName']}:8081"
+    secret_keys = set(SHARED_SECRET) | {"DATABASE_URL"}
+    if diff(plan, "environment", current_shared, shared, secret_keys):
+        plan.changed_apps.update(ORDER)
+        if args.apply:
+            dokploy.call(
+                "environment.update", {"environmentId": environment["environmentId"], "env": render_env(shared)}
+            )
+
+    # --- Per-app variables
+    for name in ORDER:
+        if name not in apps:
+            continue
+        spec, app, source = APPS[name], apps[name], sources[name]
+        values = dict(spec["plain"])
+        for key in spec["tunable"]:
+            if source.get(key):
+                values[key] = source[key]
+        for key in spec["secret"]:
+            if source.get(key):
+                values[key] = source[key]
+        for key in spec["shared"]:
+            if key in shared:
+                values[key] = "${{environment.%s}}" % key
+        current = parse_env(app.get("env") or "")
+        if diff(plan, name, current, values, set(spec["secret"])):
+            plan.changed_apps.add(name)
+            if args.apply:
+                dokploy.call(
+                    "application.saveEnvironment",
+                    {
+                        "applicationId": app["applicationId"],
+                        "env": render_env(values),
+                        "buildArgs": None,
+                        "buildSecrets": None,
+                        "createEnvFile": False,
+                    },
+                )
+
+    if not args.apply:
+        print("\nDry run. Re-run with --apply to make these changes.")
+        return
+    if args.no_redeploy:
+        return
+    # Env only takes effect on a deploy. Apps still on the placeholder image wait
+    # for CI's first push.
+    for name in ORDER:
+        if name in plan.changed_apps and name in apps:
+            app = dokploy.call("application.one", applicationId=apps[name]["applicationId"])
+            if app.get("dockerImage") == PLACEHOLDER_IMAGE.format(name=name) and app.get("applicationStatus") == "idle":
+                print(f"  {name}: waiting for CI's first image; not deployed")
+                continue
+            dokploy.call("application.redeploy", {"applicationId": app["applicationId"], "title": "env change"})
+            print(f"  {name}: redeploying")
+
+
+def find_environment(dokploy: Dokploy) -> dict:
+    for project in dokploy.call("project.all"):
+        if project["name"] == PROJECT:
+            for environment in project.get("environments", []):
+                if environment["name"] == ENVIRONMENT:
+                    return dokploy.call("environment.one", environmentId=environment["environmentId"])
+    sys.exit(f"no Dokploy environment {PROJECT}/{ENVIRONMENT}; create the project in Dokploy first")
+
+
+if __name__ == "__main__":
+    main()
