@@ -304,13 +304,15 @@ fn resource(env: impl Fn(&str) -> Option<String>) -> Resource {
         KeyValue::new("service.namespace", "kiki"),
         KeyValue::new(
             "deployment.environment.name",
-            env("RAILWAY_ENVIRONMENT_NAME").unwrap_or_else(|| "local".into()),
+            env("KIKI_ENVIRONMENT")
+                .or_else(|| env("RAILWAY_ENVIRONMENT_NAME"))
+                .unwrap_or_else(|| "local".into()),
         ),
         // The `instance` label. Each service runs as one instance, so the name:
         // a restart or a new replica continues the same series.
         KeyValue::new("service.instance.id", name.clone()),
     ];
-    if let Some(sha) = env("RAILWAY_GIT_COMMIT_SHA") {
+    if let Some(sha) = env("KIKI_VERSION").or_else(|| env("RAILWAY_GIT_COMMIT_SHA")) {
         attributes.push(KeyValue::new("service.version", sha));
     }
     Resource::builder()
@@ -457,6 +459,21 @@ mod tests {
         assert_eq!(
             get(&railway, "service.instance.id"),
             Some(Value::from("ingester-staging"))
+        );
+
+        // Self-hosted (Dokploy): the image bakes in KIKI_VERSION.
+        let dokploy = resource(env(&[
+            ("KIKI_ENVIRONMENT", "production"),
+            ("KIKI_VERSION", "def456"),
+            ("RAILWAY_GIT_COMMIT_SHA", "abc123"),
+        ]));
+        assert_eq!(
+            get(&dokploy, "deployment.environment.name"),
+            Some(Value::from("production"))
+        );
+        assert_eq!(
+            get(&dokploy, "service.version"),
+            Some(Value::from("def456"))
         );
     }
 }

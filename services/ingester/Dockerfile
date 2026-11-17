@@ -17,10 +17,16 @@ RUN cargo build --release --bin ingester
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 kiki
 COPY --from=builder /app/target/release/ingester /usr/local/bin/ingester
 USER kiki
-ENV LOG_FORMAT=json
+# CI passes the commit; telemetry and fault reports name it (KIKI_VERSION).
+ARG KIKI_VERSION=""
+ENV LOG_FORMAT=json KIKI_VERSION=${KIKI_VERSION}
+# Swarm (Dokploy) waits for this before stopping the old task, and rolls back
+# if it never passes (a failed MIGRATE_ON_START, say). Railway ignores it.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=3 \
+    CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/health" || exit 1
 CMD ["ingester"]

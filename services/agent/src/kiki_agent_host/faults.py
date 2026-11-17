@@ -247,8 +247,8 @@ async def save(connection, faults: list[Fault], *, job_kind: str, run_id: str, m
     """Inserts a job's faults. Never raises: reporting can't fail a job."""
     if not faults:
         return
-    version = os.getenv("RAILWAY_GIT_COMMIT_SHA") or None
-    environment = os.getenv("RAILWAY_ENVIRONMENT_NAME") or "local"
+    version = os.getenv("KIKI_VERSION") or os.getenv("RAILWAY_GIT_COMMIT_SHA") or None
+    environment = os.getenv("KIKI_ENVIRONMENT") or os.getenv("RAILWAY_ENVIRONMENT_NAME") or "local"
     rows = [
         (
             f.fingerprint(),

@@ -3,7 +3,8 @@
 //!
 //! Usage:
 //!   ingester           run the service
-//!   ingester migrate   apply database migrations and exit (Railway pre-deploy step)
+//!   ingester migrate   apply database migrations and exit (Railway pre-deploy step;
+//!                      self-hosted deploys set MIGRATE_ON_START=true instead)
 
 mod agent;
 mod catch_up;
@@ -67,6 +68,13 @@ async fn run(config: Config) -> anyhow::Result<()> {
         .context("connecting to Postgres")?;
 
     match std::env::args().nth(1).as_deref() {
+        // Self-hosted deploys have no pre-deploy step, so the service migrates
+        // before it starts. A failed migration exits, the new task never turns
+        // healthy, and Swarm rolls back to the old one, which keeps serving.
+        None if std::env::var("MIGRATE_ON_START").is_ok_and(|v| v == "true") => {
+            MIGRATOR.run(&pool).await.context("running migrations")?;
+            info!("migrations applied");
+        }
         None => {}
         Some("migrate") => {
             MIGRATOR.run(&pool).await.context("running migrations")?;

@@ -89,13 +89,16 @@ def resource_attributes(env: Mapping[str, str] = os.environ) -> dict[str, str]:
     attributes = {
         "service.name": name,
         "service.namespace": "kiki",
-        "deployment.environment.name": get("RAILWAY_ENVIRONMENT_NAME") or "local",
+        "deployment.environment.name": get("KIKI_ENVIRONMENT")
+        or get("RAILWAY_ENVIRONMENT_NAME")
+        or "local",
         # The `instance` label. One instance runs, so the name: never the SDK's
         # random per-process ID, which would start new series on every wake.
         "service.instance.id": name,
     }
-    if get("RAILWAY_GIT_COMMIT_SHA"):
-        attributes["service.version"] = get("RAILWAY_GIT_COMMIT_SHA")
+    # KIKI_VERSION is baked into the image by CI; Railway sets its own.
+    if version := get("KIKI_VERSION") or get("RAILWAY_GIT_COMMIT_SHA"):
+        attributes["service.version"] = version
     return attributes
 
 
